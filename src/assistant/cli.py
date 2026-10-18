@@ -176,8 +176,12 @@ def main(argv: list[str] | None = None) -> int:
     ask_p.add_argument("text")
     sub.add_parser("halt", help="panic switch (§4.4)")
     sub.add_parser("resume", help="clear the halt flag")
-    ptt_p = sub.add_parser("ptt", help="push-to-talk (Phase 1 capture; ack is local now)")
+    ptt_p = sub.add_parser("ptt", help="push-to-talk (bind press/release in Hyprland)")
     ptt_p.add_argument("action", choices=["start", "stop", "toggle"])
+    tr_p = sub.add_parser("transcribe", help="batch-transcribe a WAV (post tier, §3.6)")
+    tr_p.add_argument("file")
+    sub.add_parser("dictate", help="terminal push-to-talk: Enter to stop")
+    sub.add_parser("events", help="stream daemon events (overlay/Waybar feed)")
     args = parser.parse_args(argv)
     config = load_config()
 
@@ -242,6 +246,52 @@ def main(argv: list[str] | None = None) -> int:
                 from .safety import clear_halt
                 clear_halt(config.socket_path.parent)
             print("Resumed.")
+            return 0
+
+        if args.command == "transcribe":
+            try:
+                result = call(config.socket_path, "transcribe.file",
+                              {"path": args.file}, timeout=180.0)
+            except (DaemonUnavailable, RuntimeError, OSError):
+                # Same module, no extra design (§3.6): run the service locally.
+                import asyncio as _asyncio
+                from pathlib import Path as _Path
+
+                from .gemini_client import GeminiClient
+                from .store import Store
+                from .transcribe import DictationService
+                store = Store(config.db_path)
+                service = DictationService(config, store, GeminiClient(config, store))
+                session = _asyncio.run(service.transcribe_file(_Path(args.file).expanduser()))
+                result = {"text": (session.cleaned_text
+                                   if (session.cleaned_text and not session.flagged)
+                                   else session.raw_text),
+                          "backend": session.backend, "inbox_path": session.inbox_path}
+                store.close()
+            print(result.get("text", ""))
+            print(f"\n[backend: {result.get('backend')} · inbox: {result.get('inbox_path')}]",
+                  file=sys.stderr)
+            return 0
+
+        if args.command == "dictate":
+            started = call(config.socket_path, "ptt.start", timeout=5.0)
+            note = " (SIMULATED capture — no PipeWire here)" if started.get("simulated_capture") else ""
+            input(f"Listening{note}… press Enter to stop. ")
+            stopped = call(config.socket_path, "ptt.stop", timeout=90.0)
+            result = stopped.get("result") or {}
+            print(result.get("narration", ""))
+            print(result.get("text", result.get("error", "(no transcript)")))
+            print(f"[inbox: {result.get('inbox_path')} · clipboard: "
+                  f"{(result.get('clipboard') or {}).get('copied')}]", file=sys.stderr)
+            return 0
+
+        if args.command == "events":
+            from .ipc import subscribe_events
+            try:
+                for event in subscribe_events(config.socket_path):
+                    print(json.dumps(event), flush=True)
+            except KeyboardInterrupt:
+                pass
             return 0
 
         if args.command == "ptt":

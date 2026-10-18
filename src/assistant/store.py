@@ -15,6 +15,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from pathlib import Path
+from typing import ClassVar
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS llm_calls (
@@ -53,6 +54,22 @@ CREATE TABLE IF NOT EXISTS persona_events (
   ts TEXT NOT NULL,
   kind TEXT NOT NULL,          -- decision | pushback | ack | tone
   detail TEXT NOT NULL         -- JSON; decisions + reasons, never canned lines
+);
+
+CREATE TABLE IF NOT EXISTS transcripts (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  audio_path TEXT,              -- raw audio is the truth; always kept (§12.5)
+  raw_text TEXT NOT NULL,       -- the record
+  cleaned_text TEXT,            -- the convenience (NULL if cleanup skipped)
+  language TEXT NOT NULL,
+  backend TEXT NOT NULL,        -- gemini_live | gemini_batch | local | mock
+  model TEXT,
+  duration_s REAL NOT NULL DEFAULT 0,
+  divergence_pct REAL,          -- cleanup diff-gate measurement (§12.5)
+  flagged INTEGER NOT NULL DEFAULT 0,  -- 1 = divergence/language gate tripped
+  inbox_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS state (
@@ -134,6 +151,30 @@ class Store:
             params = (since_iso, model)
         with self._lock:
             return int(self._conn.execute(query, params).fetchone()["n"])
+
+    # -- transcripts (raw + cleaned side by side, §12.5) ----------------------
+    _TRANSCRIPT_COLUMNS: ClassVar[list[str]] = [
+        "ts", "session_id", "audio_path", "raw_text", "cleaned_text", "language",
+        "backend", "model", "duration_s", "divergence_pct", "flagged", "inbox_path",
+    ]
+
+    def log_transcript(self, **fields) -> int:
+        values = [fields.get(c) for c in self._TRANSCRIPT_COLUMNS]
+        with self._lock:
+            cur = self._conn.execute(
+                f"INSERT INTO transcripts ({', '.join(self._TRANSCRIPT_COLUMNS)}) "
+                f"VALUES ({', '.join('?' * len(self._TRANSCRIPT_COLUMNS))})",
+                values,
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def recent_transcripts(self, limit: int = 10) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM transcripts ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # -- safety-spine journal (§4.2) ----------------------------------------
     def outstanding_intents(self) -> list[dict]:

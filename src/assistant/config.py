@@ -92,6 +92,27 @@ DEFAULTS: dict = {
         "assert_output_language": True,
     },
     "capture": {"source": "mic", "sample_rate": 16000, "chunk_ms": 30, "retention_days": 30},
+    "transcribe": {
+        # §3.5: rolling local buffer replayed into a resumed session so a
+        # mid-sentence reset doesn't lose the utterance.
+        "reconnect_replay_s": 30,
+        # Rotate before the ~10min Live connection lifetime (§3.5 table).
+        "live_session_max_s": 540,
+        "save_audio": True,               # disk is free; re-transcription isn't
+        "inbox_dir": "~/.local/share/assistant/inbox",
+        "copy_to_clipboard": True,        # wl-copy only (Wayland, §3.3)
+        # Adaptive endpointing (§13.8 soft check-in): per-mode silence
+        # before the single "Is that all?" — narration waits far longer.
+        "checkin_after_s": {"command": 4, "conversation": 6, "narration": 20},
+        "vad_rms_threshold": 0.01,        # never stream silence (§8)
+    },
+    "cleanup": {
+        "enabled": True,
+        "max_divergence_pct": 35,         # diff-gate (§12.5): rewrite != repair
+        "keep_raw": True,                 # raw is the record, cleaned the convenience
+        "min_chars": 40,                  # short utterances aren't worth a call (§13.4)
+        "glossary_file": "~/.config/assistant/glossary.toml",
+    },
     "persona": {
         "name": "Elaria",
         "candour": 0.7,

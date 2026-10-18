@@ -9,9 +9,12 @@ Design: [`assistant-blueprint.md`](assistant-blueprint.md) (v29) ·
 Setup/build order: [`GETTING-STARTED.md`](GETTING-STARTED.md) ·
 Personality profile: [`humour.toml`](humour.toml)
 
-**Status: Phase 0 built** (plus the §9-order-first `assist-voice-test`).
-`assist doctor`, `assist status`, `assist cost` work; the test suite passes
-with **no API key**. Transcription is Phase 1; the file executor is Phase 4.
+**Status: Phase 1 built** (on Phase 0 + the §9-order-first `assist-voice-test`).
+`assist doctor/status/cost` work; push-to-talk dictation now runs end-to-end —
+capture → Live transcription → cleanup gates → markdown inbox + clipboard —
+with the test suite passing with **no API key** (mock live transport).
+The real Gemini Live transport is wired but UNVERIFIED until first run with
+the owner's key (Step 0). The file executor is Phase 4.
 
 ---
 
@@ -87,9 +90,13 @@ No key yet? Everything still runs — `GEMINI_MODE` defaults to **mock**
 | Safety spine primitives | `safety.py` | Policy checks (protected paths, never-overwrite→`_Conflicts`, no-`rm`, 15-min guard), blast-radius tripwire, write-ahead journal, halt flag. Executor itself is Phase 4. |
 | Local ack (§18) | `persona.ack` + daemon | Pure in-process code, zero network by construction; tests assert <300ms with sockets sabotaged. Cached-audio acks arrive with TTS in Phase 2. |
 | ASR seam + capture helpers | `asr.py`, `capture.py` | `live → batch → local` chain (§12.7), language pinned (`en`; Kiswahili = Phase 7 config flip), `pw-record` target trap (object.id) guarded in code. |
+| **Dictation (Phase 1)** | `transcribe.py`, `live_client.py`, `cleanup.py`, `inbox.py`, `clipboard.py` | PTT session: `pw-record` frames → WAV sink (raw always kept) + rolling 30s buffer + VAD gate → Live manual-activity streaming with interim events; disconnect/GoAway → resumption + tail replay; unrecoverable → batch on the saved WAV. Silence ladder emits ONE soft check-in per segment, per-mode thresholds. Cleanup pass with diff-gate + language gate (raw is the record); note lands in the markdown inbox + `wl-copy`. `assist dictate` (terminal PTT), `assist transcribe FILE.wav`, `assist events` (overlay feed). Live-session fixtures are recordable *sequences* (hashes only — no audio in git). |
 
-**Phase 0 definition of done:** `assist doctor` ✓ · `assist status` ✓ ·
-`assist cost` ✓ · `pytest` with no API key ✓ (61 tests).
+**Definitions of done:** Phase 0 — `assist doctor/status/cost` ✓ · keyless
+tests ✓. Phase 1 — “you dictate a note and it appears” ✓ in mock/simulated
+mode everywhere; on Fedora with a key it's the same code path with
+`pw-record` + the real Live transport (verify model/quotas first, Step 0).
+81 tests, all offline.
 
 ## §10 open decisions — defaults taken, awaiting your word
 
@@ -132,6 +139,9 @@ never breaks.
 - **You:** Step 0 verification + key file; run `assist-voice-test` in real
   life for a few days (TV on, other voices, morning voice), label with
   `f`/`m`, tune thresholds from `report`. Targets: <1 false light-up/day,
-  >95% deliberate catches.
-- **Phase 1:** hotkey → `pw-record` → Gemini Live → markdown inbox +
-  clipboard, ASR seam filled, Live-session fixture recorder.
+  >95% deliberate catches. Then: Hyprland PTT binds (Step 6) + the Step 3
+  A/B/C capture listening test (§10.1), one live dictation, and a
+  `GEMINI_MODE=record` session so the first real fixtures exist.
+- **Phase 2:** Waybar module (config snippet in GETTING-STARTED Step 6 —
+  `assist status --waybar` and `assist events` already feed it) +
+  Quickshell overlay with live partials, `keyboard-interactivity: none`.

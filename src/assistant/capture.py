@@ -13,9 +13,20 @@ keeps serial + name, and deliberately never uses the bare ID as a target.
 
 from __future__ import annotations
 
+import asyncio
+import math
 import re
 import shutil
+import struct
 import subprocess
+import wave
+from collections import deque
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Protocol
+
+SAMPLE_RATE = 16000
+BYTES_PER_SAMPLE = 2  # s16le mono — what the Live API wants natively (§3.4)
 
 
 def tool_available(name: str) -> bool:
@@ -70,6 +81,202 @@ def pw_record_command(target: str, output_path: str, *, sample_rate: int = 16000
         )
     return ["pw-record", f"--target={target}", "--rate", str(sample_rate),
             "--channels", "1", output_path]
+
+
+# --------------------------------------------------------------------------
+# PCM utilities (Phase 1): energy, rolling buffer, WAV sink, VAD gate
+# --------------------------------------------------------------------------
+def frame_rms(pcm: bytes) -> float:
+    """Normalised RMS of an s16le frame (0.0 silence … 1.0 clipping)."""
+    if len(pcm) < 2:
+        return 0.0
+    samples = struct.unpack(f"<{len(pcm) // 2}h", pcm[: len(pcm) - len(pcm) % 2])
+    return math.sqrt(sum(s * s for s in samples) / len(samples)) / 32768
+
+
+def pcm_duration_s(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> float:
+    return len(pcm) / BYTES_PER_SAMPLE / sample_rate
+
+
+def wav_duration_s(path: Path) -> float:
+    with wave.open(str(path), "rb") as wav:
+        return wav.getnframes() / wav.getframerate()
+
+
+class RollingAudioBuffer:
+    """Last ~30s of PCM (§3.5). On an unexpected Live disconnect the tail
+    is replayed into the resumed session — the difference between
+    'feels solid' and 'drops words'. Memory only; the durable copy is
+    the WAV sink below."""
+
+    def __init__(self, seconds: float = 30.0, sample_rate: int = SAMPLE_RATE):
+        self._max_bytes = int(seconds * sample_rate * BYTES_PER_SAMPLE)
+        self._chunks: deque[bytes] = deque()
+        self._size = 0
+
+    def push(self, frame: bytes) -> None:
+        self._chunks.append(frame)
+        self._size += len(frame)
+        while self._size > self._max_bytes and len(self._chunks) > 1:
+            self._size -= len(self._chunks.popleft())
+
+    def tail(self) -> bytes:
+        return b"".join(self._chunks)
+
+    def clear(self) -> None:
+        self._chunks.clear()
+        self._size = 0
+
+    @property
+    def seconds(self) -> float:
+        return pcm_duration_s(b"x" * self._size)
+
+
+class WavSink:
+    """Raw-audio persistence: 'always save the raw audio' (§3.5/§12.5).
+    Enables diarization post-pass, batch fallback and re-checks."""
+
+    def __init__(self, path: Path, sample_rate: int = SAMPLE_RATE):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._wav = wave.open(str(self.path), "wb")  # noqa: SIM115 — sink owns lifecycle; close() is the API
+        self._wav.setnchannels(1)
+        self._wav.setsampwidth(BYTES_PER_SAMPLE)
+        self._wav.setframerate(sample_rate)
+        self._frames = 0
+
+    def write(self, frame: bytes) -> None:
+        self._wav.writeframes(frame)
+        self._frames += len(frame) // BYTES_PER_SAMPLE
+
+    def close(self) -> float:
+        self._wav.close()
+        return self._frames / SAMPLE_RATE
+
+
+class FrameGate:
+    """Energy VAD: never stream empty audio (§8 — hallucinated transcripts
+    on silence). Speech frames pass, plus a short hangover so word
+    endings aren't clipped; deep silence is dropped and counted."""
+
+    def __init__(self, rms_threshold: float = 0.01, hangover_frames: int = 10):
+        self.threshold = rms_threshold
+        self.hangover_frames = hangover_frames
+        self._hangover = 0
+        self.dropped_silent = 0
+        self.passed = 0
+
+    def allows(self, frame: bytes) -> bool:
+        if frame_rms(frame) >= self.threshold:
+            self._hangover = self.hangover_frames
+            self.passed += 1
+            return True
+        if self._hangover > 0:
+            self._hangover -= 1
+            self.passed += 1
+            return True
+        self.dropped_silent += 1
+        return False
+
+
+class AsyncFrameSource(Protocol):
+    def frames(self) -> AsyncIterator[bytes]: ...
+    async def aclose(self) -> None: ...
+
+
+class PipeWireCapture:
+    """One pw-record process per session (§3.4) — never per-chunk spawns."""
+
+    def __init__(self, target: str | None = None, *, sample_rate: int = SAMPLE_RATE,
+                 frame_ms: int = 30):
+        if not tool_available("pw-record"):
+            raise RuntimeError(
+                "pw-record not found (pipewire-utils) — live capture needs the "
+                "Fedora target. Headless/test runs use SimulatedCapture."
+            )
+        self._command = pw_record_pcm_stream_command(target, sample_rate=sample_rate)
+        self._frame_bytes = sample_rate * frame_ms // 1000 * BYTES_PER_SAMPLE
+        self._proc: asyncio.subprocess.Process | None = None
+
+    async def frames(self) -> AsyncIterator[bytes]:
+        self._proc = await asyncio.create_subprocess_exec(
+            *self._command, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        assert self._proc.stdout is not None
+        while True:
+            try:
+                chunk = await self._proc.stdout.readexactly(self._frame_bytes)
+            except asyncio.IncompleteReadError as partial:
+                if partial.partial:
+                    yield partial.partial
+                return
+            yield chunk
+
+    async def aclose(self) -> None:
+        if self._proc and self._proc.returncode is None:
+            self._proc.terminate()
+            await self._proc.wait()
+
+
+class FileCapture:
+    """Replay a WAV as capture frames (tests, `assist transcribe` live-path
+    debugging). `realtime=True` paces at wall-clock; tests use burst mode."""
+
+    def __init__(self, path: Path, *, frame_ms: int = 30, realtime: bool = False):
+        self.path = Path(path)
+        self.frame_ms = frame_ms
+        self.realtime = realtime
+
+    async def frames(self) -> AsyncIterator[bytes]:
+        with wave.open(str(self.path), "rb") as wav:
+            if wav.getframerate() != SAMPLE_RATE or wav.getnchannels() != 1:
+                raise ValueError(f"{self.path}: need 16kHz mono WAV")
+            per_frame = SAMPLE_RATE * self.frame_ms // 1000
+            while chunk := wav.readframes(per_frame):
+                yield chunk
+                if self.realtime:
+                    await asyncio.sleep(self.frame_ms / 1000)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class SimulatedCapture:
+    """Deterministic frames for headless runs (no mic/PipeWire anywhere):
+    bursts of synthetic 'speech' energy separated by silence. Proves the
+    full dictation pipeline in mock mode; says nothing about acoustics."""
+
+    def __init__(self, speech_frames: int = 20, silent_frames: int = 5, *,
+                 frame_ms: int = 30, realtime: bool = False):
+        self.speech_frames = speech_frames
+        self.silent_frames = silent_frames
+        self.frame_ms = frame_ms
+        self.realtime = realtime
+        self._stopped = asyncio.Event()
+
+    def stop(self) -> None:
+        self._stopped.set()
+
+    async def frames(self) -> AsyncIterator[bytes]:
+        samples = SAMPLE_RATE * self.frame_ms // 1000
+        speech = struct.pack(f"<{samples}h", *([6000] * samples))  # steady energy
+        silence = b"\x00\x00" * samples
+        for _ in range(self.speech_frames):
+            if self._stopped.is_set():
+                return
+            yield speech
+            if self.realtime:
+                await asyncio.sleep(self.frame_ms / 1000)
+        for _ in range(self.silent_frames):
+            if self._stopped.is_set():
+                return
+            yield silence
+            if self.realtime:
+                await asyncio.sleep(self.frame_ms / 1000)
+
+    async def aclose(self) -> None:
+        self.stop()
 
 
 def pw_record_pcm_stream_command(target: str | None, *, sample_rate: int = 16000) -> list[str]:

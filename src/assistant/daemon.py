@@ -22,6 +22,7 @@ import socket as socket_mod
 import time
 
 from . import __version__
+from .capture import PipeWireCapture, SimulatedCapture
 from .config import Config, load_config, load_humour_profile
 from .cost import day_start_iso, iso_now, month_start_iso
 from .gemini_client import GeminiClient
@@ -29,6 +30,7 @@ from .ipc import serve
 from .persona import PersonaGovernor, TurnContext
 from .safety import clear_halt, is_halted, set_halt
 from .store import Store
+from .transcribe import DictationService
 
 
 def _sd_notify(message: str) -> None:
@@ -55,7 +57,24 @@ class Daemon:
         self.started_at = iso_now()
         self.started_monotonic = time.monotonic()
         self.mode = "idle"
+        self.dictation = DictationService(config, self.store, self.client)
+        self._subscribers: set = set()          # event-stream writers (§3.1)
+        self._dictation_task: asyncio.Task | None = None
+        self._capture_source = None
+        self._stop_event: asyncio.Event | None = None
         self._load_relationship_state()
+
+    async def broadcast(self, event: dict) -> None:
+        line = (json.dumps(event) + "\n").encode()
+        dead = []
+        for writer in self._subscribers:
+            try:
+                writer.write(line)
+                await writer.drain()
+            except (ConnectionResetError, BrokenPipeError, RuntimeError):
+                dead.append(writer)
+        for writer in dead:
+            self._subscribers.discard(writer)
 
     # -- relationship state persists across restarts (§16) -------------------
     def _load_relationship_state(self) -> None:
@@ -73,7 +92,7 @@ class Daemon:
         )
 
     # -- handlers --------------------------------------------------------------
-    async def handle(self, method: str, params: dict) -> dict:
+    async def handle(self, method: str, params: dict, writer=None) -> dict:
         handlers = {
             "ping": self._ping,
             "status": self._status,
@@ -83,12 +102,20 @@ class Daemon:
             "resume": self._resume,
             "ptt.start": self._ptt_start,
             "ptt.stop": self._ptt_stop,
+            "transcribe.file": self._transcribe_file,
             "ask": self._ask,
         }
+        if method == "events.subscribe":
+            if writer is not None:
+                self._subscribers.add(writer)
+            return {"subscribed": True,
+                    "events": ["session.started", "transcript.interim",
+                               "session.checkin", "transcript.final",
+                               "session.ended", "error"]}
         handler = handlers.get(method)
         if handler is None:
-            raise ValueError(f"unknown method '{method}' — Phase 0 supports: "
-                             f"{', '.join(sorted(handlers))}")
+            raise ValueError(f"unknown method '{method}' — supported: "
+                             f"{', '.join(sorted(handlers))}, events.subscribe")
         return await handler(params)
 
     async def _ping(self, params: dict) -> dict:
@@ -135,16 +162,82 @@ class Daemon:
         return {"halted": False}
 
     async def _ptt_start(self, params: dict) -> dict:
-        # Local ack NOW (<300ms budget); capture + Live session join behind
-        # it in Phase 1 (§18 rule 1-2). The socket opens after the user
-        # already knows it's listening.
+        # §18: ack RETURNS immediately; capture + Live session spin up in a
+        # background task behind it. The user is already talking while the
+        # socket opens — parse-while-you-speak starts here (§18 rule 3).
+        if self._dictation_task and not self._dictation_task.done():
+            return {"listening": True, **self.governor.ack(), "note": "already listening"}
+        ack = self.governor.ack()
+        capture_cfg = self.config.section("capture")
+        frame_ms = int(capture_cfg.get("chunk_ms", 30))
+        source_kind = params.get("source") or capture_cfg.get("source", "mic")
+        simulated = False
+        if source_kind == "simulated":
+            self._capture_source = SimulatedCapture(speech_frames=100_000,
+                                                    frame_ms=frame_ms, realtime=True)
+            simulated = True
+        else:
+            try:
+                self._capture_source = PipeWireCapture(
+                    params.get("target"), frame_ms=frame_ms)
+            except RuntimeError:
+                # No PipeWire (headless/containers): simulated frames keep
+                # the full pipeline exercisable; status reports it honestly.
+                self._capture_source = SimulatedCapture(speech_frames=100_000,
+                                                        frame_ms=frame_ms, realtime=True)
+                simulated = True
+        self._stop_event = asyncio.Event()
         self.mode = "listening"
-        return {"listening": True, **self.governor.ack(),
-                "phase": "capture/ASR streaming lands in Phase 1 (§9)"}
+        self._dictation_task = asyncio.create_task(
+            self.dictation.dictate(
+                self._capture_source, mode=params.get("mode", "narration"),
+                sink=self.broadcast, stop_event=self._stop_event))
+        return {"listening": True, **ack, "simulated_capture": simulated}
 
     async def _ptt_stop(self, params: dict) -> dict:
+        ack = self.governor.ack()  # release acknowledged locally, instantly
+        if self._stop_event:
+            self._stop_event.set()
+        result = None
+        if self._dictation_task:
+            try:
+                session = await asyncio.wait_for(self._dictation_task, timeout=60)
+                result = {
+                    "text": (session.cleaned_text
+                             if (session.cleaned_text and not session.flagged)
+                             else session.raw_text),
+                    "raw_text": session.raw_text,
+                    "backend": session.backend,
+                    "inbox_path": session.inbox_path,
+                    "audio_path": session.audio_path,
+                    "clipboard": session.clipboard,
+                    "flagged": session.flagged,
+                    "notes": session.notes,
+                    # Factual narration from real state (§13.1) — no model call.
+                    "narration": self.governor.narrate_fact(
+                        "transcribe.done",
+                        {"words": len(session.raw_text.split()),
+                         "seconds": session.duration_s}),
+                }
+            except Exception as exc:
+                result = {"error": f"dictation did not finish cleanly: {exc}"}
+            self._dictation_task = None
         self.mode = "idle"
-        return {"listening": False, **self.governor.ack()}
+        return {"listening": False, **ack, "result": result}
+
+    async def _transcribe_file(self, params: dict) -> dict:
+        from pathlib import Path
+
+        path = Path(str(params.get("path", ""))).expanduser()
+        if not path.exists():
+            raise ValueError(f"no such audio file: {path}")
+        session = await self.dictation.transcribe_file(path)
+        return {"text": (session.cleaned_text
+                         if (session.cleaned_text and not session.flagged)
+                         else session.raw_text),
+                "raw_text": session.raw_text, "backend": session.backend,
+                "inbox_path": session.inbox_path, "flagged": session.flagged,
+                "clipboard": session.clipboard}
 
     async def _ask(self, params: dict) -> dict:
         """Conversational turn: governor first (local), harness second (§17).
@@ -189,7 +282,7 @@ class Daemon:
                   f"the executor.", flush=True)
         server = await serve(self.config.socket_path, self.handle)
         _sd_notify("READY=1")
-        print(f"[assistd] Elaria Phase 0 up · mode={self.config.gemini_mode} "
+        print(f"[assistd] Elaria up · mode={self.config.gemini_mode} "
               f"· socket={self.config.socket_path}", flush=True)
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()

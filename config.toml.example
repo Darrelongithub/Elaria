@@ -42,6 +42,26 @@ sample_rate = 16000
 chunk_ms = 30
 retention_days = 30
 
+[transcribe]
+reconnect_replay_s = 30             # rolling buffer replayed on session reset (§3.5)
+live_session_max_s = 540            # rotate before the ~10min Live lifetime
+save_audio = true                   # always keep raw audio (§12.5)
+inbox_dir = "~/.local/share/assistant/inbox"
+copy_to_clipboard = true            # wl-copy only — X11 tools fail silently
+vad_rms_threshold = 0.01            # never stream silence (§8)
+
+[transcribe.checkin_after_s]        # soft check-in ladder (§13.8): narration waits
+command = 4
+conversation = 6
+narration = 20
+
+[cleanup]
+enabled = true
+max_divergence_pct = 35             # diff-gate: above this, flag for review (§12.5)
+keep_raw = true                     # never destroy the original transcript
+min_chars = 40                      # shorter than this: not worth a model call
+glossary_file = "~/.config/assistant/glossary.toml"  # names, places, jargon
+
 [persona]
 name = "Elaria"                     # also the wake word (§13.10)
 candour = 0.7                       # 0 butler -> 1 brutally honest friend

@@ -281,6 +281,61 @@ class GeminiClient:
         return HarnessResult(last_text, ladder[min(tier, len(ladder) - 1)],
                              attempts, tier > 0, last_verified, correlation_id)
 
+    # -- batch transcription: second tier (§3.6) + Live fallback (§12.7) ------
+    def transcribe_batch(self, audio_path, language: str = "en") -> dict:
+        """generateContent on saved audio: accurate pass, same ledger rules.
+
+        Mock/record keying uses the audio's SHA-256, so fixtures replay
+        per-recording without embedding audio in the repo. Live mode
+        uploads via the SDK Files API (lazy; UNVERIFIED without a key).
+        The prompt pins the language and forbids translation (§12.4/§12.5).
+        """
+        import hashlib
+        from pathlib import Path
+
+        from .capture import wav_duration_s
+
+        path = Path(audio_path)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        duration = wav_duration_s(path)
+        model = self.config.model_for_role("transcribe_batch")
+        prompt = (f"Transcribe this audio verbatim. The language is {language}; "
+                  "transcribe in that language exactly as spoken. Do NOT translate. "
+                  "Return only the transcript.")
+        contents = {"audio_sha256": digest, "language": language, "prompt": prompt}
+        correlation_id = uuid.uuid4().hex[:12]
+        if isinstance(self._transport, _SdkTransport) and self.mode != "mock":
+            text = self._sdk_transcribe(path, model, prompt, correlation_id, duration)
+            return {"text": text, "model": model, "duration_s": duration, "backend": "gemini_batch"}
+        response = self._call_once(
+            "transcribe_batch", model, contents, {},
+            correlation_id=correlation_id, attempt=1, audio_seconds=duration,
+        )
+        return {"text": response.get("text", ""), "model": model,
+                "duration_s": duration, "backend": "gemini_batch",
+                "fixture": response.get("fixture")}
+
+    def _sdk_transcribe(self, path, model, prompt, correlation_id, duration):  # pragma: no cover
+        started = time.monotonic()
+        try:
+            uploaded = self._transport._client.files.upload(file=str(path))
+            response = self._transport._client.models.generate_content(
+                model=model, contents=[prompt, uploaded])
+            text = response.text or ""
+            error = None
+        except Exception as exc:
+            text, error = "", f"{type(exc).__name__}: {exc}"
+        self.store.log_llm_call(
+            ts=iso_now(), correlation_id=correlation_id, role="transcribe_batch",
+            model=model, mode=self.mode, tokens_in=0, tokens_out=estimate_tokens(text),
+            tokens_estimated=1, audio_seconds=duration,
+            cost_usd=shadow_cost_usd(model, 0, estimate_tokens(text), duration),
+            latency_ms=(time.monotonic() - started) * 1000, ok=0 if error else 1,
+            verified=None, attempt=1, fixture_key=None, error=error)
+        if error:
+            raise RuntimeError(error)
+        return text
+
     def list_models(self) -> dict:
         """For `assist doctor`: live list when possible, else configured set."""
         configured = sorted({self.config.model_for_role(r) for r in

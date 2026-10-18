@@ -35,7 +35,8 @@ async def serve(socket_path: Path, handler: Handler,
             while line := await reader.readline():
                 try:
                     request = json.loads(line)
-                    result = await handler(request.get("method", ""), request.get("params") or {})
+                    result = await handler(request.get("method", ""),
+                                           request.get("params") or {}, writer)
                     reply = {"id": request.get("id"), "ok": True, "result": result}
                 except Exception as exc:
                     reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -53,6 +54,28 @@ async def serve(socket_path: Path, handler: Handler,
 
 class DaemonUnavailable(RuntimeError):
     pass
+
+
+def subscribe_events(socket_path: Path):
+    """Generator of daemon event dicts (transcript.interim, …) — the feed
+    Waybar/overlay (Phase 2) and `assist events` render from."""
+    import socket as _socket
+
+    if not socket_path.exists():
+        raise DaemonUnavailable(f"daemon socket not found at {socket_path}")
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sock.connect(str(socket_path))
+    sock.sendall(b'{"id": 1, "method": "events.subscribe", "params": {}}\n')
+    buffer = b""
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return
+        buffer += chunk
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            if line.strip():
+                yield json.loads(line)
 
 
 def call(socket_path: Path, method: str, params: dict | None = None, timeout: float = 10.0) -> dict:

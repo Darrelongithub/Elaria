@@ -1,29 +1,39 @@
 """ASR seam (§12.7) — the backend is a config change, not a rewrite.
 
-Phase 0 ships the seam and the fallback chain resolver only:
-
     gemini_live ──429/disconnect──► gemini_batch ──offline──► local
      (primary,                        (same quality,             (small,
       streaming)                        ~1–3s latency)            English only)
 
-Real backends land in Phase 1 (Live) behind this exact interface.
+Phase 1 state: Live transport factory + batch transcription are wired
+through `GeminiClient` (ledgered, fixture-able). Local Whisper stays an
+honest pending stub — §12.6: on the owner's UHD 620 it's an offline
+emergency fallback at best, and unusable for Kiswahili regardless.
+
 Languages are pinned explicitly from config — never auto-detected
-(Whisper's silent-translation failure mode, §12.4) — and English-only
-until Kiswahili flips on in Phase 7 via config alone.
+(Whisper's silent-translation failure mode, §12.4) — English-only until
+Kiswahili flips on in Phase 7 via config alone.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
+
+from .fixtures import FixtureStore
+from .live_client import (
+    FixtureLiveTransport,
+    GenaiLiveTransport,
+    LiveTransport,
+    ScriptedLiveTransport,
+)
 
 
 class PhasePending(NotImplementedError):
     """Honest stub: designed, seamed, scheduled — not secretly fake."""
     def __init__(self, backend: str, phase: str):
         super().__init__(f"ASR backend '{backend}' is {phase} (blueprint §9). "
-                         "The seam exists now so Phase 1 fills it without "
-                         "touching callers.")
+                         "The seam exists now so filling it never touches callers.")
 
 
 @dataclass
@@ -34,18 +44,29 @@ class Transcript:
     confidence: float | None = None
 
 
-class ASRBackend(Protocol):
+class BatchBackend(Protocol):
     name: str
 
     def transcribe(self, audio_path: str, language: str) -> Transcript: ...
 
 
-class _PendingBackend:
-    def __init__(self, name: str, phase: str):
-        self.name, self._phase = name, phase
+class GeminiBatchBackend:
+    name = "gemini_batch"
+
+    def __init__(self, client):
+        self._client = client
 
     def transcribe(self, audio_path: str, language: str) -> Transcript:
-        raise PhasePending(self.name, self._phase)
+        result = self._client.transcribe_batch(Path(audio_path), language)
+        return Transcript(text=result["text"], language=language, backend=self.name)
+
+
+class _LocalPending:
+    name = "local"
+
+    def transcribe(self, audio_path: str, language: str) -> Transcript:
+        raise PhasePending("local", "offline-only fallback (§13.9); whisper.cpp "
+                                   "`small`, English only, not yet wired")
 
 
 class MockASR:
@@ -58,17 +79,42 @@ class MockASR:
                           language=language, backend=self.name, confidence=1.0)
 
 
-BACKEND_PHASES = {"gemini_live": "Phase 1", "gemini_batch": "Phase 1/6", "local": "offline fallback (§13.9)"}
-
-
-def backend_chain(config) -> list[ASRBackend]:
+def batch_chain(config, client) -> list[BatchBackend]:
+    """Ordered file-transcription fallbacks (live streaming is separate)."""
     asr = config.section("asr")
-    names = [asr.get("primary", "gemini_live")] + list(asr.get("fallback") or [])
-    chain: list[ASRBackend] = []
-    for name in names:
-        chain.append(MockASR() if name == "mock"
-                     else _PendingBackend(name, BACKEND_PHASES.get(name, "unscheduled")))
+    names = [n for n in (asr.get("fallback") or []) if n != "gemini_live"]
+    chain: list[BatchBackend] = []
+    for name in names or ["gemini_batch"]:
+        if name == "gemini_batch":
+            chain.append(GeminiBatchBackend(client))
+        elif name == "mock":
+            chain.append(MockASR())
+        else:
+            chain.append(_LocalPending())
     return chain
+
+
+def transcribe_file(config, client, audio_path: str) -> Transcript:
+    """Walk the fallback chain until one backend produces text (§12.7:
+    quota exhaustion degrades instead of failing)."""
+    language = primary_language(config)
+    errors: list[str] = []
+    for backend in batch_chain(config, client):
+        try:
+            return backend.transcribe(audio_path, language)
+        except Exception as exc:
+            errors.append(f"{backend.name}: {exc}")
+    raise RuntimeError("all ASR backends failed — " + " | ".join(errors))
+
+
+def make_live_transport(config, *, fixture_name: str | None = None) -> LiveTransport:
+    """Factory for the streaming path, by effective GEMINI_MODE."""
+    if fixture_name:
+        return FixtureLiveTransport(FixtureStore(config.fixtures_dir), fixture_name)
+    if config.gemini_mode == "mock":
+        return ScriptedLiveTransport()
+    model = config.model_for_role("transcribe_live")
+    return GenaiLiveTransport(config.api_key, model, primary_language(config))
 
 
 def primary_language(config) -> str:
@@ -77,6 +123,6 @@ def primary_language(config) -> str:
 
 
 def assert_output_language(transcript: Transcript, expected: list[str]) -> bool:
-    """Catch silent translation (§12.4/§12.5). Phase 0: tag check only;
-    the real language-mix gate arrives with the cleanup pass in Phase 1."""
+    """Catch silent translation (§12.4/§12.5). Tag check here; the
+    content-level marker gate lives in cleanup.language_mix_preserved."""
     return transcript.language in expected
