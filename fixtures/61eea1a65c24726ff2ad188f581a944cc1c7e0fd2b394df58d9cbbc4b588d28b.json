@@ -1,0 +1,15 @@
+{
+  "request": {
+    "model": "gemini-flash-latest",
+    "contents": "ping",
+    "config": {}
+  },
+  "response": {
+    "text": "pong (committed sample fixture — replace by recording real behaviour)",
+    "usage": {
+      "tokens_in": 1,
+      "tokens_out": 2
+    },
+    "sample": true
+  }
+}

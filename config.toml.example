@@ -1,0 +1,84 @@
+# config.toml.example — copy to ~/.config/assistant/config.toml and edit.
+# The API key does NOT go here (GETTING-STARTED Step 1):
+#   ~/.config/assistant/gemini.env  (0600, read by systemd EnvironmentFile=)
+# Values marked VERIFY come from blueprint Appendix A / §12.1 and must be
+# confirmed against aistudio.google.com/rate-limit on YOUR account (§11).
+
+[gemini]
+# Models by role (§3.2). Cheapest-first is the default (§17 reasoning harness).
+model_default        = "gemini-flash-lite-latest"   # VERIFY exact ID on your account
+model_organise       = "gemini-flash-lite-latest"   # VERIFY
+model_cleanup        = "gemini-flash-lite-latest"   # VERIFY
+model_chat           = "gemini-flash-latest"        # VERIFY
+model_transcribe_live  = "gemini-3.5-transcribe-live"  # VERIFY (§11.1)
+model_transcribe_batch = "gemini-flash-lite-latest"    # VERIFY
+# Escalation ladder for the reasoning harness: cheapest -> next tier (§17).
+escalation_ladder    = ["gemini-flash-lite-latest", "gemini-flash-latest"]
+escalate_after_failures = 2
+max_scaffold_calls      = 6
+# live | record | mock. Env GEMINI_MODE overrides. No key present => mock.
+mode = "mock"
+
+[quota]
+# ASSUMED free-tier shape (§12.1) — UNVERIFIED until Step 0 is done.
+flash_rpm = 10
+flash_lite_rpm = 15
+max_requests_per_day = 1200
+max_requests_per_minute = 12
+
+[asr]
+primary  = "gemini_live"            # chain: live -> batch -> local (§12.7)
+fallback = ["gemini_batch", "local"]
+offline_model = "small"             # English only offline (§12.6)
+languages = ["en"]                  # English first; Kiswahili is Phase 7.
+                                    # Pinned explicitly, never auto-detected.
+preserve_code_switching = false     # flip with sw+en in Phase 7
+assert_output_language  = true
+
+[capture]
+source = "mic"                      # §10.1 OPEN — blueprint recommendation:
+                                    # mic first (Phase 1), mix in Phase 6.
+sample_rate = 16000
+chunk_ms = 30
+retention_days = 30
+
+[persona]
+name = "Elaria"                     # also the wake word (§13.10)
+candour = 0.7                       # 0 butler -> 1 brutally honest friend
+verbosity = "normal"                # quiet | normal | chatty
+humour = "witty"                    # calibrated register — humour.toml (§13.7)
+humour_profile = "~/.local/share/assistant/persona/humour.toml"
+proactive = true
+proactive_max_per_day = 3
+pushback_budget_per_day = 5
+quiet_hours = "23:00-07:00"
+
+[privacy]
+tier = "free"                       # free | paid — see §12.2 before changing
+# §10.7 OPEN — decide before any indexing (Phase 3). Placeholder:
+never_send_to_cloud = []
+
+[organise]
+mode = "shadow"                     # shadow | live, per-root override (§4.3)
+confidence_auto = 0.90
+confidence_review = 0.60
+max_ops_per_run = 200
+max_ops_per_hour = 500
+tree_tripwire_pct = 25
+
+[policy]
+protected = ["~/.ssh", "~/.gnupg", "~/.config", "~/.local/share/assistant"]
+recently_modified_guard_minutes = 15
+
+[tools]
+shell = "confirm"                   # §10.4 OPEN — off | confirm | allow.
+                                    # Default: blueprint recommendation.
+
+[voice_test]
+keyword = "Elaria"
+# Strict threshold is affordable at measured consistency 0.96 (§13.10),
+# but this number is UNTUNED until `assist-voice-test report` has labelled
+# impostor data. Tune from the report, never from a default.
+speaker_threshold = 0.75
+keyword_threshold = 0.5
+save_near_miss_clips = false        # privacy: off by default (§13.10)

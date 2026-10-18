@@ -1,0 +1,20 @@
+[Unit]
+Description=Elaria — personal AI assistant daemon (Phase 0)
+After=pipewire.service
+Documentation=file:%h/Elaria/assistant-blueprint.md
+
+[Service]
+Type=notify
+# The key lives ONLY in this file (0600), outside the repo (Step 1).
+# Optional at Phase 0: no file => GEMINI_MODE=mock, daemon still runs.
+EnvironmentFile=-%h/.config/assistant/gemini.env
+ExecStart=%h/.local/bin/assistd
+Restart=on-failure
+RestartSec=3
+# Light hardening that doesn't fight a personal desktop tool. filesystem
+# access to $HOME is the product (§3.7), so no ProtectHome here.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+# Secrets & local state — never in git (GETTING-STARTED Step 1, blueprint §12.9)
+config.toml
+*.env
+.venv/
+__pycache__/
+*.db
+audio/
+# Biometric template: voiceprint.json stays OUT of git entirely (§13.10)
+voiceprint.json
+# Humour calibration corpus: private conversations, never committed (§13.7)
+corpus/
+near-miss/
+*.opus
+*.wav
+# NOTE: fixtures/ IS committed on purpose — it is the shared debugging
+# artifact that lets mentors reproduce behaviour in mock mode (§12.9).
