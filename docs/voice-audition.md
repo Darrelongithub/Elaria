@@ -10,9 +10,19 @@ identical online and offline.
 
 ## Selected voice
 
+> **STATUS: PROVISIONAL — NOT CANONICAL.** Re-auditioned 2026-10-19: the owner
+> could not parse this voice in normal playback, and round-3 measurements rank
+> it last of four on intelligibility (see
+> [`voice-audition-round3.md`](voice-audition-round3.md)). The root cause is
+> mechanical, not a matter of taste: this model is **16 kHz**, so it has no
+> 8–11 kHz band at all, and `length_scale`/volume/prompt changes cannot add a
+> band that is not in the file. Do not treat it as final; do not build Hyprland
+> binds or live-Gemini voice routing on it until a replacement is approved.
+
 **`en_GB-southern_english_female-low`** — Piper Southern English Female, low
-quality. Selected by the owner on 2026-10-19 after two audition rounds. The
-roughness is the point: edge won over polish.
+quality. Chosen by the owner on 2026-10-19 after two audition rounds, on the
+theory that the roughness was the point (edge over polish). That trade turned
+out to cost intelligibility, not just polish.
 
 Official sample:
 [speaker_0.mp3](https://github.com/rhasspy/piper-samples/blob/master/samples/en/en_GB/southern_english_female/low/speaker_0.mp3)
