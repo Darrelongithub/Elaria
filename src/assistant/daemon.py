@@ -123,6 +123,15 @@ class Daemon:
 
     async def _status(self, params: dict) -> dict:
         runtime = self.config.socket_path.parent
+        recent = self.store.recent_transcripts(1)
+        last = None
+        if recent:
+            snippet = (recent[0]["cleaned_text"] or recent[0]["raw_text"] or "").strip()
+            last = {"snippet": snippet[:80] + ("…" if len(snippet) > 80 else ""),
+                    "ts": recent[0]["ts"], "backend": recent[0]["backend"]}
+        capture = None
+        if self._capture_source is not None:
+            capture = type(self._capture_source).__name__.replace("Capture", "").lower()
         return {
             "running": True,
             "name": self.config.section("persona").get("name", "Elaria"),
@@ -133,6 +142,11 @@ class Daemon:
             "started_at": self.started_at,
             "uptime_s": round(time.monotonic() - self.started_monotonic, 1),
             "outstanding_intents": len(self.store.outstanding_intents()),
+            "dictation_active": bool(self._dictation_task and not self._dictation_task.done()),
+            "capture": capture,
+            "last_transcript": last,
+            "quota_today_live_calls": self.store.calls_since(day_start_iso()),
+            "event_subscribers": len(self._subscribers),
         }
 
     async def _cost(self, params: dict) -> dict:
@@ -153,12 +167,14 @@ class Daemon:
     async def _halt(self, params: dict) -> dict:
         set_halt(self.config.socket_path.parent)
         self.mode = "halted"
+        await self.broadcast({"event": "status.changed", "mode": self.mode, "halted": True})
         return {"halted": True, "note": "executor checks this flag between every op (§4.4)"}
 
     async def _resume(self, params: dict) -> dict:
         clear_halt(self.config.socket_path.parent)
         if self.mode == "halted":
             self.mode = "idle"
+        await self.broadcast({"event": "status.changed", "mode": self.mode, "halted": False})
         return {"halted": False}
 
     async def _ptt_start(self, params: dict) -> dict:
@@ -188,6 +204,7 @@ class Daemon:
                 simulated = True
         self._stop_event = asyncio.Event()
         self.mode = "listening"
+        await self.broadcast({"event": "status.changed", "mode": self.mode})
         self._dictation_task = asyncio.create_task(
             self.dictation.dictate(
                 self._capture_source, mode=params.get("mode", "narration"),
@@ -196,6 +213,9 @@ class Daemon:
 
     async def _ptt_stop(self, params: dict) -> dict:
         ack = self.governor.ack()  # release acknowledged locally, instantly
+        if self.mode == "listening":
+            self.mode = "transcribing"  # waiting on final + cleanup (§3.9 states)
+            await self.broadcast({"event": "status.changed", "mode": self.mode})
         if self._stop_event:
             self._stop_event.set()
         result = None
@@ -223,6 +243,7 @@ class Daemon:
                 result = {"error": f"dictation did not finish cleanly: {exc}"}
             self._dictation_task = None
         self.mode = "idle"
+        await self.broadcast({"event": "status.changed", "mode": self.mode})
         return {"listening": False, **ack, "result": result}
 
     async def _transcribe_file(self, params: dict) -> dict:

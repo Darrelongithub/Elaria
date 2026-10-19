@@ -9,12 +9,14 @@ Design: [`assistant-blueprint.md`](assistant-blueprint.md) (v29) ·
 Setup/build order: [`GETTING-STARTED.md`](GETTING-STARTED.md) ·
 Personality profile: [`humour.toml`](humour.toml)
 
-**Status: Phase 1 built** (on Phase 0 + the §9-order-first `assist-voice-test`).
-`assist doctor/status/cost` work; push-to-talk dictation now runs end-to-end —
-capture → Live transcription → cleanup gates → markdown inbox + clipboard —
-with the test suite passing with **no API key** (mock live transport).
-The real Gemini Live transport is wired but UNVERIFIED until first run with
-the owner's key (Step 0). The file executor is Phase 4.
+**Status: Phase 2 built** (on Phase 0/1 + the §9-order-first `assist-voice-test`).
+Push-to-talk dictation runs end-to-end, and its state is now visible: a
+streaming Waybar module and a Quickshell overlay pill rendering live
+partials — layer-shell, `keyboardFocus: None`, no focus steal (guarded by
+tests). Test suite passes with **no API key** (mock live transport). The
+real Gemini Live transport + all Wayland surfaces are UNVERIFIED until
+first run on the owner's Fedora box (Step 0; `ui/README.md` checklist).
+The file executor is Phase 4; Phase 3 (shadow-mode organiser) is next.
 
 ---
 
@@ -92,11 +94,15 @@ No key yet? Everything still runs — `GEMINI_MODE` defaults to **mock**
 | ASR seam + capture helpers | `asr.py`, `capture.py` | `live → batch → local` chain (§12.7), language pinned (`en`; Kiswahili = Phase 7 config flip), `pw-record` target trap (object.id) guarded in code. |
 | **Dictation (Phase 1)** | `transcribe.py`, `live_client.py`, `cleanup.py`, `inbox.py`, `clipboard.py` | PTT session: `pw-record` frames → WAV sink (raw always kept) + rolling 30s buffer + VAD gate → Live manual-activity streaming with interim events; disconnect/GoAway → resumption + tail replay; unrecoverable → batch on the saved WAV. Silence ladder emits ONE soft check-in per segment, per-mode thresholds. Cleanup pass with diff-gate + language gate (raw is the record); note lands in the markdown inbox + `wl-copy`. `assist dictate` (terminal PTT), `assist transcribe FILE.wav`, `assist events` (overlay feed). Live-session fixtures are recordable *sequences* (hashes only — no audio in git). |
 
+| **Surfaces (Phase 2)** | `waybar.py`, `overlay.py`, `ui/` | Event-driven Waybar (`assist status --waybar --follow`: idle/listening/transcribing/halted/mock, last-transcript tooltip, click=PTT, right-click=halt) + voice-test LED module. Overlay state machine in tested Python (`assist events --overlay`); `ui/quickshell/shell.qml` is a dumb binder (layer-shell, `WlrKeyboardFocus.None` — tests static-guard the QML). Hyprland binds in both Lua/.conf syntaxes. |
+
 **Definitions of done:** Phase 0 — `assist doctor/status/cost` ✓ · keyless
 tests ✓. Phase 1 — “you dictate a note and it appears” ✓ in mock/simulated
 mode everywhere; on Fedora with a key it's the same code path with
 `pw-record` + the real Live transport (verify model/quotas first, Step 0).
-81 tests, all offline.
+Phase 2 — state visible ✓, partials render ✓ (overlay feed), no focus
+steal ✓ by construction + test guards; on-screen QML rendering itself
+awaits the Fedora checklist in `ui/README.md`. 98 tests, all offline.
 
 ## §10 open decisions — defaults taken, awaiting your word
 
@@ -142,6 +148,6 @@ never breaks.
   >95% deliberate catches. Then: Hyprland PTT binds (Step 6) + the Step 3
   A/B/C capture listening test (§10.1), one live dictation, and a
   `GEMINI_MODE=record` session so the first real fixtures exist.
-- **Phase 2:** Waybar module (config snippet in GETTING-STARTED Step 6 —
-  `assist status --waybar` and `assist events` already feed it) +
-  Quickshell overlay with live partials, `keyboard-interactivity: none`.
+- **Phase 3 (where the project succeeds or fails):** journal + shadow mode
+  + indexer + Tier 0 rules cascade — **no writes at all**. Needs your
+  §10.2 taxonomy bootstrap + §10.7 never-send list before any indexing.

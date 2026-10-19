@@ -171,6 +171,8 @@ def main(argv: list[str] | None = None) -> int:
     doctor_p.add_argument("--json", action="store_true")
     status_p = sub.add_parser("status", help="daemon health")
     status_p.add_argument("--waybar", action="store_true", help="Waybar custom-module JSON")
+    status_p.add_argument("--follow", action="store_true",
+                          help="with --waybar: stream a line per state change (no poll lag)")
     sub.add_parser("cost", help="request/token spend from the ledger")
     ask_p = sub.add_parser("ask", help="one conversational turn (governor + harness)")
     ask_p.add_argument("text")
@@ -181,7 +183,9 @@ def main(argv: list[str] | None = None) -> int:
     tr_p = sub.add_parser("transcribe", help="batch-transcribe a WAV (post tier, §3.6)")
     tr_p.add_argument("file")
     sub.add_parser("dictate", help="terminal push-to-talk: Enter to stop")
-    sub.add_parser("events", help="stream daemon events (overlay/Waybar feed)")
+    events_p = sub.add_parser("events", help="stream daemon events (overlay/Waybar feed)")
+    events_p.add_argument("--overlay", action="store_true",
+                          help="stream pre-computed overlay states for the Quickshell pill")
     args = parser.parse_args(argv)
     config = load_config()
 
@@ -194,15 +198,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if report["blockers"] == 0 else 2
 
         if args.command == "status":
+            if args.waybar and args.follow:
+                from .waybar import stream_waybar
+                try:
+                    for line in stream_waybar(config.socket_path):
+                        print(json.dumps(line), flush=True)
+                except KeyboardInterrupt:
+                    pass
+                return 0
             try:
                 status = call(config.socket_path, "status", timeout=3.0)
             except (DaemonUnavailable, RuntimeError, OSError):
                 status = {"running": False, "mode": "down",
                           "name": config.section("persona").get("name", "Elaria")}
             if args.waybar:
-                state = status.get("mode", "down") if status.get("running") else "down"
-                print(json.dumps({"text": f"Elaria: {state}", "class": state,
-                                  "tooltip": json.dumps(status)}))
+                from .waybar import format_waybar
+                print(json.dumps(format_waybar(status)))
             else:
                 print(json.dumps(status, indent=2))
             return 0 if status.get("running") else 1
@@ -286,10 +297,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "events":
-            from .ipc import subscribe_events
             try:
-                for event in subscribe_events(config.socket_path):
-                    print(json.dumps(event), flush=True)
+                if args.overlay:
+                    from .overlay import stream_overlay_states
+                    for state in stream_overlay_states(config.socket_path):
+                        print(json.dumps(state), flush=True)
+                else:
+                    from .ipc import subscribe_events
+                    for event in subscribe_events(config.socket_path):
+                        print(json.dumps(event), flush=True)
             except KeyboardInterrupt:
                 pass
             return 0

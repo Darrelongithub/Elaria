@@ -1,6 +1,5 @@
 """Daemon + IPC + CLI end-to-end, no key, no network (Phase 0 done-when)."""
 
-import asyncio
 import json
 import subprocess
 import sys
@@ -9,24 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from assistant.daemon import Daemon
-from assistant.ipc import call, serve
+from assistant.ipc import call
 
 REPO = Path(__file__).resolve().parents[1]
 
 
-@pytest.fixture
-def running_daemon(config):
-    import threading
-
-    daemon = Daemon(config)
-    loop = asyncio.new_event_loop()
-    server = loop.run_until_complete(serve(config.socket_path, daemon.handle))
-    thread = threading.Thread(target=loop.run_forever, daemon=True)
-    thread.start()
-    yield daemon, server
-    loop.call_soon_threadsafe(server.close)
-    loop.call_soon_threadsafe(loop.stop)
+# running_daemon fixture lives in conftest.py (shared across phases).
 
 
 def test_socket_is_owner_only(config, running_daemon):

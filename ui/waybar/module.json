@@ -1,0 +1,15 @@
+{
+  "custom/elaria": {
+    "exec": "assist status --waybar --follow",
+    "return-type": "json",
+    "on-click": "assist ptt toggle",
+    "on-click-right": "assist halt",
+    "tooltip": true
+  },
+  "custom/elaria-voicetest": {
+    "exec": "cat ~/.local/state/assistant/voice-test-led.json 2>/dev/null || echo '{\"text\":\"○ elaria\",\"class\":\"voice-test-idle\"}'",
+    "return-type": "json",
+    "interval": 1,
+    "tooltip": true
+  }
+}

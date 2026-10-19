@@ -41,3 +41,22 @@ def config():
     from assistant.config import load_config
 
     return load_config()
+
+
+@pytest.fixture
+def running_daemon(config):
+    """Real daemon on a real Unix socket, event loop in a thread."""
+    import asyncio
+    import threading
+
+    from assistant.daemon import Daemon
+    from assistant.ipc import serve
+
+    daemon = Daemon(config)
+    loop = asyncio.new_event_loop()
+    server = loop.run_until_complete(serve(config.socket_path, daemon.handle))
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    yield daemon, server
+    loop.call_soon_threadsafe(server.close)
+    loop.call_soon_threadsafe(loop.stop)
