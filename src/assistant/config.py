@@ -236,6 +236,15 @@ DEFAULTS: dict = {
         # Adaptive endpointing (§13.8 soft check-in): per-mode silence
         # before the single "Is that all?" — narration waits far longer.
         "checkin_after_s": {"command": 4, "conversation": 6, "narration": 20},
+        # VB-5/VB-6: speech must last this long to count as a resumption (so a
+        # breath between silences cannot re-arm the check-in), and silence this
+        # long AFTER the check-in closes the session instead of holding the mic.
+        "speech_resume_s": 0.4,
+        "checkin_grace_s": 8.0,
+        # VB-8: a command transcript below this ASR confidence (or flagged by
+        # cleanup) is never executed. Unknown confidence still allows read-only
+        # intents, never a mutating one.
+        "command_min_confidence": 0.85,
         "vad_rms_threshold": 0.01,        # never stream silence (§8)
     },
     "cleanup": {

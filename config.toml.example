@@ -157,8 +157,24 @@ inbox_dir = "~/.local/share/assistant/inbox"
 copy_to_clipboard = true            # wl-copy only — X11 tools fail silently
 vad_rms_threshold = 0.01            # never stream silence (§8)
 
+# How long speech must last before it counts as a RESUMPTION (VB-5). Below this,
+# a frame over the RMS gate is a breath, a click, or playback bleed: it must not
+# re-arm the ladder and earn the same thought a second "Is that all?".
+speech_resume_s = 0.4
+
+# Silence this long AFTER the check-in closes the session (VB-6). Without it the
+# microphone, the "listening" state and the Live session stay open until the user's
+# own hotkey release — an abandoned dictation held the mic for ~50 minutes.
+checkin_grace_s = 8.0
+
+# VB-8: a command-mode transcript below this ASR confidence — or flagged by
+# cleanup as unreliable — is never routed to an intent, so a mumble that sounds
+# like "undo." cannot reverse files. Unknown confidence still allows read-only
+# intents; it never allows a mutating one. Refusals are reported with the number.
+command_min_confidence = 0.85
+
 [transcribe.checkin_after_s]        # soft check-in ladder (§13.8): narration waits
-command = 4
+command = 4                          # ONE ask per thought, then the grace above
 conversation = 6
 narration = 20
 

@@ -341,6 +341,63 @@ class Daemon:
         self.store.log_persona_event(iso_now(), "ack", json.dumps(ack))
         return ack
 
+    # Intents that change the user's files. Reached from a dictation transcript,
+    # they get the strict gate; read-only intents keep their normal behaviour.
+    MUTATING_INTENTS = ("undo",)
+
+    def _command_gate(self, result: dict) -> dict | None:
+        """VB-8: no intent executes from a transcript she is not sure about.
+
+        Command mode and dictation share one microphone, so background speech (a
+        TV saying "undo.") lands in the same buffer as a deliberate command and the
+        same buffer used to feed the intent ladder directly. Two facts decide it,
+        both already computed: cleanup's `flagged` (the transcript is unreliable and
+        kept for review) and ASR's `confidence`. A veto is silent about actions and
+        loud about state: the text, the numbers, and the fact that nothing ran.
+        """
+        from .intents import route as route_intent
+
+        text = str(result.get("text") or "").strip()
+        confidence = result.get("confidence")
+        flagged = bool(result.get("flagged"))
+        threshold = float(self.config.section("transcribe").get("command_min_confidence",
+                                                                 0.85))
+        try:
+            intent = route_intent(text)
+        except Exception:            # a router that cannot parse cannot act either
+            intent = None
+        mutating = bool(intent is not None and str(getattr(intent, "kind", ""))
+                        in self.MUTATING_INTENTS)
+        low = confidence is not None and float(confidence) < threshold
+        unknown = confidence is None
+        # Flagged or below-threshold: nothing is routed, because the words
+        # themselves are in doubt. Known-confident, or unknown-but-harmless
+        # (a read-only intent): the ladder runs, as it did before. `mutating`
+        # is the line a mumble can never cross on an unverifiable transcript.
+        if not (flagged or low or (unknown and mutating)):
+            return None
+        reasons = []
+        if flagged:
+            reasons.append("cleanup flagged this transcript as unreliable")
+        if low:
+            reasons.append(f"ASR confidence {float(confidence):.2f} is below "
+                           f"{threshold:.2f}")
+        if unknown and mutating:
+            reasons.append("confidence is unknown and the intent would change files")
+        return {
+            "via": "refused",
+            "executed": False,
+            "intent": (getattr(intent, "kind", None) if intent is not None else None),
+            "text": text,
+            "confidence": confidence,
+            "flagged": flagged,
+            "threshold": threshold,
+            "reason": "; ".join(reasons) or "gated",
+            "note": ("Not executed — " + "; ".join(reasons)
+                      + ". Repeat it clearly, or run the command deliberately "
+                        "(`assist undo`, `assist remember ...`)."),
+        }
+
     async def _halt(self, params: dict) -> dict:
         set_halt(self.config.socket_path.parent)
         self.mode = "halted"
@@ -436,7 +493,15 @@ class Daemon:
         # background task behind it. The user is already talking while the
         # socket opens — parse-while-you-speak starts here (§18 rule 3).
         if self._dictation_task and not self._dictation_task.done():
-            return {"listening": True, **await self._ack({"kind": "on_it"}),
+            # VB-11: the loser of the race is refused, and a refusal is not a
+            # request to be acknowledged. She is already listening; saying "On it."
+            # again is a second voice event for one press (and double audio when the
+            # user mashes the hotkey). No ack is played and none is queued.
+            route = self.speech.route(STANDARD_ACKS["on_it"])
+            return {"listening": True, "already_listening": True, "ack": None,
+                    "speech": {**route, "ack_kind": "on_it", "audio_path": None,
+                               "cached": False, "played": False,
+                               "suppressed": "already listening — no second ack"},
                     "note": "already listening"}
         ack = await self._ack({"kind": "on_it"})
         capture_cfg = self.config.section("capture")
@@ -513,12 +578,20 @@ class Daemon:
                          "seconds": session.duration_s}),
                 }
                 if self._dictation_session_mode == "command" and result["text"].strip():
-                    # Known grammar climbs the local ladder first; open text
-                    # follows the same offline queue policy as `ask`.
-                    result["command"] = await self._ask({
-                        "text": result["text"],
-                        "speak": params.get("speak", True),
-                    })
+                    veto = self._command_gate(result)
+                    if veto is not None:
+                        # Nothing was routed, so nothing was executed. The words are
+                        # still reported (they are the user's dictation, kept in the
+                        # transcript row) and the reason is stated as a fact.
+                        result["command"] = veto
+                        result["narration"] = veto["note"]
+                    else:
+                        # Known grammar climbs the local ladder first; open text
+                        # follows the same offline queue policy as `ask`.
+                        result["command"] = await self._ask({
+                            "text": result["text"],
+                            "speak": params.get("speak", True),
+                        })
                     result["narration"] = result["command"].get("reply", result["narration"])
             except Exception as exc:
                 result = {"error": f"dictation did not finish cleanly: {exc}"}

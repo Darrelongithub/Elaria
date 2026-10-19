@@ -44,27 +44,59 @@ EventSink = Callable[[dict], Awaitable[None]]
 
 
 class SilenceLadder:
-    """Adaptive endpointing (§13.8): listen → ONE soft 'Is that all?' →
-    (user ends it). A thought is never nagged twice: after the check-in
-    fires, only resumed speech re-arms the ladder for a new segment."""
+    """Adaptive endpointing (§13.8): listen → ONE soft 'Is that all?' → grace →
+    close.
 
-    def __init__(self, checkin_after_s: float, speech_rms: float = 0.01):
+    Two rules the owner stated, both enforced here rather than hoped for:
+
+    * ONE check-in per thought (VB-5). "Speech resumed" used to mean *any* frame at
+      or over the RMS gate, so a breath, a key click or a mic pop between two
+      silences re-armed the ladder and she asked twice in one sentence. Re-arming
+      now requires sustained speech (`resume_s`).
+    * a grace close (VB-6). After the check-in, if nothing is said for
+      `grace_s`, the thought is finished for them and the session ends — the
+      microphone used to stay open until the user's hotkey, ~50 minutes in one
+      headless repro.
+    """
+
+    def __init__(self, checkin_after_s: float, speech_rms: float = 0.01, *,
+                 resume_s: float = 0.4, grace_s: float = 8.0):
         self.checkin_after_s = checkin_after_s
         self.speech_rms = speech_rms
+        self.resume_s = resume_s
+        self.grace_s = grace_s
         self._silent_s = 0.0
+        self._speech_s = 0.0
         self._asked = False
+        self._asked_at_s: float | None = None
+
+    @property
+    def asked(self) -> bool:
+        return self._asked
 
     def observe(self, frame: bytes, frame_s: float) -> bool:
         """True exactly once per segment: time for the soft check-in."""
         if frame_rms(frame) >= self.speech_rms:
             self._silent_s = 0.0
-            self._asked = False  # resumed speech: check-in forgotten instantly
+            self._speech_s += frame_s
+            if self._speech_s >= self.resume_s:
+                # Actual speech resumed: a new segment, and a new check-in is
+                # earned. One frame above the gate is not a resumption.
+                self._asked = False
+                self._asked_at_s = None
             return False
+        self._speech_s = 0.0
         self._silent_s += frame_s
         if not self._asked and self._silent_s >= self.checkin_after_s:
             self._asked = True
+            self._asked_at_s = self._silent_s
             return True
         return False
+
+    def close_due(self) -> bool:
+        """True once the grace period after the check-in has also run out."""
+        return (self._asked and self._asked_at_s is not None
+                and self._silent_s - self._asked_at_s >= self.grace_s)
 
 
 @dataclass
@@ -85,6 +117,24 @@ class SessionResult:
     cloud_status: str = "complete"
     queued_job_ids: list[int] = field(default_factory=list)
     connectivity_mode: str | None = None
+
+
+def _final_texts(events) -> list[str]:
+    """Final transcript segments in order, without the replayed tail's echoes.
+
+    A rotation replays the buffered audio, so the new session can recognise the
+    same words a second time. Dropping everything collected before the rotation
+    (the old behaviour) destroyed the head of the dictation; suppressing only the
+    immediately-repeated segment keeps every word and still reads cleanly.
+    """
+    out: list[str] = []
+    for event in events:
+        if event.type == "final" and event.text:
+            text = " ".join(event.text.split())
+            if out and out[-1] == text:
+                continue
+            out.append(text)
+    return out
 
 
 class DictationService:
@@ -112,6 +162,10 @@ class DictationService:
         self.copy_clipboard = bool(settings.get("copy_to_clipboard", True))
         self.vad_threshold = float(settings.get("vad_rms_threshold", 0.01))
         self.checkin_after = settings.get("checkin_after_s") or {}
+        # How long speech must last before the ladder treats it as a resumption,
+        # and how much silence after the one check-in closes the session (VB-5/6).
+        self.resume_s = float(settings.get("speech_resume_s", 0.4))
+        self.grace_s = float(settings.get("checkin_grace_s", 8.0))
         self.audio_dir = config.data_dir / "audio"
 
     def _connectivity(self):
@@ -171,7 +225,8 @@ class DictationService:
         buffer = RollingAudioBuffer(seconds=self.replay_s)
         gate = FrameGate(rms_threshold=self.vad_threshold)
         ladder = SilenceLadder(
-            float(self.checkin_after.get(mode, 20)), speech_rms=self.vad_threshold)
+            float(self.checkin_after.get(mode, 20)), speech_rms=self.vad_threshold,
+            resume_s=self.resume_s, grace_s=self.grace_s)
         notes: list[str] = []
         final_text = ""
         confidence: float | None = None
@@ -237,6 +292,15 @@ class DictationService:
                 if ladder.observe(frame, frame_s):
                     await emit({"event": "session.checkin", "prompt": "Is that all?",
                                 "session_id": session_id})
+                elif ladder.close_due():
+                    # VB-6: the thought ended. Release the microphone instead of
+                    # holding it open until the hotkey; the words already heard
+                    # are kept, which is exactly what the check-in was for.
+                    notes.append(f"closed after the check-in grace ({ladder.grace_s:g}s "
+                                 f"of continued silence)")
+                    await emit({"event": "session.grace_close", "session_id": session_id,
+                                "silence_after_checkin_s": round(ladder.grace_s, 3)})
+                    break
                 if transport is None or not gate.allows(frame):
                     continue
                 try:
@@ -244,7 +308,13 @@ class DictationService:
                     if time.monotonic() - started > self.session_max_s:
                         raise LiveUnavailable("proactive rotation at session age cap")
                     if any(e.type == "go_away" for e in collected):
-                        collected.clear()
+                        # VB-7: finals are TRANSCRIBED TEXT and are not recoverable
+                        # from the replay buffer, so clearing the list deleted the
+                        # first words of any dictation longer than the buffer. Only
+                        # the GoAway markers may be consumed (leaving them would
+                        # spin the rotation); duplicates from the replayed tail are
+                        # folded when the finals are joined.
+                        collected[:] = [e for e in collected if e.type != "go_away"]
                         raise LiveUnavailable("server GoAway — rotating session")
                     await transport.send_audio(frame)
                     # Yield so the event collector can surface interims /
@@ -283,7 +353,7 @@ class DictationService:
                         await asyncio.wait_for(collector, timeout=15)
                     except (TimeoutError, asyncio.CancelledError):
                         notes.append("timed out waiting for final transcript")
-                finals = [e.text for e in collected if e.type == "final" and e.text]
+                finals = _final_texts(collected)
                 final_text = " ".join(finals).strip()
         finally:
             if wav_sink:

@@ -505,7 +505,19 @@ def test_forced_offline_daemon_paths_make_zero_gemini_calls(config, tmp_path, ru
     stopped = call(config.socket_path, "ptt.stop", {"speak": True}, timeout=90)
     assert stopped["result"]["backend"] == "local"
     assert stopped["result"]["cloud_status"] == "pending_cloud_transcription"
-    assert stopped["result"]["command"]["via"] == "local-intent"
+    # VB-8 (owner decision 2026-10-20, voice hunt): a command transcript is gated
+    # on ASR confidence before anything is routed. This offline local-ASR pass
+    # reports 0.30 — below [transcribe] command_min_confidence — and the audio is
+    # pending cloud transcription, so the words are kept but NOTHING runs. The
+    # previous contract ("local ASR at any confidence climbs the intent ladder")
+    # is the one that let a mumble move files; it is replaced deliberately.
+    command = stopped["result"]["command"]
+    assert command["via"] == "refused" and command["executed"] is False, command
+    assert command["confidence"] == 0.3 and command["threshold"] == 0.85, command
+    assert "below" in command["reason"] and "Not executed" in command["note"]
+    # The dictation itself is still saved and reported, and the cloud redo is queued.
+    assert stopped["result"]["text"] == "status"
+    assert any(j["kind"] == "cloud_transcription" for j in daemon.cloud_queue.list_jobs(limit=50))
 
     kinds = [j["kind"] for j in daemon.cloud_queue.list_jobs(limit=50)]
     assert {"chat", "plan_tiers", "cloud_transcription"}.issubset(kinds)

@@ -88,7 +88,13 @@ def test_silence_ladder_asks_once_per_segment():
     ladder = SilenceLadder(checkin_after_s=0.09)  # 3 silent frames
     asks = [ladder.observe(SILENCE, 0.03) for _ in range(10)]
     assert asks.count(True) == 1  # never nagged twice (§13.8)
-    assert ladder.observe(SPEECH, 0.03) is False  # speech re-arms
+    # VB-5 (voice hunt): re-arming takes SUSTAINED speech, not one frame over the
+    # RMS gate — a breath or a key click used to earn a second nag mid-thought.
+    assert ladder.observe(SPEECH, 0.03) is False
+    assert [ladder.observe(SILENCE, 0.03) for _ in range(10)].count(True) == 0, (
+        "a single blip re-armed the ladder inside the same pause")
+    for _ in range(int(ladder.resume_s / 0.03) + 1):   # real speech resumes
+        assert ladder.observe(SPEECH, 0.03) is False
     asks2 = [ladder.observe(SILENCE, 0.03) for _ in range(4)]
     assert asks2.count(True) == 1
 

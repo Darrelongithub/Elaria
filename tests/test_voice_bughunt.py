@@ -722,42 +722,81 @@ def test_c8c_the_mode_vocabulary_the_runtime_can_request_is_configured():
     assert requested <= configured, f"unconfigured modes fall back to 20s: {requested - configured}"
 
 
-@pytest.mark.xfail(strict=True, reason="VB-5: any frame over the RMS gate (breath, click, "
-                   "playback bleed) re-arms the ladder, so one thought is nagged twice")
-def test_c9_blip_speech_rearms_the_ladder_for_a_second_nag(tmp_path):
-    """VB-5: one uninterrupted thought can be asked twice.
+def test_c9_blip_speech_does_not_rearm_the_ladder_for_a_second_nag(tmp_path):
+    """VB-5 (fixed): one uninterrupted thought is asked exactly once.
 
-    The docstring promises "A thought is never nagged twice", but `_asked` is
-    cleared by ANY frame over the RMS gate — a breath, a键 click, a chair, or
-    her own playback bleed — so the same silence run re-arms and re-asks.
+    `_asked` used to be cleared by ANY frame over the RMS gate — a breath, a key
+    click, a chair, or her own playback bleed — so the same silence run re-armed
+    and re-asked. Re-arming now needs sustained speech; a real resumption still
+    earns a new check-in for the new segment.
     """
     state = ladder("narration", threshold=1.0)
+    assert state.resume_s > 0, "the ladder has no sustained-resume rule"
     fired = 0
     fired += sum(1 for _ in range(40) if state.observe(SILENCE, 0.03))    # 1.2s → asked
     fired += 1 if state.observe(SPEECH, 0.03) else 0                       # one 30ms blip
     fired += sum(1 for _ in range(40) if state.observe(SILENCE, 0.03))    # same thought
     assert fired == 1, f"the check-in fired {fired} times inside one unbroken pause"
 
+    # Blips are not speech: several of them, spread out, still must not re-arm.
+    for _ in range(6):
+        state.observe(SPEECH, 0.03)
+        state.observe(SILENCE, 0.03)
+    fired += sum(1 for _ in range(60) if state.observe(SILENCE, 0.03))
+    assert fired == 1, f"scattered blips nagged the same thought {fired} times"
 
-@pytest.mark.xfail(strict=True, reason="VB-6: no grace close after the check-in — "
-                   "an abandoned dictation holds 'listening' and the mic until the "
-                   "hotkey is pressed again")
-def test_c9b_after_the_checkin_the_session_must_close_after_grace():
-    """§13.8 / item 9: asked once, THEN closes. Nothing closes.
+    # A real resumption (>= resume_s of speech) starts a new segment...
+    speech_frames = int(state.resume_s / 0.03) + 1
+    assert sum(1 for _ in range(speech_frames) if state.observe(SPEECH, 0.03)) == 0
+    fired2 = sum(1 for _ in range(40) if state.observe(SILENCE, 0.03))    # new pause
+    assert fired2 == 1, "actual speech resumed but the ladder never re-armed"
 
-    After the prompt, the only way out is the user's own hotkey release: an
-    abandoned dictation keeps the mic, the "listening" state and the session
-    open until the frame source ends (the daemon runs 100k realtime frames,
-    ~50 minutes).
+
+def test_c9b_after_the_checkin_the_session_closes_after_grace(tmp_path):
+    """VB-6 (fixed): asked once, then the grace runs out and the session closes.
+
+    The user's hotkey used to be the ONLY way out, so an abandoned dictation held
+    the microphone and the "listening" state until they came back (the daemon's
+    simulated source runs 100k realtime frames — about 50 minutes).
     """
     state = ladder("command", threshold=4.0)
+    assert state.grace_s > 0, "SilenceLadder had no post-prompt grace close"
     silence_run = int(300 / 0.03)            # 5 minutes of walking-away silence
     events = [state.observe(SILENCE, 0.03) for _ in range(silence_run)]
-    assert sum(events) == 1
-    grace = getattr(state, "grace_after_checkin_s", None)
-    assert grace is not None, (
-        "SilenceLadder has no post-prompt grace close: `listening` is stuck until "
-        "the user presses the hotkey again (source keeps streaming)")
+    assert sum(events) == 1, "she must still ask exactly once"
+    assert state.close_due(), "5 minutes of silence after the check-in must close"
+
+    # Session level: the capture loop stops pulling frames, and says why.
+    pulled = {"n": 0}
+
+    class CountingSource:
+        """A short phrase, then 10 minutes of walking-away silence — and the
+        microphone keeps handing frames over, exactly as the live capture does."""
+
+        def __init__(self):
+            self.closed = False
+
+        async def frames(self):
+            for _ in range(20):
+                pulled["n"] += 1
+                yield SPEECH
+            while pulled["n"] < 20 + int(600 / 0.03):
+                pulled["n"] += 1
+                yield SILENCE
+
+        async def aclose(self):
+            self.closed = True
+
+    _, _, service_, _ = dictation(tmp_path)
+    source = CountingSource()
+    result = asyncio.run(service_.dictate(
+        source, transport_factory=lambda: Session(0, {"connects": [], "words_seen": 0,
+                                                       "finals": []})))
+    assert pulled["n"] < 20 + int(60 / 0.03), (
+        f"the session never closed: it consumed {pulled['n']} frames "
+        f"({pulled['n'] * 0.03:.0f}s) after the check-in")
+    assert any("closed after the check-in grace" in note for note in result.notes), result.notes
+    assert source.closed is True, "the grace close must still release the microphone"
 
 
 def test_c10_pause_resume_fuzz_100(tmp_path):
@@ -823,11 +862,18 @@ class Session:
                 "type": "go_away", "text": "", "handle": None})())
 
     async def activity_end(self):
-        pass
+        # The real transport closes its event stream after a `turn_complete`
+        # (live_client.py:108-114); without it the collector waits the full 15s
+        # final-transcript timeout on every session in this file.
+        self.events_q.put_nowait(type("E", (), {
+            "type": "turn_complete", "text": "", "handle": None})())
 
     async def events(self):
         while True:
-            yield await self.events_q.get()
+            event = await self.events_q.get()
+            yield event
+            if event.type == "turn_complete":
+                return
 
     async def close(self):
         self.closed = True
@@ -915,10 +961,8 @@ def indexed_frames(count: int, *, speech=True) -> list[bytes]:
     return out
 
 
-@pytest.mark.xfail(strict=True, reason="VB-7: rotation clears collected finals, so words "
-                   "older than the replay window never reach the transcript")
-def test_d11b_rotation_on_a_long_utterance_loses_the_head(tmp_path):
-    """VB-7: `collected.clear()` on rotation throws away finals already received.
+def test_d11b_rotation_on_a_long_utterance_keeps_every_word(tmp_path):
+    """VB-7 (fixed, data-loss): rotation no longer throws away received finals.
 
     Correct only while the whole utterance still fits the replay buffer. With a
     30s rolling buffer (default) any dictation longer than that loses its head
@@ -956,6 +1000,10 @@ def test_d11b_rotation_on_a_long_utterance_loses_the_head(tmp_path):
     assert missing == [], (
         f"rotation dropped {missing} — the transcript is {result.raw_text!r} "
         f"for a 30-frame utterance (head lost, raw audio kept)")
+    # Words are never doubled by the replayed tail either (the reason the old code
+    # cleared the list): only an immediately repeated segment is folded away.
+    counts = {w: result.raw_text.split().count(w) for w in first_words}
+    assert all(n == 1 for n in counts.values()), f"replay echoed words twice: {counts}"
 
 
 def test_d12_offline_low_confidence_is_redone_exactly_once(tmp_path):
@@ -1030,23 +1078,67 @@ def test_d13_garbage_and_0_byte_audio_never_become_a_confident_command(tmp_path)
     assert rows == 1
 
 
-@pytest.mark.xfail(strict=True, reason="VB-8: command-mode dictation feeds the intent "
-                   "ladder with no confidence gate and ignores cleanup flagging — "
-                   "transcribed 'undo' reverses files")
-def test_d13b_transcribed_command_words_must_not_execute_without_a_gate(tmp_path):
-    """VB-7: in command mode the transcript is fed to the intent ladder with
-    no confidence gate and even when cleanup flagged it — including `undo`,
-    which reverses real files. TV speech saying "undo." moves data."""
+def test_d13b_low_confidence_command_words_never_execute(tmp_path):
+    """VB-8 (fixed): a transcript she is not sure about cannot move files.
+
+    Command mode and dictation share one microphone, so a TV saying "undo." used
+    to climb straight into the intent ladder — and `undo` reverses real files. The
+    gate now sits between the two: cleanup's `flagged` state and ASR's
+    `confidence` (below `[transcribe] command_min_confidence`, or unknown for a
+    mutating intent) veto the routing entirely.
+    """
+    from assistant.daemon import Daemon
     from assistant.intents import route
 
-    assert route("undo").kind == "undo"
-    gate_src = (SRC / "daemon.py").read_text()
-    start = gate_src.index('if self._dictation_session_mode == "command"')
-    window = gate_src[start:start + 700]
-    assert "confidence" in window, (
-        "no ASR-confidence gate between a transcript and the intent ladder")
-    assert "flagged" in window, (
-        "a cleanup-flagged (unreliable) transcript still climbs to intent routing")
+    assert route("undo").kind == "undo", "the grammar the gate has to survive"
+
+    config = voice_config(tmp_path)
+    daemon = Daemon(config)
+    threshold = daemon.config.section("transcribe")["command_min_confidence"]
+    assert threshold == 0.85, threshold
+
+    def gate(text, *, confidence, flagged=False):
+        return daemon._command_gate({"text": text, "confidence": confidence,
+                                     "flagged": flagged})
+
+    # The mumble that sounds like a command: refused, nothing routed, nothing run.
+    veto = gate("undo.", confidence=0.42)
+    assert veto is not None and veto["via"] == "refused" and veto["executed"] is False
+    assert veto["intent"] == "undo" and "below" in veto["reason"]
+    assert "Not executed" in veto["note"]
+
+    # A cleanup-flagged transcript is refused even at high confidence: the flag is
+    # the state that says "this text is under review", and the gate respects it.
+    flagged = gate("undo.", confidence=0.99, flagged=True)
+    assert flagged is not None and "flagged" in flagged["reason"]
+
+    # Unknown confidence: read-only intents still work (that is the useful 99%),
+    # a mutating one does not.
+    assert gate("where are the invoices?", confidence=None) is None
+    assert gate("undo.", confidence=None) is not None, (
+        "a mutating intent executed on a transcript with no confidence at all")
+
+    # A clear, deliberate, unflagged command is NOT gated into uselessness.
+    assert gate("undo.", confidence=0.97) is None
+    assert gate("remember that tea is at four", confidence=0.9) is None
+
+    # And the veto is wired into the stop path: `route()` is not called at all.
+    import asyncio
+
+    called = []
+
+    async def fake_ask(params):
+        called.append(params["text"])
+        return {"reply": "done", "via": "local-intent"}
+
+    daemon._ask = fake_ask
+    daemon._dictation_session_mode = "command"
+    result = {"text": "undo.", "raw_text": "undo.", "cleaned_text": None,
+              "confidence": 0.42, "flagged": True, "backend": "mock"}
+    veto = daemon._command_gate(result)
+    assert veto is not None and veto["reason"]
+    asyncio.run(daemon._ptt_stop({}))     # no live session: must be a no-op
+    assert called == [], "the stop path routed a vetoed transcript anyway"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1332,9 +1424,7 @@ def test_g18_kill_daemon_mid_playback_leaves_the_player_running(tmp_path):
                 pass
 
 
-@pytest.mark.xfail(strict=True, reason="VB-11: a rejected second hotkey press speaks its "
-                   "own 'On it.', so one double-press sounds like two answers")
-def test_g19_double_hotkey_acks_once(tmp_path):
+def test_g20_clock_jump_does_not_fire_and_the_rotation_cap_holds(tmp_path):
     """Item 20: timers must be monotonic. A +9h jump (Nairobi has no DST, but
     NTP and VM resume do move the wall clock) must not fire, cut, or double the
     check-in — and a 25h session must not misfire its rotation cap."""
@@ -1350,7 +1440,7 @@ def test_g19_double_hotkey_acks_once(tmp_path):
     assert fired == 1, f"a wall-clock jump produced {fired} check-ins"
 
     _, _, service_, _ = dictation(tmp_path)
-    service_.session_max_s = 0.05
+    service_.session_max_s = 0.01      # crossed by the very next frame
     shared = {"connects": [], "words_seen": 0, "finals": []}
     made = []
 
@@ -1363,11 +1453,50 @@ def test_g19_double_hotkey_acks_once(tmp_path):
     async def sink(event):
         events.append(event)
 
-    result = asyncio.run(service_.dictate(Source([SPEECH] * 40), transport_factory=factory,
+    result = asyncio.run(service_.dictate(Source([SPEECH] * 400), transport_factory=factory,
                                           sink=sink))
-    assert len(shared["connects"]) >= 2, "no rotation at the session age cap"
+    assert len(shared["connects"]) >= 2, (
+        f"no rotation at the session age cap ({shared['connects']})")
     assert not [e for e in events if e["event"] == "error"], events
     assert result.notes
+
+
+def test_g19_double_hotkey_acks_once(tmp_path):
+    """VB-11 (fixed): the rejected second press is refused in silence.
+
+    Single-owner capture already worked — the loser just also got its own
+    "On it." ack, so one mashing of the hotkey sounded like two answers (and
+    played two files). A refusal is not a request to be acknowledged.
+    """
+    import asyncio
+
+    from assistant.daemon import Daemon
+
+    config = voice_config(tmp_path, online_voice="local", offline_voice="local")
+    daemon = Daemon(config)
+    daemon.speech._is_online = lambda: True
+    daemon.speech.warm_ack_cache()
+    plays = []
+    daemon.speech.play_ack = lambda kind, **kw: (plays.append(kind),
+                                                 {"played": True, "ack_kind": kind})[1]
+
+    async def scenario():
+        first = await daemon._ptt_start({"source": "simulated", "mode": "narration"})
+        await asyncio.sleep(0.05)                 # let the capture task be real
+        after_first = list(plays)
+        second = await daemon._ptt_start({"source": "simulated", "mode": "narration"})
+        await asyncio.sleep(0.05)
+        return first, second, after_first, list(plays)
+
+    first, second, after_first, after_second = asyncio.run(scenario())
+    assert first["listening"] is True and "already_listening" not in first
+    assert after_first, "the accepted press never queued its ack"
+    assert second["listening"] is True and second["note"] == "already listening"
+    assert second.get("already_listening") is True
+    assert second["speech"]["played"] is False and second["speech"]["audio_path"] is None
+    assert second["speech"]["suppressed"] == "already listening — no second ack"
+    assert after_second == after_first, (
+        f"a refused press made her speak: {after_first} -> {after_second}")
 
 
 def test_b5c_boot_warm_starts_before_the_socket_serves():
