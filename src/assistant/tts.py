@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import canonical_voices, resolve_voice
+from .proc import child_kwargs
 
 # The ack strings are load-bearing for audibility, not style. This voice cannot
 # render a one-word utterance legibly: "Done." and "Sorted." recovered 0 of 6
@@ -592,7 +593,13 @@ class SpeechService:
         command = self._player_command()
         if command is None:
             return False
-        result = self._player_runner([*command, str(path)], capture_output=True, timeout=120)
+        # VB-10: the player is spawned with PR_SET_PDEATHSIG in its own session,
+        # so a killed daemon cannot leave audio playing (or the sink claimed).
+        # An injected test runner keeps the plain signature — it must not have to
+        # know about prctl to stand in for a player.
+        protect = self._player_runner is subprocess.run
+        result = self._player_runner([*command, str(path)], capture_output=True,
+                                     timeout=120, **child_kwargs() if protect else {})
         return getattr(result, "returncode", 0) == 0
 
     def speak(self, text: str, *, play: bool = True) -> SpeechResult:

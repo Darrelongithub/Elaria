@@ -67,8 +67,7 @@ def format_waybar(status: dict) -> dict:
             f"{k}={v}" for k, v in sorted(queue_counts.items())))
     voice = status.get("voice") or {}
     if voice:
-        tooltip_lines.append(
-            f"voice: local {voice.get('backend')} / {voice.get('voice_id')}")
+        tooltip_lines.append(format_voice_line(voice))
     if status.get("capture"):
         tooltip_lines.append(f"capture: {status['capture']}")
     if last.get("snippet"):
@@ -79,6 +78,27 @@ def format_waybar(status: dict) -> dict:
         "class": classes,
         "tooltip": "\n".join(tooltip_lines),
     }
+
+
+def format_voice_line(voice: dict) -> str:
+    """The pill's `voice:` line: the posture as it is, never a label by habit.
+
+    It used to read `voice: local <backend> / <voice_id>` in every mode, which
+    called Gemini's Flare "local" while online and "local none" while offline
+    (VB-14). The surfaces have to be trustworthy about who speaks: cloud says
+    cloud, the dormant-path posture says local, and silence says silence and why.
+    """
+    mode = str(voice.get("voice_mode") or "")
+    backend, voice_id = voice.get("backend"), voice.get("voice_id")
+    if voice.get("cloud_voice") or mode == "gemini-interim":
+        return (f"voice: cloud — {voice_id} via {backend} "
+                f"(Gemini native audio; online only)")
+    if voice.get("local"):
+        return f"voice: local — {voice_id} via {backend} (the one owned local voice)"
+    if voice.get("muted") or voice_id in (None, "", "none"):
+        why = str(voice.get("reason") or "").split("(")[0].strip().rstrip(":, ")
+        return "voice: silent — nothing is spoken" + (f" — {why}" if why else "")
+    return f"voice: unknown — {backend} / {voice_id} (run `assist voice status`)"
 
 
 def stream_waybar(socket_path, *, interval_s: float = 5.0):

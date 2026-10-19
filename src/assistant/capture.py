@@ -208,9 +208,15 @@ class PipeWireCapture:
         self._proc: asyncio.subprocess.Process | None = None
 
     async def frames(self) -> AsyncIterator[bytes]:
+        # VB-10: `pw-record` must die with the daemon instead of keeping the
+        # microphone claimed: PR_SET_PDEATHSIG in the child, in its own session
+        # (see assistant.proc). The graceful path below still terminates it.
+        from .proc import child_kwargs
+
         self._proc = await asyncio.create_subprocess_exec(
             *self._command, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            **child_kwargs(),
         )
         assert self._proc.stdout is not None
         while True:

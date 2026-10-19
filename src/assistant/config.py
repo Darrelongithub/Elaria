@@ -302,6 +302,11 @@ DEFAULTS: dict = {
     "tools": {"shell": "confirm"},
     "voice_test": {
         "keyword": "Elaria",
+        # The biometric template: where it lives and what produced it. `doctor`
+        # validates size, JSON, schema, dimension, model AND file mode against
+        # these (VB-9) — it no longer asks only whether the file exists.
+        "voiceprint_path": "~/voiceprint.json",
+        "embedding_dim": 192,
         "speaker_threshold": 0.75,
         "keyword_threshold": 0.5,
         "save_near_miss_clips": False,

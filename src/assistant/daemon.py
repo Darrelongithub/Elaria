@@ -1041,6 +1041,21 @@ class Daemon:
         # VB-13: the ack cache starts warming BEFORE anything can ask for an ack,
         # and `_ack` queues behind it, so the first hotkey press after boot finds
         # audio instead of silence. Everything else on the socket is unaffected.
+        # VB-10: if a previous run was SIGKILLed mid-playback (or mid-recording),
+        # its audio children are still holding the sink and the microphone, and a
+        # fresh daemon must not inherit that. pdeathsig covers the normal case;
+        # this covers the kernel/thread arrangements where it does not fire.
+        try:
+            from .proc import audio_child_names, reap_orphans
+
+            reaped = await asyncio.to_thread(
+                lambda: reap_orphans(names=audio_child_names(self.config)))
+            if reaped["killed"]:
+                print(f"[assistd] released {len(reaped['killed'])} orphaned audio "
+                      f"process(es) from a previous run: "
+                      f"{', '.join(reaped['detail'])}", flush=True)
+        except Exception as exc:            # never a reason to refuse to start
+            print(f"[assistd] audio-orphan sweep failed: {exc}", flush=True)
         self._warm_pending = True
         warm_task = asyncio.create_task(self._warm_speech_cache())
         server = await serve(self.config.socket_path, self.handle)

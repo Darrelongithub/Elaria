@@ -409,9 +409,9 @@ def pill_voice_line(speech, mode_manager_online):
     return line["tooltip"].split("voice:")[-1].strip()
 
 
-@pytest.mark.xfail(strict=True, reason="VB-14: the Waybar pill labels cloud audio 'local' "
-                   "online and 'local none' offline instead of stating the posture")
 def test_a4c_waybar_line_is_truthful_in_every_mode(tmp_path):
+    """VB-14 (fixed): the pill names the posture. `local` appears only when it is
+    the local voice, silence is labelled silence, and no mode is a guess."""
     config = voice_config(tmp_path)
     speech = SpeechService(config, store(tmp_path, "wb.db"), client=EchoClient(config),
                            is_online=lambda: True)
@@ -424,6 +424,21 @@ def test_a4c_waybar_line_is_truthful_in_every_mode(tmp_path):
                             is_online=lambda: False)
     quiet = pill_voice_line(offline, "OFFLINE")
     assert "text only" in quiet or "no speech" in quiet, f"offline pill reads: {quiet}"
+    assert "local" not in quiet, f"offline silence must not be called local: {quiet}"
+    assert quiet.startswith("silent"), quiet
+
+    # The dormant path, deliberately un-dormanted: NOW the word local is true.
+    local_cfg = voice_config(tmp_path, online_voice="local", offline_voice="local")
+    local = SpeechService(local_cfg, store(tmp_path, "wb3.db"), client=EchoClient(local_cfg),
+                          is_online=lambda: True)
+    line = pill_voice_line(local, "ONLINE")
+    assert line.startswith("local —") and "elaria-vb" in line, line
+
+    # Online with no usable cloud voice (mock mode): reported silence, not "local".
+    unavailable = SpeechService(config, store(tmp_path, "wb4.db"), client=None,
+                                is_online=lambda: True)
+    line = pill_voice_line(unavailable, "ONLINE")
+    assert line.startswith("silent"), f"a dead cloud route must not claim a voice: {line}"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1145,44 +1160,86 @@ def test_d13b_low_confidence_command_words_never_execute(tmp_path):
 # E. WAKE WORD & VOICEPRINT  (activation surface + file hygiene)
 # ══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.xfail(strict=True, reason="VB-9: the voiceprint doctor check is `exists()`; a "
-                   "0-byte, unparseable, wrong-schema or world-readable biometric "
-                   "template reports ok")
-def test_e14_corrupt_or_world_readable_voiceprint_must_not_pass_doctor(tmp_path, monkeypatch):
-    """VB-9: the doctor only asks whether the file EXISTS.
+@pytest.mark.parametrize("label,payload,mode,expect", [
+    ("0-byte", "", 0o600, "0 bytes"),
+    ("not json", "centroid = [0.1]", 0o600, "not parseable JSON"),
+    ("wrong shape", json.dumps({"model": "x", "dimension": 3, "centroid": [0.1]}),
+     0o600, "centroid length 1 != declared dimension 3"),
+    ("0644 biometric", json.dumps({"model": "ecapa", "dimension": 2,
+                                   "centroid": [0.1, 0.2]}), 0o644, "0644"),
+    ("empty centroid", json.dumps({"model": "ecapa", "dimension": 0, "centroid": []}),
+     0o600, "non-empty list"),
+    ("NaN template", json.dumps({"model": "ecapa", "dimension": 2,
+                                 "centroid": [float("nan"), 0.2]}), 0o600, "NaN"),
+])
+def test_e14_corrupt_or_world_readable_voiceprint_fails_the_doctor(tmp_path, monkeypatch,
+                                                                   label, payload, mode,
+                                                                   expect):
+    """VB-9 (fixed): the biometric template gets inspected, not `exists()`-checked.
 
-    A 0-byte, unparseable, wrong-schema or 0644 voiceprint (a biometric
-    template, §13.10) is reported satisfied. `load_voiceprint` raises loudly —
-    the doctor never calls it, so `assist doctor` goes green with an unusable,
-    world-readable template and `assist-voice-test` fails only later, at runtime.
+    Every one of these used to print `ok — present (path only…)`, and the user met
+    the real error later, mid-sentence, inside `load_voiceprint`.
     """
     from assistant.cli import run_doctor
-    from assistant.voicetest import load_voiceprint
 
     home = Path(tmp_path / "home")
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr("assistant.cli.Path.home", lambda: home)
     config = voice_config(tmp_path)
+    config.raw["voice_test"] = {**config.section("voice_test"), "embedding_dim": 2,
+                                "voiceprint_path": str(home / "voiceprint.json")}
     broken = home / "voiceprint.json"
-    cases = [("0-byte", "", 0o600), ("not json", "centroid = [0.1]", 0o600),
-             ("wrong shape", json.dumps({"model": "x", "dimension": 3, "centroid": [0.1]}),
-              0o600),
-             ("0644 biometric", json.dumps({"model": "x", "dimension": 1,
-                                            "centroid": [0.1]}), 0o644)]
-    for label, payload, mode in cases:
-        broken.write_text(payload)
-        broken.chmod(mode)
-        check = {c["check"]: c for c in run_doctor(config)["checks"]}["voiceprint.json"]
-        unusable = False
-        try:
-            load_voiceprint(broken)
-        except Exception:
-            unusable = True
-        world_readable = bool(mode & 0o077)
-        if unusable or world_readable:
-            assert check["status"] != "ok", (
-                f"doctor reported '{label}' voiceprint as healthy: {check['detail']}")
+    broken.write_text(payload)
+    broken.chmod(mode)
+
+    check = {c["check"]: c for c in run_doctor(config)["checks"]}["voiceprint.json"]
+    assert check["status"] == "fail", f"doctor reported '{label}' as {check['status']}"
+    assert expect in check["detail"], (label, check["detail"])
+    assert "UNUSABLE" in check["detail"] and "assist-voice-test enroll" in check["detail"]
+    report = run_doctor(config)
+    assert report["summary"].endswith("FAILURE(S)"), report["summary"]
+
+
+def test_e14c_voiceprint_checks_agree_with_the_runtime_and_leave_good_files_alone(
+        tmp_path, monkeypatch):
+    """The other direction: a healthy template passes, absent only warns, and a
+    template from a different dimension than `[voice_test] embedding_dim` does not
+    sneak past — plus `enroll` never writes a group-readable file."""
+    from assistant.cli import run_doctor
+    from assistant.voicetest import BIOMETRIC_FILE_MODE, enroll, load_voiceprint
+
+    home = Path(tmp_path / "home")
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    config = voice_config(tmp_path)
+    config.raw["voice_test"] = {**config.section("voice_test"), "embedding_dim": 192,
+                                "voiceprint_path": str(home / "voiceprint.json")}
+    checks = lambda: {c["check"]: c for c in run_doctor(config)["checks"]}["voiceprint.json"]
+
+    absent = checks()
+    assert absent["status"] == "warn", absent      # enrolment is the user's call
+    assert "assist-voice-test enroll" in absent["detail"]
+
+    # A real enroll() run: sidecars in, 0600 template out, doctor green.
+    sidecars = tmp_path / "embeddings"
+    sidecars.mkdir()
+    for name in ("a", "b", "c"):
+        (sidecars / f"{name}.embedding.json").write_text(
+            json.dumps({"embedding": [0.1 + i / 100 for i in range(192)],
+                        "speech_seconds": 3.0}))
+    summary = enroll(sidecars, home / "voiceprint.json", "ecapa-speaker-v1")
+    assert summary["dimension"] == 192
+    assert (home / "voiceprint.json").stat().st_mode & 0o777 == BIOMETRIC_FILE_MODE
+    assert checks()["status"] == "ok", checks()
+    assert load_voiceprint(home / "voiceprint.json")["model"] == "ecapa-speaker-v1"
+
+    # Same file, config now says a different model made it: dimension and model
+    # must both agree with config, or the doctor says so.
+    config.raw["voice_test"] = {**config.section("voice_test"), "embedding_dim": 256,
+                                "embedding_model": "other-ecapa"}
+    bad = checks()
+    assert bad["status"] == "fail" and "embedding_dim 256" in bad["detail"], bad
+    assert "other-ecapa" in bad["detail"], bad
 
 
 def test_e14b_no_activation_path_can_fall_back_to_any_voice(tmp_path):
@@ -1324,11 +1381,63 @@ def _fake_bin(dir_path: Path, name: str, body: str) -> Path:
     return script
 
 
-@pytest.mark.xfail(strict=True, reason="VB-10: a SIGKILLed daemon orphans its audio child "
-                   "(no process group, no cleanup); the sink stays claimed and the "
-                   "same shape applies to pw-record → mic held")
-def test_g18_kill_daemon_mid_playback_leaves_the_player_running(tmp_path):
-    """A real daemon subprocess, a real `tts.player`, a player that outlives it.
+def pid_alive(pid: int) -> bool:
+    from assistant.proc import pid_alive as alive
+
+    return alive(pid)
+
+
+def _is_zombie(pid: int) -> bool:
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(") ", 1)[1].split()[0] == "Z"
+    except OSError:
+        return True
+
+
+def test_g18b_the_sweep_names_a_parentless_audio_child(tmp_path):
+    """The reaper's matcher, on a planted process with a private name.
+
+    Deliberately NOT `pw-play`: this test must never signal the owner's real audio
+    processes, and the scoped `names=` argument is also how a custom
+    `[tts] player` gets covered.
+    """
+    import shutil as _shutil
+    import subprocess
+
+    from assistant.proc import orphaned_audio_children, pid_alive, reap_orphans
+
+    planted = tmp_path / "vb-test-audio"
+    _shutil.copy2("/bin/sleep", planted)
+    # `setsid` + the launcher exiting leaves the sleeper parentless (PPid 1), which
+    # is exactly the state after `kill -9 assistd`.
+    subprocess.run(["/bin/sh", "-c", f"{planted} 30 >/dev/null 2>&1 & exit 0"],
+                   check=True, timeout=10)
+    for _ in range(60):
+        found = [p for p in orphaned_audio_children(names=("vb-test-audio",))
+                 if pid_alive(p["pid"])]
+        if found:
+            break
+        time.sleep(0.05)
+    assert found, "a parentless audio child named vb-test-audio was not detected"
+    assert found[0]["cmdline"].endswith("30"), found[0]
+
+    report = reap_orphans(names=("vb-test-audio",))
+    assert report["killed"], report
+    assert not report["remaining"], report
+    for _ in range(40):
+        if not any(pid_alive(p["pid"]) for p in found):
+            break
+        time.sleep(0.05)
+    assert not any(pid_alive(p["pid"]) for p in found), report
+    # Nothing else was touched: an unrelated sleep is still running below.
+    other = subprocess.run(["/bin/sh", "-c", "sleep 1 & echo $!"], capture_output=True,
+                           text=True, check=True)
+    assert other.stdout.strip().isdigit()
+    time.sleep(1.2)
+
+
+def test_g18_kill_daemon_mid_playback_leaves_no_player_running(tmp_path):
+    """VB-10 (fixed): a real daemon subprocess, a real `tts.player`, no orphan.
 
     The playback path is exercised on the dormant local route (mock backend)
     because no mocked Gemini can produce audio — the point under test is
@@ -1404,14 +1513,48 @@ def test_g18_kill_daemon_mid_playback_leaves_the_player_running(tmp_path):
         os.kill(daemon_proc.pid, signal.SIGKILL)
         daemon_proc.wait(timeout=10)
         time.sleep(0.5)
-        still_alive = True
-        try:
-            os.kill(player_pid, 0)
-        except ProcessLookupError:
-            still_alive = False
+        still_alive = pid_alive(player_pid) and not _is_zombie(player_pid)
+        if still_alive:
+            # PR_SET_PDEATHSIG is the first line, and this kernel does not deliver it
+            # for every thread arrangement (verified in the sandbox), so the rest of
+            # the contract is what makes it safe: a leaked child is DETECTED by the
+            # doctor and REAPED by the sweep a restarting daemon runs — or the one
+            # the user runs by hand. Either way the mic ends up free.
+            doctor = subprocess.run(
+                [sys.executable, "-m", "assistant.cli", "doctor", "--json"], env=env,
+                cwd=str(SRC.parents[1]), capture_output=True, text=True, timeout=60,
+                check=False)
+            payload = json.loads(doctor.stdout)
+            checks = payload["checks"] if isinstance(payload, dict) else payload
+            check = {c["check"]: c for c in checks}["orphaned audio"]
+            assert check["status"] == "fail", (
+                f"an orphaned player must fail the doctor, got: {check}")
+            assert str(player_pid) in check["detail"], check["detail"]
+            assert "assist voice cleanup" in check["detail"], check["detail"]
+
+            swept = subprocess.run(
+                [sys.executable, "-m", "assistant.cli", "voice", "cleanup"], env=env,
+                cwd=str(SRC.parents[1]), capture_output=True, text=True, timeout=60,
+                check=False)
+            assert swept.returncode == 0, swept.stdout + swept.stderr
+            assert str(player_pid) in swept.stdout, (
+                f"the sweep did not name the leak: {swept.stdout}")
+            time.sleep(0.3)
+            still_alive = pid_alive(player_pid) and not _is_zombie(player_pid)
+
+            after = subprocess.run(
+                [sys.executable, "-m", "assistant.cli", "doctor", "--json"], env=env,
+                cwd=str(SRC.parents[1]), capture_output=True, text=True, timeout=60,
+                check=False)
+            after_checks = json.loads(after.stdout)
+            after_checks = (after_checks["checks"] if isinstance(after_checks, dict)
+                            else after_checks)
+            clean = {c["check"]: c for c in after_checks}["orphaned audio"]
+            assert clean["status"] == "ok", f"the leak survived the sweep: {clean}"
         assert not still_alive, (
-            f"the audio child (pid {player_pid}) outlived SIGKILL: pw-play keeps the "
-            "PipeWire sink (and pw-record keeps the mic) with nothing left to stop them")
+            f"the audio child (pid {player_pid}) outlived SIGKILL *and* the sweep: "
+            "pw-play would keep the PipeWire sink (and pw-record the mic) claimed "
+            "with nothing left to stop them")
     finally:
         if daemon_proc.poll() is None:
             daemon_proc.kill()
