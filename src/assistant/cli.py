@@ -560,7 +560,16 @@ def _print_plan_summary(result: dict) -> None:
     print(f"Nothing moved. Read and judge: {result['shadow_log']}")
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Every `assist` command surface, built in one place.
+
+    Split out of `main()` so tests can construct the parser and render every
+    help string without spawning a subprocess: since Python 3.14 argparse
+    validates %-formatting in `help=` eagerly inside `add_argument()`, one
+    unescaped `%` used to take the *entire* CLI down at construction time
+    (bugs.md BH-G4). On 3.11-3.13 the same string only crashed when that one
+    subcommand's `--help` was formatted, so it went unnoticed.
+    """
     parser = argparse.ArgumentParser(prog="assist", description=f"Elaria assistant CLI v{__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
     doctor_p = sub.add_parser("doctor", help="honest environment check (§11)")
@@ -619,8 +628,11 @@ def main(argv: list[str] | None = None) -> int:
     apply_p = plan_sub.add_parser("apply", help="EXECUTE a plan (live roots only, Phase 4)")
     apply_p.add_argument("plan_id", type=int)
     apply_p.add_argument("--include-review", action="store_true")
+    # `%%` renders as one `%`. argparse %-formats every help string, and
+    # since Python 3.14 it does so eagerly in add_argument() — a bare `%`
+    # here is not a cosmetic typo, it is a CLI that cannot be constructed.
     apply_p.add_argument("--allow-tripwire", action="store_true",
-                         help="explicitly allow moving >tripwire% of the tree (§4.4)")
+                         help="explicitly allow moving >tripwire%% of the tree (§4.4)")
     review_p = sub.add_parser("review", help="the 0.60-0.89 queue (§4.4)")
     review_sub = review_p.add_subparsers(dest="review_action", required=True)
     review_sub.add_parser("list")
@@ -674,6 +686,11 @@ def main(argv: list[str] | None = None) -> int:
     events_p = sub.add_parser("events", help="stream daemon events (overlay/Waybar feed)")
     events_p.add_argument("--overlay", action="store_true",
                           help="stream pre-computed overlay states for the Quickshell pill")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     config = load_config()
 

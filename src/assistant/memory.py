@@ -72,11 +72,12 @@ class Memory:
                 hit.score = rank_component
                 scores[key] = hit
 
-        # FTS arm (keyword exactness — filenames, names, codes).
+        # FTS arm (keyword exactness — filenames, names, codes). Terms go
+        # through the store's OR arm so they stay literal search text; the
+        # store, not this module, decides how to quote them for FTS5 (BH-E2).
         if terms:
-            fts_query = " OR ".join(terms)
             try:
-                hits = self.store.search_documents(fts_query, limit=limit * 2)
+                hits = self.store.search_documents_any(terms, limit=limit * 2)
             except Exception:
                 hits = []
             for rank, hit in enumerate(hits):

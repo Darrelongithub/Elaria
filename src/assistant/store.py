@@ -12,10 +12,60 @@ exists in this module — memory is offline by architecture (§16).
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import ClassVar
+
+# FTS5 treats the operand of `MATCH` as a query *language*, so raw user text
+# such as `"`, `NEAR(`, `invoice OR` or `invoice)` is a syntax error and
+# `search_documents()` used to raise OperationalError (bugs.md BH-E2).
+# Search input is therefore always reduced to literal terms first: this
+# tokenizer mirrors FTS5's default `unicode61` (letters/digits are tokens,
+# everything else — including `_` — is a separator), and every term is then
+# emitted as a quoted string, which is the one FTS5 form that can never be
+# re-read as an operator.
+_SEARCH_TERM_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _search_terms(text: str) -> list[str]:
+    """Literal search terms from arbitrary user text (BH-E2).
+
+    Punctuation, operators and stray quotes are dropped as separators rather
+    than passed through as syntax.
+    """
+    return _SEARCH_TERM_RE.findall(text or "")
+
+
+def _fts_match_expression(terms: Iterable[str], *, joiner: str = " ") -> str | None:
+    """A syntactically safe FTS5 MATCH expression, or None if nothing to find.
+
+    Each term is double-quoted (with any embedded quote doubled, the FTS5
+    escape), so the result is always a well-formed query no matter what the
+    user typed. `joiner` is `" "` for AND (plain search) or `" OR "` for the
+    any-term arm used by `Memory.recall()`.
+    """
+    quoted = ['"{}"'.format(term.replace('"', '""')) for term in terms if term]
+    if not quoted:
+        return None
+    return joiner.join(quoted)
+
+
+def _like_patterns(terms: Iterable[str]) -> list[str]:
+    """`%term%` LIKE patterns with the wildcards escaped (BH-E1/BH-E2).
+
+    Without the escaping a literal `%` or `_` in user text would become a
+    wildcard and silently match the whole corpus.
+    """
+    patterns = []
+    for term in terms:
+        escaped = (term.replace("\\", "\\\\").replace("%", "\\%")
+                   .replace("_", "\\_").lower())
+        patterns.append(f"%{escaped}%")
+    return patterns
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS llm_calls (
@@ -390,6 +440,28 @@ class Store:
                  1 if increment_attempts else 0, job_id))
             self._conn.commit()
 
+    def claim_cloud_job(self, job_id: int, *, to_status: str = "running",
+                        from_statuses: Sequence[str] = ("pending", "approved"),
+                        increment_attempts: bool = True) -> bool:
+        """Atomic conditional state claim on one queue job (BH-C3).
+
+        Selecting a job and then updating it to `running` are two separate
+        statements, so two concurrent drains could both select the same job
+        and both run it — repeating model calls and side effects. This is a
+        single conditional UPDATE: SQLite applies it atomically, so at most
+        one caller sees `rowcount == 1` and only that caller may handle the
+        job (and only it increments `attempts`).
+        """
+        placeholders = ", ".join("?" * len(from_statuses))
+        with self._lock:
+            cur = self._conn.execute(
+                f"""UPDATE cloud_jobs
+                    SET status = ?, attempts = attempts + ?
+                    WHERE id = ? AND status IN ({placeholders})""",
+                (to_status, 1 if increment_attempts else 0, job_id, *from_statuses))
+            self._conn.commit()
+            return cur.rowcount == 1
+
     def cloud_job_counts(self) -> dict[str, int]:
         with self._lock:
             rows = self._conn.execute(
@@ -453,22 +525,50 @@ class Store:
         return row["text"][:chars] if row else ""
 
     def search_documents(self, query: str, limit: int = 10) -> list[dict]:
-        """FTS5 keyword search (LIKE fallback). Local-only: zero tokens."""
+        """Keyword search over the local index (FTS5, LIKE fallback).
+
+        `query` is *user text*, never FTS5 syntax: quotes, parentheses and
+        operators are searched as literal text, and a query made only of
+        punctuation safely returns no hits instead of raising (BH-E2).
+        Local-only: zero tokens.
+        """
+        return self._search(_search_terms(query), limit=limit)
+
+    def search_documents_any(self, terms: Iterable[str], limit: int = 10) -> list[dict]:
+        """OR-combined keyword search — the FTS arm of `Memory.recall()` (§16).
+
+        Terms are still tokenized and quoted, so this keeps OR *semantics*
+        without becoming an injection point for FTS5 operators.
+        """
+        return self._search(_search_terms(" ".join(terms)), limit=limit, joiner=" OR ")
+
+    def _search(self, terms: list[str], *, limit: int, joiner: str = " ") -> list[dict]:
+        if not terms:
+            return []          # nothing but punctuation: no hits, no crash
         with self._lock:
             if self.fts5_available:
-                rows = self._conn.execute(
-                    """SELECT d.path, snippet(doc_chunks_fts, 0, '[', ']', '…', 12) AS snip
-                       FROM doc_chunks_fts f JOIN doc_chunks c ON c.id = f.rowid
-                       JOIN documents d ON d.id = c.doc_id
-                       WHERE doc_chunks_fts MATCH ? AND d.status != 'missing'
-                       ORDER BY rank LIMIT ?""",
-                    (query, limit)).fetchall()
-            else:
-                rows = self._conn.execute(
-                    """SELECT d.path, substr(c.text, 1, 120) AS snip
-                       FROM doc_chunks c JOIN documents d ON d.id = c.doc_id
-                       WHERE c.text LIKE ? AND d.status != 'missing' LIMIT ?""",
-                    (f"%{query}%", limit)).fetchall()
+                try:
+                    rows = self._conn.execute(
+                        """SELECT d.path,
+                                  snippet(doc_chunks_fts, 0, '[', ']', '…', 12) AS snip
+                           FROM doc_chunks_fts f JOIN doc_chunks c ON c.id = f.rowid
+                           JOIN documents d ON d.id = c.doc_id
+                           WHERE doc_chunks_fts MATCH ? AND d.status != 'missing'
+                           ORDER BY rank LIMIT ?""",
+                        (_fts_match_expression(terms, joiner=joiner), limit)).fetchall()
+                    return [dict(r) for r in rows]
+                except sqlite3.OperationalError:
+                    pass       # degrade to LIKE, never crash (module contract)
+            # LIKE fallback (SQLite builds without FTS5): same literal-term
+            # reading, wildcards escaped so punctuation cannot widen a match.
+            boolean = "OR" if joiner.strip().upper() == "OR" else "AND"
+            clause = f" {boolean} ".join(
+                ["LOWER(c.text) LIKE ? ESCAPE '\\'"] * len(terms))
+            rows = self._conn.execute(
+                f"""SELECT d.path, substr(c.text, 1, 120) AS snip
+                    FROM doc_chunks c JOIN documents d ON d.id = c.doc_id
+                    WHERE ({clause}) AND d.status != 'missing' LIMIT ?""",
+                (*_like_patterns(terms), limit)).fetchall()
         return [dict(r) for r in rows]
 
     # -- plans (shadow mode first, §4.3) -------------------------------------
