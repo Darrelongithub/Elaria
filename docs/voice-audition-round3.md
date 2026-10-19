@@ -264,5 +264,25 @@ git). `1-*` = test line at 0.92, `2-*` = the four acks, `3-*` = pace ladder at
 cori-high audio obtainable from here — listen for timbre only; it is not our
 test line).
 
+Two stitched files exist for actually listening, because per-voice files invite
+comparing one clip to a memory:
+
+* `A-listen-blind-testline.{wav,mp3}` — all four voices, same test line,
+  back-to-back with 0.75 s gaps, in a **seeded shuffled order** so the measured
+  ranking cannot bias the ear. Order is withheld in
+  `A-listen-BLIND-ORDER-KEY.txt`; score all four, then reveal.
+* `B-listen-acks-incumbent-vs-alba.{wav,mp3}` — the four **production** acks,
+  incumbent first then the front-runner. This is the closest thing to how
+  Elaria actually sounds on the hotkey path.
+
+Stitching is sample-rate conversion plus mono→duplication only — **no EQ, no
+gain change, no time-stretch**. Verified against the source WAVs rather than
+assumed: correlation ≥ 0.9998 after accounting for the ~25 ms MPEG encoder
+delay, and the incumbent's 8–11 kHz energy stays at 0.40 % (wav) / 0.38 %
+(mp3) where alba sits at 7.74 % / 7.49 % — i.e. the low voice's missing band is
+still missing, nothing was brightened to make it look better or worse. The
+`.wav` is bit-faithful; the `.mp3` is for browser players (16-bit/22.05 kHz
+mono can fail in some web players).
+
 Not approved, not canonical: owner ear-check required before anything else
 (Hyprland binds, live Gemini) proceeds.
