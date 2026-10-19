@@ -144,11 +144,97 @@ def test_forget_underscore_is_a_literal_topic_not_a_wildcard(tmp_path):
     assert [fact["text"] for fact in memory.beliefs()] == ["alpha fact"]
 
 
-@pytest.mark.xfail(strict=True, reason="BH-E2: raw user text is passed to FTS5 MATCH")
-@pytest.mark.parametrize("query", ['"', "NEAR(", "invoice OR", "(invoice", "invoice)"])
-def test_search_documents_treats_user_text_as_text_not_fts_syntax(tmp_path, query):
+# BH-E2 (fixed): `search_documents()` used to hand raw user text to FTS5
+# `MATCH`, so `"`, `NEAR(`, `invoice OR`, `(invoice` and `invoice)` raised
+# sqlite3.OperationalError. These tests run against a *populated* index: an
+# empty one lets SQLite skip MATCH evaluation entirely, which is how the
+# bug hid as an XPASS on some SQLite builds.
+BH_E2_QUERIES = ['"', "NEAR(", "invoice OR", "(invoice", "invoice)"]
+
+
+def _indexed_store(tmp_path) -> Store:
+    """A populated index — FTS5 really has to parse MATCH against rows."""
     store = Store(tmp_path / "search.db")
-    assert store.search_documents(query) == []
+
+    def index(path, *chunks):
+        store.upsert_document(
+            path=path, root="/docs", sha256="0" * 64, size=1, mtime=1.0,
+            mime="text/plain", ext=".txt", indexed_ts="2026-01-01T00:00:00+00:00",
+            never_send=0, text_chunks=list(chunks))
+
+    index("/docs/invoice-2026.txt",
+          "invoice total for the march shipment",
+          "paid by bank transfer on monday")
+    index("/docs/notes.txt", "meeting notes about compilers and the budget")
+    assert store.search_documents("invoice"), "fixture index must be searchable"
+    return store
+
+
+@pytest.mark.parametrize("query", BH_E2_QUERIES)
+def test_search_documents_treats_user_text_as_text_not_fts_syntax(tmp_path, query):
+    store = _indexed_store(tmp_path)
+    assert isinstance(store.search_documents(query), list)   # no OperationalError
+
+
+@pytest.mark.parametrize("query,expected", [
+    ('"', []),                                   # punctuation only: no terms
+    ("NEAR(", []),                               # operator keyword read as a word
+    ("***", []),
+    ("     ", []),
+    ("(invoice", ["/docs/invoice-2026.txt"]),    # parens are text, term still found
+    ("invoice)", ["/docs/invoice-2026.txt"]),
+])
+def test_search_documents_punctuation_is_text_not_operator(tmp_path, query, expected):
+    store = _indexed_store(tmp_path)
+    assert [hit["path"] for hit in store.search_documents(query)] == expected
+
+
+def test_search_documents_still_finds_plain_keywords(tmp_path):
+    """The BH-E2 fix must not blunt ordinary keyword search."""
+    store = _indexed_store(tmp_path)
+    assert [h["path"] for h in store.search_documents("budget")] == ["/docs/notes.txt"]
+    assert [h["path"] for h in store.search_documents("invoice total")] == [
+        "/docs/invoice-2026.txt"]
+    assert {h["path"] for h in store.search_documents_any(["budget", "bank"])} == {
+        "/docs/invoice-2026.txt", "/docs/notes.txt"}
+    if store.fts5_available:
+        # `snippet()` is FTS5-only: these brackets prove the MATCH arm ran.
+        assert "[" in store.search_documents("invoice")[0]["snip"]
+
+
+def test_fts5_match_expression_is_always_well_formed(tmp_path):
+    """The real BH-E2 repro: feed the generated MATCH to a populated FTS5
+    index. The old raw pass-through raised OperationalError right here."""
+    from assistant.store import _fts_match_expression, _search_terms
+
+    store = _indexed_store(tmp_path)
+    if not store.fts5_available:
+        pytest.skip("this SQLite build has no FTS5")
+    for query in [*BH_E2_QUERIES, "*", "-", "NOT", "NEAR/a b/", "col:invoice",
+                  '"a""b"', "%%%", "a" * 300]:
+        expression = _fts_match_expression(_search_terms(query))
+        if expression is None:
+            continue
+        for term in expression.split(" OR "):
+            assert term.startswith('"') and term.endswith('"'), expression
+        store._conn.execute(
+            "SELECT count(*) FROM doc_chunks_fts WHERE doc_chunks_fts MATCH ?",
+            (expression,)).fetchone()          # must not raise
+
+
+def test_like_fallback_is_literal_and_wildcard_safe(tmp_path):
+    """BH-E2 fallback path: builds without FTS5 must be just as safe."""
+    from assistant.store import _like_patterns
+
+    assert _like_patterns(["a%b", "c_d", "e\\f"]) == [
+        "%a\\%b%", "%c\\_d%", "%e\\\\f%"]
+    store = _indexed_store(tmp_path)
+    store.fts5_available = False               # force the LIKE arm
+    assert [h["path"] for h in store.search_documents("invoice")] == [
+        "/docs/invoice-2026.txt"]
+    for query in BH_E2_QUERIES:
+        assert isinstance(store.search_documents(query), list)
+    assert store.search_documents("invoice total")[0]["snip"].startswith("invoice total")
 
 
 @pytest.mark.xfail(strict=True, reason="BH-E3: every OSError is misclassified as network failure")
@@ -221,28 +307,79 @@ def test_verified_outcome_is_recorded_in_the_ledger(config, tmp_path):
     assert [row[0] for row in rows] == [0, 1]
 
 
-@pytest.mark.xfail(strict=True, reason="BH-C3: concurrent queue drains process one job twice")
 def test_concurrent_queue_drains_claim_a_job_once(config, tmp_path):
+    """BH-C3 (fixed): claiming a job is ONE conditional UPDATE.
+
+    The old code selected candidates and then updated the winner to
+    `running` as two separate steps, so two drains that listed the same
+    pending job both ran it. This test removes the scheduler luck: both
+    drains are forced to finish listing candidates before either may claim,
+    so they always compete for the same job.
+    """
     store = Store(tmp_path / "queue.db")
     queue = CloudQueue(config, store, client=None)
-    queue.enqueue_chat("once", "once")
-    barrier = threading.Barrier(2)
+    job_id = queue.enqueue_chat("once", "once")
+
+    contested = threading.Barrier(2)
+    real_list = store.list_cloud_jobs
+
+    def contested_list(*args, **kwargs):
+        jobs = real_list(*args, **kwargs)
+        contested.wait(timeout=10)   # both drains now hold the same candidate
+        return jobs
+
+    store.list_cloud_jobs = contested_list
+
     calls = []
+    results = []
     lock = threading.Lock()
+    release = threading.Barrier(2)
 
     def handle(kind, payload, approved=False):
         with lock:
             calls.append(kind)
-        barrier.wait(timeout=3)
         return {"ok": True}
 
     queue._handle = handle
-    threads = [threading.Thread(target=queue.drain) for _ in range(2)]
+
+    def run():
+        release.wait(timeout=10)
+        result = queue.drain()
+        with lock:
+            results.append(result)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=5)
-    assert calls == ["chat"]
+        thread.join(timeout=15)
+    assert not [t for t in threads if t.is_alive()], "a drain deadlocked"
+
+    assert calls == ["chat"]                        # handled exactly once
+    assert len(results) == 2
+    assert sum(r["done"] for r in results) == 1
+    assert sorted(r["processed"] for r in results) == [0, 1]
+    job = store.get_cloud_job(job_id)
+    assert job["status"] == "done"                  # coherent final state
+    assert job["attempts"] == 1                     # only the claimant counted
+
+
+def test_claim_cloud_job_lets_exactly_one_caller_win(config, tmp_path):
+    """The atomic primitive behind the BH-C3 fix, without the threads."""
+    store = Store(tmp_path / "queue.db")
+    queue = CloudQueue(config, store, client=None)
+    job_id = queue.enqueue_chat("once", "once")
+
+    assert store.claim_cloud_job(job_id) is True
+    assert store.claim_cloud_job(job_id) is False   # already running
+    assert store.get_cloud_job(job_id)["attempts"] == 1
+    store.update_cloud_job(job_id, status="done")
+    assert store.claim_cloud_job(job_id) is False   # done is not claimable
+
+    approved = queue.enqueue_external("download", "fetch a model")
+    store.update_cloud_job(approved, status="approved")
+    assert store.claim_cloud_job(approved) is True  # approved -> running
+    assert store.get_cloud_job(approved)["status"] == "running"
 
 
 # -- F: ASR / capture / TTS ----------------------------------------------------

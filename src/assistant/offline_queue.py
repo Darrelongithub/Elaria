@@ -138,12 +138,21 @@ class CloudQueue:
         for job in candidates:
             job_id = int(job["id"])
             if job["requires_approval"] and job["status"] != "approved":
-                self.store.update_cloud_job(job_id, status="awaiting_approval")
+                # Conditional claim: only the drain that actually moved the
+                # job to awaiting_approval reports it (BH-C3).
+                if not self.store.claim_cloud_job(
+                        job_id, to_status="awaiting_approval",
+                        from_statuses=("pending",), increment_attempts=False):
+                    continue
                 result["awaiting_approval"] += 1
                 result["jobs"].append({"id": job_id, "kind": job["kind"],
                                         "status": "awaiting_approval"})
                 continue
-            self.store.update_cloud_job(job_id, status="running", increment_attempts=True)
+            # THE claim: pending/approved -> running in one atomic UPDATE, so
+            # a second drain that listed the same candidate skips it instead
+            # of running the job twice (BH-C3).
+            if not self.store.claim_cloud_job(job_id):
+                continue
             try:
                 payload = json.loads(job["payload_json"])
                 outcome = self._handle(job["kind"], payload, approved=job["status"] == "approved")

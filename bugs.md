@@ -183,6 +183,107 @@ into a regular hunt test).
   old system destination.
 - **Fix:** independent no-overwrite copies for each channel.
 
+## Fixed after merge — Python 3.14 follow-up
+
+Found by running the keyless suite on Fedora/Python 3.14 after PR #1 merged:
+**14 failed, 965 passed, 5 skipped, 46 xfailed**. Eight failures were one CLI
+crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
+`XPASS(strict)` because they passed *for the wrong reason* on that build.
+
+### BH-G4 — One unescaped `%` in a help string broke the entire CLI on Python 3.14
+
+- **Severity:** crash-with-safe-state
+- **Status:** fixed
+- **Repros:** `test_cli_every_help_string_renders`,
+  `test_cli_plan_apply_help_renders_a_single_percent`,
+  `test_cli_help_exits_zero_for_every_command_group`,
+  `test_no_unescaped_percent_in_any_argparse_help_string`
+- **Expected:** `pyproject.toml` declares `requires-python = ">=3.11"`, so
+  every `assist` command must at least construct its argument parser on any
+  supported interpreter.
+- **Was:** `plan apply`'s `--allow-tripwire` help read
+  `"explicitly allow moving >tripwire% of the tree (§4.4)"`. argparse
+  `%`-formats every help string; `% o` is an invalid conversion.
+  - On Python 3.11–3.13 that only raised when `assist plan apply --help`
+    was formatted, so one subcommand's help was broken.
+  - On Python 3.14, `add_argument()` calls the new `_check_help()`, which
+    formats help **eagerly**, so `build_parser()` raised
+    `ValueError: badly formed help string` (caused by
+    `TypeError: %o format: an integer is required, not dict`) — every
+    `assist` command died before its own logic ran, including
+    `doctor`, `cost` and `status --waybar`.
+- **Evidence (CPython 3.14.0 `Lib/argparse.py`, run against this tree):**
+  original `main(["doctor"])` → `ValueError: badly formed help string` /
+  cause `TypeError: %o format: an integer is required, not dict`; fixed
+  source constructs the parser and renders all 47 help outputs.
+- **Fix:** escape it as `>tripwire%%`; rendered help still shows one `%`
+  (`>tripwire% of the tree (§4.4)`). Audited every `help=`/`description=`/
+  `epilog=`/`usage=`/`metavar=`/`prog=` literal in `src/` — no other
+  unescaped `%` exists, including `assist-voice-test`. Parser construction
+  moved out of `main()` into `build_parser()` so the whole command tree can
+  be rendered in-process on every supported Python.
+
+### BH-E2 — Raw user search text is interpreted as FTS5 syntax
+
+- **Severity:** crash-with-safe-state
+- **Status:** fixed (was open-xfail)
+- **Repros:** `test_search_documents_treats_user_text_as_text_not_fts_syntax`,
+  `test_search_documents_punctuation_is_text_not_operator`,
+  `test_search_documents_still_finds_plain_keywords`,
+  `test_fts5_match_expression_is_always_well_formed`,
+  `test_like_fallback_is_literal_and_wildcard_safe`
+- **Expected:** quotes/parentheses/operators are searched as text, or safely
+  return no hits.
+- **Was:** `Store.search_documents()` passed raw user text straight to
+  SQLite FTS5 `MATCH ?`, so `"`, `NEAR(`, `invoice OR`, `(invoice` and
+  `invoice)` raised `sqlite3.OperationalError`.
+- **Why it XPASSed on Fedora, and why that was not a fix:** the old test
+  searched an **empty** store, so no rows were scanned and the malformed
+  `MATCH` was never evaluated (and on a SQLite build without FTS5 the LIKE
+  fallback never parses `MATCH` at all). Repopulated, the same five queries
+  raise on every build. Environment measured while fixing this:
+  Python 3.11.2, `sqlite3.sqlite_version` 3.40.1,
+  `Store.fts5_available` `True`.
+- **Fix:** search input is reduced to literal terms first
+  (`_search_terms()`, mirroring FTS5's `unicode61` tokenization), then each
+  term is emitted as a quoted string by `_fts_match_expression()`, so no
+  operator can survive into `MATCH`. A punctuation-only query yields no
+  terms and returns `[]`. Punctuation is now *text*, so `(invoice` finds the
+  invoice document instead of erroring.
+  - `Memory.recall()`'s OR arm moved to the new
+    `Store.search_documents_any()` — same literal quoting, OR semantics —
+    so recall keeps matching any term instead of losing its `OR`.
+  - The non-FTS5 LIKE fallback escapes `\`, `%` and `_` with `ESCAPE '\'`
+    (same class as BH-E1) so a literal wildcard cannot widen a match, and
+    degrades to LIKE rather than crashing if FTS5 ever rejects a query.
+
+### BH-C3 — Concurrent queue drains can process the same job twice
+
+- **Severity:** wrong-action
+- **Status:** fixed (was open-xfail)
+- **Repros:** `test_concurrent_queue_drains_claim_a_job_once`,
+  `test_claim_cloud_job_lets_exactly_one_caller_win`
+- **Expected:** exactly one drain claims and handles a pending job.
+- **Was:** `CloudQueue.drain()` selected candidates and then updated the
+  winner to `running` as two separate statements, so two drains that listed
+  the same job both ran it — repeating model calls and side effects, and
+  double-counting `attempts`.
+- **Why it XPASSed on Fedora, and why that was not a fix:** the old test
+  raced two threads with no synchronization at the select/claim boundary, so
+  it passed whenever one thread marked the job `running` before the other
+  listed candidates. Barrier-synchronised at that boundary it reproduces
+  **20/20** on the unfixed code (`['chat', 'chat'] == ['chat']`).
+- **Fix:** `Store.claim_cloud_job()` — one conditional
+  `UPDATE … SET status='running', attempts = attempts + 1 WHERE id = ? AND
+  status IN ('pending','approved')`, reporting success from `rowcount`.
+  SQLite applies it atomically, so at most one caller wins; `drain()` skips
+  any job it fails to claim, and only the claimant increments `attempts`.
+  The `awaiting_approval` transition is claimed the same way, so only the
+  drain that actually moved the job reports it.
+- **Evidence:** with the fix the strengthened test passes **20/20**
+  consecutive runs; handler runs once, final state `done`, `attempts == 1`,
+  and the two drains report `done` counts `1` and `0`.
+
 ## Open reproduced bugs: executor/organiser continuation
 
 ### BH-A5 — Executor does not verify plan root against root spec
@@ -334,15 +435,7 @@ into a regular hunt test).
 
 ## Open reproduced bugs: Area E — store, queue, modes, harness
 
-### BH-E2 — Raw user search text is interpreted as FTS5 syntax
-
-- **Severity:** crash-with-safe-state
-- **Status:** open-xfail
-- **Repro:** `test_search_documents_treats_user_text_as_text_not_fts_syntax`
-- **Expected:** quotes/parentheses/operators are searched as text or safely
-  return no hits.
-- **Actual:** `"`, `NEAR(`, `invoice OR`, `(invoice`, and `invoice)` raise
-  SQLite FTS5 `OperationalError`.
+(BH-E2 moved to *Fixed* below.)
 
 ### BH-E3 — Every `OSError` is classified as a network failure
 
@@ -394,15 +487,7 @@ into a regular hunt test).
 - **Actual:** `_call_once()` always writes `verified=None` before the
   verifier runs, and nothing updates the row afterward.
 
-### BH-C3 — Concurrent queue drains can process the same job twice
-
-- **Severity:** wrong-action
-- **Status:** open-xfail
-- **Repro:** `test_concurrent_queue_drains_claim_a_job_once`
-- **Expected:** exactly one drain claims and handles a pending job.
-- **Actual:** job selection and the transition to `running` are not an
-  atomic claim; two drains both select and handle it, potentially repeating
-  API calls and side effects.
+(BH-C3 moved to *Fixed* below.)
 
 ## Open reproduced bugs: Area F — audio, dictation, meeting, TTS
 

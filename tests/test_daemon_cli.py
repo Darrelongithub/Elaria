@@ -3,6 +3,7 @@
 import json
 import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -93,3 +94,103 @@ def test_cli_status_waybar_shape():
     out = _cli(["status", "--waybar"])
     payload = json.loads(out.stdout)
     assert {"text", "class", "tooltip"} <= payload.keys()
+
+
+# -- BH-G4 (fixed): argparse help strings must survive %-formatting ----------
+#
+# `help="…>tripwire% of the tree…"` is not a cosmetic typo. argparse
+# %-formats every help string, and since Python 3.14 it does so eagerly
+# inside add_argument() — so one unescaped `%` made `build_parser()` raise
+# `ValueError: badly formed help string` (caused by `TypeError: %o format:
+# an integer is required, not dict`) and took EVERY `assist` command down.
+# On 3.11-3.13 the same string only crashed when that one subcommand's
+# `--help` was formatted, which is how it shipped.
+
+def _walk_parsers(parser, path=()):
+    import argparse
+
+    yield list(path), parser
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for name, subparser in action.choices.items():
+                yield from _walk_parsers(subparser, (*path, name))
+
+
+def test_cli_every_help_string_renders():
+    """Construct the parser and format every subcommand's help in-process.
+
+    Fails on 3.11+ (format time) and on 3.14+ (construction time), so this
+    catches the bug on every supported Python, not just the one that
+    validates eagerly.
+    """
+    from assistant.cli import build_parser
+
+    rendered = [tuple(path) for path, parser in _walk_parsers(build_parser())
+                if parser.format_help() or True]
+    # The walk really reached the parser that used to explode.
+    assert ("plan", "apply") in rendered
+    assert ("queue", "add-external") in rendered
+    assert len(rendered) > 30            # whole command tree, not a smoke test
+
+
+def test_cli_plan_apply_help_renders_a_single_percent():
+    out = _cli(["plan", "apply", "--help"])
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert ">tripwire% of the tree" in out.stdout   # `%%` renders as one `%`
+    assert "%%" not in out.stdout
+
+
+@pytest.mark.parametrize("args", [
+    [], ["plan"], ["plan", "apply"], ["queue"], ["queue", "add-external"],
+    ["voice"], ["review"], ["meeting"], ["taxonomy"],
+])
+def test_cli_help_exits_zero_for_every_command_group(args):
+    out = _cli([*args, "--help"])
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "usage: assist" in out.stdout
+
+
+def test_no_unescaped_percent_in_any_argparse_help_string():
+    """Static audit over the whole tree, so `assist-voice-test` (whose parser
+    is built inside its own main()) is covered too, and so a future bare `%`
+    is caught at lint time rather than on someone's Fedora.
+
+    Run in a fresh interpreter: CPython's parser keeps its own recursion
+    bookkeeping, and auditing after ~1000 tests have perturbed it can raise
+    `SystemError: AST constructor recursion depth mismatch` on a deep file.
+    """
+    script = textwrap.dedent("""
+        import ast, sys
+        from pathlib import Path
+
+        HELP_KWARGS = {"help", "description", "epilog", "usage", "metavar", "prog"}
+        offenders = []
+        for path in sorted(Path(sys.argv[1]).rglob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                callee = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                if callee not in {"add_argument", "add_parser", "ArgumentParser"}:
+                    continue
+                for kw in node.keywords:
+                    if kw.arg not in HELP_KWARGS:
+                        continue
+                    try:
+                        value = ast.literal_eval(kw.value)
+                    except ValueError:
+                        continue
+                    for text in (value if isinstance(value, (list, tuple)) else [value]):
+                        if not isinstance(text, str) or "%" not in text:
+                            continue
+                        try:
+                            text % {"prog": "assist", "default": 0, "const": 0,
+                                    "type": "str", "choices": "a, b"}
+                        except (TypeError, ValueError, KeyError) as exc:
+                            offenders.append(f"{path.name}:{node.lineno} {kw.arg} "
+                                             f"{text!r} -> {exc}")
+        print("\\n".join(offenders))
+        """)
+    audit = subprocess.run([sys.executable, "-c", script, str(REPO / "src")],
+                           check=False, capture_output=True, text=True, timeout=60)
+    assert audit.returncode == 0, audit.stderr
+    assert audit.stdout.strip() == "", audit.stdout
