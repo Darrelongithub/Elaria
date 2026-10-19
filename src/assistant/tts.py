@@ -643,14 +643,14 @@ class SpeechService:
         Reported by `voice status` and the doctor so a cold cache is a visible
         state with a cure, never an unexplained silence (VB-2, VB-13).
         """
-        route, why = self.voice_route()
+        route = self.voice_route()[0]
         if route == "silent":
             # Nothing is spoken, so nothing is missing - but the reason must say
             # that, not "all four cached", or the doctor implies audio that is not
             # there.
             return {"route": "silent", "complete": True, "missing": [], "speaks": False,
-                    "reason": f"nothing is spoken in this posture, so no acks are needed "
-                              f"({why})"}
+                    "reason": "nothing is spoken in this posture, so no acks are needed "
+                              "(the reason is on the line above)"}
         missing = [kind for kind in STANDARD_ACKS if self.cached_ack(kind) is None]
         return {"route": route, "complete": not missing, "missing": missing, "speaks": True,
                 "reason": ("all four acks cached for this voice identity" if not missing else
