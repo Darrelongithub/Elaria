@@ -164,9 +164,51 @@ def _print_doctor(report: dict) -> None:
 
 
 # --------------------------------------------------------------------------
+def _local_store(config):
+    from .store import Store
+    return Store(config.db_path)
+
+
 def _plan_command(args, config) -> int:
-    """`assist plan …` — shadow plans via daemon (async) or locally."""
+    """`assist plan …` — plans via daemon (async) or locally."""
     import time as _time
+
+    if args.plan_action == "apply":
+        params = {"plan_id": args.plan_id, "include_review": args.include_review,
+                  "allow_tripwire": args.allow_tripwire}
+        try:
+            report = call(config.socket_path, "plan.apply", params, timeout=900.0)
+        except (DaemonUnavailable, RuntimeError, OSError) as exc:
+            if isinstance(exc, RuntimeError) and "socket" not in str(exc):
+                print(f"assist: {exc}", file=sys.stderr)
+                return 1
+            from dataclasses import asdict
+
+            from .executor import Executor
+            store = _local_store(config)
+            plan = store.get_plan(args.plan_id)
+            spec = next((r for r in config.organise_roots()
+                         if plan and r["path"] == plan["root"]), None)
+            if spec is None:
+                print("plan root not in config", file=sys.stderr)
+                return 1
+            try:
+                report = asdict(Executor(config, store).apply_plan(
+                    args.plan_id, spec, include_review=args.include_review,
+                    allow_tripwire=args.allow_tripwire))
+            except PermissionError as perm:
+                print(f"assist: {perm}", file=sys.stderr)
+                return 1
+            store.close()
+        print(f"Applied plan #{args.plan_id}: {report['applied']} filed, "
+              f"{report['conflicts']} conflict(s) to _Conflicts, "
+              f"{report['skipped']} skipped, {len(report['refused'])} refused"
+              + (" [HALTED]" if report["halted"] else "")
+              + (" [CAPPED]" if report["capped"] else ""))
+        for refusal in report["refused"]:
+            print(f"  refused: {refusal}")
+        print(f"Undo any time: assist undo --plan {args.plan_id}")
+        return 0
 
     if args.plan_action == "list":
         try:
@@ -205,17 +247,19 @@ def _plan_command(args, config) -> int:
 
     # build: daemon runs async (§18) — poll plan.show until ready.
     try:
-        started = call(config.socket_path, "plan.build",
-                       {"root": args.root} if args.root else {}, timeout=10.0)["started"]
+        build_params = {"root": args.root, "tiers": args.tiers}
+        started = call(config.socket_path, "plan.build", build_params,
+                       timeout=10.0)["started"]
     except (DaemonUnavailable, RuntimeError, OSError):
+        from .gemini_client import GeminiClient
         from .organiser import OrganiserService
         from .store import Store
         store = Store(config.db_path)
-        service = OrganiserService(config, store)
+        service = OrganiserService(config, store, GeminiClient(config, store))
         for spec in config.organise_roots():
             if args.root and spec["path"] != args.root:
                 continue
-            result = service.build_plan(spec)
+            result = service.build_plan(spec, with_llm_tiers=args.tiers)
             _print_plan_summary(result)
         store.close()
         return 0
@@ -267,8 +311,28 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("index", help="index configured roots (local only, shadow-safe)")
     plan_p = sub.add_parser("plan", help="shadow organisation plans (Phase 3: no writes)")
     plan_sub = plan_p.add_subparsers(dest="plan_action", required=True)
-    build_p = plan_sub.add_parser("build", help="index + Tier 0 cascade -> shadow log")
+    build_p = plan_sub.add_parser("build", help="index + cascade -> plan (no writes)")
     build_p.add_argument("--root", help="only this root path")
+    build_p.add_argument("--tiers", action="store_true",
+                         help="also run Tier 1/2 LLM classification on abstentions")
+    apply_p = plan_sub.add_parser("apply", help="EXECUTE a plan (live roots only, Phase 4)")
+    apply_p.add_argument("plan_id", type=int)
+    apply_p.add_argument("--include-review", action="store_true")
+    apply_p.add_argument("--allow-tripwire", action="store_true",
+                         help="explicitly allow moving >tripwire% of the tree (§4.4)")
+    review_p = sub.add_parser("review", help="the 0.60-0.89 queue (§4.4)")
+    review_sub = review_p.add_subparsers(dest="review_action", required=True)
+    review_sub.add_parser("list")
+    approve_p = review_sub.add_parser("approve")
+    approve_p.add_argument("item_id", type=int)
+    reject_p = review_sub.add_parser("reject")
+    reject_p.add_argument("item_id", type=int)
+    undo_p = sub.add_parser("undo", help="reverse committed ops (itself journaled)")
+    undo_p.add_argument("op_id", nargs="?", type=int)
+    undo_p.add_argument("--plan", type=int)
+    undo_p.add_argument("--since", help="e.g. 2h, 24h, 7d")
+    verify_p = sub.add_parser("verify", help="re-walk journal destinations, check hashes")
+    verify_p.add_argument("--since", help="e.g. 24h")
     show_p = plan_sub.add_parser("show", help="show a plan and its proposals")
     show_p.add_argument("plan_id", type=int)
     show_p.add_argument("--decision", choices=["auto", "review", "unsorted", "abstain"])
@@ -400,6 +464,66 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "plan":
             return _plan_command(args, config)
+
+        if args.command == "review":
+            if args.review_action == "list":
+                try:
+                    items = call(config.socket_path, "review.list", timeout=30.0)["review_items"]
+                except (DaemonUnavailable, RuntimeError, OSError):
+                    store = _local_store(config)
+                    items = [i for p in store.list_plans(5)
+                             for i in store.plan_items(p["id"], "review")]
+                    store.close()
+                for item in items:
+                    print(f"#{item['id']} ({item['confidence']}, {item['rule']}) "
+                          f"{item['src']} -> {item['dest']}: {item['reason']}")
+                print(f"{len(items)} item(s) waiting. approve/reject by id.")
+            else:
+                verdict = args.review_action
+                try:
+                    call(config.socket_path, "review.decide",
+                         {"item_id": args.item_id, "verdict": verdict}, timeout=10.0)
+                except (DaemonUnavailable, RuntimeError, OSError):
+                    store = _local_store(config)
+                    store.set_item_decision(args.item_id,
+                                            "auto" if verdict == "approve" else "rejected")
+                    store.close()
+                print(f"item {args.item_id}: {verdict}d")
+            return 0
+
+        if args.command == "undo":
+            params = {"op_id": args.op_id, "plan_id": args.plan, "since": args.since}
+            if not any(params.values()):
+                print("undo needs an op id, --plan, or --since", file=sys.stderr)
+                return 2
+            try:
+                result = call(config.socket_path, "undo", params, timeout=900.0)
+            except (DaemonUnavailable, RuntimeError, OSError):
+                from .executor import Executor, parse_since
+                store = _local_store(config)
+                result = Executor(config, store).undo(
+                    op_id=args.op_id, plan_id=args.plan,
+                    since_iso=parse_since(args.since) if args.since else None)
+                store.close()
+            print(f"Undone: {result['undone']} op(s). {result['note']}")
+            for problem in result["problems"]:
+                print(f"  problem: {problem}")
+            return 0 if not result["problems"] else 1
+
+        if args.command == "verify":
+            try:
+                result = call(config.socket_path, "verify",
+                              {"since": args.since} if args.since else {}, timeout=300.0)
+            except (DaemonUnavailable, RuntimeError, OSError):
+                from .executor import Executor, parse_since
+                store = _local_store(config)
+                result = Executor(config, store).verify(
+                    since_iso=parse_since(args.since) if args.since else None)
+                store.close()
+            print(f"Verified OK: {result['verified_ok']} · problems: {len(result['problems'])}")
+            for problem in result["problems"]:
+                print(f"  {problem}")
+            return 0 if not result["problems"] else 1
 
         if args.command == "taxonomy":
             from pathlib import Path as _Path

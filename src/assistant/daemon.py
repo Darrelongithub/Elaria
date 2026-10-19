@@ -59,7 +59,9 @@ class Daemon:
         self.started_monotonic = time.monotonic()
         self.mode = "idle"
         self.dictation = DictationService(config, self.store, self.client)
-        self.organiser = OrganiserService(config, self.store)
+        self.organiser = OrganiserService(config, self.store, self.client)
+        from .executor import Executor
+        self.executor = Executor(config, self.store)
         self._plan_tasks: dict[int, asyncio.Task] = {}
         self._subscribers: set = set()          # event-stream writers (§3.1)
         self._dictation_task: asyncio.Task | None = None
@@ -111,6 +113,11 @@ class Daemon:
             "plan.show": self._plan_show,
             "plan.list": self._plan_list,
             "docs.search": self._docs_search,
+            "plan.apply": self._plan_apply,
+            "review.list": self._review_list,
+            "review.decide": self._review_decide,
+            "undo": self._undo,
+            "verify": self._verify,
             "ask": self._ask,
         }
         if method == "events.subscribe":
@@ -299,7 +306,8 @@ class Daemon:
                 try:
                     await asyncio.to_thread(
                         self.organiser.build_plan, spec,
-                        progress=progress, plan_id=plan_id)
+                        progress=progress, plan_id=plan_id,
+                        with_llm_tiers=bool(params.get("tiers")))
                 except Exception as exc:
                     await self.broadcast({"event": "error", "error": str(exc),
                                           "plan_id": plan_id})
@@ -325,6 +333,63 @@ class Daemon:
             raise ValueError("docs.search needs params.query")
         return {"results": self.store.search_documents(query), "engine":
                 "fts5" if self.store.fts5_available else "like-fallback"}
+
+    def _root_spec_for_plan(self, plan_id: int) -> dict:
+        plan = self.store.get_plan(plan_id)
+        if plan is None:
+            raise ValueError(f"no plan {plan_id}")
+        for spec in self.config.organise_roots():
+            if spec["path"] == plan["root"]:
+                return spec
+        raise ValueError(f"plan {plan_id} root {plan['root']} no longer configured")
+
+    async def _plan_apply(self, params: dict) -> dict:
+        """THE write path (Phase 4). Refuses shadow roots in Executor."""
+        from dataclasses import asdict
+
+        plan_id = int(params["plan_id"])
+        spec = self._root_spec_for_plan(plan_id)
+        report = await asyncio.to_thread(
+            self.executor.apply_plan, plan_id, spec,
+            include_review=bool(params.get("include_review")),
+            allow_tripwire=bool(params.get("allow_tripwire")))
+        await self.broadcast({"event": "op.applied", "plan_id": plan_id,
+                              "applied": report.applied, "conflicts": report.conflicts})
+        narration = self.governor.narrate_fact(
+            "organise.summary",
+            {"filed": report.applied, "review": len(report.refused),
+             "unsorted": report.conflicts})
+        return {**asdict(report), "narration": narration}
+
+    async def _review_list(self, params: dict) -> dict:
+        plan_id = params.get("plan_id")
+        plans = [int(plan_id)] if plan_id else [p["id"] for p in self.store.list_plans(5)]
+        items = []
+        for pid in plans:
+            items.extend(self.store.plan_items(pid, "review"))
+        return {"review_items": items}
+
+    async def _review_decide(self, params: dict) -> dict:
+        item_id = int(params["item_id"])
+        verdict = params.get("verdict")
+        if verdict not in ("approve", "reject"):
+            raise ValueError("verdict must be approve|reject")
+        self.store.set_item_decision(item_id, "auto" if verdict == "approve" else "rejected")
+        return {"item_id": item_id, "decision": "auto" if verdict == "approve" else "rejected"}
+
+    async def _undo(self, params: dict) -> dict:
+        from .executor import parse_since
+
+        since = parse_since(str(params["since"])) if params.get("since") else None
+        return await asyncio.to_thread(
+            self.executor.undo, op_id=params.get("op_id"),
+            plan_id=params.get("plan_id"), since_iso=since)
+
+    async def _verify(self, params: dict) -> dict:
+        from .executor import parse_since
+
+        since = parse_since(str(params["since"])) if params.get("since") else None
+        return await asyncio.to_thread(self.executor.verify, since_iso=since)
 
     async def _ask(self, params: dict) -> dict:
         """Conversational turn: governor first (local), harness second (§17).

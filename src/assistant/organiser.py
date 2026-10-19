@@ -23,9 +23,10 @@ from .safety import check_blast_radius
 
 
 class OrganiserService:
-    def __init__(self, config, store):
+    def __init__(self, config, store, client=None):
         self.config = config
         self.store = store
+        self.client = client  # enables Tier 1/2 when asked (Phase 4)
         self.indexer = Indexer(config, store)
         self.shadow_dir = config.data_dir / "shadow"
 
@@ -33,17 +34,18 @@ class OrganiserService:
         return [self.indexer.index_root(spec) for spec in self.config.organise_roots()]
 
     def build_plan(self, root_spec: dict, *, reindex: bool = True,
-                   progress=None, plan_id: int | None = None) -> dict:
+                   progress=None, plan_id: int | None = None,
+                   with_llm_tiers: bool = False) -> dict:
         """Build (and persist) a shadow plan for one root. Sync; callers
         run it off the event loop (§18: long work never blocks acks)."""
         root = root_spec["path"]
         mode = root_spec.get("mode", "shadow")
-        if mode != "shadow":
-            # Phase 3 is shadow-only by construction. A live root is a
-            # Phase 4 conversation with the owner, not a config typo.
-            raise ValueError(f"root {root} is mode={mode!r} — Phase 3 builds "
-                             "SHADOW plans only (§4.3). Live execution arrives "
-                             "in Phase 4 behind the executor.")
+        if mode not in ("shadow", "live"):
+            raise ValueError(f"root {root} has unknown mode {mode!r} "
+                             "(shadow = propose only; live = executor may apply, §4.3)")
+        # Building a plan never writes either way — mode governs only
+        # whether the EXECUTOR may later apply it. Even live roots get
+        # the same readable proposal log first.
         plan_id = plan_id or self.store.create_plan(iso_now(), root, mode)
         try:
             index_stats = self.indexer.index_root(root_spec) if reindex else {}
@@ -70,7 +72,19 @@ class OrganiserService:
                 # only, so the flag's meaning stays airtight end-to-end.
                 proposal = tier0_propose(doc["path"], preview, taxonomy, doc_id=doc["id"])
                 items.append(proposal.as_item())
+            api_calls_before = self.store.llm_summary()["calls"]
+            if with_llm_tiers:
+                if self.client is None:
+                    raise ValueError("Tier 1/2 requested but no Gemini client wired")
+                from .planner_llm import LlmPlanner
+
+                LlmPlanner(self.config, self.store, self.client) \
+                    .classify_abstained(items, taxonomy)
+                if progress:
+                    progress({"event": "plan.progress", "plan_id": plan_id,
+                              "stage": "llm-tiers"})
             self.store.add_plan_items(plan_id, items)
+            self._api_calls_made = self.store.llm_summary()["calls"] - api_calls_before
             stats = self._stats(documents, items, in_place, index_stats)
             shadow_path = self._write_shadow_log(plan_id, root_spec, items, stats)
             self.store.finish_plan(
@@ -112,7 +126,8 @@ class OrganiserService:
             "rules": dict(Counter(i["rule"] for i in items)),
             "tripwire": {"allowed": tripwire.allowed, "note": tripwire.reason},
             "index": index_stats,
-            "api_calls": 0,  # Tier 0's whole point (§3.7) — keep it explicit
+            # Ledger-measured: 0 unless Tier 1/2 ran (§3.7 honesty).
+            "api_calls": getattr(self, "_api_calls_made", 0),
         }
 
     def _write_shadow_log(self, plan_id, root_spec, items, stats) -> Path:

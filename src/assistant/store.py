@@ -365,6 +365,53 @@ class Store:
             rows = self._conn.execute(query + " ORDER BY src", params).fetchall()
         return [dict(r) for r in rows]
 
+    def set_item_decision(self, item_id: int, decision: str) -> None:
+        """Review queue mutations (§4.4): approve → auto, reject → rejected."""
+        with self._lock:
+            self._conn.execute("UPDATE plan_items SET decision = ? WHERE id = ?",
+                               (decision, item_id))
+            self._conn.commit()
+
+    def set_plan_status(self, plan_id: int, status: str) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE plans SET status = ? WHERE id = ?",
+                               (status, plan_id))
+            self._conn.commit()
+
+    # -- operations journal queries (executor/undo, §4.2/§4.4) -----------------
+    def get_operation(self, op_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM operations WHERE id = ?", (op_id,)).fetchone()
+        return dict(row) if row else None
+
+    def committed_operations(self, *, plan_id: int | None = None,
+                             since_iso: str | None = None) -> list[dict]:
+        query = "SELECT * FROM operations WHERE status = 'committed'"
+        params: list = []
+        if plan_id is not None:
+            query += " AND plan_id = ?"
+            params.append(plan_id)
+        if since_iso:
+            query += " AND ts >= ?"
+            params.append(since_iso)
+        with self._lock:
+            rows = self._conn.execute(query + " ORDER BY id", params).fetchall()
+        return [dict(r) for r in rows]
+
+    def ops_since(self, since_iso: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM operations WHERE ts >= ? "
+                "AND status IN ('committed','intent')", (since_iso,)).fetchone()
+        return int(row["n"])
+
+    def mark_rolled_back(self, op_id: int) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE operations SET status = 'rolled_back' "
+                               "WHERE id = ?", (op_id,))
+            self._conn.commit()
+
     # -- safety-spine journal (§4.2) ----------------------------------------
     def outstanding_intents(self) -> list[dict]:
         """Intents with no commit — daemon startup recovery inspects these."""

@@ -178,12 +178,15 @@ def test_shadow_plan_writes_nothing_and_tier0_places_majority(config, tmp_path):
     assert "private-stuff" not in json.dumps(items)
 
 
-def test_live_root_is_refused_in_phase3(config, tmp_path):
+def test_plan_building_never_writes_even_for_live_roots(config, tmp_path):
+    # Phase 4 update: live roots may BUILD plans (proposals are still just
+    # literature) — the gate moved to the executor, where it belongs.
     root = make_tree(tmp_path / "docs")
     svc, _store = organiser(config, tmp_path, root)
-    spec = {**config.organise_roots()[0], "mode": "live"}
-    with pytest.raises(ValueError, match="SHADOW plans only"):
-        svc.build_plan(spec)
+    before = tree_fingerprint(root)
+    result = svc.build_plan({**config.organise_roots()[0], "mode": "live"})
+    assert result["mode"] == "live"
+    assert tree_fingerprint(root) == before
 
 
 def test_no_roots_means_no_indexing(config, tmp_path):
