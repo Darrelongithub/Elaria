@@ -12,10 +12,28 @@ model_cleanup        = "gemini-flash-lite-latest"   # VERIFY
 model_chat           = "gemini-flash-latest"        # VERIFY
 model_transcribe_live  = "gemini-3.5-transcribe-live"  # VERIFY (§11.1)
 model_transcribe_batch = "gemini-flash-lite-latest"    # VERIFY
-# INTERIM speaking voice (2026-10-20). Flare is her voice while online; the local
-# Piper voice owns every offline turn. model_voice must be native-audio capable.
+# Her ONE voice (owner decisions 2026-10-19 and 2026-10-20). Flare is the ONLY
+# voice Elaria speaks with while online; OFFLINE HAS NO VOICE AT ALL (text-only
+# surfaces). model_voice must be native-audio capable.
 voice                      = "Flare"           # VERIFY the exact name on your account
 model_voice                = "gemini-2.5-flash-preview-tts"   # VERIFY
+voice_sample_rate          = 24000   # 22050 for a local Piper voice; changing it
+                                     # invalidates cached audio ON PURPOSE (never
+                                     # play 24 kHz audio through a 22 kHz player)
+# The one-voice rule as data (VB-4). `voice` must be one of these, or she refuses
+# to speak in it, says so in `voice status`, and `assist doctor` FAILS. A stray or
+# mistyped voice name is never silently adopted, and never answered with audio from
+# another voice. Changing who she sounds like means editing BOTH keys on purpose.
+allowed_voices             = ["Flare"]
+# PRECEDENCE (documented because the two used to disagree): online, [gemini] voice
+# is the ONLY voice setting that matters. The legacy `assist voice select` row
+# (`tts.selected_voice` in the store) and [tts] voice_id / model describe the
+# DORMANT local path only - they are ignored while the online route is active, and
+# `assist voice status` reports legacy_selection_ignored_online = true rather than
+# leaving it to be guessed.
+# Voice-audio cache: files are keyed by the ACTIVE route's own identity (voice +
+# model online; voice + model + speaker + length_scale offline), so a voice change
+# can never replay the previous voice's audio (VB-1).
 # Escalation ladder for the reasoning harness: cheapest -> next tier (§17).
 escalation_ladder    = ["gemini-flash-lite-latest", "gemini-flash-latest"]
 escalate_after_failures = 2

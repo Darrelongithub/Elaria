@@ -166,16 +166,33 @@ def run_doctor(config) -> dict:
         "connectivity mode", True,
         f"preference={connectivity.preference}, effective={connectivity.effective_mode} "
         f"— {connectivity.reason}; switch with `assist mode offline|online|auto`"))
+    identity = voice.get("voice_identity", {})
+    acks = voice.get("ack_cache", {})
+    # A voice that is not the canonical one is a FAILURE, not a footnote: she stays
+    # silent rather than speak in it, so the doctor says so loudly (VB-4).
+    voice_ok = bool(voice["available"]) and bool(identity.get("allowed", True))
+    voice_detail = (
+        (f"VOICE IDENTITY REFUSED — {identity.get('reason')} "
+         f"(configured={identity.get('configured')}, canonical={identity.get('canonical')})\n"
+         if not voice_ok else "")
+        + f"{voice['voice_mode'].replace('-', ' ')} — backend={voice['backend']}, "
+          f"voice={voice['voice_id']}, cached acks={voice['cached_acks'] or 'none'}: "
+          f"{voice['reason']}. "
+          + ("" if voice_ok else "SILENT until that is fixed — nothing is spoken.\n")
+          + f"acks: {acks.get('reason', 'unknown')}\n"
+          + ("legacy `tts.selected_voice` row is IGNORED while online: [gemini] voice is "
+             "the only voice that speaks (the stored row describes the dormant local "
+             "path)\n" if voice.get("legacy_selection_ignored_online") else ""))
     checks.append(_check(
-        "voice routing", voice["available"],
-        f"{voice['voice_mode'].replace('-', ' ')} — backend={voice['backend']}, "
-        f"voice={voice['voice_id']}, cached acks={voice['cached_acks'] or 'none'}: "
-        f"{voice['reason']}. "
+        # A refused voice identity is a FAIL, not a warning: she is silent until
+        # it is fixed, so it has to read like one (§12.9 icons).
+        "voice routing", voice_ok, voice_detail + " " + (
         f"One-voice rule DEFERRED, not cancelled: {voice.get('gemini_voice')} via Gemini "
         f"native audio is the only voice; offline: {voice.get('offline_output')}; a cloud "
         f"failure is reported silence, never local audio. Local voice dormant - "
         f"{voice.get('dormant_local_voice', {}).get('enable_with', '')} to un-dormant; "
-        f"endgame switch: {voice.get('switch_back')}"))
+        f"endgame switch: {voice.get('switch_back')}"),
+        warn_only=bool(voice["available"]) and bool(identity.get("allowed", True))))
     offline_asr = local_asr_status(config)
     checks.append(_check(
         "offline ASR", offline_asr["available"],
@@ -211,7 +228,9 @@ def run_doctor(config) -> dict:
     blockers = [c for c in checks if c["status"] == "fail"]
     return {"checks": checks, "blockers": len(blockers),
             "summary": f"{sum(c['status'] == 'ok' for c in checks)}/{len(checks)} ok, "
-                       f"{sum(c['status'] == 'warn' for c in checks)} warning(s)"}
+                       f"{sum(c['status'] == 'warn' for c in checks)} warning(s)"
+                       + (f", {sum(c['status'] == 'fail' for c in checks)} FAILURE(S)"
+                          if any(c["status"] == "fail" for c in checks) else "")}
 
 
 def _print_doctor(report: dict) -> None:

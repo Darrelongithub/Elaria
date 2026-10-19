@@ -246,11 +246,24 @@ class GeminiClient:
         return response
 
     def voice_request(self, text: str, *, voice: str | None = None) -> dict:
-        """The exact request that would go out - inspectable without a network call."""
+        """The exact request that would go out - inspectable without a network call.
+
+        The voice is resolved against `[gemini] allowed_voices` (the one-voice rule
+        as data). `voice_allowed: False` means this request would be REFUSED: a
+        voice name that is not canonical is never sent out, and never quietly
+        replaced by another one.
+        """
+        from .config import canonical_voices, resolve_voice
+
         gemini = self.config.section("gemini")
+        configured = str(voice or gemini.get("voice") or "Flare")
+        effective, allowed = resolve_voice(self.config, configured)
         return {
             "model": str(gemini.get("model_voice") or "gemini-2.5-flash-preview-tts"),
-            "voice_name": str(voice or gemini.get("voice") or "Flare"),
+            "voice_name": effective or configured,
+            "voice_requested": configured,
+            "voice_allowed": allowed,
+            "canonical_voices": list(canonical_voices(self.config)),
             "response_modalities": ["AUDIO"],
             "text": text,
         }
@@ -263,6 +276,15 @@ class GeminiClient:
                        correlation_id: str = "-") -> dict:
         """One rate-limited, ledgered native-audio call. Interim online voice."""
         request = self.voice_request(text, voice=voice)
+        if not request["voice_allowed"]:
+            # The pin, enforced at the last moment: no transport will ever be told
+            # to speak a voice the owner did not approve (VB-4).
+            raise RuntimeError(
+                f"voice {request['voice_requested']!r} is not canonical "
+                f"(allowed: {', '.join(request['canonical_voices'])}); refusing to "
+                f"speak in an unapproved voice - set [gemini] voice back to a "
+                f"canonical name or widen [gemini] allowed_voices deliberately"
+            )
         if not self.can_speak():
             raise RuntimeError(
                 f"GEMINI_MODE={self.mode} cannot produce native audio - nothing is "

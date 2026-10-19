@@ -38,6 +38,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .config import canonical_voices, resolve_voice
+
 # The ack strings are load-bearing for audibility, not style. This voice cannot
 # render a one-word utterance legibly: "Done." and "Sorted." recovered 0 of 6
 # takes at every length_scale from 0.80 to 1.30, on two Piper versions, with and
@@ -274,6 +276,50 @@ class SpeechService:
         return PiperTtsBackend(descriptor, command=str(settings.get("command", "piper")),
                                runner=self._runner)
 
+    # -- voice identity: ONE voice, pinned in config (VB-1, VB-4) -----------------
+    def configured_voice(self) -> str:
+        """What `[gemini] voice` asks for. The shipped answer is Flare."""
+        gemini = self.config.section("gemini") if self.config else {}
+        return str(gemini.get("voice") or "Flare")
+
+    def canonical_voices(self) -> tuple[str, ...]:
+        """`[gemini] allowed_voices` — the one documented place the one-voice rule
+        is expressed. Defaults to `("Flare",)`; changing her voice is an edit here,
+        never a code change."""
+        return canonical_voices(self.config)
+
+    def voice_identity(self) -> dict:
+        """Is the configured voice the canonical one? A mismatch is a REFUSAL.
+
+        Never a silent adoption and never a shadowed winner: she says nothing,
+        says why, and `assist doctor` fails the `voice routing` check until the
+        config is either corrected or deliberately widened.
+        """
+        configured, canonical = self.configured_voice(), canonical_voices(self.config)
+        effective, allowed = resolve_voice(self.config)
+        return {
+            "configured": configured, "canonical": list(canonical), "allowed": allowed,
+            "effective": effective,
+            "reason": (f"voice identity refused: [gemini] voice = {configured!r} is not "
+                       f"canonical (allowed: {', '.join(canonical)}); she will not speak "
+                       f"in an unapproved voice — correct [gemini] voice, or widen "
+                       f"[gemini] allowed_voices deliberately"),
+        }
+
+    def cloud_cache_identity(self) -> dict:
+        """The audio identity of the CLOUD route: voice + model, nothing else.
+
+        VB-1: this used to be the local Piper descriptor, so a voice change kept
+        replaying the previous voice's files. The dormant path must never leak
+        into a key that decides what the user hears online.
+        """
+        gemini = self.config.section("gemini") if self.config else {}
+        return {
+            "voice": self.voice_identity()["effective"] or self.configured_voice(),
+            "model": str(gemini.get("model_voice") or "gemini-2.5-flash-preview-tts"),
+            "sample_rate": int(gemini.get("voice_sample_rate", 24000)),
+        }
+
     # -- status / routing ---------------------------------------------------------
     def status(self) -> dict:
         descriptor = self.descriptor()
@@ -283,14 +329,15 @@ class SpeechService:
             error = backend.availability_error()
         route, why = self.voice_route()
         gemini = self.config.section("gemini")
+        identity = self.voice_identity()
         speaking_gemini = route == "gemini"
         silent = route == "silent"
         return {
             "enabled": bool(self.config.section("tts").get("enabled", True)),
             "backend": "gemini-native-audio" if speaking_gemini else ("none" if silent
                                                                        else backend.name),
-            "voice_id": gemini.get("voice", "Flare") if speaking_gemini else (
-                "none" if silent else backend.voice_id),
+            "voice_id": (identity["effective"] if speaking_gemini else
+                        "none" if silent else backend.voice_id),
             "voice_mode": self.voice_mode_label(route),
             "posture": self._posture(),
             "one_voice_rule": "deferred (2026-10-20): one owned local voice is still the endgame",
@@ -300,8 +347,18 @@ class SpeechService:
             "muted": silent,
             "offline_output": "text only: Waybar, overlay, notification, log - no speech",
             "gemini_native_audio": speaking_gemini,
-            "gemini_voice": gemini.get("voice", "Flare"),
+            "gemini_voice": identity["effective"] or gemini.get("voice", "Flare"),
             "gemini_voice_model": gemini.get("model_voice", "gemini-2.5-flash-preview-tts"),
+            "voice_identity": identity,
+            "cache_identity": (self.cloud_cache_identity() if speaking_gemini else
+                               {"voice": backend.voice_id,
+                                "model": Path(self.descriptor().model).name,
+                                "speaker": self.descriptor().speaker,
+                                "length_scale": self.descriptor().length_scale}),
+            "legacy_selection_ignored_online": bool(
+                self.prefers_cloud_voice() and self.store
+                and self.store.get_state(_SELECTED_KEY)),
+            "ack_cache": self.ack_cache_state(),
             "dormant_local_voice": {
                 "backend": backend.name, "voice_id": backend.voice_id,
                 "available": error is None, "reason": error or "wired, but silent by default",
@@ -339,13 +396,32 @@ class SpeechService:
         }
 
     # -- synthesis + playback -------------------------------------------------------
-    def _cache_path(self, text: str, descriptor: VoiceDescriptor, backend_name: str) -> Path:
-        key = json.dumps({
-            "text": text, "backend": backend_name, "voice": descriptor.voice_id,
-            "model": Path(descriptor.model).name, "speaker": descriptor.speaker,
-            "length_scale": descriptor.length_scale,
-        }, sort_keys=True)
+    def _cache_path(self, text: str, descriptor: VoiceDescriptor, backend_name: str,
+                    *, identity: dict | None = None) -> Path:
+        """Where this text's audio for `backend_name` lives.
+
+        The key is the identity of the AUDIO, and only that: the cloud route keys
+        on the Gemini voice + model (VB-1), the dormant local route on the local
+        descriptor (voice, model, speaker, pace). A change to one route therefore
+        cannot poison — or invalidate — the other (VB-2).
+        """
+        if identity is None:
+            identity = {
+                "voice": descriptor.voice_id, "model": Path(descriptor.model).name,
+                "speaker": descriptor.speaker, "length_scale": descriptor.length_scale,
+            }
+        key = json.dumps({"text": text, "backend": backend_name, **identity},
+                         sort_keys=True)
         return self.cache_dir / f"speech-{hashlib.sha256(key.encode()).hexdigest()[:20]}.wav"
+
+    def _route_cache_path(self, text: str, route: str | None = None) -> Path:
+        """Cache path for `text` under the ACTIVE route's own audio identity."""
+        route = route or self.voice_route()[0]
+        if route == "gemini":
+            return self._cache_path(text, self.descriptor(), "gemini-native-audio",
+                                    identity=self.cloud_cache_identity())
+        backend = self._make_backend()
+        return self._cache_path(text, self.descriptor(), backend.name)
 
     # -- interim online voice (Gemini native audio) --------------------------------
     def _gemini_client(self):
@@ -384,6 +460,19 @@ class SpeechService:
                 "unknown": "text-only-posture-unknown"}.get(
                     posture, "text-only-cloud-voice-unavailable")
 
+    def prefers_cloud_voice(self) -> bool:
+        """Does the config ASK for the cloud voice in this posture?
+
+        Intent, not outcome: a refusal (unapproved voice, missing key, mock mode)
+        stops the audio but does not change which voice setting is in charge. The
+        precedence statement about the legacy local row is about intent, so it does
+        not flicker every time the cloud becomes unreachable.
+        """
+        settings = self.config.section("tts") if self.config else {}
+        if self._posture() == "offline":
+            return False
+        return str(settings.get("online_voice", "gemini")).lower() == "gemini"
+
     def voice_route(self) -> tuple[str, str]:
         """("gemini" | "silent" | "local", why). The one place the posture is decided.
 
@@ -409,6 +498,11 @@ class SpeechService:
             return "local", "one-voice posture selected: owned local voice in every mode"
         if online == "none":
             return "silent", "online voice explicitly disabled; nothing is spoken"
+        identity = self.voice_identity()
+        if not identity["allowed"]:
+            # Never adopt an unapproved voice silently, and never substitute the
+            # dormant local one: refuse, report, and let doctor fail loudly.
+            return "silent", identity["reason"]
         client = self._gemini_client()
         if client is None:
             return self._unavailable("no Gemini client available")
@@ -462,13 +556,12 @@ class SpeechService:
         text = text.strip()
         if not text:
             raise ValueError("speech text is empty")
-        descriptor = self.descriptor()
         backend = self._make_backend()
         route, why = self.voice_route()
         if route == "silent":
             raise TtsUnavailable(why)
         key_name = "gemini-native-audio" if route == "gemini" else backend.name
-        path = Path(dest).expanduser() if dest else self._cache_path(text, descriptor, key_name)
+        path = Path(dest).expanduser() if dest else self._route_cache_path(text, route)
         cached = bool(use_cache and path.exists() and path.stat().st_size > 0)
         if cached:
             # A cached Flare render is still a cloud voice, not a local one: the
@@ -526,21 +619,37 @@ class SpeechService:
 
     # -- cached standard acks (§18 <300ms path) ---------------------------------------
     def _ack_path(self, kind: str) -> Path:
-        """Ack files are keyed by voice route, so an online (Flare) warm and an
-        offline (Piper) warm never overwrite each other."""
-        descriptor = self.descriptor()
-        backend = self._make_backend()
+        """The ack file for `kind` UNDER THE ACTIVE ROUTE'S OWN IDENTITY.
+
+        There is deliberately no fallback here. A missing Flare ack is a miss —
+        reported, re-warmed, never answered with audio from another voice. The
+        previous "a warmed local copy beats silence" substitution put the dormant
+        Piper voice on an online turn, which is the one thing the owner forbade.
+        """
         route, why = self.voice_route()
         if route == "silent":
             raise TtsUnavailable(why)
-        key_name = "gemini-native-audio" if route == "gemini" else backend.name
-        path = self._cache_path(STANDARD_ACKS[kind], descriptor, key_name)
-        if route == "gemini" and not (path.exists() and path.stat().st_size > 0):
-            # A warmed local copy beats silence on the <300ms ack path.
-            local = self._cache_path(STANDARD_ACKS[kind], descriptor, backend.name)
-            if local.exists() and local.stat().st_size > 0:
-                return local
-        return path
+        return self._route_cache_path(STANDARD_ACKS[kind], route)
+
+    def ack_cache_state(self) -> dict:
+        """Which of the four §18 acks are cached for the ACTIVE route's identity.
+
+        Reported by `voice status` and the doctor so a cold cache is a visible
+        state with a cure, never an unexplained silence (VB-2, VB-13).
+        """
+        route, why = self.voice_route()
+        if route == "silent":
+            # Nothing is spoken, so nothing is missing - but the reason must say
+            # that, not "all four cached", or the doctor implies audio that is not
+            # there.
+            return {"route": "silent", "complete": True, "missing": [], "speaks": False,
+                    "reason": f"nothing is spoken in this posture, so no acks are needed "
+                              f"({why})"}
+        missing = [kind for kind in STANDARD_ACKS if self.cached_ack(kind) is None]
+        return {"route": route, "complete": not missing, "missing": missing, "speaks": True,
+                "reason": ("all four acks cached for this voice identity" if not missing else
+                           f"{len(missing)} ack(s) missing for the active voice — run "
+                           f"`assist voice warm` (the daemon re-warms on its own)")}
 
     def cached_ack(self, kind: str) -> str | None:
         if kind not in STANDARD_ACKS:
@@ -567,9 +676,13 @@ class SpeechService:
                     "reason": self.voice_route()[1]}
         path = self.cached_ack(kind)
         if path is None:
-            # The ack budget forbids synthesising here; warm at startup instead.
+            # The ack budget forbids synthesising here. Report it as a cold cache
+            # that needs warming (VB-2): a miss must never pass for intent, and
+            # it is never filled in with another voice's file.
             return {**route, "ack_kind": kind, "audio_path": None,
-                    "cached": False, "played": False, "cache_miss": True}
+                    "cached": False, "played": False, "cache_miss": True,
+                    "warning": "ack cache cold for the active voice — re-warming",
+                    "rewarm_needed": True}
         return {**route, "ack_kind": kind, "audio_path": path,
                 "cached": True, "played": self.play_audio(Path(path)),
                 "cache_miss": False}

@@ -149,12 +149,31 @@ accuracy on your voice is a live-key Step-0 measurement.
 Phase 8 — offline competence without a second personality: local
 search/memory/Tier 0/undo keep working; dictation and meetings use
 local Whisper with raw audio retained; cloud judgement queues
-instead of vanishing; and both online/offline spoken replies use the
-same configured local voice. Required Phase 8 tests cover a simulated
+instead of vanishing; and offline mode is TEXT-ONLY by owner amendment
+(2026-10-20) — online replies are voiced by Flare, offline replies are
+never voiced. Required Phase 8 tests cover a simulated
 network drop mid-dictation (offline transcript + queued Gemini redo),
-forced-offline zero-network behaviour, identical TTS backend+voice in
-both modes, and reconnect drain with external work still approval-gated.
-196 tests, all offline and keyless.
+forced-offline zero-network behaviour, the single-voice route plus
+reported silence in both modes, and reconnect drain with external work
+still approval-gated. 196 tests, all offline and keyless.
+
+### Her voice: one name, pinned, with documented precedence
+
+`[gemini] voice` is the whole story while online (Flare, the owner's
+pick). The legacy `assist voice select` row (`tts.selected_voice`) and
+`[tts] voice_id`/`model` belong to the **dormant local path only** and
+are ignored online — `assist voice status` reports
+`legacy_selection_ignored_online: true` instead of leaving it to be
+guessed, and `assist doctor` names which voice is actually live.
+
+Two keys, deliberately: `[gemini] allowed_voices` (default
+`["Flare"]`) is the one-voice rule as data. A `voice` that is not in
+that list is never silently adopted — she refuses to speak, says the
+reason in `voice status`, and `assist doctor` FAILS until you either
+correct `voice` or widen `allowed_voices` on purpose. Changing her
+voice therefore means editing both keys and running `assist voice warm`:
+spoken audio and the ack cache are keyed on the voice and model that are
+actually live, so old audio can never be served under a new identity.
 
 ## §10 open decisions — defaults taken, awaiting your word
 
@@ -208,9 +227,16 @@ never breaks.
 - **Phase 7 done-when:** after the flip, dictate code-switched
   sentences and confirm the mix survives end-to-end (the guards will
   flag loudly if the model normalises — that's them working).
-- **Phase 8 voice:** the pick is made — `en_GB-southern_english_female-low`
-  (see [`docs/voice-audition.md`](docs/voice-audition.md)). On Fedora,
-  download its model pair, run `assist voice warm`, and judge the
-  exact-script acks, not the sample sentence. Finally verify
-  faster-whisper or whisper.cpp on the actual microphone, including
-  one forced-offline dictation and one Wi-Fi-drop/reconnect drill.
+- **Phase 8 voice:** the online pick is made — **Flare** (`[gemini]
+  voice`), and it is pinned by `[gemini] allowed_voices`. The local pick
+  (`en_GB-southern_english_female-low`, see
+  [`docs/voice-audition.md`](docs/voice-audition.md)) stays dormant
+  behind config; download its model pair only if you mean to switch the
+  endgame in (`online_voice = "local"`). Either way run
+  `assist voice warm` and judge the exact-script acks, not the sample
+  sentence — and after any voice change, confirm `assist doctor` is
+  green on `voice routing` and that the acks you hear are the NEW voice
+  (by ear: the cache key changed, so a stale file cannot answer).
+  Finally verify faster-whisper or whisper.cpp on the actual
+  microphone, including one forced-offline dictation and one
+  Wi-Fi-drop/reconnect drill.

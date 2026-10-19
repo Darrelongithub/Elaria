@@ -77,14 +77,24 @@ class EchoClient:
         return self._can
 
     def voice_request(self, text, *, voice=None):
+        """Mirrors the real client, including the canonical-voice pin (VB-4):
+        a caller that skips `voice_route` still cannot get audio out."""
+        from assistant.config import canonical_voices, resolve_voice
+
         gemini = self.config.section("gemini")
+        requested = str(voice or gemini.get("voice") or "Flare")
+        effective, allowed = resolve_voice(self.config, requested)
         return {"model": gemini.get("model_voice", "x"),
-                "voice_name": str(voice or gemini.get("voice") or "Flare"),
+                "voice_name": effective or requested, "voice_requested": requested,
+                "voice_allowed": allowed, "canonical_voices": list(
+                    canonical_voices(self.config)),
                 "response_modalities": ["AUDIO"], "text": text}
 
     def generate_voice(self, text, *, voice=None, correlation_id="-"):
         request = self.voice_request(text, voice=voice)
         self.calls.append((text, request["voice_name"]))
+        if not request["voice_allowed"]:
+            raise RuntimeError(f"voice {request['voice_requested']!r} is not canonical")
         if self._fail:
             raise RuntimeError(self._fail)
         return {"pcm": self.pcm, "sample_rate": 24000,
@@ -216,30 +226,74 @@ def test_a2_network_death_makes_zero_audio(tmp_path):
     assert sorted(p.name for p in cache.glob("*.wav")) == files_before, "audio written offline"
 
 
-@pytest.mark.xfail(strict=True, reason="VB-4 CRITICAL class: any string in [gemini] voice "
-                   "is honoured silently; nothing pins Flare and doctor stays green")
-def test_a3_config_poisoning_precedence(tmp_path):
-    """A bogus voice in config AND a legacy row in tts.selected_voice.
+def test_a3_voice_is_pinned_and_the_precedence_is_documented(tmp_path):
+    """VB-4 (was: any string in [gemini] voice was honoured silently).
 
-    Requirement: honour exactly one documented precedence, or fail loudly in
-    `assist doctor`. A shadowed voice speaking silently is the defect.
+    Contract: `[gemini] voice` must be in `[gemini] allowed_voices` (default
+    `["Flare"]`). A mismatch is a REFUSAL - silence with a reason, doctor FAIL -
+    never a silent adoption and never a substitution of the dormant voice.
+    Changing her voice means editing BOTH keys on purpose; the legacy
+    `tts.selected_voice` row is ignored online and says so.
     """
     config = voice_config(tmp_path)
-    db = store(tmp_path, "poison.db")
+    # The legacy row lives in the store the DOCTOR opens, so the precedence line
+    # is exercised end to end and not only in the service's own view.
+    db = Store(Path(config.db_path))
     db.set_state("tts.selected_voice", json.dumps(VoiceDescriptor(
         voice_id="en_GB-alba-medium", model="/nowhere/alba.onnx", backend="piper").as_dict()))
     config.raw["gemini"] = {**config.section("gemini"), "voice": "Zephyr"}
     speech = SpeechService(config, db, client=EchoClient(config), is_online=lambda: True)
 
     spoken = speech.speak("On it.", play=False)
+    assert spoken.voice_id != "Zephyr", (
+        f"config silently changed the voice to {spoken.voice_id!r}")
+    assert spoken.muted and spoken.audio_path is None and spoken.backend == "none", (
+        f"an unapproved voice still produced audio: {spoken}")
+    assert "not canonical" in (spoken.error or ""), spoken.error
+
     from assistant.cli import run_doctor
 
     doctor = {c["check"]: c for c in run_doctor(config)["checks"]}
     routing = doctor["voice routing"]
-    assert spoken.voice_id == "Flare", (
-        f"config silently changed the voice to {spoken.voice_id!r}")
-    assert routing["status"] != "ok" or "Zephyr" not in routing["detail"], (
-        "doctor reported the poisoned voice as healthy")
+    assert routing["status"] == "fail", (
+        f"a poisoned voice must read as a doctor FAILURE, got {routing['status']}")
+    assert "VOICE IDENTITY REFUSED" in routing["detail"] and "Zephyr" in routing["detail"]
+    assert "SILENT" in routing["detail"], "the doctor must name the consequence"
+
+    status = speech.status()
+    identity = status["voice_identity"]
+    assert (identity["configured"], identity["canonical"], identity["allowed"]) == (
+        "Zephyr", ["Flare"], False), identity
+    assert status["voice_id"] == "none" and status["muted"] is True
+    # Precedence, reported rather than guessed: the stored local row is inert online.
+    assert status["legacy_selection_ignored_online"] is True
+    assert "legacy `tts.selected_voice` row is IGNORED" in routing["detail"]
+    assert "acks: all four cached" not in routing["detail"], (
+        "a silent route must not be described as if it were speaking")
+
+    # Deliberate widening is allowed, and then that voice is genuinely the voice.
+    config.raw["gemini"] = {**config.section("gemini"), "voice": "Zephyr",
+                            "allowed_voices": ["Flare", "Zephyr"]}
+    widened = speech.speak("On it.", play=False)
+    assert (widened.voice_id, widened.backend, widened.cloud_voice) == (
+        "Zephyr", "gemini-native-audio", True), widened
+    assert speech.status()["voice_identity"]["allowed"] is True
+    assert speech.status()["voice_id"] == "Zephyr"
+
+
+def test_a3b_client_refuses_an_unapproved_voice_even_when_called_directly(tmp_path):
+    """The pin is enforced at the transport too, so no other caller can bypass it."""
+    from assistant.gemini_client import GeminiClient
+
+    config = voice_config(tmp_path)
+    config.raw["gemini"] = {**config.section("gemini"), "voice": "Zephyr"}
+    client = GeminiClient(config, store(tmp_path, "pin.db"))
+    request = client.voice_request("On it.")
+    assert request["voice_allowed"] is False
+    assert request["voice_requested"] == "Zephyr"
+    assert request["canonical_voices"] == ["Flare"]
+    with pytest.raises(RuntimeError, match="not canonical"):
+        client.generate_voice("On it.")
 
 
 def test_a4_status_is_truthful_in_all_three_modes(tmp_path):
@@ -405,24 +459,60 @@ def test_b5_ack_latency_states(tmp_path):
         assert sample["p95_ms"] < 300, f"{name} ack exceeded the 300ms budget: {sample}"
 
 
-@pytest.mark.xfail(strict=True, reason="VB-2: the online ack cache key includes the DORMANT "
-                   "local descriptor, so an irrelevant change makes every ack a permanent miss")
 def test_b5b_dormant_config_change_must_not_silence_the_hotkey_path(tmp_path):
-    """VB-2: changing the DORMANT local voice invalidates the ONLINE ack cache.
+    """VB-2 (key half): the ONLINE ack cache no longer carries dormant settings.
 
-    length_scale / the selected local voice have nothing to do with Flare
-    audio, yet they are in the cache key, so every ack becomes a permanent
-    cache miss (silence on the hotkey path) until someone thinks to re-warm.
+    length_scale and the selected local voice have nothing to do with Flare
+    audio. They used to sit in the online cache key, so any edit there turned
+    every ack into a permanent cache miss - silence on the hotkey path.
+    """
+    config, speech, _ = service(tmp_path)
+    warmed = speech.warm_ack_cache()
+    before = {kind: Path(info["audio_path"]) for kind, info in warmed.items()}
+    assert speech.cached_ack("on_it") is not None
+
+    for change in ({"length_scale": 1.0}, {"length_scale": 1.30, "voice_id": "elsewhere"},
+                   {"model": "/nowhere/other.onnx", "speaker": 3}):
+        config.raw["tts"] = {**config.section("tts"), **change}
+        after = speech.play_ack("on_it")
+        assert after["cache_miss"] is False, (
+            f"a dormant-path setting change ({change}) silently killed every cached ack")
+        assert after["cached"] is True
+        assert Path(after["audio_path"]) == before["on_it"]
+        assert speech.ack_cache_state()["complete"] is True
+
+    # The reverse half of the same rule: a change to the LIVE voice identity must
+    # invalidate, and the dormant key must stay addressable for its own route.
+    config.raw["tts"] = {**config.section("tts"), "backend": "mock", "length_scale": 0.92}
+    local = SpeechService(config, store(tmp_path, "b5b-local.db"), client=EchoClient(config),
+                          is_online=lambda: True, )
+    config.raw["tts"] = {**config.section("tts"), "online_voice": "local"}
+    assert local._ack_path("on_it") != before["on_it"], (
+        "the local route is resolving to the cloud route's files")
+
+
+@pytest.mark.xfail(strict=True, reason="VB-2 (remaining half, Gate B): a cold ack cache is a "
+                   "permanent silence - nothing re-warms it after a config change")
+def test_b5d_ack_miss_self_heals_within_one_warm_cycle(tmp_path):
+    """Gate B: invalidation must trigger a re-warm, never permanent `cache_miss`.
+
+    Repro at report level: change a LIVE voice identity (or delete the ack
+    files), then press the hotkey. The first press must be allowed to be silent,
+    but the warm must already be scheduled so the next press is audible again -
+    `assist doctor` says so in the meantime.
     """
     config, speech, _ = service(tmp_path)
     speech.warm_ack_cache()
-    assert speech.cached_ack("on_it") is not None
+    config.raw["gemini"] = {**config.section("gemini"), "voice": "Kore",
+                            "allowed_voices": ["Flare", "Kore"]}
+    assert speech.play_ack("on_it")["cache_miss"] is True, "the change did not invalidate"
 
-    config.raw["tts"] = {**config.section("tts"), "length_scale": 1.0}
-    after = speech.play_ack("on_it")
-    assert after["cache_miss"] is False, (
-        "a dormant-path setting change silently killed every cached ack")
-    assert after["cached"] is True
+    # A daemon-level warm cycle has to run (scheduled by the miss, or by the
+    # config-change hook) and the very next ack must hit cache.
+    speech.warm_due()                      # the cure: one warm cycle, triggered now
+    assert speech.play_ack("on_it")["cached"] is True, (
+        "acks did not return within one warm cycle after invalidation")
+    assert speech.ack_cache_state()["complete"] is True
 
 
 def test_b6_deleted_and_corrupt_ack_files(tmp_path):
@@ -453,25 +543,53 @@ def test_b6_deleted_and_corrupt_ack_files(tmp_path):
     assert speech.play_ack("on_it")["cached"] is True
 
 
-@pytest.mark.xfail(strict=True, reason="VB-1 CRITICAL: online ack cache key omits "
-                   "[gemini] voice, so a voice change replays the old voice's audio")
-def test_b7_voice_change_invalidates_the_cache(tmp_path):
-    """VB-1 (CRITICAL): stale Flare audio is served after the voice changes.
+def test_b7_voice_change_invalidates_the_online_cache(tmp_path):
+    """VB-1 (fixed): the online key IS the cloud voice identity.
 
-    The online cache key contains the *local Piper* descriptor and not
-    [gemini] voice, so changing the voice keeps the same path and replays the
-    previous voice's audio while status reports the new one.
+    The key used to carry the *local Piper* descriptor and none of
+    `[gemini] voice`, so a voice change kept the same path and replayed the
+    previous voice's bytes while `status` reported the new voice. Now a voice or
+    model change moves every path - in both directions - and no stale file is
+    ever addressable under a new identity.
     """
     config, speech, _ = service(tmp_path)
-    speech.warm_ack_cache()
-    before = Path(speech.cached_ack("on_it"))
-    config.raw["gemini"] = {**config.section("gemini"), "voice": "Kore"}
-    after = speech.cached_ack("on_it")
-    assert after is None or Path(after) != before, (
-        "the voice changed but the ack cache still points at the old voice's file")
+    warmed = speech.warm_ack_cache()
+    before = {kind: Path(info["audio_path"]) for kind, info in warmed.items()}
+    assert len({p.name for p in before.values()}) == 4, warmed
+    assert speech.status()["cache_identity"]["voice"] == "Flare"
 
+    # A deliberate widening of the pin (VB-4) is a real identity change: the old
+    # audio must stop being addressable, not be replayed under a new name.
+    config.raw["gemini"] = {**config.section("gemini"), "voice": "Kore",
+                            "allowed_voices": ["Flare", "Kore"]}
+    assert all(speech.cached_ack(kind) is None for kind in STANDARD_ACKS), (
+        "the voice changed but the ack cache still points at the old voice's file")
+    miss = speech.play_ack("on_it")
+    assert miss["cache_miss"] is True and miss["audio_path"] is None, (
+        f"a voice change served stale audio: {miss}")
+
+    re_warmed = speech.warm_ack_cache()
+    after = {kind: Path(info["audio_path"]) for kind, info in re_warmed.items()}
+    assert not ({p.name for p in after.values()} & {p.name for p in before.values()}), (
+        f"Kore reused Flare's files: {after}")
+    assert all(p.exists() and p.stat().st_size > 0 for p in after.values())
     spoken = speech.speak("On it.", play=False)
-    assert Path(spoken.audio_path) != before or spoken.voice_id == "Flare"
+    assert (spoken.voice_id, spoken.cloud_voice) == ("Kore", True), spoken
+    assert Path(spoken.audio_path) == after["on_it"], (
+        "speech and the ack cache resolved to different files for one identity")
+
+    # Flare's files are untouched and still hers: switching back finds them,
+    # without a re-render, which is what makes the pin cheap to test by ear.
+    config.raw["gemini"] = {**config.section("gemini"), "voice": "Flare"}
+    assert {kind: Path(speech.cached_ack(kind)) for kind in STANDARD_ACKS} == before
+    assert speech.speak("On it.", play=False).cached is True
+
+    # The model is part of the identity too: same voice name, different model
+    # voice = different audio.
+    config.raw["gemini"] = {**config.section("gemini"),
+                            "model_voice": "gemini-2.5-pro-preview-tts"}
+    assert speech.cached_ack("on_it") != before["on_it"].as_posix(), (
+        "a model_voice change replays the previous model's audio")
 
 
 def test_b7b_pace_change_invalidates_the_dormant_cache(tmp_path):
@@ -491,13 +609,13 @@ def test_b7b_pace_change_invalidates_the_dormant_cache(tmp_path):
     assert path_slow.exists() is False
 
 
-@pytest.mark.xfail(strict=True, reason="VB-3 CRITICAL: _ack_path falls back to a local "
-                   "(Piper/mock) render on the online path — a dormant voice speaks")
 def test_b7c_local_audio_never_answers_an_online_ack(tmp_path):
-    """VB-3 (CRITICAL): a dormant Piper ack file plays over the online path.
+    """VB-3 (fixed): the fallback is gone - a missing Flare ack is silence + warning.
 
-    `_ack_path` deliberately falls back to the LOCAL backend's file when the
-    Flare file is missing, so any leftover local render speaks for her.
+    `_ack_path` used to fall back to the LOCAL backend's file "because a warmed
+    local copy beats silence". That is the one thing the owner forbade: the dormant
+    Piper voice speaking for her. A miss is now reported, never substituted, and
+    never described as a healthy cache.
     """
     config, speech, _ = service(tmp_path)
     # An era where the local voice was the voice leaves Piper acks behind.
@@ -512,6 +630,25 @@ def test_b7c_local_audio_never_answers_an_online_ack(tmp_path):
         f"online ack served a dormant-path file: {speech.cached_ack('on_it')}")
     result = speech.play_ack("on_it")
     assert result["audio_path"] is None and result["played"] is False
+    assert result["cache_miss"] is True and result["rewarm_needed"] is True, result
+    assert "cold" in str(result.get("warning", "")), (
+        "a miss on the ack path must be reported, not just returned")
+    assert local_path.read_bytes() == b"RIFFfake-piper-audio", "the dormant file was consumed"
+    assert "RIFF" not in str(result.get("audio_path") or ""), "substitute audio played"
+
+    # Reporting honesty: `cached_acks` may not claim health from a local file.
+    status = speech.status()
+    assert status["cached_acks"] == [], status["cached_acks"]
+    assert status["ack_cache"]["missing"] == list(STANDARD_ACKS), status["ack_cache"]
+    assert status["ack_cache"]["route"] == "gemini"
+    assert "assist voice warm" in status["ack_cache"]["reason"], status["ack_cache"]
+
+    # Warming the real route fixes it, and the dormant file is still not in play.
+    speech.warm_ack_cache()
+    assert sorted(speech.status()["cached_acks"]) == sorted(STANDARD_ACKS)
+    played = speech.play_ack("on_it")
+    assert played["cached"] is True and Path(played["audio_path"]) != local_path
+    assert local_path.read_bytes() == b"RIFFfake-piper-audio"
 
 
 def test_b7d_acks_are_not_cross_wired(tmp_path):

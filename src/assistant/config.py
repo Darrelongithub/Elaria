@@ -50,6 +50,34 @@ def runtime_dir() -> Path:
     return Path(f"/tmp/assistant-{os.getuid()}")
 
 
+def canonical_voices(config) -> tuple[str, ...]:
+    """`[gemini] allowed_voices`, defaulting to `("Flare",)`.
+
+    The one-voice rule as data: the list is the whole policy, so approving a
+    different voice is a config edit the owner makes on purpose (VB-4) and never
+    something a stray `voice = "..."` achieves by itself.
+    """
+    gemini = config.section("gemini") if config else {}
+    allowed = gemini.get("allowed_voices")
+    if allowed is None:
+        # Absent means the shipped answer, not "whatever `voice` says": a typo in
+        # `voice` must never widen the rule by itself. An explicit empty list is
+        # respected as written, which refuses every voice - a loud config error.
+        allowed = ["Flare"]
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    return tuple(str(item) for item in allowed if str(item).strip())
+
+
+def resolve_voice(config, requested: str | None = None) -> tuple[str, bool]:
+    """(effective voice, allowed). An unapproved voice resolves to "" — refused."""
+    gemini = config.section("gemini") if config else {}
+    configured = str(requested or gemini.get("voice") or "Flare")
+    canonical = canonical_voices(config)
+    allowed = configured.lower() in {name.lower() for name in canonical}
+    return (configured if allowed else ""), allowed
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     out = dict(base)
     for key, value in override.items():
@@ -78,6 +106,11 @@ DEFAULTS: dict = {
         # capable model.
         "model_voice": "gemini-2.5-flash-preview-tts",
         "voice": "Flare",
+        # The one-voice rule, expressed in config (VB-4): `[gemini] voice` must be
+        # one of these or she refuses to speak and `assist doctor` fails. Widening
+        # this list is the ONLY way to change her voice — no code edit, and no
+        # silent adoption of whatever string is in `voice`.
+        "allowed_voices": ["Flare"],
         "escalation_ladder": ["gemini-flash-lite-latest", "gemini-flash-latest"],
         "escalate_after_failures": 2,
         "max_scaffold_calls": 6,
