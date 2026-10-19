@@ -27,7 +27,41 @@ from pathlib import Path
 # Discourse markers from humour.toml [codeswitch] — the canary for the
 # language gate. If raw speech carries them and cleaned text has none,
 # the model translated/normalised. That is a failure, not a cleanup.
-SW_MARKERS = {"sasa", "alafu", "kwanza", "mbona", "sijui", "unajua", "wewe", "apana"}
+# High-precision Swahili words (rarely English names/words), so English
+# transcripts don't trip false flags. humour.toml [codeswitch].markers
+# extends this set when present (your personal Sheng heartbeat).
+SW_MARKERS = {
+    "sasa", "alafu", "halafu", "kwanza", "mbona", "sijui", "unajua", "najua",
+    "wewe", "mimi", "nyinyi", "apana", "hapana", "ndio", "ndiyo", "lakini",
+    "kabisa", "asante", "karibu", "kwaheri", "polepole", "baada", "baadaye",
+    "kabla", "mpaka", "wapi", "nini", "gani", "lini", "nani", "labda",
+    "kumbe", "bado", "tayari", "hakika", "kweli", "hivyo", "tena", "zaidi",
+    "kidogo", "nyingi", "wote", "kila", "ingine", "hii", "hiyo", "hapa",
+    "pale", "sasaivi", "usiku", "leo", "kesho", "jana", "asubuhi", "jioni",
+}
+
+
+def load_extra_markers(config) -> set[str]:
+    """Personal markers from humour.toml [codeswitch].markers, if declared."""
+    try:
+        path = config.humour_profile_path()
+        if path is None:
+            return set()
+        with Path(path).open("rb") as handle:
+            data = tomllib.load(handle)
+        markers = data.get("codeswitch", {}).get("markers", [])
+        return {str(m).lower() for m in markers if isinstance(m, str)}
+    except Exception:
+        return set()
+
+
+def language_profile(text: str, markers: set[str] | None = None) -> dict:
+    """Cheap local language-mix readout: marker count + share of words.
+    Used by the guard, by `doctor`, and by tests — never a model call."""
+    words = re.findall(r"[a-z']+", text.lower())
+    hits = sum(1 for w in words if w in (markers or SW_MARKERS))
+    return {"words": len(words), "sw_markers": hits,
+            "sw_share": round(hits / len(words), 3) if words else 0.0}
 
 CLEANUP_PROMPT = """You are repairing a speech-to-text transcript. Rules, no exceptions:
 - Fix punctuation, capitalisation and paragraphing. Remove filler words \
@@ -62,13 +96,21 @@ def divergence_pct(raw: str, cleaned: str) -> float:
     return round((1.0 - ratio) * 100, 2)
 
 
-def _marker_count(text: str) -> int:
-    return sum(1 for w in re.findall(r"[a-z']+", text.lower()) if w in SW_MARKERS)
+def _marker_count(text: str, markers: set[str] | None = None) -> int:
+    return language_profile(text, markers)["sw_markers"]
 
 
-def language_mix_preserved(raw: str, cleaned: str) -> bool:
-    """Raw had Swahili/Sheng markers => cleaned must still have some."""
-    return _marker_count(raw) == 0 or _marker_count(cleaned) > 0
+def language_mix_preserved(raw: str, cleaned: str,
+                           markers: set[str] | None = None,
+                           min_retention: float = 0.5) -> bool:
+    """Proportional code-switch guard (Phase 7, §12.5): a cleanup that
+    keeps ONE token 'sasa' while translating everything else has still
+    normalised the speech. Raw with markers ⇒ cleaned must retain at
+    least half of them (cleanup legitimately drops some fillers)."""
+    raw_hits = _marker_count(raw, markers)
+    if raw_hits == 0:
+        return True
+    return _marker_count(cleaned, markers) >= max(1, raw_hits * min_retention)
 
 
 def load_glossary(path: Path) -> list[str]:
@@ -89,6 +131,7 @@ def load_glossary(path: Path) -> list[str]:
 class CleanupPass:
     def __init__(self, config, client):
         settings = config.section("cleanup")
+        self.markers = SW_MARKERS | load_extra_markers(config)
         self.enabled = bool(settings.get("enabled", True))
         self.max_divergence = float(settings.get("max_divergence_pct", 35))
         self.min_chars = int(settings.get("min_chars", 40))
@@ -107,7 +150,8 @@ class CleanupPass:
             glossary=", ".join(self.glossary) or "(none)", raw=raw)
         result = self._client.generate(
             "cleanup", prompt,
-            verify=lambda text: bool(text.strip()) and language_mix_preserved(raw, text),
+            verify=lambda text: bool(text.strip())
+            and language_mix_preserved(raw, text, self.markers),
         )
         if result.fixture and result.fixture.get("synthetic"):
             # Mock mode with no recorded fixture: no real cleanup happened.
@@ -118,9 +162,9 @@ class CleanupPass:
                                  result.model)
         cleaned = result.text.strip()
         divergence = divergence_pct(raw, cleaned)
-        if not language_mix_preserved(raw, cleaned):
+        if not language_mix_preserved(raw, cleaned, self.markers):
             return CleanupResult(cleaned, divergence, True,
-                                 "language gate: code-switching markers vanished — "
+                                 "language gate: code-switching markers collapsed — "
                                  "likely translated/normalised; raw kept as the record",
                                  result.model)
         if divergence > self.max_divergence:

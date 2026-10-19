@@ -282,13 +282,19 @@ class GeminiClient:
                              attempts, tier > 0, last_verified, correlation_id)
 
     # -- batch transcription: second tier (§3.6) + Live fallback (§12.7) ------
-    def transcribe_batch(self, audio_path, language: str = "en") -> dict:
+    def transcribe_batch(self, audio_path, language: str = "en", *,
+                         also_languages: list[str] | None = None,
+                         preserve_code_switching: bool = False) -> dict:
         """generateContent on saved audio: accurate pass, same ledger rules.
 
-        Mock/record keying uses the audio's SHA-256, so fixtures replay
-        per-recording without embedding audio in the repo. Live mode
-        uploads via the SDK Files API (lazy; UNVERIFIED without a key).
-        The prompt pins the language and forbids translation (§12.4/§12.5).
+        Mock/record keying uses the audio's SHA-256 (+ language set), so
+        fixtures replay per-recording without embedding audio in the repo,
+        and flipping languages never replays a stale-language fixture.
+        Live mode uploads via the SDK Files API (lazy; UNVERIFIED without
+        a key). The prompt pins languages and forbids translation
+        (§12.4/§12.5); with also_languages + preserve_code_switching
+        (Phase 7) it instructs passage-faithful bilingual transcription —
+        the switch itself is content, normalising it away is the failure.
         """
         import hashlib
         from pathlib import Path
@@ -299,10 +305,20 @@ class GeminiClient:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         duration = wav_duration_s(path)
         model = self.config.model_for_role("transcribe_batch")
-        prompt = (f"Transcribe this audio verbatim. The language is {language}; "
-                  "transcribe in that language exactly as spoken. Do NOT translate. "
-                  "Return only the transcript.")
-        contents = {"audio_sha256": digest, "language": language, "prompt": prompt}
+        others = [lang for lang in (also_languages or []) if lang != language]
+        if others and preserve_code_switching:
+            prompt = (
+                f"Transcribe this audio verbatim. The speaker's primary language "
+                f"is {language} and they code-switch with {', '.join(others)}. "
+                "Transcribe EVERY passage in the language actually spoken in it. "
+                "Do NOT translate. Do NOT normalise mixed speech into one "
+                "language. Return only the transcript.")
+        else:
+            prompt = (f"Transcribe this audio verbatim. The language is {language}; "
+                      "transcribe in that language exactly as spoken. Do NOT "
+                      "translate. Return only the transcript.")
+        contents = {"audio_sha256": digest, "language": language,
+                    "languages": [language, *others], "prompt": prompt}
         correlation_id = uuid.uuid4().hex[:12]
         if isinstance(self._transport, _SdkTransport) and self.mode != "mock":
             text = self._sdk_transcribe(path, model, prompt, correlation_id, duration)

@@ -201,7 +201,13 @@ class GenaiLiveTransport:  # pragma: no cover - needs owner's key + network
 
     Response-shape parsing is defensive (getattr chains) because Live
     message types churn between SDK versions; anything unrecognised is
-    ignored rather than fatal. Verify on first live run (§11)."""
+    ignored rather than fatal. Verify on first live run (§11).
+
+    Language: Live input transcription has no explicit multi-language
+    pin in this config surface (verify against current SDK at Step 0);
+    the primary language steers it, and Phase 7 code-switch drift is
+    caught downstream by cleanup's proportional marker gate + the
+    batch re-transcription path, which prompts bilingual-faithfully."""
 
     name = "gemini_live"
 

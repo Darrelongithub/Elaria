@@ -105,8 +105,8 @@ class MeetingService:
         pcm, sample_rate = read_pcm(wav_path)
         segments = segment_utterances(pcm, sample_rate)
         turns: list[Turn] = []
-        backend = asr.GeminiBatchBackend(self.client)
-        language = (self.config.section("asr").get("languages") or ["en"])[0]
+        backend = asr.GeminiBatchBackend(self.client, self.config)
+        language = asr.primary_language(self.config)
         for idx, (start, end) in enumerate(segments[:400]):  # sane ceiling
             piece = slice_wav(pcm, sample_rate, start, end,
                               work_dir / f"{speaker.lower()}-{idx:03d}.wav")

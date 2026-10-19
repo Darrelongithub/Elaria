@@ -9,15 +9,17 @@ Design: [`assistant-blueprint.md`](assistant-blueprint.md) (v29) ·
 Setup/build order: [`GETTING-STARTED.md`](GETTING-STARTED.md) ·
 Personality profile: [`humour.toml`](humour.toml)
 
-**Status: Phase 3 built** (on Phases 0–2 + the §9-order-first `assist-voice-test`).
-Dictation runs end-to-end with visible state (Waybar + overlay), and the
-organiser now indexes configured roots and produces **shadow plans**:
-`assist plan build` runs the Tier 0 deterministic cascade (zero API
-calls) and writes a readable log of what *would* happen — nothing moves,
-by construction (Phase 3 has no write path; live roots are refused).
-Test suite passes with **no API key**. The real Gemini Live transport +
-all Wayland surfaces are UNVERIFIED until first run on the owner's
-Fedora box (Step 0; `ui/README.md` checklist). The executor is Phase 4 —
+**Status: Phases 0–7 built** (the full §9 sequence, on the
+§9-order-first `assist-voice-test`). Dictation runs end-to-end with
+visible state (Waybar + overlay); the organiser indexes, plans
+(Tier 0 → Tier 1/2), executes on live roots behind the §4 spine
+(journal, review, undo); memory + hybrid recall answers “where's
+that March invoice” locally; meeting mode records both call sides
+with exact channel labels; Kiswahili flips on by config with
+code-switch guards armed. Test suite passes with **no API key**.
+The real Gemini Live transport + all Wayland surfaces are
+UNVERIFIED until first run on the owner's Fedora box (Step 0;
+`ui/README.md` checklist).
 it only earns existence after shadow logs the owner agrees with.
 
 ---
@@ -114,7 +116,33 @@ taxonomy only), polling watcher with debounce, shadow logs in
 70% with the blast-radius tripwire correctly firing. **The human half of
 Phase 3's done-when — “a week of shadow logs you actually agree with” —
 is yours: configure one real root, build plans, argue with them.**
-118 tests, all offline.
+Phase 4 — executor (live-gate in code, halt per op, index-identity
+re-verified, write-ahead journal → move → hash-verify → commit,
+`_Conflicts/` never overwrites, trash-with-manifest, no `rm` anywhere),
+review queue, `assist undo --plan/--since/<op>`, `assist verify`,
+Tier 1/2 batched classification behind the §17 harness (schema-strict,
+taxonomy-only, never-send = filename-only). 500-file round trip tested.
+Phase 5 — §16 memory (stated vs inferred-with-evidence, inspectable via
+`assist memory`, forgettable without argument), local embeddings
+(stdlib hashing baseline; `sentence-transformers` extra), hybrid recall
+(FTS5 + vectors + filename exactness, relevance floor, no bluffing),
+and `assist ask` on the §13.4 ladder: local intents + memory at zero
+tokens (`via` says which), open questions climb to the cheapest-first
+harness with assembled context.
+Phase 6 — meeting mode: mic + sink as separate channels, energy
+segmentation, per-utterance batch transcription, You/Them channel
+diarization (optional pyannote refine of the far side,
+`--extra diarize` + HF_TOKEN), timestamped markdown notes.
+Rehearse: `assist meeting transcribe mic.wav sys.wav`; node plan:
+`assist meeting setup` (Step 3C).
+Phase 7 — Kiswahili: `languages = ["sw", "en"]` +
+`preserve_code_switching = true` flips it (config only, §12.4 pinned,
+never auto-detected). Guards: bilingual batch prompt, proportional
+(≥50%) Swahili-marker retention gate in cleanup, subset language-tag
+assertion, Kiswahili intent ladder (`kumbuka`, `tafuta`, `iko wapi`,
+`simama`, `rudisha`…), doctor reports guards ARMED. Swahili ASR
+accuracy on your voice is a live-key Step-0 measurement.
+177 tests, all offline.
 
 ## §10 open decisions — defaults taken, awaiting your word
 
@@ -152,15 +180,19 @@ Core Phase 0 is **standard-library only**; `google-genai` (`--extra live`)
 and the voice models (`--extra voice`) are lazy imports so clone-and-run
 never breaks.
 
-## Next (§9)
+## Next — the human halves (§9 done-whens that code can't self-certify)
 
-- **You:** Step 0 verification + key file; run `assist-voice-test` in real
-  life for a few days (TV on, other voices, morning voice), label with
-  `f`/`m`, tune thresholds from `report`. Targets: <1 false light-up/day,
-  >95% deliberate catches. Then: Hyprland PTT binds (Step 6) + the Step 3
-  A/B/C capture listening test (§10.1), one live dictation, and a
-  `GEMINI_MODE=record` session so the first real fixtures exist.
-- **Phase 4:** the executor — one test folder, review + undo, Tiers 1–2
-  (Flash-Lite/Flash batches behind the §17 harness) wired behind it.
-  Gate: shadow logs you agree with first. “File 500 files, then
-  `undo --since` all of it cleanly” is the done-when.
+- **You, Step 0:** verify quotas + model IDs at
+  `aistudio.google.com/rate-limit`, create the key file (0600), run
+  `assist doctor`, one live dictation, and a `GEMINI_MODE=record`
+  session so the first real fixtures exist. Then `assist-voice-test`
+  for a few days (<1 false light-up/day, >95% deliberate catches),
+  Hyprland binds (Step 6), Step 3 A/B/C listening test, `ui/README.md`
+  on-hardware checklist.
+- **You, §10 decisions:** freeze the taxonomy (`assist taxonomy
+  suggest`), fill `never_send_to_cloud`, keep one root `shadow` until
+  a week of logs you agree with — only then flip a TEST folder to
+  `live` and rehearse file → `undo --since` before any real tree.
+- **Phase 7 done-when:** after the flip, dictate code-switched
+  sentences and confirm the mix survives end-to-end (the guards will
+  flag loudly if the model normalises — that's them working).

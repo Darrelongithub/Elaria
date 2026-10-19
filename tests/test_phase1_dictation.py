@@ -133,7 +133,10 @@ def test_diff_gate_flags_a_rewrite(config, tmp_path):
 def test_language_gate_catches_vanished_codeswitching(config, tmp_path):
     raw = "sasa file that invoice alafu remind me friday, mbona downloads is chaos again"
     cleaned = "File that invoice and remind me Friday. The downloads folder is chaotic."
-    assert language_mix_preserved(raw, "sasa file that invoice") is True
+    # Phase 7 proportional gate: 3 raw markers (sasa/alafu/mbona) — keeping
+    # 2 of 3 passes, keeping only 1 (token 'sasa') is normalisation, fails.
+    assert language_mix_preserved(raw, "sasa file that invoice, alafu remind me") is True
+    assert language_mix_preserved(raw, "sasa file that invoice") is False
     assert language_mix_preserved(raw, cleaned) is False
     result = _cleanup(config, tmp_path, cleaned).run(raw)
     assert result.flagged and "language gate" in result.reason

@@ -50,13 +50,33 @@ class BatchBackend(Protocol):
     def transcribe(self, audio_path: str, language: str) -> Transcript: ...
 
 
+def configured_languages(config) -> list[str]:
+    """The pinned language set (§12.4: pinned, NEVER auto-detected).
+    Phase 7 flips this to ["sw", "en"] in config — nothing else moves."""
+    languages = config.section("asr").get("languages") or ["en"]
+    return [str(lang) for lang in languages]
+
+
+def code_switching_enabled(config) -> bool:
+    return bool(config.section("asr").get("preserve_code_switching")) and \
+        len(configured_languages(config)) > 1
+
+
 class GeminiBatchBackend:
     name = "gemini_batch"
 
-    def __init__(self, client):
+    def __init__(self, client, config=None):
         self._client = client
+        self._config = config
 
     def transcribe(self, audio_path: str, language: str) -> Transcript:
+        if self._config is not None:
+            languages = configured_languages(self._config)
+            result = self._client.transcribe_batch(
+                Path(audio_path), languages[0], also_languages=languages[1:],
+                preserve_code_switching=code_switching_enabled(self._config))
+            return Transcript(text=result["text"],
+                              language=",".join(languages), backend=self.name)
         result = self._client.transcribe_batch(Path(audio_path), language)
         return Transcript(text=result["text"], language=language, backend=self.name)
 
@@ -86,7 +106,7 @@ def batch_chain(config, client) -> list[BatchBackend]:
     chain: list[BatchBackend] = []
     for name in names or ["gemini_batch"]:
         if name == "gemini_batch":
-            chain.append(GeminiBatchBackend(client))
+            chain.append(GeminiBatchBackend(client, config))
         elif name == "mock":
             chain.append(MockASR())
         else:
@@ -118,11 +138,12 @@ def make_live_transport(config, *, fixture_name: str | None = None) -> LiveTrans
 
 
 def primary_language(config) -> str:
-    languages = config.section("asr").get("languages") or ["en"]
-    return str(languages[0])
+    return configured_languages(config)[0]
 
 
 def assert_output_language(transcript: Transcript, expected: list[str]) -> bool:
-    """Catch silent translation (§12.4/§12.5). Tag check here; the
+    """Catch silent translation (§12.4/§12.5). Tag check here (bilingual
+    tags like 'sw,en' must be a subset of the configured set); the
     content-level marker gate lives in cleanup.language_mix_preserved."""
-    return transcript.language in expected
+    produced = {part.strip() for part in transcript.language.split(",")}
+    return produced <= set(expected)

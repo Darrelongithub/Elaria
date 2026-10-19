@@ -127,6 +127,27 @@ def run_doctor(config) -> dict:
          else nodes.get("reason", "unavailable"))
         + " · capture source=config 'mic' (§10.1 open; mic-first is the blueprint recommendation)"))
 
+    # Phase 7: language pinning + code-switch guard state (§12.4/§12.5).
+    from .asr import code_switching_enabled, configured_languages
+    from .cleanup import SW_MARKERS, load_extra_markers
+
+    languages = configured_languages(config)
+    codeswitch = code_switching_enabled(config)
+    marker_count = len(SW_MARKERS | load_extra_markers(config))
+    if "sw" in languages and codeswitch:
+        lang_detail = (f"pinned: {languages} — code-switching guards ARMED "
+                       f"({marker_count} Swahili markers, ≥50% retention gate; "
+                       "bilingual batch prompt; Kiswahili intent ladder)")
+    elif "sw" in languages:
+        lang_detail = ("pinned: " + str(languages) + " — 'sw' present but "
+                       "preserve_code_switching=false: batch prompt stays "
+                       "primary-only; set it true for bilingual dictation")
+    else:
+        lang_detail = (f"pinned: {languages} (English first, §9). Phase 7 flip: "
+                       "languages=[\"sw\",\"en\"] + preserve_code_switching=true — "
+                       "guards are built and dormant until then")
+    checks.append(_check("languages", True, lang_detail))
+
     profile_path = config.humour_profile_path()
     profile = load_humour_profile(config)
     spoken = profile.get("spoken_delivery", {})

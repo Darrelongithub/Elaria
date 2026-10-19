@@ -30,9 +30,12 @@ max_requests_per_minute = 12
 primary  = "gemini_live"            # chain: live -> batch -> local (§12.7)
 fallback = ["gemini_batch", "local"]
 offline_model = "small"             # English only offline (§12.6)
-languages = ["en"]                  # English first; Kiswahili is Phase 7.
-                                    # Pinned explicitly, never auto-detected.
-preserve_code_switching = false     # flip with sw+en in Phase 7
+languages = ["en"]                  # Phase 7 flip: ["sw", "en"] — first entry
+                                    # is the primary pin. Pinned explicitly,
+                                    # never auto-detected (§12.4).
+preserve_code_switching = false     # set true WITH sw+en: bilingual batch
+                                    # prompt, cleanup marker-retention gate,
+                                    # Kiswahili intent ladder (kumbuka/tafuta…)
 assert_output_language  = true
 
 [capture]
