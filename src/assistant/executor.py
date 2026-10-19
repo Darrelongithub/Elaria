@@ -23,14 +23,23 @@ is itself journaled, so undo is undoable.
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import shutil
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .cost import iso_now
-from .safety import Journal, check_blast_radius, check_operation, is_halted, sha256_file
+from .safety import (
+    Journal,
+    check_blast_radius,
+    check_operation,
+    is_halted,
+    is_safe_filename,
+    sha256_file,
+)
 
 
 @dataclass
@@ -118,14 +127,71 @@ class Executor:
         return report
 
     # -- one op, fully journaled --------------------------------------------------
+    @staticmethod
+    def _copy_file_no_overwrite(src: Path, dst: Path) -> None:
+        """Exclusive-create copy for the cross-device path. `xb` makes a
+        destination that raced us a hard failure, never an overwrite."""
+        with src.open("rb") as source, dst.open("xb") as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        shutil.copystat(src, dst)
+
+    @classmethod
+    def _create_destination_no_overwrite(cls, src: Path, dst: Path) -> str:
+        """Create dst without clobbering anything; DO NOT unlink src here.
+
+        Returns the placement kind (`link`, `symlink`, or `copy`). Keeping
+        creation separate lets `_journaled_move` hash-verify the new
+        destination before the explicitly journaled source-unlink step.
+        Same-filesystem regular files use link(2), which is atomic and
+        fails if dst appeared after the policy check (BH-A1) — safer than
+        rename(2), whose POSIX semantics silently replace an existing dst.
+        """
+        if os.path.lexists(dst):
+            raise FileExistsError(f"destination appeared after policy check: {dst}")
+        if src.is_symlink():
+            os.symlink(os.readlink(src), dst)
+            return "symlink"
+        if not src.is_file():
+            raise OSError(f"refusing to move non-regular file: {src}")
+        try:
+            os.link(src, dst)
+            return "link"
+        except OSError as exc:
+            if exc.errno not in (errno.EXDEV, errno.EPERM, errno.EMLINK,
+                                 errno.EOPNOTSUPP):
+                raise
+        cls._copy_file_no_overwrite(src, dst)
+        return "copy"
+
     def _apply_item(self, item: dict, root: Path, plan_id: int):
         src = Path(item["src"])
-        dest_dir = root / item["dest"]
         new_name = item["new_name"] or src.name
+        # Defence in depth: the executor is the last line before a syscall,
+        # so it re-validates plan data even if a planner/verifier was fooled.
+        # new_name must be a bare filename and dest a relative taxonomy path;
+        # the resolved destination must stay inside the resolved root.
+        if not is_safe_filename(new_name):
+            return {"src": str(src),
+                    "reason": f"unsafe new_name {new_name!r} — not a bare filename"}
+        dest_value = item["dest"]
+        dest_parts = Path(dest_value).parts if isinstance(dest_value, str) else ()
+        if (not isinstance(dest_value, str) or Path(dest_value).is_absolute()
+                or not dest_parts
+                or any(part in ("", ".", "..") or "\\" in part for part in dest_parts)):
+            return {"src": str(src),
+                    "reason": f"unsafe destination folder {dest_value!r}"}
+        dest_dir = root / dest_value
         dst = dest_dir / new_name
+        root_resolved = root.resolve()
+        dst_resolved = dst.resolve()
+        if root_resolved != dst_resolved and root_resolved not in dst_resolved.parents:
+            return {"src": str(src),
+                    "reason": f"destination escapes the root: {dst_resolved}"}
 
         # Already in place (verify-only proposal): nothing to do, honestly.
-        if src.resolve() == dst.resolve():
+        if src.resolve() == dst_resolved:
             return "skipped"
         if not src.exists():
             return {"src": str(src), "reason": "source vanished since planning — re-index"}
@@ -151,16 +217,26 @@ class Executor:
     def _journaled_move(self, src: Path, dst: Path, plan_id: int | None,
                         sha_before: str, *, op: str = "move") -> str:
         dst.parent.mkdir(parents=True, exist_ok=True)
+        # lstat (not stat) so a symlink journals its own size, not its target's.
         op_id = self.journal.begin(op, str(src), str(dst), plan_id=plan_id,
-                                   sha_before=sha_before, nbytes=src.stat().st_size)
+                                   sha_before=sha_before, nbytes=src.lstat().st_size)
         try:
-            shutil.move(str(src), str(dst))
+            placement = self._create_destination_no_overwrite(src, dst)
             sha_after = sha256_file(dst)
             if sha_after != sha_before:
-                self.journal.fail(op_id, "sha256 mismatch after move — file left at "
-                                         "destination for inspection, NOT deleted")
-                return {"src": str(src), "reason": "post-move hash mismatch (journal op "
-                                                   f"{op_id}); inspect {dst}"}
+                self.journal.fail(
+                    op_id,
+                    "sha256 mismatch after destination creation — source kept; "
+                    "destination left for inspection, NOT deleted")
+                return {"src": str(src),
+                        "reason": "destination hash mismatch before source unlink "
+                                  f"(journal op {op_id}); inspect {dst}"}
+            if placement == "copy":
+                # Explicit phase boundary (§4.2): copied + verified, source
+                # still present. A crash here is an outstanding intent with
+                # two complete copies — never zero.
+                self.journal.mark_copied(op_id, sha_after)
+            src.unlink()
             self.journal.commit(op_id, sha_after=sha_after)
             return "applied"
         except Exception as exc:
@@ -171,9 +247,23 @@ class Executor:
         conflicts = root / "_Conflicts"
         candidate = conflicts / src.name
         counter = 2
-        while candidate.exists():  # never overwrite, even in _Conflicts
+        while os.path.lexists(candidate):  # never overwrite, even in _Conflicts
             candidate = conflicts / f"{src.stem} ({counter}){src.suffix}"
             counter += 1
+        # A _Conflicts symlink must not become a second escape hatch.
+        if root.resolve() not in candidate.resolve().parents:
+            return {"src": str(src),
+                    "reason": "_Conflicts route refused: destination escapes the root: "
+                              f"{candidate.resolve()}"}
+        # The conflicts route is still a write: it passes the same policy
+        # spine as the original destination (protected + recent-guard),
+        # rather than inheriting the earlier check on a different path.
+        decision = check_operation(
+            "move", src, candidate, protected=self.protected,
+            recent_guard_minutes=self.recent_guard)
+        if not decision.allowed:
+            return {"src": str(src),
+                    "reason": f"_Conflicts route refused: {decision.reason}"}
         result = self._journaled_move(src, candidate, plan_id, sha)
         return "conflict" if result == "applied" else result
 
@@ -221,18 +311,18 @@ class Executor:
                                  "reason": f"original location {dst} now occupied "
                                            "by different content — refused"})
                 continue
-            reverse_id = self.journal.begin(
-                op["op"], str(src), str(dst), plan_id=op["plan_id"],
-                sha_before=op["sha256_after"], nbytes=src.stat().st_size)
-            try:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src), str(dst))
-                self.journal.commit(reverse_id, sha_after=sha256_file(dst))
+            # Reuse the one journaled move path: create + verify destination
+            # first, only then unlink the current home (cross-device safe).
+            result = self._journaled_move(
+                src, dst, op["plan_id"], op["sha256_after"] or sha256_file(src),
+                op=op["op"])
+            if result == "applied":
                 self.store.mark_rolled_back(op["id"])
                 undone += 1
-            except Exception as exc:
-                self.journal.fail(reverse_id, str(exc))
-                problems.append({"op": op["id"], "reason": str(exc)})
+            else:
+                problems.append({
+                    "op": op["id"],
+                    "reason": result["reason"] if isinstance(result, dict) else str(result)})
         return {"undone": undone, "problems": problems,
                 "note": "undo is itself journaled — undoing the undo is possible"}
 

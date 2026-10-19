@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 
 from .planner import Proposal, decide
+from .safety import is_safe_filename
 
 PROMPT_TEMPLATE = """Classify each file into exactly one folder from this frozen taxonomy:
 {taxonomy}
@@ -49,6 +50,9 @@ def _parse_batch(text: str, allowed: set[str], expected_paths: set[str]) -> list
             return None  # hallucinated or dropped file
         if entry.get("dest") not in allowed:
             return None  # invented folder — the one unforgivable sin
+        new_name = entry.get("new_name")
+        if new_name not in (None, "") and not is_safe_filename(new_name):
+            return None  # path escape via new_name (../../, absolute, a/b)
         confidence = entry.get("confidence")
         if not isinstance(confidence, (int, float)) or not (0.0 <= confidence <= 1.0):
             return None

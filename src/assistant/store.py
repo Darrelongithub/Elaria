@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS operations (
   op TEXT,            -- move | rename | copy | mkdir | trash
   src TEXT, dst TEXT,
   sha256_before TEXT, sha256_after TEXT, bytes INTEGER,
-  status TEXT,        -- intent | committed | failed | rolled_back
+  status TEXT,        -- intent | copied | committed | failed | rolled_back
   error TEXT
 );
 
@@ -647,7 +647,7 @@ class Store:
         with self._lock:
             row = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM operations WHERE ts >= ? "
-                "AND status IN ('committed','intent')", (since_iso,)).fetchone()
+                "AND status IN ('committed','intent','copied')", (since_iso,)).fetchone()
         return int(row["n"])
 
     def mark_rolled_back(self, op_id: int) -> None:
@@ -658,10 +658,12 @@ class Store:
 
     # -- safety-spine journal (§4.2) ----------------------------------------
     def outstanding_intents(self) -> list[dict]:
-        """Intents with no commit — daemon startup recovery inspects these."""
+        """Intents with no commit — daemon startup recovery inspects these.
+        `copied` is still outstanding: its source unlink may not have run."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM operations WHERE status = 'intent' ORDER BY id"
+                "SELECT * FROM operations "
+                "WHERE status IN ('intent', 'copied') ORDER BY id"
             ).fetchall()
         return [dict(r) for r in rows]
 

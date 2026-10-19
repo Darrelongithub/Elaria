@@ -32,6 +32,23 @@ def expand(path: str | Path) -> Path:
     return Path(path).expanduser()
 
 
+def is_safe_filename(value: object) -> bool:
+    """A model/plan-supplied name must be ONE filename, never a path.
+
+    Reject separators and dot-segments outright rather than silently
+    taking ``Path(value).name``: a hostile ``../../x`` or absolute path
+    is a failed verification, not a rename to ``x``.
+    """
+    return (
+        isinstance(value, str)
+        and value not in ("", ".", "..")
+        and "/" not in value
+        and "\\" not in value
+        and "\x00" not in value
+        and Path(value).name == value
+    )
+
+
 def is_protected(path: str | Path, protected: list[str]) -> bool:
     target = expand(path).resolve()
     for entry in protected:
@@ -135,6 +152,12 @@ class Journal:
                 (status, sha_after, error, op_id),
             )
             self._store._conn.commit()
+
+    def mark_copied(self, op_id: int, sha_after: str) -> None:
+        """Cross-device phase boundary: destination bytes exist and have
+        been hash-verified, but the source name has not been unlinked yet.
+        This remains an outstanding intent until `commit`."""
+        self._set_status(op_id, "copied", sha_after=sha_after)
 
     def commit(self, op_id: int, sha_after: str | None = None) -> None:
         self._set_status(op_id, "committed", sha_after=sha_after)
