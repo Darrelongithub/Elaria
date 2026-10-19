@@ -562,6 +562,178 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
   the result claims the second text while the file still contains the first
   synthesis.
 
+## Voice hunt (VOICE-BUGTEST.md) — status after the Gate A–D fixes
+
+Same ledger rules as the sections above; `VB-*` ids are the ones used in
+[`VOICE-BUGTEST.md`](VOICE-BUGTEST.md). Hunt classes are quoted alongside the
+severity vocabulary because the owner marked wrong-voice and offline-speaking as
+their own CRITICAL class.
+
+### VB-1 — Online cache key ignored the voice, so a voice change replayed Flare
+
+- **Severity:** wrong-action (hunt class: CRITICAL — wrong voice)
+- **Status:** fixed in `3d2b9e5`
+- **Repro:** `test_b7_voice_change_invalidates_the_online_cache`
+- **Expected:** a `[gemini] voice` (or `model_voice`) change cannot serve audio
+  rendered for the previous identity, in either direction.
+- **Actual (before):** the key carried the dormant local descriptor, so the same
+  `speech-<hash>.wav` answered for a different voice while `status` reported the
+  new one. The key is now the route's own audio identity.
+
+### VB-2 — A dormant-path setting made every cached ack a permanent silence
+
+- **Severity:** wrong-action (hunt class: HIGH — silent hotkey)
+- **Status:** fixed in `3d2b9e5` (key) and `d63f0de` (re-warm)
+- **Repro:** `test_b5b_dormant_config_change_must_not_silence_the_hotkey_path`,
+  `test_b5d_ack_miss_self_heals_within_one_warm_cycle`, `test_b5e_daemon_re_warms_after_a_miss`
+- **Expected:** either the change does not invalidate the online acks, or a miss
+  triggers exactly one warm cycle and a doctor/`voice status` warning — never a
+  permanent silent `cache_miss`.
+- **Actual (before):** `[tts] length_scale` (a dormant-path key) invalidated every
+  online ack forever; 1.286 ms audible became 0.063 ms silence, and only a manual
+  `assist voice warm` healed it.
+
+### VB-3 — A dormant Piper render answered an online ack
+
+- **Severity:** wrong-action (hunt class: CRITICAL — a voice that must never speak
+  spoke)
+- **Status:** fixed in `3d2b9e5`
+- **Repro:** `test_b7c_local_audio_never_answers_an_online_ack`
+- **Expected:** a missing Flare ack file is silence + a warning + a re-warm, never
+  substitute audio, and `cached_acks` must not call a local file healthy.
+- **Actual (before):** `_ack_path` preferred any warmed local copy "beats silence"
+  — introduced with the interim online-voice commit and reachable on any box that
+  had ever run the local voice. The fallback and its comment are deleted.
+
+### VB-4 — Any string in `[gemini] voice` silently became her voice
+
+- **Severity:** wrong-action (hunt class: CRITICAL — config poisoning)
+- **Status:** fixed in `3d2b9e5`
+- **Repro:** `test_a3_voice_is_pinned_and_the_precedence_is_documented`,
+  `test_a3b_client_refuses_an_unapproved_voice_even_when_called_directly`
+- **Expected:** `[gemini] voice` validated against the configured canonical voice
+  (Flare); a mismatch is a loud doctor FAIL and reported silence, never silent
+  adoption; the precedence over the legacy `tts.selected_voice` row is documented.
+- **Actual (before):** `voice_name = voice or "Flare"` with no validation, doctor
+  green, and two config sources disagreeing about who speaks.
+
+### VB-5 — One thought, two check-ins
+
+- **Severity:** wrong-action (hunt class: MED — she speaks when she should not)
+- **Status:** fixed in `c1469cc`
+- **Repro:** `test_c9_blip_speech_does_not_rearm_the_ladder_for_a_second_nag`
+- **Expected:** "Is that all?" once per thought; only a real resumption re-arms.
+- **Actual (before):** any frame ≥ the RMS gate cleared `_asked`, so a 30 ms breath
+  or click inside one long pause earned a second nag.
+
+### VB-6 — Asked, then the mic never released
+
+- **Severity:** crash-with-safe-state (hunt class: MED — resource hold)
+- **Status:** fixed in `c1469cc`
+- **Repro:** `test_c9b_after_the_checkin_the_session_closes_after_grace`
+- **Expected:** the check-in is followed by a grace close that releases the
+  microphone and the `listening` state.
+- **Actual (before):** the user's hotkey was the only exit; a headless repro held
+  the source for ~50 minutes.
+
+### VB-7 — Rotation dropped the head of a long dictation
+
+- **Severity:** data-loss
+- **Status:** fixed in `c1469cc`
+- **Repro:** `test_d11b_rotation_on_a_long_utterance_keeps_every_word`
+- **Expected:** words already transcribed are never discarded because a Live
+  session rotated.
+- **Actual (before):** `collected.clear()` threw away received finals; anything
+  older than the ≤30 s replay buffer vanished from the transcript while
+  `assist events` had already shown it.
+
+### VB-8 — Transcribed words reached the intent ladder with no confidence gate
+
+- **Severity:** wrong-action (hunt class: HIGH)
+- **Status:** fixed in `c1469cc`
+- **Repro:** `test_d13b_low_confidence_command_words_never_execute`
+- **Expected:** a command-mode transcript is gated on ASR confidence and on the
+  cleanup-flagged state before anything is routed, and a mutating intent never runs
+  on unverifiable audio.
+- **Actual (before):** `route(text)` ran whatever the mic heard: a TV saying
+  "undo." reversed files. `Daemon._command_gate` now vetoes and says why.
+
+### VB-9 — The doctor green-lit a broken biometric template
+
+- **Severity:** cosmetic (hunt class: MED — misleading reporting about a real
+  failure)
+- **Status:** fixed in `b058ea2`
+- **Repro:** `test_e14_corrupt_or_world_readable_voiceprint_fails_the_doctor`
+  (6 parametrised cases), `test_e14c_voiceprint_checks_agree_with_the_runtime_and_leave_good_files_alone`
+- **Expected:** non-empty, parseable, right schema, dimension and model agreeing
+  with config, mode `0600`; anything else FAILs.
+- **Actual (before):** `voiceprint.exists()` only — `ok — present (path only…)` for
+  a 0-byte or 0644 template.
+
+### VB-10 — SIGKILL of the daemon orphaned its audio child
+
+- **Severity:** crash-with-safe-state (hunt class: MED)
+- **Status:** fixed in `b058ea2`
+- **Repro:** `test_g18_kill_daemon_mid_playback_leaves_no_player_running`,
+  `test_g18b_the_sweep_names_a_parentless_audio_child`
+- **Expected:** no audio process survives the daemon; if one does, it is named by
+  the doctor and reaped by `assist voice cleanup` / the boot sweep.
+- **Actual (before):** the player (observed pid 11712) outlived `kill -9`;
+  `pw-record` had the same shape, so the mic stayed claimed. `PR_SET_PDEATHSIG`
+  plus a real supervisor sweep now cover it — the sandbox kernel proved pdeathsig
+  alone is not a promise to rely on.
+
+### VB-11 — A rejected second hotkey press spoke its own ack
+
+- **Severity:** cosmetic (hunt class: LOW)
+- **Status:** fixed in `c1469cc`
+- **Repro:** `test_g19_double_hotkey_acks_once`
+- **Expected:** a refusal is not a request to be acknowledged.
+- **Actual (before):** the loser got `note: "already listening"` *and* an "On it."
+  clip: one double-press, two answers.
+
+### VB-12 — 0-byte audio blamed on a missing package
+
+- **Severity:** cosmetic (hunt class: LOW)
+- **Status:** open-reproduced, deliberately unpinned — it fails safe
+- **Repro:** `test_d13_empty_or_silent_audio_is_never_a_confident_transcript`
+  covers the safe half; the misleading message is unreproducible without
+  `faster-whisper` absent, so it is recorded, not tested.
+- **Expected:** "the recording is empty", not "install faster-whisper".
+
+### VB-13 — The socket opened before the ack cache existed
+
+- **Severity:** wrong-action (hunt class: HIGH — silent at boot)
+- **Status:** fixed in `d63f0de`
+- **Repro:** `test_b5c_boot_warm_starts_before_the_socket_serves`,
+  `test_b5cb_early_acks_queue_behind_the_boot_warm`
+- **Expected:** the warm starts before anything can ask for an ack, or early acks
+  queue behind it.
+- **Actual (before):** `await serve(...)` came first and the warm was a background
+  task afterwards, so the first press after boot was silent — online, one
+  rate-limited render per ack.
+
+### VB-14 — The Waybar pill called cloud audio "local"
+
+- **Severity:** cosmetic (hunt class: LOW)
+- **Status:** fixed in `b058ea2`
+- **Repro:** `test_a4c_waybar_line_is_truthful_in_every_mode`
+- **Expected:** the pill states the posture: cloud, local, or silent-with-reason.
+- **Actual (before):** `voice: local gemini-native-audio / Flare` online and
+  `voice: local none / none` offline.
+
+### VB-15 — "do it anyway" / "approve" are not voice-reachable (gap, not a bug)
+
+- **Severity:** cosmetic (a missing capability, recorded so it is not mistaken for
+  a broken gate)
+- **Status:** open — deliberately not implemented while fixing bugs
+- **Evidence:** `intents.route("do it anyway")` and `route("approve")` return
+  `None`; `test_f16d_do_it_anyway_by_voice_is_not_a_gate_bypass` pins that no
+  spoken phrase bypasses a gate today.
+- **Note for the owner:** this is also why VB-8's veto ends with a typed
+  instruction rather than "say it again to confirm" — there is no spoken
+  confirmation channel to offer yet.
+
 ## Open reproduced bugs: Area G — IPC, daemon, voice-test
 
 ### BH-G1 — Speaker-threshold suggestion tie-breaks dangerously low

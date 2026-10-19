@@ -3,21 +3,34 @@
 Run 2026-10-20 in the Arena sandbox. `GEMINI_MODE=mock`, no API key (the suite
 fixture deletes `GEMINI_API_KEY`/`GOOGLE_API_KEY` and asserts it stays absent),
 `HOME`/XDG redirected to temp dirs — no real folders, no voiceprint, no mic.
-`pytest -q tests/test_voice_bughunt.py` → **34 passed, 13 xfailed** (every
-`xfail` is a confirmed defect pinned as an executable repro; strict, so a fix
-turns the suite red until the pin is removed).
+`pytest -q tests/test_voice_bughunt.py` → **34 passed, 13 xfailed** at hunt time
+(every `xfail` was a confirmed defect pinned as an executable repro; strict, so a
+fix turns the suite red until the pin is removed).
+
+**After the fix passes (Gates A–D, 2026-10-20): 59 passed, 1 skipped, 0 xfailed** —
+all 13 pins were converted into passing regressions and each one was re-run against
+the pre-fix source to prove it still bites. The skipped test is the needs-live
+placeholder (`test_b5f`), never faked. See **FIXES** below and the ledgers in
+[`bugs.md`](bugs.md) / [`change.md`](change.md).
 
 Re-run everything:
 
 ```bash
 cd ~/Elaria && PYTHONPATH=src pytest -q tests/test_voice_bughunt.py         # all of it
-PYTHONPATH=src pytest -q tests/test_voice_bughunt.py --runxfail   # failures as failures
+# prove a guard still bites (hide the fix, keep the test):
+git stash push -u -- src/assistant/tts.py src/assistant/proc.py && \
+  PYTHONPATH=src pytest -q tests/test_voice_bughunt.py -k "b7 or g18b"; git stash pop
 PYTHONPATH=src pytest -q --tb=line                            # whole suite, complete
 ```
 
 ## Verdict up front
 
-**She can be trusted to stay silent, and cannot yet be trusted to speak.**
+**Hunt verdict (before the fixes): she could be trusted to stay silent, and could
+not be trusted to speak.** Post-fix verdict: **both halves hold in the sandbox** —
+she stays silent on every text-only path and speaks only as Flare, from cached
+audio, with every refusal and every cold cache reported. Two things remain open by
+nature, not by neglect: the *ear-level* confirmation of the voice pin and the size
+of the online boot-warm window, both on the needs-live list below.
 
 * Silence: 0 defects. Every offline, unavailable-cloud and mock path was proven
   to make **zero** audio calls, write **zero** files, and report why
@@ -77,6 +90,8 @@ VB-12 and VB-15 are observations, not pins.
 ## CRITICAL class — wrong voice
 
 ### VB-1 · a voice change replays the previous voice's audio
+
+**Status:** FIXED in `3d2b9e5` — the online cache key is now the cloud identity (`[gemini] voice` + `model_voice` + sample rate); guarded by `test_b7_voice_change_invalidates_the_online_cache`. The *ear* verdict still needs a live key: see needs-live item 2.
 `src/assistant/tts.py:342-348`
 
 The cache key is `{text, backend, voice: descriptor.voice_id, model, speaker,
@@ -98,6 +113,8 @@ identical reply. Fix: for the cloud route key on `("gemini-native-audio",
 gemini.voice, gemini.model_voice)` and nothing else.
 
 ### VB-3 · a dormant Piper render answers an online ack
+
+**Status:** FIXED in `3d2b9e5` — the local fallback in `_ack_path` is deleted; a missing Flare ack is silence + warning + re-warm; `test_b7c`.
 `src/assistant/tts.py:538-542`
 
 ```python
@@ -121,9 +138,11 @@ assert speech.cached_ack("on_it") is None       # FAILS: returns the Piper file
 
 Fix: delete the fallback — a missing online ack is a miss, and a miss is a
 re-warm, not a substitute voice. Interim relief on the box:
-`rm -rf ~/.local/share/assistant/voice-cache && assist voice warm`.
+~~`rm -rf ~/.local/share/assistant/voice-cache && assist voice warm`~~ — no longer needed: the fallback that made the stale local file playable is deleted (`3d2b9e5`), so an online box now re-warms on its own after any invalidation and `assist voice status` reports `ack_cache` instead of implying health.
 
 ### VB-4 · any config string silently becomes her voice
+
+**Status:** FIXED in `3d2b9e5` — `[gemini] voice` must be in `[gemini] allowed_voices` (default `["Flare"]`) or she refuses and `assist doctor` FAILs; `test_a3`, `test_a3b`.
 `src/assistant/gemini_client.py:253`, no validation anywhere
 
 `[gemini] voice = "Zephyr"` ⇒ she speaks Zephyr. A legacy `tts.selected_voice`
@@ -146,6 +165,8 @@ Owner said one voice ever, so a warning is the minimum honest behaviour.
 ## HIGH — the ack that never arrives
 
 ### VB-2 · an unrelated setting kills every cached ack, forever
+
+**Status:** FIXED in `3d2b9e5` + `d63f0de` — the dormant descriptor left the online key, and a miss now requests one warm cycle (never permanent silence); `test_b5b`, `test_b5d`, `test_b5e`.
 `src/assistant/tts.py:342-348` (same key, opposite direction)
 
 `length_scale`, `speaker`, `model`, the selected local voice — all dormant-path
@@ -167,6 +188,8 @@ make `_ack` self-heal: on a miss, schedule a warm task and say so in doctor
 until it clears.
 
 ### VB-13 · the socket opens before the cache exists
+
+**Status:** FIXED in `d63f0de` — the warm task is created before `serve()` and `_ack` queues behind it (bounded 2 s); `test_b5c`, `test_b5cb`. The *size* of the online window is needs-live (`test_b5f`, skipped by design).
 `src/assistant/daemon.py:903-905`
 
 ```python
@@ -182,6 +205,8 @@ config is the §18 failure mode. Fix: `await` the warm before `serve()`, or hold
 `ack` at the text surface (as now) plus a `voice warming` doctor line.
 
 ### VB-8 · transcribed words reach the intent ladder with no confidence gate
+
+**Status:** FIXED in `c1469cc` — `Daemon._command_gate` vetoes flagged / low-confidence transcripts (and any mutating intent at unknown confidence); `test_d13b`.
 `src/assistant/daemon.py:489`
 
 ```python
@@ -206,19 +231,19 @@ need the typed path or an explicit confirm.
 
 ## MED — endpointing, transcripts, abuse
 
-* **VB-5 — one thought, two nags.** `transcribe.py:61` clears `_asked` on any
+* **VB-5 — one thought, two nags.** **FIXED `c1469cc`** · `test_c9_blip_speech_does_not_rearm_the_ladder_for_a_second_nag` `transcribe.py:61` clears `_asked` on any
   frame over the RMS gate, so a breath, a key click, or her own playback bleed
   mid-pause re-arms the ladder and "Is that all?" fires again inside the same
   silence. The docstring promises otherwise. Repro: 1.2 s silence (ask) → one
   30 ms blip → 1.2 s silence → **asked twice**. Needs the (currently missing —
   see the note at the end) energy-VAD or a minimum re-arm window
   (e.g. speech sustained ≥250 ms) to tell a thought-resumes from a noise.
-* **VB-6 — asked, then never closed.** Item 9: asked once, *then closes after
+* **VB-6 — asked, then never closed.** **FIXED `c1469cc`** · `test_c9b_after_the_checkin_the_session_closes_after_grace` Item 9: asked once, *then closes after
   grace*. Nothing closes: the only exit is the user's own hotkey release, and
   the daemon's capture source is `speech_frames=100_000` (~50 min). Walk away
   mid-dictation and the mic, the `listening` state and the PipeWire stream stay
   held, silently. `SilenceLadder` has no grace concept at all.
-* **VB-7 — rotation eats the head.** `transcribe.py:247` does
+* **VB-7 — rotation eats the head.** **FIXED `c1469cc`** (data-loss) · `test_d11b_rotation_on_a_long_utterance_keeps_every_word` `transcribe.py:247` does
   `collected.clear()` on a server GoAway, discarding finals already received;
   only the ≤30 s replay buffer is re-heard. Repro (replay window shrunk to
   0.12 s so it fits one test): 30-frame utterance, session 1 emits `w0 w3 w6`,
@@ -227,18 +252,18 @@ need the typed path or an explicit confirm.
   does not, and `assist events` already showed the words — so the user watches
   text evaporate. Fix: keep the earlier finals and append (dedupe by frame
   offset), or persist interim finals as they arrive.
-* **VB-9 — doctor trusts a broken biometric.** `cli.py:196-201` checks
+* **VB-9 — doctor trusts a broken biometric.** **FIXED `b058ea2`** · `test_e14_corrupt_or_world_readable_voiceprint_fails_the_doctor` (6 cases) + `test_e14c` `cli.py:196-201` checks
   `voiceprint.exists()` only. A 0-byte, unparseable, wrong-schema or **0644**
   `voiceprint.json` prints `ok — present (path only…)`, while
   `load_voiceprint()` raises on the same file. Refuse loudly (and check mode
   `& 0o077`) instead of green-lighting an unusable, world-readable template.
-* **VB-14 — the pill mislabels the voice** (`waybar.py:71`): it prints
+* **VB-14 — the pill mislabels the voice** **FIXED `b058ea2`** · `test_a4c_waybar_line_is_truthful_in_every_mode` (`waybar.py:71`): it prints
   `voice: local <backend> / <voice_id>`, so **online** it reads
   "voice: local gemini-native-audio / Flare" (cloud audio, labelled local) and
   **offline** "voice: local none / none" — which reads as broken, not as the
   posture. The `voice status` *payload* is truthful (A.4 passes); only this
   label is stale. Pinned; LOW because it misinforms rather than misbehaves.
-* **VB-10 — SIGKILL orphans the audio child.** `tts.py:503` runs the player via
+* **VB-10 — SIGKILL orphans the audio child.** **FIXED `b058ea2`** · `test_g18_kill_daemon_mid_playback_leaves_no_player_running` + `test_g18b` `tts.py:503` runs the player via
   `subprocess.run` with no `start_new_session`/process group, so a killed daemon
   leaves `pw-play` holding the sink. Proven with a real daemon subprocess and a
   real player: after `kill -9`, the player pid **11712 was still alive**. Same
@@ -246,13 +271,13 @@ need the typed path or an explicit confirm.
   path is fine (`aclose` → `terminate()` + `await wait()`, `capture.py:225-228`).
   Fix: `start_new_session=True` + a systemd user scope with
   `Delegate=yes`/`KillMode=control-group`, or track and kill children on exit.
-* **VB-11 — a rejected double-press still speaks.** `daemon.py:412-414` answers
+* **VB-11 — a rejected double-press still speaks.** **FIXED `c1469cc`** · `test_g19_double_hotkey_acks_once` `daemon.py:412-414` answers
   the *loser* of the race with its own `on_it` ack, so one double-press sounds
   like two answers (measured: 2 plays across two starts, 3 including the
   release ack). The single-owner guard itself works — `note: "already
   listening"` and no second session — so this is wording, not correctness:
   the rejected press should return the note with no ack speech.
-* **VB-12 — one diagnostic that lies by omission.** 0-byte audio offline raises
+* **VB-12 — one diagnostic that lies by omission.** **OPEN (unpinned, LOW)** 0-byte audio offline raises
   `RuntimeError: all ASR backends failed — local: offline ASR needs
   faster-whisper…`: an empty file is blamed on a missing package. Fails safe
   (no confident transcript, no crash, no phantom queue row), but the message
@@ -304,22 +329,88 @@ identical (file lookup + spawn) and only the *warm* step gains network latency.
 Real `pw-play`/`pipewire` queueing, device wake latency, and per-clip
 wall-clock duration are needs-live.
 
+## FIXES — Gates A–D, in the order the gate rule required
+
+Each gate went green before the next one started. Every fix converted its
+strict-xfail pin into a passing regression, and every converted test was re-run
+against the pre-fix source (a `git worktree` at `9b0e4dd` for Gates A/B, `git
+stash` of the source files for C/D) to confirm it still fails there.
+
+**Gate A — voice identity, before anything else is trusted (`3d2b9e5`)**
+
+| Finding | What changed | Now guarded by |
+| --- | --- | --- |
+| VB-1 | `_cache_path` takes the *route's own audio identity*: `[gemini] voice` + `model_voice` + sample rate online, and voice/model/speaker/length_scale on the dormant local path. A voice or model change moves every path in both directions, so stale audio is not addressable under a new identity. | `test_b7_voice_change_invalidates_the_online_cache` |
+| VB-3 | `_ack_path`'s "a warmed local copy beats silence" fallback is deleted, comment included. A missing Flare ack is silence + `warning` + `rewarm_needed`, and `cached_acks`/`ack_cache` cannot report health off a local file. | `test_b7c_local_audio_never_answers_an_online_ack` |
+| VB-4 | `[gemini] voice` is validated against `[gemini] allowed_voices` (default `["Flare"]`) in `config.py`; a mismatch refuses at the route *and* at the transport, and `assist doctor` prints `VOICE IDENTITY REFUSED` as a **FAIL**. Precedence is documented in README + `config.toml.example`, and `legacy_selection_ignored_online` reports the inert `tts.selected_voice` row. | `test_a3_voice_is_pinned_and_the_precedence_is_documented`, `test_a3b_client_refuses_an_unapproved_voice_even_when_called_directly` |
+
+**Gate B — she speaks when she should (`d63f0de`, with the key half in A)**
+
+| Finding | What changed | Now guarded by |
+| --- | --- | --- |
+| VB-2 | A miss on a speaking route *is* the trigger: `request_rewarm` / `take_rewarm_request` / `warm_due`, consumed by the daemon after `_ack`, so the next press is audible. Never a permanent silent `cache_miss`; `voice status` + doctor state the cold cache. | `test_b5b`, `test_b5d_ack_miss_self_heals_within_one_warm_cycle`, `test_b5e_daemon_re_warms_after_a_miss` |
+| VB-13 | `run()` creates the warm task **before** `serve(...)`, and `_ack` queues a would-be miss behind the in-flight warm through a bounded (2 s), pending-aware gate. `speech.warm` opens the gate, so `assist voice warm` stays the documented cure. | `test_b5c_boot_warm_starts_before_the_socket_serves`, `test_b5cb_early_acks_queue_behind_the_boot_warm` |
+
+**Gate C — session behaviour (`c1469cc`)**
+
+| Finding | What changed | Now guarded by |
+| --- | --- | --- |
+| VB-5 | Re-arming needs speech sustained ≥ `speech_resume_s` (0.4 s); a blip never nags twice, a real resumption still earns a new check-in. | `test_c9_blip_speech_does_not_rearm_the_ladder_for_a_second_nag` |
+| VB-6 | After the check-in, `checkin_grace_s` (8 s) of continued silence closes the session: `session.grace_close`, a note, and the capture source released. | `test_c9b_after_the_checkin_the_session_closes_after_grace` |
+| VB-7 (data-loss) | Rotation consumes only the GoAway markers; received finals are kept, and the replayed tail's echo is folded by suppressing an immediately repeated segment — no lost head, no doubled words. | `test_d11b_rotation_on_a_long_utterance_keeps_every_word` |
+| VB-8 | `Daemon._command_gate` between transcript and ladder: `flagged`, `confidence < command_min_confidence` (0.85), or unknown confidence **for a mutating intent** → nothing is routed; the veto reports the text, the numbers, the intent and "Not executed". | `test_d13b_low_confidence_command_words_never_execute` |
+| VB-11 | The refused press gets no ack at all (`suppressed: "already listening — no second ack"`). | `test_g19_double_hotkey_acks_once` |
+
+**Gate D — integrity and surfaces (`b058ea2`)**
+
+| Finding | What changed | Now guarded by |
+| --- | --- | --- |
+| VB-9 | `voicetest.voiceprint_health()`: size, JSON, schema, centroid/dimension agreement, finite values, configured dimension + model, and mode `0600`. Wrong = doctor **FAIL** with the cure; absent = warning; `enroll` chmods as it writes. | `test_e14_…` (6 parametrised cases), `test_e14c_…` |
+| VB-10 | `assistant/proc.py`: player and recorder spawn with `PR_SET_PDEATHSIG` in their own session; because that kernel promise does not hold for every thread arrangement (this sandbox proves it), the daemon also sweeps parentless audio children **before it serves**, `assist doctor` FAILs on `orphaned audio` naming the pids, and `assist voice cleanup` works with the daemon dead. A custom `[tts] player` is part of the match list. | `test_g18_kill_daemon_mid_playback_leaves_no_player_running`, `test_g18b_the_sweep_names_a_parentless_audio_child` |
+| VB-14 | `waybar.format_voice_line()`: cloud says cloud, the deliberately un-dormanted path says local, silence says silent and why. | `test_a4c_waybar_line_is_truthful_in_every_mode` |
+
+Two shipped contract changes were made *deliberately* and are commented in place:
+`test_silence_ladder_asks_once_per_segment` (phase 1 — a single frame no longer
+re-arms) and the phase-8 offline command (a 0.30-confidence local transcript is
+**refused**, transcript kept, cloud redo queued). One test-integrity fix came out
+of Gate C: `test_g19_double_hotkey_acks_once` had carried the clock-jump/rotation
+body under the wrong name, with the VB-11 marker hiding a fixture too short to
+cross the age cap — it is now `test_g20_clock_jump_does_not_fire_and_the_rotation_cap_holds`,
+with a cap it really crosses, and the VB-11 repro is the real double-press test.
+The `Session` fake also gained the `turn_complete` the real transport sends, which
+removed a 15 s stall from every session test: whole-suite time 73 s → 32 s.
+
 ## needs-live list — parked, not faked
 
 1. **VB-13 online warm window** — time `assist voice warm` with a real key:
    `GEMINI_MODE=live GEMINI_API_KEY=… PYTHONPATH=src python -m assistant.cli
    voice warm`, and press the hotkey immediately after `systemctl --user restart
    assistant` to see whether the first ack is silent.
-2. **VB-1/VB-4 on real audio** — set `[gemini] voice` to a second prebuilt name,
-   `assist voice warm`, then confirm by ear whether the ack still sounds like
-   the previous voice. Also confirm Flare is the voice you want before pinning
-   it in code.
+2. **VB-1/VB-4 by ear (still required after the fix)** — the cache-key half is
+   proven in the sandbox (`test_b7`: the file paths move with the identity, so a
+   stale clip *cannot* be served), but only ears can settle the sound. With a
+   real key: `assist voice status` → note the acks; set
+   `[gemini] voice = "Kore"` **plus** `[gemini] allowed_voices = ["Flare", "Kore"]`;
+   `assist doctor` (must stay green), `assist voice warm`, press the hotkey —
+   the ack must sound like the NEW voice immediately, and setting the voice back
+   must sound like Flare again with no re-render (`cached: true`). Remove
+   `Kore` from `allowed_voices` while leaving `voice = "Kore"`: she must go
+   silent and the doctor must FAIL — the pin is the fix, so a *silent* refusal is
+   a pass, and only the ear test can prove the audio itself changed.
 3. **VB-10 with real PipeWire** — `kill -9` the daemon mid-`pw-play` and
    mid-dictation; check `pw-cli ls Node` for the leaked stream and
-   `pactl list source-outputs` for the held mic.
+   `pactl list source-outputs` for the held mic. On a normal Fedora kernel
+   PR_SET_PDEATHSIG should kill the child outright; the sandbox kernel does not
+   deliver it for the threaded spawn, which is why the sweep exists. Confirm both
+   halves: after `kill -9`, `assist doctor` must name any survivor and
+   `assist voice cleanup` (or a plain restart) must free the sink/mic.
 4. **VB-5/VB-6 acoustics** — narration with real 0.6/1.5/3 s pauses, a cough
-   after the check-in, and walking away mid-session; confirm the double-nag and
-   the 50-minute `listening` hold on hardware.
+   after the check-in, and walking away mid-session. The double-nag and the
+   held-mic behaviour are fixed at the ladder level (`speech_resume_s`,
+   `checkin_grace_s`); what hardware decides is whether those two numbers are
+   *comfortable* — raise `checkin_grace_s` if she closes while you are still
+   thinking, lower `speech_resume_s` if a genuine restart of a sentence fails to
+   re-arm. Log first, tune second (E.14).
 5. **E.14 wake word + voiceprint** — no wake-word activation exists in the
    runtime (`voicetest.py` is the offline harness only), so "other speakers / TV
    / playback must not wake her" and "never fall back to any voice" are true
@@ -327,8 +418,11 @@ wall-clock duration are needs-live.
    over a day, and the `OpenWakeWordScorer` path on the Fedora box.
 6. **D.13 real garbage audio** — silence-only, music, TV speech, clipped
    screaming through the *actual* ASR, then `assist dictate --command` on a TV
-   saying "undo." The structural gate (or lack of one) is proven; the acoustic
-   behaviour cannot be.
+   saying "undo." The structural gate now exists (`command_min_confidence`,
+   `flagged`, mutating-intent veto) and `test_d13b` proves the veto; what only
+   hardware can answer is whether real ASR reports confidence *high enough to be
+   trusted* for a TV voice — if it reports 0.95 on a mumble, the number is the
+   thing to fix, not the gate.
 7. **A.2 with a live call in flight** — `GEMINI_MODE=live`, start a reply, pull
    the cable mid-stream: expect a *reported* silence, and check that no partial
    Flare clip is played.
