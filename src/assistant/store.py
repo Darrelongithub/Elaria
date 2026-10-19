@@ -69,7 +69,24 @@ CREATE TABLE IF NOT EXISTS transcripts (
   duration_s REAL NOT NULL DEFAULT 0,
   divergence_pct REAL,          -- cleanup diff-gate measurement (§12.5)
   flagged INTEGER NOT NULL DEFAULT 0,  -- 1 = divergence/language gate tripped
-  inbox_path TEXT
+  inbox_path TEXT,
+  confidence REAL,              -- ASR confidence when a backend reports one
+  cloud_status TEXT NOT NULL DEFAULT 'complete',
+  offline_text TEXT             -- preserved placeholder after cloud redo
+);
+
+CREATE TABLE IF NOT EXISTS cloud_jobs (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  kind TEXT NOT NULL,           -- cloud_transcription | transcript_cleanup |
+                                -- plan_tiers | chat | external_action
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  requires_approval INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  result_json TEXT,
+  completed_ts TEXT
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -167,6 +184,18 @@ class Store:
             columns = {r[1] for r in self._conn.execute("PRAGMA table_info(doc_chunks)")}
             if "embedding" not in columns:
                 self._conn.execute("ALTER TABLE doc_chunks ADD COLUMN embedding BLOB")
+            # Additive migration (Phase 8): offline transcript provenance.
+            transcript_columns = {
+                r[1] for r in self._conn.execute("PRAGMA table_info(transcripts)")
+            }
+            if "confidence" not in transcript_columns:
+                self._conn.execute("ALTER TABLE transcripts ADD COLUMN confidence REAL")
+            if "cloud_status" not in transcript_columns:
+                self._conn.execute(
+                    "ALTER TABLE transcripts ADD COLUMN cloud_status TEXT "
+                    "NOT NULL DEFAULT 'complete'")
+            if "offline_text" not in transcript_columns:
+                self._conn.execute("ALTER TABLE transcripts ADD COLUMN offline_text TEXT")
             self.fts5_available = self._init_fts5()
             self._conn.commit()
 
@@ -248,9 +277,11 @@ class Store:
     _TRANSCRIPT_COLUMNS: ClassVar[list[str]] = [
         "ts", "session_id", "audio_path", "raw_text", "cleaned_text", "language",
         "backend", "model", "duration_s", "divergence_pct", "flagged", "inbox_path",
+        "confidence", "cloud_status", "offline_text",
     ]
 
     def log_transcript(self, **fields) -> int:
+        fields.setdefault("cloud_status", "complete")
         values = [fields.get(c) for c in self._TRANSCRIPT_COLUMNS]
         with self._lock:
             cur = self._conn.execute(
@@ -267,6 +298,104 @@ class Store:
                 "SELECT * FROM transcripts ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_transcript(self, transcript_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM transcripts WHERE id = ?", (transcript_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_transcript_cloud(self, transcript_id: int, *, text: str,
+                                backend: str, model: str | None,
+                                confidence: float | None = None) -> None:
+        """Replace an offline placeholder with the cloud pass while keeping
+        the placeholder itself in offline_text — provenance is not erased."""
+        with self._lock:
+            self._conn.execute(
+                """UPDATE transcripts
+                   SET offline_text = COALESCE(offline_text, raw_text),
+                       raw_text = ?, backend = ?, model = ?,
+                       confidence = COALESCE(?, confidence),
+                       cloud_status = 'cloud_complete'
+                   WHERE id = ?""",
+                (text, backend, model, confidence, transcript_id))
+            self._conn.commit()
+
+    def update_transcript_cleanup(self, transcript_id: int, *, cleaned_text,
+                                  divergence_pct, flagged: bool,
+                                  model: str | None) -> None:
+        with self._lock:
+            self._conn.execute(
+                """UPDATE transcripts
+                   SET cleaned_text = ?, divergence_pct = ?, flagged = ?,
+                       model = COALESCE(?, model)
+                   WHERE id = ?""",
+                (cleaned_text, divergence_pct, 1 if flagged else 0,
+                 model, transcript_id))
+            self._conn.commit()
+
+    def set_transcript_cloud_status(self, transcript_id: int, status: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE transcripts SET cloud_status = ? WHERE id = ?",
+                (status, transcript_id))
+            self._conn.commit()
+
+    # -- durable cloud-work queue (Phase 8, §13.9: queue, don't fail) ---------
+    def enqueue_cloud_job(self, *, ts: str, kind: str, payload_json: str,
+                          requires_approval: bool = False,
+                          status: str = "pending") -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO cloud_jobs
+                   (ts, kind, payload_json, status, requires_approval)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (ts, kind, payload_json, status, 1 if requires_approval else 0))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def list_cloud_jobs(self, status: str | None = None,
+                        limit: int = 100) -> list[dict]:
+        query = "SELECT * FROM cloud_jobs"
+        params: list = []
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY id LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_cloud_job(self, job_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM cloud_jobs WHERE id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def update_cloud_job(self, job_id: int, *, status: str,
+                         result_json: str | None = None,
+                         error: str | None = None,
+                         completed_ts: str | None = None,
+                         increment_attempts: bool = False) -> None:
+        with self._lock:
+            self._conn.execute(
+                """UPDATE cloud_jobs
+                   SET status = ?, result_json = ?, last_error = ?,
+                       completed_ts = ?,
+                       attempts = attempts + ?
+                   WHERE id = ?""",
+                (status, result_json, error, completed_ts,
+                 1 if increment_attempts else 0, job_id))
+            self._conn.commit()
+
+    def cloud_job_counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS n FROM cloud_jobs GROUP BY status"
+            ).fetchall()
+        return {str(r["status"]): int(r["n"]) for r in rows}
 
     # -- documents / chunks (indexer, §3.7-3.8) -------------------------------
     def upsert_document(self, *, path, root, sha256, size, mtime, mime, ext,

@@ -9,11 +9,11 @@ One formatter, two delivery modes sharing it:
              state too, not just the ack)
 
 Classes emitted here are styled in ui/waybar/style.css — keep them in sync:
-idle | listening | transcribing | halted | down | mock (combinable).
+idle | listening | transcribing | halted | down | mock | offline |
+forced-offline (combinable).
 
-The mock/offline glyph follows §13.9 rule 1: one small marker, that's the
-entire UI change. It reflects GEMINI_MODE today; real connectivity
-detection joins it later without reshaping this contract.
+The offline marker follows §13.9 rule 1: one small suffix, while the
+tooltip carries the exact connectivity mode, queue and local voice.
 """
 
 from __future__ import annotations
@@ -42,12 +42,33 @@ def format_waybar(status: dict) -> dict:
     if status.get("gemini_mode") == "mock":
         classes.append("mock")
         suffix = " ·mock"
+    connectivity = status.get("connectivity") or {}
+    connectivity_mode = str(status.get("connectivity_mode")
+                            or connectivity.get("effective_mode") or "")
+    if connectivity_mode == "FORCED_OFFLINE":
+        classes.append("forced-offline")
+        suffix = " ·forced offline"
+    elif connectivity_mode == "OFFLINE":
+        classes.append("offline")
+        suffix = " ·offline"
     last = status.get("last_transcript") or {}
     tooltip_lines = [
         f"Elaria — {mode_label} (gemini: {status.get('gemini_mode')})",
         (f"uptime {status.get('uptime_s', 0):.0f}s · live calls today: "
          f"{status.get('quota_today_live_calls', 0)}"),
     ]
+    if connectivity_mode:
+        tooltip_lines.append(
+            f"connectivity: {connectivity_mode.lower().replace('_', ' ')} "
+            f"(preference: {connectivity.get('preference', 'auto')})")
+    queue_counts = status.get("cloud_queue") or {}
+    if queue_counts:
+        tooltip_lines.append("cloud queue: " + ", ".join(
+            f"{k}={v}" for k, v in sorted(queue_counts.items())))
+    voice = status.get("voice") or {}
+    if voice:
+        tooltip_lines.append(
+            f"voice: local {voice.get('backend')} / {voice.get('voice_id')}")
     if status.get("capture"):
         tooltip_lines.append(f"capture: {status['capture']}")
     if last.get("snippet"):

@@ -22,16 +22,20 @@ import socket as socket_mod
 import time
 
 from . import __version__
+from .asr import local_asr_status
 from .capture import PipeWireCapture, SimulatedCapture
 from .config import Config, load_config, load_humour_profile
 from .cost import day_start_iso, iso_now, month_start_iso
 from .gemini_client import GeminiClient
 from .ipc import serve
+from .modes import ModeManager
+from .offline_queue import CloudQueue
 from .organiser import OrganiserService
 from .persona import PersonaGovernor, TurnContext
 from .safety import clear_halt, is_halted, set_halt
 from .store import Store
 from .transcribe import DictationService
+from .tts import STANDARD_ACKS, SpeechService
 
 
 def _sd_notify(message: str) -> None:
@@ -58,7 +62,13 @@ class Daemon:
         self.started_at = iso_now()
         self.started_monotonic = time.monotonic()
         self.mode = "idle"
-        self.dictation = DictationService(config, self.store, self.client)
+        # Phase 8 resident hot paths: connectivity, ONE local voice, queue.
+        self.mode_manager = ModeManager(config, self.store)
+        self.speech = SpeechService(config, self.store)
+        self.cloud_queue = CloudQueue(config, self.store, self.client, self.mode_manager)
+        self.dictation = DictationService(
+            config, self.store, self.client,
+            mode_manager=self.mode_manager, offline_queue=self.cloud_queue)
         self.organiser = OrganiserService(config, self.store, self.client)
         from .executor import Executor
         self.executor = Executor(config, self.store)
@@ -66,13 +76,18 @@ class Daemon:
         from .memory import Memory
         self.memory = Memory(self.store, make_embedder(config))
         from .meeting import MeetingService
-        self.meetings = MeetingService(config, self.store, self.client)
+        self.meetings = MeetingService(
+            config, self.store, self.client, mode_manager=self.mode_manager)
         self._meeting: dict | None = None  # {task, dual, mic_frames, sys_frames}
+        self._meeting_processing = False
         self._plan_tasks: dict[int, asyncio.Task] = {}
         self._subscribers: set = set()          # event-stream writers (§3.1)
         self._dictation_task: asyncio.Task | None = None
+        self._dictation_session_mode = "narration"
         self._capture_source = None
         self._stop_event: asyncio.Event | None = None
+        self._last_connectivity_mode = self.mode_manager.status(refresh=False).effective_mode
+        self._background_tasks: set[asyncio.Task] = set()
         self._load_relationship_state()
 
     async def broadcast(self, event: dict) -> None:
@@ -86,6 +101,84 @@ class Daemon:
                 dead.append(writer)
         for writer in dead:
             self._subscribers.discard(writer)
+
+    # -- Phase 8 connectivity / speech helpers --------------------------------
+    def _track_task(self, task: asyncio.Task) -> asyncio.Task:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _session_active(self) -> bool:
+        return bool((self._dictation_task and not self._dictation_task.done())
+                    or self._meeting is not None or self._meeting_processing)
+
+    async def _note_connectivity_transition(self, status) -> None:
+        previous = self._last_connectivity_mode
+        current = status.effective_mode
+        if current == previous:
+            return
+        self._last_connectivity_mode = current
+        await self.broadcast({
+            "event": "mode.changed", "from": previous, "to": current,
+            "connectivity": status.as_dict(),
+        })
+        if (status.is_online and previous != "ONLINE"
+                and self.config.section("connectivity").get("drain_on_reconnect", True)):
+            self._track_task(asyncio.create_task(self._drain_queue_and_announce()))
+
+    async def _connectivity_snapshot(self, *, refresh: bool = True):
+        """Connectivity status without letting a TCP health probe block the
+        event loop (and therefore the ack/PTT latency path)."""
+        if refresh:
+            status = await asyncio.to_thread(self.mode_manager.status)
+        else:
+            status = self.mode_manager.status(refresh=False)
+        await self._note_connectivity_transition(status)
+        return status
+
+    async def _apply_pending_mode_switch(self) -> None:
+        if self._session_active() or self.mode_manager.pending_preference is None:
+            return
+        status = await asyncio.to_thread(self.mode_manager.apply_pending_after_session)
+        await self._note_connectivity_transition(status)
+        await self.broadcast({"event": "status.changed", "mode": self.mode,
+                              "connectivity": status.as_dict()})
+
+    async def _drain_queue_and_announce(self) -> dict:
+        result = await asyncio.to_thread(self.cloud_queue.drain)
+        await self.broadcast({"event": "offline.drained", **result})
+        if result.get("done") or result.get("failed") or result.get("awaiting_approval"):
+            await self._speak_in_background(result["summary"])
+        return result
+
+    async def _speak_in_background(self, text: str) -> dict:
+        route = self.speech.route(text)
+        if not self.config.section("tts").get("enabled", True):
+            return {**route, "played": False, "queued": False}
+
+        async def _run():
+            try:
+                return await asyncio.to_thread(self.speech.speak, text)
+            except Exception as exc:
+                await self.broadcast({"event": "speech.error", "error": str(exc),
+                                      **route})
+                return None
+
+        self._track_task(asyncio.create_task(_run()))
+        return {**route, "queued": True}
+
+    async def _maybe_speak_reply(self, text: str, params: dict) -> dict:
+        route = self.speech.route(text)
+        requested = params.get("speak")
+        if requested is True:
+            try:
+                result = await asyncio.to_thread(self.speech.speak, text)
+                return result.as_dict()
+            except Exception as exc:
+                return {**route, "played": False, "error": str(exc)}
+        if requested is None and self.config.section("tts").get("speak_replies", False):
+            return await self._speak_in_background(text)
+        return {**route, "played": False, "queued": False}
 
     # -- relationship state persists across restarts (§16) -------------------
     def _load_relationship_state(self) -> None:
@@ -131,6 +224,18 @@ class Daemon:
             "embed.run": self._embed_run,
             "meeting.start": self._meeting_start,
             "meeting.stop": self._meeting_stop,
+            "mode.status": self._mode_status,
+            "mode.set": self._mode_set,
+            "mode.refresh": self._mode_refresh,
+            "speech.status": self._speech_status,
+            "speech.say": self._speech_say,
+            "speech.warm": self._speech_warm,
+            "speech.audition": self._speech_audition,
+            "speech.select": self._speech_select,
+            "queue.list": self._queue_list,
+            "queue.drain": self._queue_drain,
+            "queue.approve": self._queue_approve,
+            "queue.enqueue_external": self._queue_enqueue_external,
             "ask": self._ask,
         }
         if method == "events.subscribe":
@@ -138,8 +243,10 @@ class Daemon:
                 self._subscribers.add(writer)
             return {"subscribed": True,
                     "events": ["session.started", "transcript.interim",
-                               "session.checkin", "transcript.final",
-                               "session.ended", "error"]}
+                               "session.checkin", "session.offline",
+                               "transcript.final", "session.ended",
+                               "mode.changed", "offline.drained",
+                               "speech.error", "error"]}
         handler = handlers.get(method)
         if handler is None:
             raise ValueError(f"unknown method '{method}' — supported: "
@@ -151,6 +258,7 @@ class Daemon:
 
     async def _status(self, params: dict) -> dict:
         runtime = self.config.socket_path.parent
+        connectivity = await self._connectivity_snapshot()
         recent = self.store.recent_transcripts(1)
         last = None
         if recent:
@@ -175,6 +283,11 @@ class Daemon:
             "last_transcript": last,
             "quota_today_live_calls": self.store.calls_since(day_start_iso()),
             "event_subscribers": len(self._subscribers),
+            "connectivity": connectivity.as_dict(),
+            "connectivity_mode": connectivity.effective_mode,
+            "voice": self.speech.status(),
+            "offline_asr": local_asr_status(self.config),
+            "cloud_queue": self.store.cloud_job_counts(),
         }
 
     async def _cost(self, params: dict) -> dict:
@@ -187,8 +300,19 @@ class Daemon:
 
     async def _ack(self, params: dict) -> dict:
         """§18: acknowledge first, think second. Pure local code — this
-        handler cannot reach GeminiClient by construction."""
+        handler cannot reach GeminiClient by construction. Speech is a
+        cache lookup only here; synthesis happens at startup/warm time."""
         ack = self.governor.ack()
+        kind = str(params.get("kind") or "on_it")
+        route = self.speech.route(STANDARD_ACKS.get(kind, "On it."))
+        cached = self.speech.cached_ack(kind)
+        ack["speech"] = {**route, "ack_kind": kind, "audio_path": cached,
+                         "cached": cached is not None, "played": False}
+        should_speak = params.get("speak", self.config.section("tts").get("speak_acks", True))
+        if should_speak and cached:
+            self._track_task(asyncio.create_task(
+                asyncio.to_thread(self.speech.play_ack, kind)))
+            ack["speech"]["queued"] = True
         self.store.log_persona_event(iso_now(), "ack", json.dumps(ack))
         return ack
 
@@ -205,13 +329,84 @@ class Daemon:
         await self.broadcast({"event": "status.changed", "mode": self.mode, "halted": False})
         return {"halted": False}
 
+    async def _mode_status(self, params: dict) -> dict:
+        status = await self._connectivity_snapshot(
+            refresh=bool(params.get("refresh", True)))
+        return {"connectivity": status.as_dict(),
+                "cloud_queue": self.store.cloud_job_counts(),
+                "session_active": self._session_active()}
+
+    async def _mode_set(self, params: dict) -> dict:
+        value = str(params.get("mode") or params.get("preference") or "")
+        if not value:
+            raise ValueError("mode.set needs params.mode = auto|online|offline")
+        status = await asyncio.to_thread(
+            self.mode_manager.request_preference,
+            value, active_session=self._session_active())
+        await self._note_connectivity_transition(status)
+        await self.broadcast({"event": "status.changed", "mode": self.mode,
+                              "connectivity": status.as_dict()})
+        return {"connectivity": status.as_dict(),
+                "session_active": self._session_active(),
+                "note": ("switch parked until the active session finishes"
+                         if status.switch_parked else "mode applied")}
+
+    async def _mode_refresh(self, params: dict) -> dict:
+        status = await asyncio.to_thread(self.mode_manager.refresh, force=True)
+        await self._note_connectivity_transition(status)
+        return {"connectivity": status.as_dict()}
+
+    async def _speech_status(self, params: dict) -> dict:
+        return {"voice": self.speech.status()}
+
+    async def _speech_say(self, params: dict) -> dict:
+        text = str(params.get("text") or "").strip()
+        if not text:
+            raise ValueError("speech.say needs params.text")
+        result = await asyncio.to_thread(
+            self.speech.speak, text, play=bool(params.get("play", True)))
+        return {"speech": result.as_dict()}
+
+    async def _speech_warm(self, params: dict) -> dict:
+        warmed = await asyncio.to_thread(self.speech.warm_ack_cache)
+        return {"warmed": warmed, "voice": self.speech.status()}
+
+    async def _speech_audition(self, params: dict) -> dict:
+        manifest = await asyncio.to_thread(
+            self.speech.generate_auditions, params.get("text"))
+        return {"audition": manifest}
+
+    async def _speech_select(self, params: dict) -> dict:
+        candidate = self.speech.select_voice(str(params.get("candidate") or ""))
+        return {"selected": candidate.as_dict(), "voice": self.speech.status()}
+
+    async def _queue_list(self, params: dict) -> dict:
+        return {"jobs": self.cloud_queue.list_jobs(params.get("status"),
+                                                  int(params.get("limit", 100))),
+                "counts": self.store.cloud_job_counts()}
+
+    async def _queue_drain(self, params: dict) -> dict:
+        return await self._drain_queue_and_announce()
+
+    async def _queue_approve(self, params: dict) -> dict:
+        job = self.cloud_queue.approve(int(params["job_id"]))
+        return {"job": job, "note": "approved; run queue.drain to process it"}
+
+    async def _queue_enqueue_external(self, params: dict) -> dict:
+        job_id = self.cloud_queue.enqueue_external(
+            str(params.get("action") or "external"),
+            str(params.get("description") or ""),
+            dict(params.get("payload") or {}))
+        return {"job_id": job_id, "status": "awaiting_approval"}
+
     async def _ptt_start(self, params: dict) -> dict:
         # §18: ack RETURNS immediately; capture + Live session spin up in a
         # background task behind it. The user is already talking while the
         # socket opens — parse-while-you-speak starts here (§18 rule 3).
         if self._dictation_task and not self._dictation_task.done():
-            return {"listening": True, **self.governor.ack(), "note": "already listening"}
-        ack = self.governor.ack()
+            return {"listening": True, **await self._ack({"kind": "on_it"}),
+                    "note": "already listening"}
+        ack = await self._ack({"kind": "on_it"})
         capture_cfg = self.config.section("capture")
         frame_ms = int(capture_cfg.get("chunk_ms", 30))
         source_kind = params.get("source") or capture_cfg.get("source", "mic")
@@ -231,16 +426,30 @@ class Daemon:
                                                         frame_ms=frame_ms, realtime=True)
                 simulated = True
         self._stop_event = asyncio.Event()
+        self._dictation_session_mode = str(params.get("mode") or "narration")
         self.mode = "listening"
-        await self.broadcast({"event": "status.changed", "mode": self.mode})
+        # Hotkey path: use the monitor's latest snapshot, never probe here.
+        connectivity = await self._connectivity_snapshot(refresh=False)
+        await self.broadcast({"event": "status.changed", "mode": self.mode,
+                              "connectivity": connectivity.as_dict()})
+
+        async def dictation_sink(event: dict) -> None:
+            # Cached audio only: the soft check-in must never wait on TTS.
+            if event.get("event") == "session.checkin" and self.speech.cached_ack("checkin"):
+                self._track_task(asyncio.create_task(
+                    asyncio.to_thread(self.speech.play_ack, "checkin")))
+            await self.broadcast(event)
+
         self._dictation_task = asyncio.create_task(
             self.dictation.dictate(
-                self._capture_source, mode=params.get("mode", "narration"),
-                sink=self.broadcast, stop_event=self._stop_event))
-        return {"listening": True, **ack, "simulated_capture": simulated}
+                self._capture_source, mode=self._dictation_session_mode,
+                sink=dictation_sink, stop_event=self._stop_event))
+        return {"listening": True, **ack, "simulated_capture": simulated,
+                "session_mode": self._dictation_session_mode,
+                "connectivity": connectivity.as_dict()}
 
     async def _ptt_stop(self, params: dict) -> dict:
-        ack = self.governor.ack()  # release acknowledged locally, instantly
+        ack = await self._ack({"kind": "on_it"})  # release acked locally, instantly
         if self.mode == "listening":
             self.mode = "transcribing"  # waiting on final + cleanup (§3.9 states)
             await self.broadcast({"event": "status.changed", "mode": self.mode})
@@ -260,6 +469,10 @@ class Daemon:
                     "audio_path": session.audio_path,
                     "clipboard": session.clipboard,
                     "flagged": session.flagged,
+                    "confidence": session.confidence,
+                    "cloud_status": session.cloud_status,
+                    "queued_job_ids": session.queued_job_ids,
+                    "connectivity_mode": session.connectivity_mode,
                     "notes": session.notes,
                     # Factual narration from real state (§13.1) — no model call.
                     "narration": self.governor.narrate_fact(
@@ -267,12 +480,22 @@ class Daemon:
                         {"words": len(session.raw_text.split()),
                          "seconds": session.duration_s}),
                 }
+                if self._dictation_session_mode == "command" and result["text"].strip():
+                    # Known grammar climbs the local ladder first; open text
+                    # follows the same offline queue policy as `ask`.
+                    result["command"] = await self._ask({
+                        "text": result["text"],
+                        "speak": params.get("speak", True),
+                    })
+                    result["narration"] = result["command"].get("reply", result["narration"])
             except Exception as exc:
                 result = {"error": f"dictation did not finish cleanly: {exc}"}
             self._dictation_task = None
         self.mode = "idle"
         await self.broadcast({"event": "status.changed", "mode": self.mode})
-        return {"listening": False, **ack, "result": result}
+        await self._apply_pending_mode_switch()
+        return {"listening": False, **ack, "result": result,
+                "connectivity": self.mode_manager.status(refresh=False).as_dict()}
 
     async def _transcribe_file(self, params: dict) -> dict:
         from pathlib import Path
@@ -286,7 +509,10 @@ class Daemon:
                          else session.raw_text),
                 "raw_text": session.raw_text, "backend": session.backend,
                 "inbox_path": session.inbox_path, "flagged": session.flagged,
-                "clipboard": session.clipboard}
+                "clipboard": session.clipboard, "confidence": session.confidence,
+                "cloud_status": session.cloud_status,
+                "queued_job_ids": session.queued_job_ids,
+                "connectivity_mode": session.connectivity_mode}
 
     # -- organiser (Phase 3: shadow only — these handlers cannot move files) --
     async def _index_run(self, params: dict) -> dict:
@@ -303,6 +529,9 @@ class Daemon:
         if not roots:
             raise ValueError("no organise roots configured — add [[organise.roots]] "
                              "to config.toml (roots start in shadow mode, §4.3)")
+        connectivity = await self._connectivity_snapshot()
+        wants_tiers = bool(params.get("tiers"))
+        queue_tiers = wants_tiers and connectivity.is_offline
         started = []
         for spec in roots:
             # Reserve the plan row on the loop thread so plan.show works
@@ -320,14 +549,25 @@ class Daemon:
                     await asyncio.to_thread(
                         self.organiser.build_plan, spec,
                         progress=progress, plan_id=plan_id,
-                        with_llm_tiers=bool(params.get("tiers")))
+                        with_llm_tiers=wants_tiers and not queue_tiers)
+                    if queue_tiers:
+                        job_id = self.cloud_queue.enqueue_plan_tiers(
+                            spec["path"], source_plan_id=plan_id)
+                        await self.broadcast({
+                            "event": "plan.tiers_queued", "plan_id": plan_id,
+                            "job_id": job_id,
+                            "note": "Tier 0 is local; Tier 1/2 judgement is parked",
+                        })
                 except Exception as exc:
                     await self.broadcast({"event": "error", "error": str(exc),
                                           "plan_id": plan_id})
 
             self._plan_tasks[plan_id] = asyncio.create_task(_run())
-            started.append({"plan_id": plan_id, "root": spec["path"], "status": "building"})
-        return {"started": started, **self.governor.ack()}
+            started.append({"plan_id": plan_id, "root": spec["path"], "status": "building",
+                            "tiers": "queued-offline" if queue_tiers else (
+                                "enabled" if wants_tiers else "tier0-only")})
+        return {"started": started, **await self._ack({"kind": "on_it"}),
+                "connectivity": connectivity.as_dict()}
 
     async def _plan_show(self, params: dict) -> dict:
         plan_id = int(params.get("plan_id", 0))
@@ -478,22 +718,29 @@ class Daemon:
         sys_wav = write_wav(self.config.data_dir / "audio" / f"meeting-{stamp}-system.wav",
                             meeting["frames"]["sys"], rate)
         self.mode = "processing"
+        self._meeting_processing = True
         await self.broadcast({"event": "status.changed", "mode": self.mode})
-        result = await asyncio.to_thread(
-            self.meetings.transcribe_dual, mic_wav, sys_wav,
-            title=params.get("title"),
-            pyannote_refine=bool(self.config.section("meeting").get("pyannote_refine")))
+        try:
+            result = await asyncio.to_thread(
+                self.meetings.transcribe_dual, mic_wav, sys_wav,
+                title=params.get("title"),
+                pyannote_refine=bool(self.config.section("meeting").get("pyannote_refine")))
+        finally:
+            self._meeting_processing = False
         self.mode = "idle"
         await self.broadcast({"event": "status.changed", "mode": self.mode})
+        await self._apply_pending_mode_switch()
         return {"state": "idle", "note_path": str(result.note_path),
                 "turns": len(result.turns), "backend": result.backend,
-                "transcript_preview": result.transcript[:400]}
+                "transcript_preview": result.transcript[:400],
+                "connectivity": self.mode_manager.status(refresh=False).as_dict()}
 
     async def _ask(self, params: dict) -> dict:
         """Conversational turn on the §13.4 ladder: governor (local) →
         exact/grammar intents (local) → memory recall (local) → and only
         then the cheapest-first harness with assembled context (§17).
-        Local answers cost zero tokens and say so (`via`)."""
+        Offline, that final rung becomes a durable queue entry instead of
+        a network attempt. Any spoken form is local TTS only (§13.8)."""
         from .intents import route
 
         text = str(params.get("text", "")).strip()
@@ -509,6 +756,8 @@ class Daemon:
         self.store.add_message(conversation_id, iso_now(), "user", text)
 
         reply, via, model, fixture = None, None, None, None
+        queued_job_id = None
+        connectivity = await self._connectivity_snapshot()
         intent = route(text)
         if intent is not None:
             reply, via = await self._run_intent(intent)
@@ -526,21 +775,34 @@ class Daemon:
                            "their playful-teasing register concisely is welcome "
                            "if a genuinely situational line exists — otherwise "
                            "plain. One short line preferred. No canned warmth.")
-            result = await asyncio.to_thread(self.client.generate, "chat", prompt)
-            reply, via, model, fixture = result.text, "gemini", result.model, result.fixture
+            if connectivity.is_offline:
+                queued_job_id = self.cloud_queue.enqueue_chat(
+                    text, prompt, conversation_id)
+                reply = (f"Offline — that needs Gemini, so I queued it durably "
+                         f"(job #{queued_job_id}). It will drain on reconnect.")
+                via = "local-queue"
+            else:
+                result = await asyncio.to_thread(self.client.generate, "chat", prompt)
+                reply, via, model, fixture = result.text, "gemini", result.model, result.fixture
+                if reply:
+                    self.mode_manager.observe_success("gemini")
 
+        speech = await self._maybe_speak_reply(reply, params)
         self.store.add_message(conversation_id, iso_now(), "assistant", reply, via)
         if params.get("reaction"):
             self.governor.note_user_reaction(str(params["reaction"]))
             self._save_relationship_state()
         return {
             "reply": reply,
-            "via": via,  # local-intent | local-memory | gemini
+            "via": via,  # local-intent | local-memory | local-queue | gemini
             "model": model,
             "register": decision.register,
             "serious_gate": decision.serious_gate,
             "mode": self.config.gemini_mode,
             "fixture": fixture,
+            "connectivity": connectivity.as_dict(),
+            "queued_job_id": queued_job_id,
+            "speech": speech,
         }
 
     async def _run_intent(self, intent) -> tuple[str | None, str]:
@@ -550,9 +812,24 @@ class Daemon:
             return ("Halted. Nothing will move until you say resume.", "local-intent")
         if intent.kind == "status":
             status = await self._status({})
-            return ((f"Running ({status['mode']}), gemini mode "
+            return ((f"Running ({status['mode']}), connectivity "
+                    f"{status['connectivity_mode']}, gemini mode "
                     f"{status['gemini_mode']}, uptime {status['uptime_s']:.0f}s."),
                     "local-intent")
+        if intent.kind in ("mode_offline", "mode_online", "mode_auto"):
+            value = intent.kind.rsplit("_", 1)[1]
+            result = await self._mode_set({"mode": value})
+            connectivity = result["connectivity"]
+            suffix = " Switch parked until this session finishes." if connectivity["switch_parked"] else ""
+            return (f"Connectivity preference: {value}; effective {connectivity['effective_mode']}.{suffix}",
+                    "local-intent")
+        if intent.kind == "queue_status":
+            counts = self.store.cloud_job_counts()
+            detail = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "empty"
+            return (f"Cloud queue: {detail}.", "local-intent")
+        if intent.kind == "queue_drain":
+            result = await self._queue_drain({})
+            return (result["summary"], "local-intent")
         if intent.kind == "cost":
             from .cost import format_cost_report
 
@@ -588,6 +865,26 @@ class Daemon:
                     "your review + apply. Watch `assist events`."), "local-intent")
         return (None, "local-intent")
 
+    async def _connectivity_loop(self) -> None:
+        interval = float(self.config.section("connectivity").get(
+            "health_check_interval_s", 20))
+        while True:
+            await asyncio.sleep(max(1.0, interval))
+            # refresh() itself returns immediately without probing when the
+            # owner forced offline; the socket probe runs off-loop in auto.
+            status = await asyncio.to_thread(self.mode_manager.refresh, force=True)
+            await self._note_connectivity_transition(status)
+
+    async def _warm_speech_cache(self) -> None:
+        if not self.config.section("tts").get("enabled", True):
+            return
+        try:
+            await asyncio.to_thread(self.speech.warm_ack_cache)
+        except Exception as exc:
+            # Text/UI ack still works; status/doctor carry the reason.
+            await self.broadcast({"event": "speech.error", "error": str(exc),
+                                  **self.speech.route("On it.")})
+
     # -- lifecycle ---------------------------------------------------------------
     async def run(self) -> None:
         outstanding = self.store.outstanding_intents()
@@ -598,6 +895,8 @@ class Daemon:
                   f"intent(s) from a previous run — inspect before enabling "
                   f"the executor.", flush=True)
         server = await serve(self.config.socket_path, self.handle)
+        connectivity_task = asyncio.create_task(self._connectivity_loop())
+        warm_task = asyncio.create_task(self._warm_speech_cache())
         _sd_notify("READY=1")
         print(f"[assistd] Elaria up · mode={self.config.gemini_mode} "
               f"· socket={self.config.socket_path}", flush=True)
@@ -608,9 +907,13 @@ class Daemon:
                 loop.add_signal_handler(sig, stop.set)
             except NotImplementedError:  # non-Unix fallback
                 pass
-        async with server:
-            await stop.wait()
-        self.store.close()
+        try:
+            async with server:
+                await stop.wait()
+        finally:
+            for task in (connectivity_task, warm_task, *self._background_tasks):
+                task.cancel()
+            self.store.close()
 
 
 def main() -> None:

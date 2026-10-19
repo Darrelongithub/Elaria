@@ -86,10 +86,73 @@ DEFAULTS: dict = {
     "asr": {
         "primary": "gemini_live",
         "fallback": ["gemini_batch", "local"],
+        # Phase 8 offline ASR (§13.9): local Whisper behind the same seam.
+        # English is the supported offline path; other pinned languages are
+        # passed through explicitly and remain best-effort (never detected).
+        "offline_backend": "faster-whisper",  # faster-whisper | whisper.cpp | mock
         "offline_model": "small",
+        "offline_device": "cpu",
+        "offline_compute_type": "int8",
+        "whisper_cpp_command": "whisper-cli",
+        "whisper_cpp_model": "",
+        "offline_low_confidence_threshold": 0.65,
+        "offline_queue_cleanup": True,
         "languages": ["en"],
         "preserve_code_switching": False,
         "assert_output_language": True,
+    },
+    "connectivity": {
+        # auto follows Gemini/network health; offline is FORCED_OFFLINE and
+        # must not probe or call the network at all (§13.9 privacy posture).
+        "mode": "auto",  # auto | online | offline
+        "health_host": "generativelanguage.googleapis.com",
+        "health_port": 443,
+        "health_timeout_s": 1.5,
+        "health_check_interval_s": 20,
+        "drain_on_reconnect": True,
+    },
+    "tts": {
+        # ONE-VOICE RULE: exactly one locally owned voice speaks for Elaria
+        # in every mode. Gemini may return text; it never supplies her voice.
+        "enabled": True,
+        "backend": "piper",  # piper | mock (tests/dev only)
+        "voice_id": "unselected",
+        "model": "",
+        "config": "",
+        "speaker": 0,
+        "length_scale": 0.92,  # Piper native pace control (<1 is brisker)
+        "command": "piper",
+        "player": "auto",  # auto | pw-play | paplay | aplay | none
+        "speak_acks": True,
+        "speak_replies": False,
+        "cache_dir": "",
+        "audition_dir": "",
+        "audition_candidates": [
+            {
+                "id": "en_GB-jenny_dioco-medium",
+                "model": "~/.local/share/piper/en_GB-jenny_dioco-medium.onnx",
+                "config": "~/.local/share/piper/en_GB-jenny_dioco-medium.onnx.json",
+                "speaker": 0,
+                "length_scale": 0.92,
+                "notes": "Audition against: brisk, bite, dry; reject if kind-polished.",
+            },
+            {
+                "id": "en_US-lessac-medium",
+                "model": "~/.local/share/piper/en_US-lessac-medium.onnx",
+                "config": "~/.local/share/piper/en_US-lessac-medium.onnx.json",
+                "speaker": 0,
+                "length_scale": 0.92,
+                "notes": "Audition against: brisk, bite, dry; reject if kind-polished.",
+            },
+            {
+                "id": "en_US-kathleen-low",
+                "model": "~/.local/share/piper/en_US-kathleen-low.onnx",
+                "config": "~/.local/share/piper/en_US-kathleen-low.onnx.json",
+                "speaker": 0,
+                "length_scale": 0.92,
+                "notes": "Lower-fidelity candidate; audition for edge without polish.",
+            },
+        ],
     },
     "capture": {"source": "mic", "sample_rate": 16000, "chunk_ms": 30, "retention_days": 30},
     "transcribe": {

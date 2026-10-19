@@ -24,7 +24,16 @@
 }
 
 #custom-elaria.mock {
-  font-style: italic;          /* the one small offline/mock glyph (§13.9) */
+  font-style: italic;          /* mock is visually distinct, never disguised */
+}
+
+#custom-elaria.offline {
+  color: #ffb86c;              /* detected offline (§13.9) */
+}
+
+#custom-elaria.forced-offline {
+  color: #ff79c6;              /* owner-forced privacy posture */
+  font-weight: bold;
 }
 
 @keyframes elaria-pulse {

@@ -148,6 +148,38 @@ def run_doctor(config) -> dict:
                        "guards are built and dormant until then")
     checks.append(_check("languages", True, lang_detail))
 
+    # Phase 8: connectivity posture, ONE local voice, offline ASR + queue.
+    # Doctor reads persisted preference but does not force a health probe.
+    from .asr import local_asr_status
+    from .modes import ModeManager
+    from .store import Store as _DoctorStore
+    from .tts import SpeechService
+
+    doctor_store = _DoctorStore(config.db_path)
+    try:
+        connectivity = ModeManager(config, doctor_store).status(refresh=False)
+        voice = SpeechService(config, doctor_store).status()
+        queue_counts = doctor_store.cloud_job_counts()
+    finally:
+        doctor_store.close()
+    checks.append(_check(
+        "connectivity mode", True,
+        f"preference={connectivity.preference}, effective={connectivity.effective_mode} "
+        f"— {connectivity.reason}; switch with `assist mode offline|online|auto`"))
+    checks.append(_check(
+        "one local voice", voice["available"],
+        f"backend={voice['backend']}, voice={voice['voice_id']}, "
+        f"cached acks={voice['cached_acks'] or 'none'} — {voice['reason']}. "
+        "Gemini native audio is disabled (Live is TEXT-only); no cloud-voice fallback exists"))
+    offline_asr = local_asr_status(config)
+    checks.append(_check(
+        "offline ASR", offline_asr["available"],
+        f"engine={offline_asr['engine']}, model={offline_asr['model']} — "
+        f"{offline_asr['reason']}; {offline_asr['supported_note']}"))
+    checks.append(_check(
+        "cloud queue", True,
+        f"durable SQLite queue counts={queue_counts or 'empty'}; external actions stay approval-gated"))
+
     profile_path = config.humour_profile_path()
     profile = load_humour_profile(config)
     spoken = profile.get("spoken_delivery", {})
@@ -256,8 +288,13 @@ def _meeting_command(args, config) -> int:
     if args.meeting_action == "transcribe":
         from .gemini_client import GeminiClient
         from .meeting import MeetingService
+        from .modes import ModeManager
         store = _local_store(config)
-        result = MeetingService(config, store, GeminiClient(config, store)).transcribe_dual(
+        manager = ModeManager(config, store)
+        manager.refresh()  # one-shot CLI: no resident monitor to snapshot from
+        result = MeetingService(
+            config, store, GeminiClient(config, store),
+            mode_manager=manager).transcribe_dual(
             Path(args.mic_wav), Path(args.system_wav), title=args.title,
             pyannote_refine=args.pyannote)
         store.close()
@@ -280,6 +317,114 @@ def _meeting_command(args, config) -> int:
         print(f"\nNote: {out.get('note_path')} · turns: {out.get('turns')} · "
               f"{out.get('backend')}")
 
+    return 0
+
+
+def _mode_command(args, config) -> int:
+    value = getattr(args, "mode_value", None)
+    try:
+        if value:
+            out = call(config.socket_path, "mode.set", {"mode": value}, timeout=10.0)
+        else:
+            out = call(config.socket_path, "mode.status", timeout=5.0)
+    except (DaemonUnavailable, RuntimeError, OSError):
+        from .modes import ModeManager
+
+        store = _local_store(config)
+        manager = ModeManager(config, store)
+        status = (manager.request_preference(value) if value else manager.status())
+        out = {"connectivity": status.as_dict(), "cloud_queue": store.cloud_job_counts(),
+               "note": "stored locally; daemon will observe it"}
+        store.close()
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def _voice_command(args, config) -> int:
+    from .tts import SpeechService
+
+    action = args.voice_action
+    if action == "status":
+        method, params = "speech.status", {}
+    elif action == "warm":
+        method, params = "speech.warm", {}
+    elif action == "audition":
+        method, params = "speech.audition", ({"text": args.text} if args.text else {})
+    elif action == "select":
+        method, params = "speech.select", {"candidate": args.candidate}
+    else:
+        method, params = "speech.say", {"text": args.text, "play": not args.no_play}
+    try:
+        out = call(config.socket_path, method, params,
+                   timeout=600.0 if action in ("audition", "warm", "say") else 15.0)
+    except (DaemonUnavailable, RuntimeError, OSError):
+        store = _local_store(config)
+        speech = SpeechService(config, store)
+        try:
+            if action == "status":
+                out = {"voice": speech.status()}
+            elif action == "warm":
+                out = {"warmed": speech.warm_ack_cache(), "voice": speech.status()}
+            elif action == "audition":
+                out = {"audition": speech.generate_auditions(args.text)}
+            elif action == "select":
+                selected = speech.select_voice(args.candidate)
+                out = {"selected": selected.as_dict(), "voice": speech.status()}
+            else:
+                out = {"speech": speech.speak(args.text, play=not args.no_play).as_dict()}
+        finally:
+            store.close()
+    print(json.dumps(out, indent=2))
+    if action == "audition":
+        for candidate in out.get("audition", {}).get("candidates", []):
+            print(f"{candidate['voice_id']}: {candidate['status']} · "
+                  f"{candidate.get('audio_path') or candidate.get('error', '')}")
+    return 0
+
+
+def _queue_command(args, config) -> int:
+    action = args.queue_action
+    try:
+        if action == "list":
+            out = call(config.socket_path, "queue.list",
+                       {"status": args.status, "limit": args.limit},
+                       timeout=15.0)
+        elif action == "drain":
+            out = call(config.socket_path, "queue.drain", timeout=900.0)
+        elif action == "approve":
+            out = call(config.socket_path, "queue.approve",
+                       {"job_id": args.job_id}, timeout=15.0)
+        else:
+            out = call(config.socket_path, "queue.enqueue_external",
+                       {"action": args.action_name, "description": args.description},
+                       timeout=15.0)
+    except (DaemonUnavailable, RuntimeError, OSError):
+        from .gemini_client import GeminiClient
+        from .modes import ModeManager
+        from .offline_queue import CloudQueue
+
+        store = _local_store(config)
+        queue = CloudQueue(config, store, GeminiClient(config, store),
+                           ModeManager(config, store))
+        try:
+            if action == "list":
+                out = {"jobs": queue.list_jobs(args.status, args.limit),
+                       "counts": store.cloud_job_counts()}
+            elif action == "drain":
+                out = queue.drain()
+            elif action == "approve":
+                out = {"job": queue.approve(args.job_id)}
+            else:
+                out = {"job_id": queue.enqueue_external(args.action_name, args.description),
+                       "status": "awaiting_approval"}
+        finally:
+            store.close()
+    if action == "list":
+        for job in out.get("jobs", []):
+            print(f"#{job['id']} [{job['status']}] {job['kind']} · {job.get('payload', {})}")
+        print(f"Counts: {out.get('counts') or 'empty'}")
+    else:
+        print(json.dumps(out, indent=2))
     return 0
 
 
@@ -366,20 +511,31 @@ def _plan_command(args, config) -> int:
                        timeout=10.0)["started"]
     except (DaemonUnavailable, RuntimeError, OSError):
         from .gemini_client import GeminiClient
+        from .modes import ModeManager
+        from .offline_queue import CloudQueue
         from .organiser import OrganiserService
         from .store import Store
         store = Store(config.db_path)
-        service = OrganiserService(config, store, GeminiClient(config, store))
+        client = GeminiClient(config, store)
+        manager = ModeManager(config, store)
+        offline = manager.status().is_offline
+        service = OrganiserService(config, store, client)
+        queue = CloudQueue(config, store, client, manager)
         for spec in config.organise_roots():
             if args.root and spec["path"] != args.root:
                 continue
-            result = service.build_plan(spec, with_llm_tiers=args.tiers)
+            result = service.build_plan(spec, with_llm_tiers=args.tiers and not offline)
             _print_plan_summary(result)
+            if args.tiers and offline:
+                job_id = queue.enqueue_plan_tiers(spec["path"], result["plan_id"])
+                print(f"Offline: Tier 1/2 judgement queued as job #{job_id}.")
         store.close()
         return 0
     for entry in started:
         plan_id = entry["plan_id"]
         print(f"Building shadow plan #{plan_id} for {entry['root']}…", file=sys.stderr)
+        if entry.get("tiers") == "queued-offline":
+            print("Offline: Tier 0 now; Tier 1/2 judgement will be queued.", file=sys.stderr)
         while True:
             data = call(config.socket_path, "plan.show", {"plan_id": plan_id}, timeout=30.0)
             if data["plan"]["status"] != "building":
@@ -414,12 +570,43 @@ def main(argv: list[str] | None = None) -> int:
     status_p.add_argument("--follow", action="store_true",
                           help="with --waybar: stream a line per state change (no poll lag)")
     sub.add_parser("cost", help="request/token spend from the ledger")
+    mode_p = sub.add_parser("mode", help="connectivity: show or set auto|online|offline")
+    mode_p.add_argument("mode_value", nargs="?", choices=["auto", "online", "offline"])
     ask_p = sub.add_parser("ask", help="one conversational turn (governor + harness)")
     ask_p.add_argument("text")
+    ask_p.add_argument("--speak", action="store_true",
+                       help="speak the reply through the ONE local voice")
+    voice_p = sub.add_parser("voice", help="one local voice: status, acks, auditions")
+    voice_sub = voice_p.add_subparsers(dest="voice_action", required=True)
+    voice_sub.add_parser("status", help="show the single local TTS routing")
+    say_p = voice_sub.add_parser("say", help="speak text through the one local voice")
+    say_p.add_argument("text")
+    say_p.add_argument("--no-play", action="store_true", help="synthesize only")
+    voice_sub.add_parser("warm", help="pre-synthesize the four standard acks")
+    audition_p = voice_sub.add_parser("audition", help="generate candidate voice samples")
+    audition_p.add_argument("--text", help="custom audition script")
+    select_p = voice_sub.add_parser("select", help="select the ONE canonical voice")
+    select_p.add_argument("candidate")
+    queue_p = sub.add_parser("queue", help="durable offline cloud-work queue")
+    queue_sub = queue_p.add_subparsers(dest="queue_action", required=True)
+    queue_list = queue_sub.add_parser("list")
+    queue_list.add_argument("--status")
+    queue_list.add_argument("--limit", type=int, default=100)
+    queue_sub.add_parser("drain", help="process auto-drainable jobs (approval stays gated)")
+    queue_approve = queue_sub.add_parser("approve", help="approve one gated external job")
+    queue_approve.add_argument("job_id", type=int)
+    queue_ext = queue_sub.add_parser("add-external", help="park an external action for approval")
+    queue_ext.add_argument("action_name")
+    queue_ext.add_argument("description")
     sub.add_parser("halt", help="panic switch (§4.4)")
     sub.add_parser("resume", help="clear the halt flag")
     ptt_p = sub.add_parser("ptt", help="push-to-talk (bind press/release in Hyprland)")
     ptt_p.add_argument("action", choices=["start", "stop", "toggle"])
+    ptt_p.add_argument("--mode", choices=["narration", "conversation", "command"],
+                       help="session mode for start; command routes via the local ladder")
+    ptt_p.add_argument("--source", help="capture source override")
+    ptt_p.add_argument("--speak", action="store_true",
+                       help="for command stop: speak the reply locally")
     tr_p = sub.add_parser("transcribe", help="batch-transcribe a WAV (post tier, §3.6)")
     tr_p.add_argument("file")
     sub.add_parser("index", help="index configured roots (local only, shadow-safe)")
@@ -479,7 +666,11 @@ def main(argv: list[str] | None = None) -> int:
     m_tr.add_argument("--pyannote", action="store_true",
                       help="refine far side with pyannote (extra + HF_TOKEN)")
     meeting_sub.add_parser("setup", help="PipeWire node discovery + loopback plan")
-    sub.add_parser("dictate", help="terminal push-to-talk: Enter to stop")
+    dictate_p = sub.add_parser("dictate", help="terminal push-to-talk: Enter to stop")
+    dictate_p.add_argument("--command", dest="command_flag", action="store_true",
+                           help="route the final transcript through the local intent ladder")
+    dictate_p.add_argument("--speak", action="store_true",
+                           help="speak a command reply through the one local voice")
     events_p = sub.add_parser("events", help="stream daemon events (overlay/Waybar feed)")
     events_p.add_argument("--overlay", action="store_true",
                           help="stream pre-computed overlay states for the Quickshell pill")
@@ -506,8 +697,16 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 status = call(config.socket_path, "status", timeout=3.0)
             except (DaemonUnavailable, RuntimeError, OSError):
+                from .modes import ModeManager
+
+                store = _local_store(config)
+                connectivity = ModeManager(config, store).status(refresh=False)
                 status = {"running": False, "mode": "down",
-                          "name": config.section("persona").get("name", "Elaria")}
+                          "name": config.section("persona").get("name", "Elaria"),
+                          "connectivity": connectivity.as_dict(),
+                          "connectivity_mode": connectivity.effective_mode,
+                          "cloud_queue": store.cloud_job_counts()}
+                store.close()
             if args.waybar:
                 from .waybar import format_waybar
                 print(json.dumps(format_waybar(status)))
@@ -533,8 +732,18 @@ def main(argv: list[str] | None = None) -> int:
             print(format_cost_report(data["month"], data["today"], data["quota"], data["tier"]))
             return 0
 
+        if args.command == "mode":
+            return _mode_command(args, config)
+
+        if args.command == "voice":
+            return _voice_command(args, config)
+
+        if args.command == "queue":
+            return _queue_command(args, config)
+
         if args.command == "ask":
-            result = call(config.socket_path, "ask", {"text": args.text}, timeout=60.0)
+            result = call(config.socket_path, "ask",
+                          {"text": args.text, "speak": args.speak}, timeout=120.0)
             print(result["reply"])
             return 0
 
@@ -566,10 +775,17 @@ def main(argv: list[str] | None = None) -> int:
                 from pathlib import Path as _Path
 
                 from .gemini_client import GeminiClient
+                from .modes import ModeManager
+                from .offline_queue import CloudQueue
                 from .store import Store
                 from .transcribe import DictationService
                 store = Store(config.db_path)
-                service = DictationService(config, store, GeminiClient(config, store))
+                client = GeminiClient(config, store)
+                manager = ModeManager(config, store)
+                manager.refresh()  # one-shot CLI: no resident monitor
+                service = DictationService(
+                    config, store, client, mode_manager=manager,
+                    offline_queue=CloudQueue(config, store, client, manager))
                 session = _asyncio.run(service.transcribe_file(_Path(args.file).expanduser()))
                 result = {"text": (session.cleaned_text
                                    if (session.cleaned_text and not session.flagged)
@@ -696,10 +912,13 @@ def main(argv: list[str] | None = None) -> int:
             return _meeting_command(args, config)
 
         if args.command == "dictate":
-            started = call(config.socket_path, "ptt.start", timeout=5.0)
+            started = call(config.socket_path, "ptt.start",
+                           {"mode": "command" if args.command_flag else "narration"},
+                           timeout=5.0)
             note = " (SIMULATED capture — no PipeWire here)" if started.get("simulated_capture") else ""
             input(f"Listening{note}… press Enter to stop. ")
-            stopped = call(config.socket_path, "ptt.stop", timeout=90.0)
+            stopped = call(config.socket_path, "ptt.stop",
+                           {"speak": args.speak}, timeout=90.0)
             result = stopped.get("result") or {}
             print(result.get("narration", ""))
             print(result.get("text", result.get("error", "(no transcript)")))
@@ -725,7 +944,16 @@ def main(argv: list[str] | None = None) -> int:
             action = args.action
             if action == "toggle":
                 action = "stop" if call(config.socket_path, "status", timeout=3.0).get("mode") == "listening" else "start"
-            result = call(config.socket_path, f"ptt.{action}", timeout=3.0)
+            params = {}
+            if action == "start":
+                if args.mode:
+                    params["mode"] = args.mode
+                if args.source:
+                    params["source"] = args.source
+            elif args.speak:
+                params["speak"] = True
+            result = call(config.socket_path, f"ptt.{action}", params,
+                          timeout=90.0 if action == "stop" else 3.0)
             print(json.dumps(result))
             return 0
     except (DaemonUnavailable, RuntimeError, OSError) as exc:

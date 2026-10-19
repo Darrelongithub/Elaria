@@ -232,6 +232,8 @@ class GenaiLiveTransport:  # pragma: no cover - needs owner's key + network
         from google.genai import types
 
         config = types.LiveConnectConfig(
+            # ONE-VOICE RULE: Gemini Live is ears + text only. Native audio
+            # output is never Elaria's voice; local TTS speaks returned text.
             response_modalities=[types.Modality.TEXT],
             input_audio_transcription=types.AudioTranscriptionConfig(),
             realtime_input_config=types.RealtimeInputConfig(

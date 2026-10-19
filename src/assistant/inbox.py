@@ -46,3 +46,28 @@ def write_inbox_note(inbox_dir: Path, *, when: datetime, raw: str,
                      "raw transcript. See `assist cost`/transcript log for the reason.\n")
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
+
+
+def append_cloud_transcript(path: Path, *, cloud_text: str,
+                            offline_text: str | None) -> Path:
+    """Phase 8 reconnect pass: append, never erase the offline placeholder."""
+    path = Path(path).expanduser()
+    lines = [
+        "",
+        "## Cloud re-transcription (after reconnect)",
+        "",
+        cloud_text.strip(),
+        "",
+    ]
+    if offline_text and offline_text.strip() != cloud_text.strip():
+        lines += [
+            "<details><summary>Offline placeholder (preserved)</summary>",
+            "",
+            offline_text.strip(),
+            "",
+            "</details>",
+            "",
+        ]
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+    return path

@@ -81,24 +81,74 @@ class SessionResult:
     duration_s: float
     transcript_id: int | None = None
     notes: list[str] = field(default_factory=list)
+    confidence: float | None = None
+    cloud_status: str = "complete"
+    queued_job_ids: list[int] = field(default_factory=list)
+    connectivity_mode: str | None = None
 
 
 class DictationService:
-    def __init__(self, config, store, client):
+    def __init__(self, config, store, client, *, mode_manager=None,
+                 offline_queue=None, local_backend=None):
         self.config = config
         self.store = store
         self.client = client
+        self.mode_manager = mode_manager
+        self.offline_queue = offline_queue
+        self.local_backend = local_backend
         self.cleanup = CleanupPass(config, client)
         settings = config.section("transcribe")
+        asr_settings = config.section("asr")
+        self.low_confidence_threshold = float(
+            asr_settings.get("offline_low_confidence_threshold", 0.65))
+        self.queue_cleanup_offline = bool(asr_settings.get("offline_queue_cleanup", True))
         self.replay_s = float(settings.get("reconnect_replay_s", 30))
         self.session_max_s = float(settings.get("live_session_max_s", 540))
-        self.save_audio = bool(settings.get("save_audio", True))
+        # Phase 8 restates §12.5 as a rule, not a preference: raw audio is
+        # the truth that makes offline placeholders recoverable.
+        self.save_audio = True
         self.inbox_dir = Path(settings.get("inbox_dir",
                                            "~/.local/share/assistant/inbox")).expanduser()
         self.copy_clipboard = bool(settings.get("copy_to_clipboard", True))
         self.vad_threshold = float(settings.get("vad_rms_threshold", 0.01))
         self.checkin_after = settings.get("checkin_after_s") or {}
         self.audio_dir = config.data_dir / "audio"
+
+    def _connectivity(self):
+        """Mode snapshot for one session. A switch requested mid-session is
+        parked by the daemon/manager, so this snapshot remains authoritative."""
+        if self.mode_manager is None:
+            return None
+        # Snapshot only: the daemon monitor (or a one-shot CLI caller)
+        # owns refreshes, so starting capture never waits on a probe.
+        return self.mode_manager.status(refresh=False)
+
+    def _cloud_status(self, *, backend: str, confidence: float | None,
+                      raw: str, audio_path, offline: bool) -> str:
+        local = backend == "local" or backend.startswith("local:")
+        if audio_path is not None and (offline or local) and (
+                not raw.strip() or confidence is None
+                or confidence < self.low_confidence_threshold):
+            return "pending_cloud_transcription"
+        return "complete"
+
+    def _enqueue_offline_work(self, result: SessionResult, *, offline: bool,
+                              skip_cleanup: bool) -> SessionResult:
+        if self.offline_queue is None or result.transcript_id is None:
+            return result
+        if result.cloud_status == "pending_cloud_transcription":
+            job_id = self.offline_queue.enqueue_transcription(
+                result.transcript_id, result.audio_path, result.language,
+                result.session_id)
+            result.queued_job_ids.append(job_id)
+            result.notes.append(
+                f"low-confidence offline transcript queued for Gemini redo (job #{job_id})")
+        if (offline and skip_cleanup and self.queue_cleanup_offline
+                and result.raw_text.strip()):
+            job_id = self.offline_queue.enqueue_cleanup(result.transcript_id)
+            result.queued_job_ids.append(job_id)
+            result.notes.append(f"transcript cleanup queued for reconnect (job #{job_id})")
+        return result
 
     # -- public entry points ---------------------------------------------------
     async def dictate(self, source, *, transport_factory=None,
@@ -124,7 +174,11 @@ class DictationService:
             float(self.checkin_after.get(mode, 20)), speech_rms=self.vad_threshold)
         notes: list[str] = []
         final_text = ""
-        backend = "gemini_live"
+        confidence: float | None = None
+        connectivity = self._connectivity()
+        offline_at_start = bool(connectivity and connectivity.is_offline)
+        network_drop = False
+        backend = "local" if offline_at_start else "gemini_live"
         duration_s = 0.0
         transport: LiveTransport | None = None
         collector: asyncio.Task | None = None
@@ -151,13 +205,25 @@ class DictationService:
             collector = asyncio.create_task(collect_events(current))
             return current
 
-        try:
-            transport = await open_session(None)
-        except Exception as exc:
-            live_failed = True
-            notes.append(f"live connect failed ({exc}) — will batch-transcribe the saved audio")
-            await emit({"event": "session.reconnecting", "reason": str(exc),
-                        "fallback": "gemini_batch", "session_id": session_id})
+        if offline_at_start:
+            notes.append("offline mode: local ASR only; raw audio saved for any redo")
+            await emit({"event": "session.offline", "backend": "local",
+                        "connectivity": connectivity.effective_mode if connectivity else None,
+                        "session_id": session_id})
+        else:
+            try:
+                transport = await open_session(None)
+            except Exception as exc:
+                from .modes import looks_like_network_failure
+
+                live_failed = True
+                network_drop = looks_like_network_failure(exc)
+                if network_drop and self.mode_manager is not None:
+                    self.mode_manager.observe_failure(exc, "gemini_live")
+                notes.append(f"live connect failed ({exc}) — will transcribe the saved audio")
+                await emit({"event": "session.reconnecting", "reason": str(exc),
+                            "fallback": "local" if network_drop else "gemini_batch",
+                            "session_id": session_id})
 
         try:
             async for frame in source.frames():
@@ -200,9 +266,15 @@ class DictationService:
                             await transport.send_audio(tail[i:i + 960])
                         notes.append("session rotated; buffered tail replayed")
                     except Exception as retry_exc:
+                        from .modes import looks_like_network_failure
+
                         live_failed = True
+                        network_drop = (network_drop or looks_like_network_failure(exc)
+                                        or looks_like_network_failure(retry_exc))
+                        if network_drop and self.mode_manager is not None:
+                            self.mode_manager.observe_failure(retry_exc, "gemini_live")
                         transport = None
-                        notes.append(f"reconnect failed ({retry_exc}) — batch fallback")
+                        notes.append(f"reconnect failed ({retry_exc}) — saved-audio fallback")
             # PTT released / source exhausted: close the utterance.
             if transport is not None:
                 await transport.activity_end()
@@ -220,27 +292,41 @@ class DictationService:
                 await transport.close()
             await source.aclose()
 
+        use_offline_chain = offline_at_start or network_drop
         if live_failed or not final_text:
             if audio_path is not None:
                 try:
                     fallback = await asyncio.to_thread(
-                        asr.transcribe_file, self.config, self.client, str(audio_path))
+                        asr.transcribe_file, self.config, self.client, str(audio_path),
+                        offline=use_offline_chain, local_backend=self.local_backend)
                     final_text = fallback.text
                     backend = fallback.backend
+                    confidence = fallback.confidence
+                    language = fallback.language
                     notes.append(f"transcribed via fallback backend '{backend}'")
                 except Exception as exc:
                     await emit({"event": "error", "error": str(exc), "session_id": session_id})
                     final_text = final_text or ""
+                    backend = "local" if use_offline_chain else backend
                     notes.append(f"all backends failed: {exc}")
             if backend == "gemini_live" and live_failed:
-                backend = "gemini_batch"
+                backend = "local" if use_offline_chain else "gemini_batch"
 
+        cloud_status = self._cloud_status(
+            backend=backend, confidence=confidence, raw=final_text,
+            audio_path=audio_path, offline=use_offline_chain)
         result = await self._persist(
             session_id=session_id, when=when, raw=final_text, backend=backend,
             language=language, audio_path=audio_path, duration_s=duration_s,
-            model=self.config.model_for_role(
-                "transcribe_live" if backend == "gemini_live" else "transcribe_batch"),
-            notes=notes)
+            model=(self.config.model_for_role(
+                "transcribe_live" if backend == "gemini_live" else "transcribe_batch")
+                if backend != "local" else self.config.section("asr").get(
+                    "offline_model", "small")),
+            notes=notes, confidence=confidence, cloud_status=cloud_status,
+            skip_cleanup=use_offline_chain,
+            connectivity_mode=connectivity.effective_mode if connectivity else None)
+        result = self._enqueue_offline_work(
+            result, offline=use_offline_chain, skip_cleanup=use_offline_chain)
         self._ledger_live_session(backend, duration_s, ok=bool(final_text))
         shown = result.cleaned_text if (result.cleaned_text and not result.flagged) else result.raw_text
         await emit({"event": "transcript.final", "text": shown,
@@ -250,25 +336,44 @@ class DictationService:
         return result
 
     async def transcribe_file(self, audio_path: Path) -> SessionResult:
-        """Post tier (§3.6): accurate pass on an existing recording."""
+        """Post tier (§3.6): accurate pass online, local pass offline."""
         session_id = uuid.uuid4().hex[:12]
         from .capture import wav_duration_s
 
+        connectivity = self._connectivity()
+        offline = bool(connectivity and connectivity.is_offline)
         transcript = await asyncio.to_thread(
-            asr.transcribe_file, self.config, self.client, str(audio_path))
-        return await self._persist(
+            asr.transcribe_file, self.config, self.client, str(audio_path),
+            offline=offline, local_backend=self.local_backend)
+        cloud_status = self._cloud_status(
+            backend=transcript.backend, confidence=transcript.confidence,
+            raw=transcript.text, audio_path=audio_path, offline=offline)
+        result = await self._persist(
             session_id=session_id, when=datetime.now().astimezone(),
             raw=transcript.text, backend=transcript.backend,
             language=transcript.language, audio_path=Path(audio_path),
             duration_s=wav_duration_s(Path(audio_path)),
-            model=self.config.model_for_role("transcribe_batch"), notes=[])
+            model=(self.config.section("asr").get("offline_model", "small")
+                   if transcript.backend == "local"
+                   else self.config.model_for_role("transcribe_batch")),
+            notes=[], confidence=transcript.confidence, cloud_status=cloud_status,
+            skip_cleanup=offline,
+            connectivity_mode=connectivity.effective_mode if connectivity else None)
+        return self._enqueue_offline_work(result, offline=offline, skip_cleanup=offline)
 
     # -- persistence: store → cleanup → inbox → clipboard -----------------------
     async def _persist(self, *, session_id, when, raw, backend, language,
-                       audio_path, duration_s, model, notes) -> SessionResult:
+                       audio_path, duration_s, model, notes,
+                       confidence=None, cloud_status="complete",
+                       skip_cleanup=False, connectivity_mode=None) -> SessionResult:
         # Cleanup is a model call — off the event loop so acks/status on
-        # other connections never wait behind it (§18).
-        cleanup = await asyncio.to_thread(self.cleanup.run, raw) if raw else None
+        # other connections never wait behind it (§18). Offline it is queued,
+        # never attempted against Gemini.
+        cleanup = None
+        if raw and not skip_cleanup:
+            cleanup = await asyncio.to_thread(self.cleanup.run, raw)
+        elif raw and skip_cleanup:
+            notes.append("cleanup skipped offline; raw transcript is the record")
         cleaned = cleanup.cleaned if cleanup else None
         flagged = bool(cleanup and cleanup.flagged)
         if cleanup and cleanup.flagged:
@@ -290,14 +395,16 @@ class DictationService:
             duration_s=duration_s,
             divergence_pct=(cleanup.divergence_pct if cleanup else None),
             flagged=1 if flagged else 0,
-            inbox_path=str(inbox_path) if inbox_path else None)
+            inbox_path=str(inbox_path) if inbox_path else None,
+            confidence=confidence, cloud_status=cloud_status)
         return SessionResult(
             session_id=session_id, raw_text=raw, cleaned_text=cleaned,
             backend=backend, language=language,
             audio_path=str(audio_path) if audio_path else None,
             inbox_path=str(inbox_path) if inbox_path else None,
             clipboard=clipboard, flagged=flagged, duration_s=duration_s,
-            transcript_id=transcript_id, notes=notes)
+            transcript_id=transcript_id, notes=notes, confidence=confidence,
+            cloud_status=cloud_status, connectivity_mode=connectivity_mode)
 
     def _ledger_live_session(self, backend: str, duration_s: float, *, ok: bool) -> None:
         """Live sessions are calls too (§3.2): audio-second accounting at

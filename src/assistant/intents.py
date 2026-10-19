@@ -26,6 +26,11 @@ class Intent:
 _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("halt", re.compile(r"^\s*(halt|stop everything|panic stop)\s*[!.]*\s*$", re.IGNORECASE)),
     ("status", re.compile(r"^\s*(status|are you (up|running|alive)|health)\s*\??\s*$", re.IGNORECASE)),
+    ("mode_offline", re.compile(r"^\s*(go offline|offline mode|force offline|disconnect)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("mode_online", re.compile(r"^\s*(go online|online mode|reconnect)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("mode_auto", re.compile(r"^\s*(auto mode|connectivity auto|automatic mode)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("queue_status", re.compile(r"^\s*(queue status|what'?s queued|what is queued|show (the )?queue)\s*\??\s*$", re.IGNORECASE)),
+    ("queue_drain", re.compile(r"^\s*(drain (the )?queue|process (the )?queue)\s*[!.]*\s*$", re.IGNORECASE)),
     ("cost", re.compile(r"^\s*(cost|spend|quota|how much (have|did) (i|we) (spend|use)|usage)\b.*$", re.IGNORECASE)),
     ("undo", re.compile(r"^\s*undo(?:\s+since\s+(\S+))?\s*[!.]*\s*$", re.IGNORECASE)),
     ("remember", re.compile(r"^\s*remember\s+(?:that\s+)?(.+?)\s*$", re.IGNORECASE | re.DOTALL)),
@@ -39,6 +44,11 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     # rudisha = restore/undo.)
     ("halt", re.compile(r"^\s*(simama|wacha yote|simamisha yote)\s*[!.]*\s*$", re.IGNORECASE)),
     ("status", re.compile(r"^\s*(hali|uko sawa|unaendelea vipi)\s*\??\s*$", re.IGNORECASE)),
+    ("mode_offline", re.compile(r"^\s*(enda nje ya mtandao|hali ya nje ya mtandao)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("mode_online", re.compile(r"^\s*(rudi mtandaoni|enda mtandaoni|hali ya mtandaoni)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("mode_auto", re.compile(r"^\s*(hali ya kiotomatiki|kiotomatiki)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("queue_status", re.compile(r"^\s*(hali ya foleni|foleni ikoje|onyesha foleni)\s*\??\s*$", re.IGNORECASE)),
+    ("queue_drain", re.compile(r"^\s*(tenda foleni|chakata foleni)\s*[!.]*\s*$", re.IGNORECASE)),
     ("cost", re.compile(r"^\s*(gharama|nimetumia kiasi gani|quota)\b.*$", re.IGNORECASE)),
     ("undo", re.compile(r"^\s*(rudisha|tenda upya)(?:\s+tangu\s+(\S+))?\s*[!.]*\s*$", re.IGNORECASE)),
     ("remember", re.compile(r"^\s*kumbuka\s+(?:kwamba\s+)?(.+?)\s*$", re.IGNORECASE | re.DOTALL)),

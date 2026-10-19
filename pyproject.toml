@@ -28,6 +28,11 @@ diarize = ["pyannote.audio"]
 # assist-voice-test harness itself (ring buffer, event log, LED, report)
 # runs without them via replay/synthetic sources.
 voice = ["openwakeword", "speechbrain", "numpy"]
+# Phase 8: local Whisper for offline dictation/commands. CPU/int8 is the
+# intended Fedora laptop posture; model download happens on first owner run.
+offline = ["faster-whisper>=1.1"]
+# Phase 8 ONE-VOICE rule: the same local Piper-class voice online/offline.
+tts = ["piper-tts"]
 dev = ["pytest>=8", "ruff"]
 
 [project.scripts]

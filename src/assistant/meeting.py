@@ -90,10 +90,12 @@ class MeetingResult:
 
 
 class MeetingService:
-    def __init__(self, config, store, client):
+    def __init__(self, config, store, client, *, mode_manager=None, local_backend=None):
         self.config = config
         self.store = store
         self.client = client
+        self.mode_manager = mode_manager
+        self.local_backend = local_backend
         self.audio_dir = config.data_dir / "audio"
         self.inbox_dir = Path(config.section("transcribe").get(
             "inbox_dir", "~/.local/share/assistant/inbox")).expanduser()
@@ -105,7 +107,10 @@ class MeetingService:
         pcm, sample_rate = read_pcm(wav_path)
         segments = segment_utterances(pcm, sample_rate)
         turns: list[Turn] = []
-        backend = asr.GeminiBatchBackend(self.client, self.config)
+        offline = bool(self.mode_manager
+                       and self.mode_manager.status(refresh=False).is_offline)
+        backend = (self.local_backend or asr.LocalWhisperBackend(self.config)
+                   if offline else asr.GeminiBatchBackend(self.client, self.config))
         language = asr.primary_language(self.config)
         for idx, (start, end) in enumerate(segments[:400]):  # sane ceiling
             piece = slice_wav(pcm, sample_rate, start, end,
@@ -130,7 +135,9 @@ class MeetingService:
 
         turns = self._transcribe_channel(mic_dest, "You", work)
         turns += self._transcribe_channel(sys_dest, "Them", work)
-        backend = "channel-diarization"
+        offline = bool(self.mode_manager
+                       and self.mode_manager.status(refresh=False).is_offline)
+        backend = "channel-diarization + local ASR (offline)" if offline else "channel-diarization"
 
         if pyannote_refine:
             try:  # refine the far side only: the near side is one person

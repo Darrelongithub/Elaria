@@ -29,7 +29,16 @@ max_requests_per_minute = 12
 [asr]
 primary  = "gemini_live"            # chain: live -> batch -> local (§12.7)
 fallback = ["gemini_batch", "local"]
-offline_model = "small"             # English only offline (§12.6)
+# Phase 8 offline ASR: install with `uv sync --extra offline`. English is
+# the supported offline path; Kiswahili remains best-effort locally.
+offline_backend = "faster-whisper"  # faster-whisper | whisper.cpp | mock
+offline_model = "small"
+offline_device = "cpu"
+offline_compute_type = "int8"
+whisper_cpp_command = "whisper-cli"
+whisper_cpp_model = ""
+offline_low_confidence_threshold = 0.65
+offline_queue_cleanup = true
 languages = ["en"]                  # Phase 7 flip: ["sw", "en"] — first entry
                                     # is the primary pin. Pinned explicitly,
                                     # never auto-detected (§12.4).
@@ -37,6 +46,55 @@ preserve_code_switching = false     # set true WITH sw+en: bilingual batch
                                     # prompt, cleanup marker-retention gate,
                                     # Kiswahili intent ladder (kumbuka/tafuta…)
 assert_output_language  = true
+
+[connectivity]
+mode = "auto"                       # auto | online | offline (forced offline)
+health_host = "generativelanguage.googleapis.com"
+health_port = 443
+health_timeout_s = 1.5
+health_check_interval_s = 20
+drain_on_reconnect = true
+
+[tts]
+# ONE VOICE: local Piper-class speech in every mode. Gemini returns text;
+# it is never Elaria's voice. Flare/Vega are trait references only.
+enabled = true
+backend = "piper"                   # install: uv sync --extra tts
+voice_id = "unselected"             # set by: assist voice select <candidate>
+model = ""
+config = ""
+speaker = 0
+length_scale = 0.92                 # native Piper pace (<1 brisker), never stretch
+command = "piper"
+player = "auto"                     # pw-play/paplay/aplay, or none
+speak_acks = true
+speak_replies = false
+
+# Candidate voice files live outside git. Generate auditions with:
+#   assist voice audition
+[[tts.audition_candidates]]
+id = "en_GB-jenny_dioco-medium"
+model = "~/.local/share/piper/en_GB-jenny_dioco-medium.onnx"
+config = "~/.local/share/piper/en_GB-jenny_dioco-medium.onnx.json"
+speaker = 0
+length_scale = 0.92
+notes = "Audition: brisk, bite, dry; reject if kind-polished."
+
+[[tts.audition_candidates]]
+id = "en_US-lessac-medium"
+model = "~/.local/share/piper/en_US-lessac-medium.onnx"
+config = "~/.local/share/piper/en_US-lessac-medium.onnx.json"
+speaker = 0
+length_scale = 0.92
+notes = "Audition: brisk, bite, dry; reject if kind-polished."
+
+[[tts.audition_candidates]]
+id = "en_US-kathleen-low"
+model = "~/.local/share/piper/en_US-kathleen-low.onnx"
+config = "~/.local/share/piper/en_US-kathleen-low.onnx.json"
+speaker = 0
+length_scale = 0.92
+notes = "Lower-fidelity candidate; audition for edge without polish."
 
 [capture]
 source = "mic"                      # §10.1 OPEN — blueprint recommendation:
