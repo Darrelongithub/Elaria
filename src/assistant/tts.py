@@ -385,9 +385,8 @@ class SpeechService:
         return {
             "backend": {"gemini": "gemini-native-audio", "silent": "none"}.get(
                 mode, backend.name),
-            "voice_id": (self.config.section("gemini").get("voice", "Flare")
-                         if mode == "gemini" else ("none" if mode == "silent"
-                                                   else backend.voice_id)),
+            "voice_id": (self.voice_identity()["effective"] if mode == "gemini"
+                        else ("none" if mode == "silent" else backend.voice_id)),
             "voice_mode": self.voice_mode_label(mode),
             "local": mode == "local",
             "cloud_voice": mode == "gemini",
@@ -651,13 +650,49 @@ class SpeechService:
                            f"{len(missing)} ack(s) missing for the active voice — run "
                            f"`assist voice warm` (the daemon re-warms on its own)")}
 
+    def request_rewarm(self) -> None:
+        """Mark that the ACTIVE route's audio is missing. Idempotent, no I/O."""
+        self._rewarm_requested = True
+
+    def take_rewarm_request(self) -> bool:
+        """Consume the flag: a long-lived host turns it into one warm cycle.
+
+        VB-2: invalidation used to leave every ack a permanent silent miss until
+        someone thought to run `assist voice warm`. The miss itself is now the
+        trigger, so the hotkey path heals within one cycle.
+        """
+        requested = bool(getattr(self, "_rewarm_requested", False))
+        self._rewarm_requested = False
+        return requested
+
+    def warm_due(self) -> dict:
+        """One warm cycle, and only if the active route actually needs it.
+
+        Returns the acks written this cycle (empty when the cache is already full
+        or nothing is spoken). Renders off the hot path is the caller's job.
+        """
+        state = self.ack_cache_state()
+        if not state["speaks"] or state["complete"]:
+            self._rewarm_requested = False
+            return {}
+        warmed = self.warm_ack_cache()
+        if not self.ack_cache_state()["missing"]:
+            self._rewarm_requested = False
+        return warmed
+
     def cached_ack(self, kind: str) -> str | None:
         if kind not in STANDARD_ACKS:
             return None
         if self.voice_route()[0] == "silent":
             return None  # the ack path checks this, so a silent route means no sound
         path = self._ack_path(kind)
-        return str(path) if path.exists() and path.stat().st_size > 0 else None
+        if path.exists() and path.stat().st_size > 0:
+            return str(path)
+        # A miss on a route that is supposed to speak is a state with a cure, not
+        # a verdict: request one warm cycle (VB-2) and let a long-lived host run
+        # it off the hot path. Never substitute another voice's file.
+        self.request_rewarm()
+        return None
 
     def warm_ack_cache(self) -> dict[str, dict]:
         if self.voice_route()[0] == "silent":
@@ -679,6 +714,7 @@ class SpeechService:
             # The ack budget forbids synthesising here. Report it as a cold cache
             # that needs warming (VB-2): a miss must never pass for intent, and
             # it is never filled in with another voice's file.
+            self.request_rewarm()
             return {**route, "ack_kind": kind, "audio_path": None,
                     "cached": False, "played": False, "cache_miss": True,
                     "warning": "ack cache cold for the active voice — re-warming",

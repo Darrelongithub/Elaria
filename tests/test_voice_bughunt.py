@@ -491,15 +491,12 @@ def test_b5b_dormant_config_change_must_not_silence_the_hotkey_path(tmp_path):
         "the local route is resolving to the cloud route's files")
 
 
-@pytest.mark.xfail(strict=True, reason="VB-2 (remaining half, Gate B): a cold ack cache is a "
-                   "permanent silence - nothing re-warms it after a config change")
 def test_b5d_ack_miss_self_heals_within_one_warm_cycle(tmp_path):
-    """Gate B: invalidation must trigger a re-warm, never permanent `cache_miss`.
+    """VB-2 (fixed): invalidation triggers a re-warm; `cache_miss` is not permanent.
 
-    Repro at report level: change a LIVE voice identity (or delete the ack
-    files), then press the hotkey. The first press must be allowed to be silent,
-    but the warm must already be scheduled so the next press is audible again -
-    `assist doctor` says so in the meantime.
+    Change a LIVE voice identity (or delete the ack files), then press the
+    hotkey. The first press is silent AND reported, the miss itself requests the
+    cure, and one warm cycle makes the next press audible.
     """
     config, speech, _ = service(tmp_path)
     speech.warm_ack_cache()
@@ -1373,16 +1370,11 @@ def test_g19_double_hotkey_acks_once(tmp_path):
     assert result.notes
 
 
-@pytest.mark.xfail(strict=True, reason="VB-13: `run()` serves the socket before "
-                   "_warm_speech_cache(), so acks in that window are silent (one cloud "
-                   "render per ack online)")
-def test_b5c_socket_opens_before_the_ack_cache_is_warm():
-    """VB-13: after every boot there is a window where the hotkey is silent.
+def test_b5c_boot_warm_starts_before_the_socket_serves():
+    """VB-13 (fixed, ordering): the warm task is created before anything can ask.
 
-    `run()` serves the socket first and starts `_warm_speech_cache()` as a
-    background task afterwards. `play_ack` never synthesises on the hot path (by
-    design, §18), so an ack that arrives before warming completes is silent —
-    and online, warming is one cloud render per ack, not a local file write.
+    `run()` used to `await serve(...)` first and start `_warm_speech_cache()`
+    afterwards, so every boot had a window where the hotkey was silent.
     """
     source = (SRC / "daemon.py").read_text()
     body = source[source.index("    async def run(self)"):]
@@ -1391,3 +1383,91 @@ def test_b5c_socket_opens_before_the_ack_cache_is_warm():
     assert warm_at < serve_at, (
         "the daemon accepts IPC requests before the ack cache exists: warm first, or "
         "gate the ack path until `status()['cached_acks']` is full")
+
+
+def test_b5cb_early_acks_queue_behind_the_boot_warm(tmp_path):
+    """VB-13 (fixed, behaviour): the first ack after boot finds audio, not silence.
+
+    A slow warm is injected through the documented seam (`speech.warm_due`), and
+    the real `_ack` handler is called while it is in flight. The handler waits
+    (bounded) and then reports a cache hit; the pre-fix code returned
+    `cached: False` in the same instant.
+    """
+    import asyncio
+
+    from assistant.daemon import Daemon
+
+    config = voice_config(tmp_path, online_voice="local", offline_voice="local")
+    daemon = Daemon(config)
+    daemon.speech._is_online = lambda: True
+    cache = Path(config.section("tts")["cache_dir"])
+    assert not list(cache.glob("*.wav")), "cache should start cold"
+
+    real_due = daemon.speech.warm_due
+    slow = {"released": 0.0}
+
+    def slow_warm_due():
+        time.sleep(0.35)                     # one render per ack, like the cloud
+        result = real_due()
+        slow["released"] = time.perf_counter()
+        return result
+
+    daemon.speech.warm_due = slow_warm_due
+
+    async def scenario():
+        warm = asyncio.ensure_future(daemon._warm_speech_cache())
+        await asyncio.sleep(0)               # the warm is now genuinely in flight
+        started = time.perf_counter()
+        ack = await daemon._ack({"kind": "on_it"})
+        await warm
+        return ack, time.perf_counter() - started
+
+    ack, elapsed = asyncio.run(scenario())
+    speech = ack["speech"]
+    assert speech["cached"] is True and speech["cache_miss"] is False, (
+        f"the first ack after boot was silent: {speech}")
+    assert Path(speech["audio_path"]).exists()
+    assert elapsed >= 0.3, (
+        f"the ack did not wait for the warm at all ({elapsed:.3f}s) — it answered "
+        f"from a cold cache instead of queueing behind it")
+    assert elapsed <= 3.0, "the ack gate must be bounded, not an unbounded wait"
+    assert slow["released"] > 0
+
+
+def test_b5e_daemon_re_warms_after_a_miss(tmp_path):
+    """VB-2 at daemon level: a miss schedules the cure, so the next press works."""
+    import asyncio
+
+    from assistant.daemon import Daemon
+
+    config = voice_config(tmp_path, online_voice="local", offline_voice="local")
+    daemon = Daemon(config)
+    daemon.speech._is_online = lambda: True
+
+    async def scenario():
+        warmed = await daemon._speech_warm({})
+        assert len(warmed["warmed"]) == 4, warmed
+        cache = Path(config.section("tts")["cache_dir"])
+        for path in cache.glob("*.wav"):
+            path.unlink()                    # the invalidation, by any cause
+        miss = await daemon._ack({"kind": "on_it"})
+        assert miss["speech"]["cache_miss"] is True and miss["speech"]["cached"] is False
+        for _ in range(200):                 # the scheduled re-warm is a background task
+            await asyncio.sleep(0.01)
+            if daemon.speech.cached_ack("on_it"):
+                break
+        healed = await daemon._ack({"kind": "on_it"})
+        return miss, healed
+    first, healed = asyncio.run(scenario())
+    assert first["speech"]["audio_path"] is None, first
+    assert healed["speech"]["cached"] is True, (
+        "acks never came back after invalidation — the permanent-silence bug: "
+        f"{healed['speech']}")
+
+
+@pytest.mark.skip(reason="needs live (VB-13): the online boot window is one rate-limited "
+                  "cloud render per ack; `assist voice warm` timing can only be measured "
+                  "with a real key — never faked in the sandbox")
+def test_b5f_boot_warm_window_online_is_measured():
+    """Registered, not simulated: see the needs-live list in VOICE-BUGTEST.md."""
+    raise AssertionError("unreachable in the sandbox")

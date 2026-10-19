@@ -87,6 +87,16 @@ class Daemon:
         self._meeting: dict | None = None  # {task, dual, mic_frames, sys_frames}
         self._meeting_processing = False
         self._plan_tasks: dict[int, asyncio.Task] = {}
+        # VB-13: early acks wait for the boot warm instead of being silent. The
+        # event is set as soon as a warm cycle ends (success, failure, or a
+        # posture that never speaks), so it can only ever delay a handler briefly.
+        self._ack_cache_ready = asyncio.Event()
+        self._warm_running = False
+        # True from the moment run() schedules the boot warm until that cycle
+        # ends: it covers the instant before the task first runs, so an ack
+        # landing there queues behind the warm instead of answering from a cold
+        # cache. A daemon driven without run() never sets it and never waits.
+        self._warm_pending = False
         self._subscribers: set = set()          # event-stream writers (§3.1)
         self._dictation_task: asyncio.Task | None = None
         self._dictation_session_mode = "narration"
@@ -312,9 +322,18 @@ class Daemon:
         kind = str(params.get("kind") or "on_it")
         route = self.speech.route(STANDARD_ACKS.get(kind, "On it."))
         cached = self.speech.cached_ack(kind)
-        ack["speech"] = {**route, "ack_kind": kind, "audio_path": cached,
-                         "cached": cached is not None, "played": False}
         should_speak = params.get("speak", self.config.section("tts").get("speak_acks", True))
+        if should_speak and cached is None and not route["muted"]:
+            await self._await_ack_cache()          # VB-13: boot warming, once
+            cached = self.speech.cached_ack(kind)
+        ack["speech"] = {**route, "ack_kind": kind, "audio_path": cached,
+                         "cached": cached is not None, "played": False,
+                         # A miss while she is supposed to speak is a reported
+                         # condition (VB-2), not a verdict: the re-warm below is
+                         # what makes the next press audible.
+                         "cache_miss": cached is None and not route["muted"]}
+        if cached is None:
+            self._schedule_rewarm_if_requested()   # VB-2: miss -> one warm cycle
         if should_speak and cached:
             self._track_task(asyncio.create_task(
                 asyncio.to_thread(self.speech.play_ack, kind)))
@@ -374,7 +393,14 @@ class Daemon:
         return {"speech": result.as_dict()}
 
     async def _speech_warm(self, params: dict) -> dict:
+        """`speech.warm`: an explicit warm cycle (also `assist voice warm`).
+
+        Opening the ack gate here is what makes `assist voice warm` the documented
+        cure for a cold cache: from now on the hot path is allowed to answer.
+        """
         warmed = await asyncio.to_thread(self.speech.warm_ack_cache)
+        if self.speech.ack_cache_state()["complete"]:
+            self._ack_cache_ready.set()
         return {"warmed": warmed, "voice": self.speech.status()}
 
     async def _speech_audition(self, params: dict) -> dict:
@@ -882,14 +908,53 @@ class Daemon:
             await self._note_connectivity_transition(status)
 
     async def _warm_speech_cache(self) -> None:
-        if not self.config.section("tts").get("enabled", True):
+        """One warm cycle for the active voice, off the hot path (§18).
+
+        Single-flight and repeatable: boot calls it before the socket serves, and
+        a cold-cache ack (VB-2) schedules it again so the next press is audible.
+        The ack gate opens when the cycle ends, however it ends - a cloud that
+        cannot render must not park every future ack behind a timeout.
+        """
+        if self._warm_running:
+            return
+        self._warm_running = True
+        self._warm_pending = True
+        try:
+            if not self.config.section("tts").get("enabled", True):
+                return
+            try:
+                await asyncio.to_thread(self.speech.warm_due)
+            except Exception as exc:
+                # Text/UI ack still works; status/doctor carry the reason.
+                self._ack_cache_ready.clear()   # a failed warm is not a ready cache
+                await self.broadcast({"event": "speech.error", "error": str(exc),
+                                      **self.speech.route("On it.")})
+                return
+            if self.speech.ack_cache_state()["complete"]:
+                self._ack_cache_ready.set()
+        finally:
+            self._warm_running = False
+            self._warm_pending = False
+
+    async def _await_ack_cache(self, timeout: float = 2.0) -> None:
+        """Queue the first acks after boot behind the warm (VB-13).
+
+        Bounded on purpose: the hot path keeps its 300 ms promise even when the
+        warm is still rendering, and a silent ack with a reason in `status` beats
+        a hung handler.
+        """
+        if self._ack_cache_ready.is_set() or not (self._warm_pending or self._warm_running):
             return
         try:
-            await asyncio.to_thread(self.speech.warm_ack_cache)
-        except Exception as exc:
-            # Text/UI ack still works; status/doctor carry the reason.
-            await self.broadcast({"event": "speech.error", "error": str(exc),
-                                  **self.speech.route("On it.")})
+            await asyncio.wait_for(asyncio.shield(self._ack_cache_ready.wait()), timeout)
+        except TimeoutError:      # asyncio.TimeoutError is this alias since 3.11
+            pass
+
+    def _schedule_rewarm_if_requested(self) -> None:
+        """VB-2: a `cache_miss` on the speaking route is the trigger, not a verdict."""
+        if self.speech.take_rewarm_request():
+            self._ack_cache_ready.clear()
+            self._track_task(asyncio.create_task(self._warm_speech_cache()))
 
     # -- lifecycle ---------------------------------------------------------------
     async def run(self) -> None:
@@ -900,9 +965,13 @@ class Daemon:
             print(f"[assistd] WARNING: {len(outstanding)} uncommitted journal "
                   f"intent(s) from a previous run — inspect before enabling "
                   f"the executor.", flush=True)
+        # VB-13: the ack cache starts warming BEFORE anything can ask for an ack,
+        # and `_ack` queues behind it, so the first hotkey press after boot finds
+        # audio instead of silence. Everything else on the socket is unaffected.
+        self._warm_pending = True
+        warm_task = asyncio.create_task(self._warm_speech_cache())
         server = await serve(self.config.socket_path, self.handle)
         connectivity_task = asyncio.create_task(self._connectivity_loop())
-        warm_task = asyncio.create_task(self._warm_speech_cache())
         _sd_notify("READY=1")
         print(f"[assistd] Elaria up · mode={self.config.gemini_mode} "
               f"· socket={self.config.socket_path}", flush=True)
