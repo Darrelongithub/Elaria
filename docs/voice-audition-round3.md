@@ -295,6 +295,16 @@ Not approved, not canonical: owner ear-check required before anything else
 
 # Round 4 addendum — keeping the incumbent, and what config can actually buy
 
+> **CLOSED 2026-10-20, by owner instruction — do not continue this line of work.**
+> The owner stopped the local-voice hunt: *"Set Elaria's ONLINE voice to Gemini
+> Flare … keep the existing local Piper voice as OFFLINE BACKUP ONLY … do not
+> spend another minute improving it"*, amended to *"offline mode has NO voice
+> output at all … keep any existing local TTS code dormant behind config; it must
+> not speak in normal operation."* Everything below is the final word on this
+> voice as measured, preserved so the reasoning is not re-derived. The
+> ear-check gate mentioned at the end of this file is **withdrawn**: the voice is
+> no longer on the speaking path.
+
 Added 2026-10-19 after the owner rejected the framing of rounds 1–3. Their
 words: *"i dont get why im picking a new voice, i already had one — the problem
 was i couldnt make out what it was saying."* So the task is **audibility of

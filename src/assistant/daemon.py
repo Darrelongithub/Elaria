@@ -64,7 +64,13 @@ class Daemon:
         self.mode = "idle"
         # Phase 8 resident hot paths: connectivity, ONE local voice, queue.
         self.mode_manager = ModeManager(config, self.store)
-        self.speech = SpeechService(config, self.store)
+        self.speech = SpeechService(
+            config, self.store, client=self.client,
+            # INTERIM online voice: Flare speaks only while actually online. Offline
+            # turns are text-only (amendment 2026-10-20) - no cloud call, and the
+            # dormant local voice does not take them over either.
+            is_online=lambda: self.mode_manager.status(refresh=False).effective_mode
+            == "ONLINE")
         self.cloud_queue = CloudQueue(config, self.store, self.client, self.mode_manager)
         self.dictation = DictationService(
             config, self.store, self.client,

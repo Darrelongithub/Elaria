@@ -167,10 +167,15 @@ def run_doctor(config) -> dict:
         f"preference={connectivity.preference}, effective={connectivity.effective_mode} "
         f"— {connectivity.reason}; switch with `assist mode offline|online|auto`"))
     checks.append(_check(
-        "one local voice", voice["available"],
-        f"backend={voice['backend']}, voice={voice['voice_id']}, "
-        f"cached acks={voice['cached_acks'] or 'none'} — {voice['reason']}. "
-        "Gemini native audio is disabled (Live is TEXT-only); no cloud-voice fallback exists"))
+        "voice routing", voice["available"],
+        f"{voice['voice_mode'].replace('-', ' ')} — backend={voice['backend']}, "
+        f"voice={voice['voice_id']}, cached acks={voice['cached_acks'] or 'none'}: "
+        f"{voice['reason']}. "
+        f"One-voice rule DEFERRED, not cancelled: {voice.get('gemini_voice')} via Gemini "
+        f"native audio is the only voice; offline: {voice.get('offline_output')}; a cloud "
+        f"failure is reported silence, never local audio. Local voice dormant - "
+        f"{voice.get('dormant_local_voice', {}).get('enable_with', '')} to un-dormant; "
+        f"endgame switch: {voice.get('switch_back')}"))
     offline_asr = local_asr_status(config)
     checks.append(_check(
         "offline ASR", offline_asr["available"],
@@ -584,8 +589,9 @@ def build_parser() -> argparse.ArgumentParser:
     ask_p = sub.add_parser("ask", help="one conversational turn (governor + harness)")
     ask_p.add_argument("text")
     ask_p.add_argument("--speak", action="store_true",
-                       help="speak the reply through the ONE local voice")
-    voice_p = sub.add_parser("voice", help="one local voice: status, acks, auditions")
+                       help="speak the reply through the configured voice for this mode")
+    voice_p = sub.add_parser(
+        "voice", help="speech routing: status, acks, auditions (online voice is interim)")
     voice_sub = voice_p.add_subparsers(dest="voice_action", required=True)
     voice_sub.add_parser("status", help="show the single local TTS routing")
     say_p = voice_sub.add_parser("say", help="speak text through the one local voice")

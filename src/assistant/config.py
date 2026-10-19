@@ -72,6 +72,12 @@ DEFAULTS: dict = {
         "model_chat": "gemini-flash-latest",
         "model_transcribe_live": "gemini-3.5-transcribe-live",
         "model_transcribe_batch": "gemini-flash-lite-latest",
+        # INTERIM speaking voice (owner choice 2026-10-20). Flare is the only
+        # voice Elaria ever speaks with; offline is text-only and the local Piper
+        # voice is dormant (see [tts]). `model_voice` must be a native-audio/TTS
+        # capable model.
+        "model_voice": "gemini-2.5-flash-preview-tts",
+        "voice": "Flare",
         "escalation_ladder": ["gemini-flash-lite-latest", "gemini-flash-latest"],
         "escalate_after_failures": 2,
         "max_scaffold_calls": 6,
@@ -112,8 +118,20 @@ DEFAULTS: dict = {
         "drain_on_reconnect": True,
     },
     "tts": {
-        # ONE-VOICE RULE: exactly one locally owned voice speaks for Elaria
-        # in every mode. Gemini may return text; it never supplies her voice.
+        # ONE-VOICE RULE — DEFERRED, NOT CANCELLED (owner decision 2026-10-20).
+        # Endgame is still exactly one locally owned voice in every mode, adopted
+        # in a single switch. Until then this is INTERIM: `online_voice = "gemini"`
+        # makes Gemini native audio (Flare) her speaking voice for online
+        # conversation. Offline nothing is spoken at all (see `offline_voice`), so
+        # the Piper voice below stays dormant - not an offline voice, not a
+        # fallback. Set `online_voice = "local"` to restore the strict one-voice
+        # posture; that one key is the whole switch back.
+        "online_voice": "gemini",  # gemini (interim) | local (the endgame posture)
+        # OFFLINE HAS NO VOICE (owner amendment 2026-10-20): offline replies are
+        # text only - Waybar, overlay, notification, log. Nothing is spoken from a
+        # local model in normal operation. `local` keeps the Piper path wired but
+        # dormant, for the future owned-voice endgame; `none` is the shipped truth.
+        "offline_voice": "none",   # none (text only) | local (dormant endgame path)
         "enabled": True,
         "backend": "piper",  # piper | mock (tests/dev only)
         # Owner-selected 2026-10-19 after two audition rounds. The first

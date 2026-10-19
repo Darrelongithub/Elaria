@@ -1,31 +1,36 @@
 # Elaria voice — selected
 
-Elaria has **one speaking voice in every mode**. Gemini supplies text
-(reasoning/transcription); it never supplies her voice. Gemini Live in this
-codebase is text-only, and native Gemini audio output is not routed anywhere.
+As of 2026-10-20 Elaria's **only spoken voice is Gemini native audio,
+`[gemini] voice = "Flare"`**, online, and **offline mode speaks not at all** (text
+on Waybar / overlay / notification / log). The old rule — one locally owned voice
+in every mode, Gemini supplying text only, no native Gemini audio routed anywhere
+— is **deferred, not cancelled**: it is the endgame, and the single config switch
+that restores it is `[tts] online_voice = "local"`.
 
-Flare and Vega in `humour.toml` are **trait references only**: brisk, bite,
-dry, edge — never kind-polished. The runtime voice is locally owned so it is
-identical online and offline.
+Flare and Vega in `humour.toml` were **trait references** (brisk, bite, dry, edge
+— never kind-polished). Flare is now literally her voice, which is exactly why the
+endgame is an owned local model: a voice the owner cannot keep must not be final.
 
 ## Selected voice
 
-> **STATUS: PROVISIONAL — NOT CANONICAL.** Re-auditioned 2026-10-19: the owner
-> could not parse this voice in normal playback, and round-3 measurements rank
-> it last of four on intelligibility (see
-> [`voice-audition-round3.md`](voice-audition-round3.md)). The owner is keeping
-> the voice — the job is audibility, not replacement.
+> **STATUS: DORMANT — NOT A SPOKEN FALLBACK (owner decisions 2026-10-20).** Two
+> things changed, in order. First, the owner set **Gemini native audio,
+> `[gemini] voice = "Flare"`, as Elaria's online speaking voice**, effective
+> immediately and without further audition. Then they amended it: **offline mode
+> has no voice output at all** — replies are text on the Waybar, overlay,
+> notification and log surfaces. This Piper voice therefore stays wired but
+> **silent in normal operation**: it is not the offline voice and it is not the
+> fallback for a cloud failure (a failed or unavailable cloud voice is *reported*
+> silence — `muted: true` plus a reason in `assist voice status`).
 >
-> The 16 kHz sample rate is a real ceiling (no 8–11 kHz band exists in the
-> file), but it is **not** the root cause: the same weight renders the long
-> sentences at 76–84 % ASR-recoverable and one-word acks at **0 %**, at every
-> pace, with or without silence padding, alone or inside a line, on piper 1.2.0
-> and 1.8.0 alike. The failure is short-phrase instability plus high
-> take-to-take variance, not missing bandwidth. Round-4 evidence and the
-> config-only knobs are in
-> [`voice-audition-round3.md`](voice-audition-round3.md) ("Round 4 addendum").
-> Do not treat it as final; do not build Hyprland binds or live-Gemini voice
-> routing on it until the owner approves the repaired setting.
+> The one-voice rule is **deferred, not cancelled**: the endgame is still one
+> locally owned voice in every mode, adopted in a single switch
+> (`[tts] online_voice = "local"`, or `offline_voice = "local"` to bring back
+> offline speech only). Round 3/4 measurements below are kept as the record of
+> *why* the local path was never blessed as canonical, and they are explicitly
+> closed work: the owner directed that no further time be spent improving it.
+> Do not build Hyprland binds or live-Gemini routing on the assumption that this
+> voice speaks.
 
 **`en_GB-southern_english_female-low`** — Piper Southern English Female, low
 quality. Chosen by the owner on 2026-10-19 after two audition rounds, on the
@@ -86,11 +91,17 @@ files and generated audio stay out of git.
 
 ## Non-negotiables
 
-- **No time-stretching.** Pace comes only from Piper's native
-  `--length-scale` (`0.92` by default: slightly faster than neutral).
-- **No cloud voice fallback.** If Piper or the selected model is unavailable,
-  speech reports an error/deferred result; Elaria does not suddenly acquire a
-  Gemini voice.
-- The standard permission-neutral acks — “On it.”, “Done.”, “Is that all?”,
-  “No. Not at this hour.” — are pre-rendered into the local cache so playback
-  is a file lookup, not synthesis on the hotkey path.
+- **Flare online, nothing offline.** Gemini native audio is the only voice and
+  it speaks only while online; offline there is no speech at all. This *replaces*
+  the old rule "Elaria does not suddenly acquire a Gemini voice" — the owner
+  overrode that rule for online speech on 2026-10-20 while deferring (not
+  cancelling) it. The surviving half: nothing routes speech to a *second* cloud
+  voice, and the dormant local voice is never used to paper over a cloud failure.
+- **Silence is reported, never implied.** An unavailable or failing cloud voice
+  returns `muted=True` with the reason in `status()["reason"]` / the doctor row.
+- **No time-stretching** on the dormant path. Pace comes only from Piper's native
+  `--length-scale` (`0.92`: slightly faster than neutral).
+- The standard permission-neutral acks — “On it.”, “That is done.”,
+  “Is that everything?”, “No. Not at this hour.” — stay one cached file lookup
+  (`§18`), warmed off the hotkey path. Online that file is Flare audio; offline
+  there is no file to play, so the ack is silent text on the normal surfaces.
