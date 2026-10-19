@@ -20,6 +20,7 @@ import pytest
 
 from assistant.executor import Executor
 from assistant.indexer import Indexer
+from assistant.organiser import OrganiserService
 from assistant.planner_llm import _parse_batch
 from assistant.safety import is_halted, is_protected, set_halt
 from assistant.store import Store
@@ -443,3 +444,122 @@ def test_trash_refuses_protected_paths_and_halt(config, tmp_path):
     result = executor.trash(doomed)
     assert doomed.exists()
     assert result["result"] != "applied"
+
+
+# -- A continued: executor must distrust its plan/spec pairing -----------------
+
+@pytest.mark.xfail(strict=True, reason="BH-A5: executor does not verify plan root == spec root")
+def test_plan_for_one_root_cannot_be_applied_with_another_root_spec(config, tmp_path):
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    src_b = aged(root_b / "invoice.txt", "belongs to B")
+    store, executor, spec_a = setup(config, tmp_path, root_a)
+    spec_b = {"path": str(root_b), "mode": "live", "taxonomy": TAXONOMY}
+    index(config, store, spec_b)
+    plan_b = manual_plan(store, root_b, [{"src": src_b}])
+
+    with pytest.raises(ValueError, match="root"):
+        executor.apply_plan(plan_b, spec_a, allow_tripwire=True)
+    assert src_b.exists()
+    assert not (root_a / "Finance" / "invoice.txt").exists()
+
+
+@pytest.mark.xfail(strict=True, reason="BH-A6: executor does not require src inside the root")
+def test_plan_item_source_outside_root_is_refused(config, tmp_path):
+    root = tmp_path / "docs"
+    outside = aged(tmp_path / "outside" / "invoice.txt", "outside")
+    store, executor, spec = setup(config, tmp_path, root)
+    outside_spec = {"path": str(tmp_path / "outside"), "mode": "live",
+                    "taxonomy": TAXONOMY}
+    index(config, store, outside_spec)  # indexed elsewhere, but not this root
+    plan_id = manual_plan(store, root, [{"src": outside}])
+
+    report = executor.apply_plan(plan_id, spec, allow_tripwire=True)
+    assert report.applied == 0 and outside.exists()
+    assert not (root / "Finance" / "invoice.txt").exists()
+
+
+@pytest.mark.xfail(strict=True, reason="BH-A7: executor accepts destinations outside taxonomy")
+def test_plan_item_invented_destination_is_refused(config, tmp_path):
+    root = tmp_path / "docs"
+    src = aged(root / "invoice.txt", "stay")
+    store, executor, spec = setup(config, tmp_path, root)
+    index(config, store, spec)
+    plan_id = manual_plan(store, root, [{"src": src, "dest": "Invented"}])
+
+    report = executor.apply_plan(plan_id, spec, allow_tripwire=True)
+    assert report.applied == 0 and src.exists()
+    assert not (root / "Invented" / "invoice.txt").exists()
+
+
+@pytest.mark.xfail(strict=True, reason="BH-A8: nested already-filed files are flattened")
+def test_nested_already_filed_file_is_not_flattened(config, tmp_path):
+    root = tmp_path / "docs"
+    src = aged(root / "Finance" / "2024" / "invoice.txt", "already nested")
+    store, executor, spec = setup(config, tmp_path, root)
+    index(config, store, spec)
+    built = OrganiserService(config, store).build_plan(spec)
+
+    report = executor.apply_plan(built["plan_id"], spec, allow_tripwire=True)
+    assert report.applied == 0
+    assert src.exists() and src.read_bytes() == b"already nested"
+    assert not (root / "Finance" / "invoice.txt").exists()
+
+
+@pytest.mark.xfail(strict=True, reason="BH-A9: destination directory crashes policy hashing")
+def test_destination_occupied_by_directory_is_refused_not_raised(config, tmp_path):
+    root = tmp_path / "docs"
+    src = aged(root / "invoice.txt", "incoming")
+    blocker = root / "Finance" / "invoice.txt"
+    blocker.mkdir(parents=True)
+    store, executor, spec = setup(config, tmp_path, root)
+    index(config, store, spec)
+    plan_id = manual_plan(store, root, [{"src": src}])
+
+    report = executor.apply_plan(plan_id, spec, allow_tripwire=True)
+    assert report.applied == 0 and report.refused
+    assert src.exists() and blocker.is_dir()
+
+
+@pytest.mark.xfail(strict=True, reason="BH-A10: ApplyReport.op_ids is never populated")
+def test_apply_report_names_the_journal_operations_it_committed(config, tmp_path):
+    root = tmp_path / "docs"
+    src = aged(root / "invoice.txt", "journal me")
+    store, executor, spec = setup(config, tmp_path, root)
+    index(config, store, spec)
+    plan_id = manual_plan(store, root, [{"src": src}])
+
+    report = executor.apply_plan(plan_id, spec, allow_tripwire=True)
+    committed = store.committed_operations(plan_id=plan_id)
+    assert report.op_ids == [op["id"] for op in committed]
+
+
+@pytest.mark.xfail(strict=True, reason="BH-B8: unreadable directory is treated as empty")
+def test_unreadable_directory_does_not_mark_known_files_missing(config, tmp_path):
+    root = tmp_path / "docs"
+    subdir = root / "sub"
+    src = aged(subdir / "invoice.txt", "known")
+    store, _executor, spec = setup(config, tmp_path, root)
+    index(config, store, spec)
+
+    subdir.chmod(0)
+    try:
+        stats = Indexer(config, store).index_root(spec)
+    finally:
+        subdir.chmod(0o700)
+    assert "error" in stats
+    assert store.document_by_path(str(src))["status"] == "indexed"
+
+
+@pytest.mark.xfail(strict=True, reason="BH-B9: build_plan ignores indexer root-missing error")
+def test_build_plan_for_missing_root_does_not_finish_ready(config, tmp_path):
+    root = tmp_path / "docs"
+    aged(root / "invoice.txt", "was here")
+    store, _executor, spec = setup(config, tmp_path, root)
+    index(config, store, spec)
+    root.rename(tmp_path / "docs-gone")
+
+    with pytest.raises((ValueError, FileNotFoundError)):
+        OrganiserService(config, store).build_plan(spec)
+    latest = store.list_plans(1)[0]
+    assert latest["status"] == "failed"

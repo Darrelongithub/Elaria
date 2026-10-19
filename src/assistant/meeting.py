@@ -17,6 +17,8 @@ capture sources are plain PipeWireCapture targets per channel.
 
 from __future__ import annotations
 
+import os
+import shutil
 import struct
 import wave
 from dataclasses import dataclass
@@ -102,6 +104,27 @@ class MeetingService:
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.inbox_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _copy_no_overwrite(src: Path, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with src.open("rb") as source, dest.open("xb") as target:
+            shutil.copyfileobj(source, target)
+
+    def _unused_meeting_stamp(self) -> str:
+        """Meeting names have only minute resolution in their readable
+        stamp, so allocate a collision suffix across the whole artifact
+        set. Raw meeting audio/notes are records: never overwrite them."""
+        base = datetime.now().strftime("%Y-%m-%d-%H%M")
+        stamp = base
+        counter = 2
+        while any(os.path.lexists(path) for path in (
+                self.audio_dir / f"meeting-{stamp}-mic.wav",
+                self.audio_dir / f"meeting-{stamp}-system.wav",
+                self.inbox_dir / f"meeting-{stamp}.md")):
+            stamp = f"{base}-{counter}"
+            counter += 1
+        return stamp
+
     def _transcribe_channel(self, wav_path: Path, speaker: str,
                             work_dir: Path) -> list[Turn]:
         pcm, sample_rate = read_pcm(wav_path)
@@ -124,12 +147,13 @@ class MeetingService:
     def transcribe_dual(self, mic_wav: Path, system_wav: Path, *,
                         title: str | None = None,
                         pyannote_refine: bool = False) -> MeetingResult:
-        stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+        stamp = self._unused_meeting_stamp()
         mic_dest = self.audio_dir / f"meeting-{stamp}-mic.wav"
         sys_dest = self.audio_dir / f"meeting-{stamp}-system.wav"
         if mic_wav.resolve() != mic_dest.resolve():
-            mic_dest.write_bytes(mic_wav.read_bytes())
-            sys_dest.write_bytes(system_wav.read_bytes())
+            self._copy_no_overwrite(mic_wav, mic_dest)
+        if system_wav.resolve() != sys_dest.resolve():
+            self._copy_no_overwrite(system_wav, sys_dest)
         work = self.config.data_dir / "meeting-work" / stamp
         work.mkdir(parents=True, exist_ok=True)
 
@@ -153,11 +177,11 @@ class MeetingService:
         turns = merge_adjacent(sorted(turns, key=lambda t: t.start_s))
         transcript = format_transcript(turns)
         note_path = self.inbox_dir / f"meeting-{stamp}.md"
-        note_path.write_text(
-            f"---\ncreated: {iso_now()}\ntype: meeting\ntitle: {title or 'Untitled call'}\n"
-            f"diarization: {backend}\nmic: {mic_dest}\nsystem: {sys_dest}\n---\n\n"
-            f"# {title or 'Meeting'} — {stamp}\n\n{transcript}\n",
-            encoding="utf-8")
+        with note_path.open("x", encoding="utf-8") as note:
+            note.write(
+                f"---\ncreated: {iso_now()}\ntype: meeting\ntitle: {title or 'Untitled call'}\n"
+                f"diarization: {backend}\nmic: {mic_dest}\nsystem: {sys_dest}\n---\n\n"
+                f"# {title or 'Meeting'} — {stamp}\n\n{transcript}\n")
         raw = "\n".join(f"{t.speaker}: {t.text}" for t in turns)
         self.store.log_transcript(
             session_id=f"meeting-{stamp}", ts=iso_now(),

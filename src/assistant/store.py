@@ -591,9 +591,14 @@ class Store:
                 cur = self._conn.execute("UPDATE facts SET active = 0 WHERE id = ?",
                                          (int(topic.lstrip("#")),))
             else:
+                # Topic is user text, not a SQL pattern: `%` and `_` must
+                # stay literal or `forget %` would deactivate every fact.
+                escaped = (topic.replace("\\", "\\\\")
+                           .replace("%", "\\%").replace("_", "\\_"))
                 cur = self._conn.execute(
-                    "UPDATE facts SET active = 0 WHERE active = 1 AND text LIKE ?",
-                    (f"%{topic}%",))
+                    "UPDATE facts SET active = 0 WHERE active = 1 "
+                    "AND text LIKE ? ESCAPE '\\'",
+                    (f"%{escaped}%",))
             self._conn.commit()
             return cur.rowcount
 

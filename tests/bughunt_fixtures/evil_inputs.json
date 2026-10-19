@@ -36,5 +36,63 @@
   "secrets": {
     "never_send_marker": "ZEBRA-SECRET-12345",
     "forgotten_marker": "PURPLE-SECRET-67890"
-  }
+  },
+  "unsafe_filenames": [
+    "../escape.txt",
+    "../../escape.txt",
+    "/absolute/escape.txt",
+    "folder/child.txt",
+    "folder\\child.txt",
+    "..\\escape.txt",
+    ".",
+    "..",
+    "",
+    "bad\u0000name.txt",
+    "trailing/",
+    "trailing\\"
+  ],
+  "intent_action_bases": [
+    "organise downloads",
+    "forget about milk",
+    "remember that the gate code is 1234",
+    "search for the March invoice",
+    "find the March invoice",
+    "undo",
+    "halt",
+    "drain the queue"
+  ],
+  "intent_negation_wrappers": [
+    "don't {action}",
+    "do not {action}",
+    "never {action}",
+    "please don't {action}",
+    "\"{action}\" is what the speaker said",
+    "he said: {action}",
+    "if I say {action}, ignore it",
+    "the transcript says {action}"
+  ],
+  "llm_malformed_payloads": [
+    "",
+    "not json",
+    "[] trailing [",
+    "[{\"path\": \"/r/a.txt\",}]",
+    "[{\"path\": \"/r/a.txt\", \"dest\": \"Finance\", \"confidence\": \"high\"}]",
+    "[{\"path\": \"/r/a.txt\", \"dest\": \"Finance\", \"confidence\": NaN}]",
+    "[{\"path\": \"/r/a.txt\", \"dest\": \"Finance\", \"confidence\": Infinity}]",
+    "[{\"path\": \"/r/a.txt\", \"dest\": \"Finance\", \"confidence\": -0.1}]",
+    "[{\"path\": \"/r/a.txt\", \"dest\": \"Finance\", \"confidence\": 1.1}]",
+    "[{\"path\": \"/r/other.txt\", \"dest\": \"Finance\", \"confidence\": 0.9}]",
+    "[{\"path\": \"/r/a.txt\", \"dest\": \"Invented\", \"confidence\": 0.9}]",
+    "[\"not-an-object\"]"
+  ],
+  "search_syntax_attacks": [
+    "\"",
+    "NEAR(",
+    "invoice OR",
+    "(invoice",
+    "invoice)",
+    "invoice AND",
+    "invoice NOT",
+    "\"unterminated phrase"
+  ]
 }
