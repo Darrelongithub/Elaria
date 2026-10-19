@@ -129,9 +129,16 @@ DEFAULTS: dict = {
         "mode": "shadow",
         "confidence_auto": 0.90,
         "confidence_review": 0.60,
+        "tier0_min_confidence": 0.85,  # below: would escalate to LLM tiers (§3.7)
         "max_ops_per_run": 200,
         "max_ops_per_hour": 500,
         "tree_tripwire_pct": 25,
+        # NO roots by default: nothing is indexed until the owner names a
+        # root in config (new roots ALWAYS start in shadow mode, §4.3).
+        "roots": [],
+        "watch": False,
+        "watch_interval_s": 60,
+        "max_extract_chars": 200_000,
     },
     "policy": {
         "protected": ["~/.ssh", "~/.gnupg", "~/.config", "~/.local/share/assistant"],
@@ -171,6 +178,24 @@ class Config:
     def api_key(self) -> str | None:
         """The key itself. Callers must never log or print this."""
         return self._api_key
+
+    def organise_roots(self) -> list[dict]:
+        """Normalised [[organise.roots]] entries: expanded paths, per-root
+        mode defaulting to shadow (§4.3 — new roots NEVER start live),
+        frozen taxonomy with the _Unsorted escape hatch guaranteed."""
+        organise = self.section("organise")
+        roots = []
+        for entry in organise.get("roots") or []:
+            taxonomy = [str(t) for t in entry.get("taxonomy") or []]
+            for required in ("_Unsorted", "_Conflicts"):
+                if required not in taxonomy:
+                    taxonomy.append(required)
+            roots.append({
+                "path": str(Path(entry["path"]).expanduser()),
+                "mode": entry.get("mode", "shadow"),
+                "taxonomy": taxonomy,
+            })
+        return roots
 
     # -- paths -------------------------------------------------------------
     @property

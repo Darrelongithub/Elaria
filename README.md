@@ -9,14 +9,16 @@ Design: [`assistant-blueprint.md`](assistant-blueprint.md) (v29) ·
 Setup/build order: [`GETTING-STARTED.md`](GETTING-STARTED.md) ·
 Personality profile: [`humour.toml`](humour.toml)
 
-**Status: Phase 2 built** (on Phase 0/1 + the §9-order-first `assist-voice-test`).
-Push-to-talk dictation runs end-to-end, and its state is now visible: a
-streaming Waybar module and a Quickshell overlay pill rendering live
-partials — layer-shell, `keyboardFocus: None`, no focus steal (guarded by
-tests). Test suite passes with **no API key** (mock live transport). The
-real Gemini Live transport + all Wayland surfaces are UNVERIFIED until
-first run on the owner's Fedora box (Step 0; `ui/README.md` checklist).
-The file executor is Phase 4; Phase 3 (shadow-mode organiser) is next.
+**Status: Phase 3 built** (on Phases 0–2 + the §9-order-first `assist-voice-test`).
+Dictation runs end-to-end with visible state (Waybar + overlay), and the
+organiser now indexes configured roots and produces **shadow plans**:
+`assist plan build` runs the Tier 0 deterministic cascade (zero API
+calls) and writes a readable log of what *would* happen — nothing moves,
+by construction (Phase 3 has no write path; live roots are refused).
+Test suite passes with **no API key**. The real Gemini Live transport +
+all Wayland surfaces are UNVERIFIED until first run on the owner's
+Fedora box (Step 0; `ui/README.md` checklist). The executor is Phase 4 —
+it only earns existence after shadow logs the owner agrees with.
 
 ---
 
@@ -102,7 +104,17 @@ mode everywhere; on Fedora with a key it's the same code path with
 `pw-record` + the real Live transport (verify model/quotas first, Step 0).
 Phase 2 — state visible ✓, partials render ✓ (overlay feed), no focus
 steal ✓ by construction + test guards; on-screen QML rendering itself
-awaits the Fedora checklist in `ui/README.md`. 98 tests, all offline.
+awaits the Fedora checklist in `ui/README.md`.
+Phase 3 — indexer (stdlib extraction incl. OOXML; `pdftotext`/PyMuPDF
+guarded; sha256 + FTS5; `.assistant-ignore`/protected/never-send honoured),
+Tier 0 cascade (folder-keyword, keyword-seed, screenshot/date rules,
+content-keyword, extension class; abstains rather than guesses; frozen
+taxonomy only), polling watcher with debounce, shadow logs in
+`~/.local/share/assistant/shadow/`. On the test chaos tree Tier 0 placed
+70% with the blast-radius tripwire correctly firing. **The human half of
+Phase 3's done-when — “a week of shadow logs you actually agree with” —
+is yours: configure one real root, build plans, argue with them.**
+118 tests, all offline.
 
 ## §10 open decisions — defaults taken, awaiting your word
 
@@ -112,12 +124,12 @@ None block Phase 0 (§14). Each defaults to the blueprint's recommendation
 | # | Decision | Default in config | Needed by |
 |---|---|---|---|
 | 1 | Capture source | `source = "mic"` (mix in Phase 6) | Phase 1 — settle with the Step 3 A/B/C listening test |
-| 2 | Taxonomy | *(unset — bootstrap in Phase 3)* | Phase 3 |
+| 2 | Taxonomy | *(yours to freeze — `assist taxonomy suggest <root>` proposes from existing folders)* | Phase 3 → now |
 | 3 | Chat surface | CLI first (`assist ask`) | Phase 2/5 |
 | 4 | Shell tool | `shell = "confirm"` (allowlisted later) | Phase 4+ |
 | 5 | Embeddings | local (deferred; no torch dep yet) | Phase 5 |
-| 6 | Overlay toolkit | Waybar-only first (`status --waybar` ready) | Phase 2 |
-| 7 | Never-send list | `never_send_to_cloud = []` — **fill before any indexing** | Phase 3 |
+| 6 | Overlay toolkit | **Decided by build:** Waybar + Quickshell shipped in `ui/` | ✓ Phase 2 |
+| 7 | Never-send list | `never_send_to_cloud = []` — enforced in the indexer; **fill before pointing at real folders** | Phase 3 → now |
 | 8 | Diarization (pyannote) | deferred | Phase 6 |
 
 ## Debugging with mentors (§12.9)
@@ -148,6 +160,7 @@ never breaks.
   >95% deliberate catches. Then: Hyprland PTT binds (Step 6) + the Step 3
   A/B/C capture listening test (§10.1), one live dictation, and a
   `GEMINI_MODE=record` session so the first real fixtures exist.
-- **Phase 3 (where the project succeeds or fails):** journal + shadow mode
-  + indexer + Tier 0 rules cascade — **no writes at all**. Needs your
-  §10.2 taxonomy bootstrap + §10.7 never-send list before any indexing.
+- **Phase 4:** the executor — one test folder, review + undo, Tiers 1–2
+  (Flash-Lite/Flash batches behind the §17 harness) wired behind it.
+  Gate: shadow logs you agree with first. “File 500 files, then
+  `undo --since` all of it cleanly” is the done-when.

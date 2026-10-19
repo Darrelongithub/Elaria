@@ -82,9 +82,20 @@ never_send_to_cloud = []
 mode = "shadow"                     # shadow | live, per-root override (§4.3)
 confidence_auto = 0.90
 confidence_review = 0.60
+tier0_min_confidence = 0.85
 max_ops_per_run = 200
 max_ops_per_hour = 500
 tree_tripwire_pct = 25
+watch = false
+
+# Roots are opt-in: nothing is indexed until you name it here. New roots
+# start in shadow (nothing moves) whatever you write — Phase 3 builds
+# shadow plans only. Propose a taxonomy with:
+#   assist taxonomy suggest ~/Documents
+# [[organise.roots]]
+# path = "~/Documents"
+# mode = "shadow"
+# taxonomy = ["Finance", "Work", "Personal", "Reference"]
 
 [policy]
 protected = ["~/.ssh", "~/.gnupg", "~/.config", "~/.local/share/assistant"]

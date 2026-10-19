@@ -164,6 +164,88 @@ def _print_doctor(report: dict) -> None:
 
 
 # --------------------------------------------------------------------------
+def _plan_command(args, config) -> int:
+    """`assist plan …` — shadow plans via daemon (async) or locally."""
+    import time as _time
+
+    if args.plan_action == "list":
+        try:
+            plans = call(config.socket_path, "plan.list", timeout=10.0)["plans"]
+        except (DaemonUnavailable, RuntimeError, OSError):
+            from .store import Store
+            store = Store(config.db_path)
+            plans = store.list_plans()
+            store.close()
+        for plan in plans:
+            print(f"#{plan['id']} [{plan['status']}/{plan['mode']}] {plan['root']} — "
+                  f"tier0 placed {plan['placed_tier0']}/{plan['total']}, "
+                  f"abstained {plan['abstained']} · {plan.get('shadow_log_path') or ''}")
+        return 0
+
+    if args.plan_action == "show":
+        try:
+            data = call(config.socket_path, "plan.show",
+                        {"plan_id": args.plan_id, "decision": args.decision}, timeout=30.0)
+        except (DaemonUnavailable, RuntimeError, OSError):
+            from .store import Store
+            store = Store(config.db_path)
+            plan = store.get_plan(args.plan_id)
+            data = {"plan": plan, "items": store.plan_items(args.plan_id, args.decision)}
+            store.close()
+        plan = data["plan"]
+        if plan is None:
+            print(f"no plan {args.plan_id}", file=sys.stderr)
+            return 1
+        print(f"Plan #{plan['id']} [{plan['status']}] root={plan['root']} mode={plan['mode']}")
+        print(f"Shadow log: {plan.get('shadow_log_path')}")
+        for item in data["items"]:
+            print(f"  [{item['decision']:8}] {item['src']} -> {item['dest'] or '—'} "
+                  f"({item['confidence']}, {item['rule']}): {item['reason']}")
+        return 0
+
+    # build: daemon runs async (§18) — poll plan.show until ready.
+    try:
+        started = call(config.socket_path, "plan.build",
+                       {"root": args.root} if args.root else {}, timeout=10.0)["started"]
+    except (DaemonUnavailable, RuntimeError, OSError):
+        from .organiser import OrganiserService
+        from .store import Store
+        store = Store(config.db_path)
+        service = OrganiserService(config, store)
+        for spec in config.organise_roots():
+            if args.root and spec["path"] != args.root:
+                continue
+            result = service.build_plan(spec)
+            _print_plan_summary(result)
+        store.close()
+        return 0
+    for entry in started:
+        plan_id = entry["plan_id"]
+        print(f"Building shadow plan #{plan_id} for {entry['root']}…", file=sys.stderr)
+        while True:
+            data = call(config.socket_path, "plan.show", {"plan_id": plan_id}, timeout=30.0)
+            if data["plan"]["status"] != "building":
+                break
+            _time.sleep(0.5)
+        plan = data["plan"]
+        if plan["status"] == "failed":
+            print(f"plan #{plan_id} failed: {plan.get('error')}", file=sys.stderr)
+            return 1
+        stats = json.loads(plan.get("stats_json") or "{}")
+        _print_plan_summary({"plan_id": plan_id, "stats": stats,
+                             "shadow_log": plan.get("shadow_log_path")})
+    return 0
+
+
+def _print_plan_summary(result: dict) -> None:
+    stats = result["stats"]
+    print(f"Shadow plan #{result['plan_id']}: Tier 0 placed "
+          f"{stats['placed_tier0']} of {stats['loose_files']} loose files "
+          f"({stats['tier0_placement_pct']}%, zero API calls); "
+          f"{stats['abstained']} abstained for Tier 1/2 (Phase 4).")
+    print(f"Nothing moved. Read and judge: {result['shadow_log']}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="assist", description=f"Elaria assistant CLI v{__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -182,6 +264,21 @@ def main(argv: list[str] | None = None) -> int:
     ptt_p.add_argument("action", choices=["start", "stop", "toggle"])
     tr_p = sub.add_parser("transcribe", help="batch-transcribe a WAV (post tier, §3.6)")
     tr_p.add_argument("file")
+    sub.add_parser("index", help="index configured roots (local only, shadow-safe)")
+    plan_p = sub.add_parser("plan", help="shadow organisation plans (Phase 3: no writes)")
+    plan_sub = plan_p.add_subparsers(dest="plan_action", required=True)
+    build_p = plan_sub.add_parser("build", help="index + Tier 0 cascade -> shadow log")
+    build_p.add_argument("--root", help="only this root path")
+    show_p = plan_sub.add_parser("show", help="show a plan and its proposals")
+    show_p.add_argument("plan_id", type=int)
+    show_p.add_argument("--decision", choices=["auto", "review", "unsorted", "abstain"])
+    plan_sub.add_parser("list", help="list recent plans")
+    tax_p = sub.add_parser("taxonomy", help="bootstrap helper for §10.2")
+    tax_sub = tax_p.add_subparsers(dest="taxonomy_action", required=True)
+    suggest_p = tax_sub.add_parser("suggest", help="propose taxonomy from existing folders")
+    suggest_p.add_argument("root")
+    search_p = sub.add_parser("search", help="full-text search the local index (FTS5)")
+    search_p.add_argument("query")
     sub.add_parser("dictate", help="terminal push-to-talk: Enter to stop")
     events_p = sub.add_parser("events", help="stream daemon events (overlay/Waybar feed)")
     events_p.add_argument("--overlay", action="store_true",
@@ -282,6 +379,54 @@ def main(argv: list[str] | None = None) -> int:
             print(result.get("text", ""))
             print(f"\n[backend: {result.get('backend')} · inbox: {result.get('inbox_path')}]",
                   file=sys.stderr)
+            return 0
+
+        if args.command == "index":
+            try:
+                result = call(config.socket_path, "index.run", timeout=600.0)
+                roots = result["roots"]
+            except (DaemonUnavailable, RuntimeError, OSError):
+                from .organiser import OrganiserService
+                from .store import Store
+                store = Store(config.db_path)
+                roots = OrganiserService(config, store).index_roots()
+                store.close()
+            if not roots:
+                print("No organise roots configured — nothing indexed. Add "
+                      "[[organise.roots]] to config.toml (shadow mode, §4.3).")
+            for stats in roots:
+                print(json.dumps(stats, indent=2))
+            return 0
+
+        if args.command == "plan":
+            return _plan_command(args, config)
+
+        if args.command == "taxonomy":
+            from pathlib import Path as _Path
+
+            from .planner import suggest_taxonomy
+            suggestions = suggest_taxonomy(_Path(args.root).expanduser())
+            print("# Proposed taxonomy (review, trim, then freeze in config.toml — §10.2):")
+            print("taxonomy = [" + ", ".join(f'"{s["folder"]}"' for s in suggestions) + "]")
+            for s in suggestions:
+                print(f"#   {s['folder']}: {s['files_below']} file(s) below"
+                      + (f" — {s['note']}" if s.get("note") else ""))
+            return 0
+
+        if args.command == "search":
+            try:
+                result = call(config.socket_path, "docs.search",
+                              {"query": args.query}, timeout=30.0)
+            except (DaemonUnavailable, RuntimeError, OSError):
+                from .store import Store
+                store = Store(config.db_path)
+                result = {"results": store.search_documents(args.query),
+                          "engine": "fts5" if store.fts5_available else "like"}
+                store.close()
+            for hit in result["results"]:
+                print(f"{hit['path']}\n    {hit['snip']}")
+            if not result["results"]:
+                print("(no matches — indexed everything you expected? `assist index`)")
             return 0
 
         if args.command == "dictate":

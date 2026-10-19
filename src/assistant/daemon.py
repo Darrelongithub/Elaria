@@ -27,6 +27,7 @@ from .config import Config, load_config, load_humour_profile
 from .cost import day_start_iso, iso_now, month_start_iso
 from .gemini_client import GeminiClient
 from .ipc import serve
+from .organiser import OrganiserService
 from .persona import PersonaGovernor, TurnContext
 from .safety import clear_halt, is_halted, set_halt
 from .store import Store
@@ -58,6 +59,8 @@ class Daemon:
         self.started_monotonic = time.monotonic()
         self.mode = "idle"
         self.dictation = DictationService(config, self.store, self.client)
+        self.organiser = OrganiserService(config, self.store)
+        self._plan_tasks: dict[int, asyncio.Task] = {}
         self._subscribers: set = set()          # event-stream writers (§3.1)
         self._dictation_task: asyncio.Task | None = None
         self._capture_source = None
@@ -103,6 +106,11 @@ class Daemon:
             "ptt.start": self._ptt_start,
             "ptt.stop": self._ptt_stop,
             "transcribe.file": self._transcribe_file,
+            "index.run": self._index_run,
+            "plan.build": self._plan_build,
+            "plan.show": self._plan_show,
+            "plan.list": self._plan_list,
+            "docs.search": self._docs_search,
             "ask": self._ask,
         }
         if method == "events.subscribe":
@@ -259,6 +267,64 @@ class Daemon:
                 "raw_text": session.raw_text, "backend": session.backend,
                 "inbox_path": session.inbox_path, "flagged": session.flagged,
                 "clipboard": session.clipboard}
+
+    # -- organiser (Phase 3: shadow only — these handlers cannot move files) --
+    async def _index_run(self, params: dict) -> dict:
+        results = await asyncio.to_thread(self.organiser.index_roots)
+        return {"roots": results,
+                "note": "local indexing only; never_send content stays on this machine"}
+
+    async def _plan_build(self, params: dict) -> dict:
+        """Long work goes async immediately (§18 rule 5): return at once
+        with the plan id; progress + completion ride the event stream."""
+        roots = self.config.organise_roots()
+        if params.get("root"):
+            roots = [r for r in roots if r["path"] == str(params["root"])]
+        if not roots:
+            raise ValueError("no organise roots configured — add [[organise.roots]] "
+                             "to config.toml (roots start in shadow mode, §4.3)")
+        started = []
+        for spec in roots:
+            # Reserve the plan row on the loop thread so plan.show works
+            # from the first millisecond; heavy lifting runs to_thread.
+            plan_id = self.store.create_plan(iso_now(), spec["path"],
+                                             spec.get("mode", "shadow"))
+            loop = asyncio.get_running_loop()
+
+            def progress(event, _loop=loop):
+                _loop.call_soon_threadsafe(
+                    lambda e=event: asyncio.create_task(self.broadcast(e)))
+
+            async def _run(spec=spec, plan_id=plan_id, progress=progress):
+                try:
+                    await asyncio.to_thread(
+                        self.organiser.build_plan, spec,
+                        progress=progress, plan_id=plan_id)
+                except Exception as exc:
+                    await self.broadcast({"event": "error", "error": str(exc),
+                                          "plan_id": plan_id})
+
+            self._plan_tasks[plan_id] = asyncio.create_task(_run())
+            started.append({"plan_id": plan_id, "root": spec["path"], "status": "building"})
+        return {"started": started, **self.governor.ack()}
+
+    async def _plan_show(self, params: dict) -> dict:
+        plan_id = int(params.get("plan_id", 0))
+        plan = self.store.get_plan(plan_id)
+        if plan is None:
+            raise ValueError(f"no plan {plan_id} — see plan.list")
+        return {"plan": plan,
+                "items": self.store.plan_items(plan_id, params.get("decision"))}
+
+    async def _plan_list(self, params: dict) -> dict:
+        return {"plans": self.store.list_plans(int(params.get("limit", 20)))}
+
+    async def _docs_search(self, params: dict) -> dict:
+        query = str(params.get("query", "")).strip()
+        if not query:
+            raise ValueError("docs.search needs params.query")
+        return {"results": self.store.search_documents(query), "engine":
+                "fts5" if self.store.fts5_available else "like-fallback"}
 
     async def _ask(self, params: dict) -> dict:
         """Conversational turn: governor first (local), harness second (§17).
