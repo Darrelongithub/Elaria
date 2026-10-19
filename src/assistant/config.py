@@ -125,6 +125,13 @@ DEFAULTS: dict = {
         "quiet_hours": "23:00-07:00",
     },
     "privacy": {"tier": "free", "never_send_to_cloud": []},
+    "meeting": {
+        # PipeWire targets per channel (§3.4/Step 3C). Verify node names
+        # with `assist meeting setup` on the real machine.
+        "mic_target": "",
+        "system_target": "",          # usually "<your-sink>.monitor"
+        "pyannote_refine": False,     # needs extra: diarize + HF_TOKEN
+    },
     "memory": {
         # §10.5: local embeddings. 'hashing' = stdlib lexical baseline;
         # 'sentence-transformers' = real semantics (extra: embeddings).

@@ -223,6 +223,45 @@ def _memory_command(args, config) -> int:
     return 0
 
 
+def _meeting_command(args, config) -> int:
+    from pathlib import Path
+
+    if args.meeting_action == "setup":
+        from .capture import list_pw_nodes
+        from .meeting import meeting_setup_text
+        nodes = list_pw_nodes()
+        print(meeting_setup_text(nodes, config.section("meeting").get("system_target")))
+        return 0
+    if args.meeting_action == "transcribe":
+        from .gemini_client import GeminiClient
+        from .meeting import MeetingService
+        store = _local_store(config)
+        result = MeetingService(config, store, GeminiClient(config, store)).transcribe_dual(
+            Path(args.mic_wav), Path(args.system_wav), title=args.title,
+            pyannote_refine=args.pyannote)
+        store.close()
+        print(result.transcript)
+        print(f"\nNote: {result.note_path} · diarization: {result.backend}", file=sys.stderr)
+        return 0
+    # start / stop need the daemon (it owns the session)
+    method = f"meeting.{args.meeting_action}"
+    params = {"title": args.title} if args.meeting_action == "stop" else {}
+    try:
+        out = call(config.socket_path, method, params, timeout=900.0)
+    except DaemonUnavailable as exc:
+        print(f"daemon unavailable (meeting capture lives there): {exc}", file=sys.stderr)
+        return 1
+    if args.meeting_action == "start":
+        print("Meeting capture ON (mic + system, separate channels). "
+              "Stop: assist meeting stop")
+    else:
+        print(out.get("transcript_preview", ""))
+        print(f"\nNote: {out.get('note_path')} · turns: {out.get('turns')} · "
+              f"{out.get('backend')}")
+
+    return 0
+
+
 def _plan_command(args, config) -> int:
     """`assist plan …` — plans via daemon (async) or locally."""
     import time as _time
@@ -406,6 +445,19 @@ def main(argv: list[str] | None = None) -> int:
     forget_p = sub.add_parser("forget", help="delete facts by id or topic — no argument")
     forget_p.add_argument("topic")
     sub.add_parser("embed", help="backfill local chunk embeddings (Phase 5)")
+    meeting_p = sub.add_parser("meeting", help="dual-channel meeting capture (Phase 6)")
+    meeting_sub = meeting_p.add_subparsers(dest="meeting_action", required=True)
+    meeting_sub.add_parser("start", help="begin meeting capture (via daemon)")
+    m_stop = meeting_sub.add_parser("stop", help="stop + labelled transcript")
+    m_stop.add_argument("--title")
+    m_tr = meeting_sub.add_parser(
+        "transcribe", help="labelled transcript from two channel WAVs (rehearsal)")
+    m_tr.add_argument("mic_wav")
+    m_tr.add_argument("system_wav")
+    m_tr.add_argument("--title")
+    m_tr.add_argument("--pyannote", action="store_true",
+                      help="refine far side with pyannote (extra + HF_TOKEN)")
+    meeting_sub.add_parser("setup", help="PipeWire node discovery + loopback plan")
     sub.add_parser("dictate", help="terminal push-to-talk: Enter to stop")
     events_p = sub.add_parser("events", help="stream daemon events (overlay/Waybar feed)")
     events_p.add_argument("--overlay", action="store_true",
@@ -618,6 +670,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command in ("remember", "memory", "forget", "embed"):
             return _memory_command(args, config)
+
+        if args.command == "meeting":
+            return _meeting_command(args, config)
 
         if args.command == "dictate":
             started = call(config.socket_path, "ptt.start", timeout=5.0)

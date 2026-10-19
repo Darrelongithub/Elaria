@@ -78,6 +78,11 @@ embedder = "hashing"                # hashing (stdlib) | sentence-transformers (
 embedding_model = "all-MiniLM-L6-v2"
 embed_on_index = true
 
+[meeting]
+mic_target = ""                     # pw node name from: assist meeting setup
+system_target = ""                  # usually "<your-sink>.monitor"
+pyannote_refine = false             # extra: diarize + HF_TOKEN
+
 [privacy]
 tier = "free"                       # free | paid — see §12.2 before changing
 # §10.7 OPEN — decide before any indexing (Phase 3). Placeholder:

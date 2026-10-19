@@ -154,6 +154,15 @@ class WavSink:
         return self._frames / SAMPLE_RATE
 
 
+def write_wav(path: Path, frames: list[bytes], sample_rate: int = SAMPLE_RATE) -> Path:
+    """Persist collected PCM frames as a mono s16 WAV (returns path)."""
+    sink = WavSink(Path(path), sample_rate)
+    for frame in frames:
+        sink.write(frame)
+    sink.close()
+    return Path(path)
+
+
 class FrameGate:
     """Energy VAD: never stream empty audio (§8 — hallucinated transcripts
     on silence). Speech frames pass, plus a short hangover so word
@@ -277,6 +286,55 @@ class SimulatedCapture:
 
     async def aclose(self) -> None:
         self.stop()
+
+
+def mix_pcm(a: bytes, b: bytes) -> bytes:
+    """Sample-wise sum with clamp — the one-stream meeting mix (§3.4).
+    Shorter input is zero-padded; overflow saturates instead of wrapping
+    (wrap would turn loud speech into clicks)."""
+    n = max(len(a), len(b)) // 2
+    sa = struct.unpack(f"<{len(a) // 2}h", a[: len(a) - len(a) % 2])
+    sb = struct.unpack(f"<{len(b) // 2}h", b[: len(b) - len(b) % 2])
+    mixed = []
+    for i in range(n):
+        value = (sa[i] if i < len(sa) else 0) + (sb[i] if i < len(sb) else 0)
+        mixed.append(max(-32768, min(32767, value)))
+    return struct.pack(f"<{n}h", *mixed)
+
+
+class DualCapture:
+    """Two sources (mic + sink monitor) as synchronised pairs (§3.4/§9-6).
+
+    Yields (mic_frame, system_frame) — kept SEPARATE, because separate
+    channels are what makes channel diarization (You vs Them) exact;
+    a mixed stream can be derived with mix_pcm when one stream is
+    wanted (Live), but information thrown away can't be unmixed."""
+
+    def __init__(self, mic_source, system_source):
+        self.mic = mic_source
+        self.system = system_source
+
+    async def frames(self):
+        mic_iter = self.mic.frames().__aiter__()
+        sys_iter = self.system.frames().__aiter__()
+        silence = b""
+        while True:
+            mic_frame = await _next_or_silence(mic_iter, silence)
+            sys_frame = await _next_or_silence(sys_iter, silence)
+            if mic_frame is None and sys_frame is None:
+                return
+            yield (mic_frame or silence, sys_frame or silence)
+
+    async def aclose(self) -> None:
+        await self.mic.aclose()
+        await self.system.aclose()
+
+
+async def _next_or_silence(iterator, _silence):
+    try:
+        return await iterator.__anext__()
+    except StopAsyncIteration:
+        return None
 
 
 def pw_record_pcm_stream_command(target: str | None, *, sample_rate: int = 16000) -> list[str]:

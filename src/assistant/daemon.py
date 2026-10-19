@@ -65,6 +65,9 @@ class Daemon:
         from .embeddings import make_embedder
         from .memory import Memory
         self.memory = Memory(self.store, make_embedder(config))
+        from .meeting import MeetingService
+        self.meetings = MeetingService(config, self.store, self.client)
+        self._meeting: dict | None = None  # {task, dual, mic_frames, sys_frames}
         self._plan_tasks: dict[int, asyncio.Task] = {}
         self._subscribers: set = set()          # event-stream writers (§3.1)
         self._dictation_task: asyncio.Task | None = None
@@ -126,6 +129,8 @@ class Daemon:
             "memory.forget": self._memory_forget,
             "memory.recall": self._memory_recall,
             "embed.run": self._embed_run,
+            "meeting.start": self._meeting_start,
+            "meeting.stop": self._meeting_stop,
             "ask": self._ask,
         }
         if method == "events.subscribe":
@@ -418,6 +423,71 @@ class Daemon:
     async def _embed_run(self, params: dict) -> dict:
         count = await asyncio.to_thread(self.organiser._embed_new_chunks)
         return {"embedded": count, "embedder": self.memory.embedder.name}
+
+    async def _meeting_start(self, params: dict) -> dict:
+        """Dual-channel capture (Phase 6). Channels stay separate so
+        diarization is exact. Same idle-safe rules as ptt."""
+        if self._meeting is not None:
+            return {"state": "already-meeting"}
+        from .capture import DualCapture, PipeWireCapture, SimulatedCapture
+
+        meeting_cfg = self.config.section("meeting")
+
+        def make_source(target: str | None):
+            if params.get("source") == "simulated" or params.get("simulation"):
+                return SimulatedCapture(speech_frames=100_000, frame_ms=30, realtime=True)
+            try:
+                return PipeWireCapture(target, frame_ms=30)
+            except RuntimeError:  # headless: simulated keeps pipeline exercisable
+                return SimulatedCapture(speech_frames=100_000, frame_ms=30, realtime=True)
+
+        mic = make_source(meeting_cfg.get("mic_target") or None)
+        system = make_source(meeting_cfg.get("system_target") or None)
+        dual = DualCapture(mic, system)
+        frames: dict[str, list[bytes]] = {"mic": [], "sys": []}
+
+        async def collect():
+            async for mic_frame, sys_frame in dual.frames():
+                frames["mic"].append(mic_frame)
+                frames["sys"].append(sys_frame)
+
+        self.mode = "meeting"
+        await self.broadcast({"event": "status.changed", "mode": self.mode})
+        self._meeting = {"dual": dual, "frames": frames,
+                         "task": asyncio.create_task(collect())}
+        return {"state": "meeting"}
+
+    async def _meeting_stop(self, params: dict) -> dict:
+        if self._meeting is None:
+            return {"state": "idle", "note": "no meeting in progress"}
+        meeting, self._meeting = self._meeting, None
+        await meeting["dual"].aclose()
+        meeting["task"].cancel()
+        try:
+            await meeting["task"]
+        except asyncio.CancelledError:
+            pass  # expected: we just cancelled it
+        from datetime import datetime
+
+        from .capture import write_wav
+
+        stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        rate = int(self.config.section("capture").get("sample_rate", 16000))
+        mic_wav = write_wav(self.config.data_dir / "audio" / f"meeting-{stamp}-mic.wav",
+                            meeting["frames"]["mic"], rate)
+        sys_wav = write_wav(self.config.data_dir / "audio" / f"meeting-{stamp}-system.wav",
+                            meeting["frames"]["sys"], rate)
+        self.mode = "processing"
+        await self.broadcast({"event": "status.changed", "mode": self.mode})
+        result = await asyncio.to_thread(
+            self.meetings.transcribe_dual, mic_wav, sys_wav,
+            title=params.get("title"),
+            pyannote_refine=bool(self.config.section("meeting").get("pyannote_refine")))
+        self.mode = "idle"
+        await self.broadcast({"event": "status.changed", "mode": self.mode})
+        return {"state": "idle", "note_path": str(result.note_path),
+                "turns": len(result.turns), "backend": result.backend,
+                "transcript_preview": result.transcript[:400]}
 
     async def _ask(self, params: dict) -> dict:
         """Conversational turn on the §13.4 ladder: governor (local) →
