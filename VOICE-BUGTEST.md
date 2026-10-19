@@ -276,7 +276,8 @@ need the typed path or an explicit confirm.
 
 ## Latency numbers (§18 budget = 300 ms)
 
-`measure_voice.py`, 200 samples in-process / 120 over a real Unix socket, fake
+`tests/measure_voice_latency.py` (in the repo, so these are re-runnable), 200 samples
+in-process / 120 over a real Unix socket, fake
 player that forks and exits (`sh` → `exit 0`), i.e. real fork+exec cost included:
 
 | state | median | p95 | max | audible? |
@@ -292,6 +293,10 @@ player that forks and exits (`sh` → `exit 0`), i.e. real fork+exec cost includ
 Warm-up of all four acks: 0.8 ms total (0.2 ms/ack, mock) / 0.9 ms to re-warm
 after VB-2 — i.e. the missing auto-re-warm costs nothing, which is why VB-2 and
 VB-13 are not excused by the budget.
+
+Re-run spread across two invocations of the harness: warm 1.286 / 1.346 ms, IPC
+2.68 / 2.51 ms median — i.e. the numbers are stable to well under a millisecond,
+and nothing near the budget.
 
 Caveats, stated plainly: playback *audibility* was measured with the local mock
 route because a mocked Gemini produces no audio; on a live box the hot path is
