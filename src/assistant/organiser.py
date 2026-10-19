@@ -30,8 +30,20 @@ class OrganiserService:
         self.indexer = Indexer(config, store)
         self.shadow_dir = config.data_dir / "shadow"
 
+    def _embed_new_chunks(self) -> int:
+        """Phase 5: vectors ride along with indexing (local, quota-free)."""
+        if not self.config.section("memory").get("embed_on_index", True):
+            return 0
+        from .embeddings import backfill_embeddings, make_embedder
+
+        return backfill_embeddings(self.store, make_embedder(self.config))
+
     def index_roots(self) -> list[dict]:
-        return [self.indexer.index_root(spec) for spec in self.config.organise_roots()]
+        results = [self.indexer.index_root(spec) for spec in self.config.organise_roots()]
+        embedded = self._embed_new_chunks()
+        for result in results:
+            result["chunks_embedded"] = embedded
+        return results
 
     def build_plan(self, root_spec: dict, *, reindex: bool = True,
                    progress=None, plan_id: int | None = None,

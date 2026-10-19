@@ -169,6 +169,60 @@ def _local_store(config):
     return Store(config.db_path)
 
 
+def _memory_command(args, config) -> int:
+    from .embeddings import backfill_embeddings, make_embedder
+    from .memory import Memory
+
+    def local():
+        store = _local_store(config)
+        return store, Memory(store, make_embedder(config))
+
+    if args.command == "remember":
+        try:
+            out = call(config.socket_path, "memory.remember",
+                       {"text": args.text, "kind": args.kind}, timeout=10.0)
+        except (DaemonUnavailable, RuntimeError, OSError):
+            store, memory = local()
+            out = {"fact_id": memory.remember(args.text, kind=args.kind)}
+            store.close()
+        print(f"Remembered as fact #{out['fact_id']} (stated). Inspect: assist memory")
+        return 0
+    if args.command == "memory":
+        try:
+            facts = call(config.socket_path, "memory.list",
+                         {"kind": args.kind} if args.kind else {}, timeout=10.0)["facts"]
+        except (DaemonUnavailable, RuntimeError, OSError):
+            store, memory = local()
+            facts = memory.beliefs(args.kind)
+            store.close()
+        for fact in facts:
+            tag = f"{fact['source']}" + (f", conf {fact['confidence']}" if fact["source"] == "inferred" else "")
+            print(f"#{fact['id']} [{fact['kind']}/{tag}] {fact['text']}"
+                  + (f"  (evidence: {fact['evidence']})" if fact.get("evidence") else ""))
+        print(f"{len(facts)} active fact(s). Delete any: assist forget <id-or-topic>")
+        return 0
+    if args.command == "forget":
+        try:
+            out = call(config.socket_path, "memory.forget",
+                       {"topic": args.topic}, timeout=10.0)
+        except (DaemonUnavailable, RuntimeError, OSError):
+            store, memory = local()
+            out = {"forgotten": memory.forget(args.topic)}
+            store.close()
+        print(f"Forgotten: {out['forgotten']} fact(s). No argument, as designed.")
+        return 0
+    # embed
+    try:
+        out = call(config.socket_path, "embed.run", timeout=600.0)
+    except (DaemonUnavailable, RuntimeError, OSError):
+        store = _local_store(config)
+        embedder = make_embedder(config)
+        out = {"embedded": backfill_embeddings(store, embedder), "embedder": embedder.name}
+        store.close()
+    print(f"Embedded {out['embedded']} chunk(s) with {out['embedder']} (local, no quota).")
+    return 0
+
+
 def _plan_command(args, config) -> int:
     """`assist plan …` — plans via daemon (async) or locally."""
     import time as _time
@@ -343,6 +397,15 @@ def main(argv: list[str] | None = None) -> int:
     suggest_p.add_argument("root")
     search_p = sub.add_parser("search", help="full-text search the local index (FTS5)")
     search_p.add_argument("query")
+    rem_p = sub.add_parser("remember", help="store a stated fact (§16)")
+    rem_p.add_argument("text")
+    rem_p.add_argument("--kind", default="profile",
+                       choices=["profile", "preference", "commitment", "relationship"])
+    mem_p = sub.add_parser("memory", help="show everything believed about you (§16)")
+    mem_p.add_argument("--kind")
+    forget_p = sub.add_parser("forget", help="delete facts by id or topic — no argument")
+    forget_p.add_argument("topic")
+    sub.add_parser("embed", help="backfill local chunk embeddings (Phase 5)")
     sub.add_parser("dictate", help="terminal push-to-talk: Enter to stop")
     events_p = sub.add_parser("events", help="stream daemon events (overlay/Waybar feed)")
     events_p.add_argument("--overlay", action="store_true",
@@ -552,6 +615,9 @@ def main(argv: list[str] | None = None) -> int:
             if not result["results"]:
                 print("(no matches — indexed everything you expected? `assist index`)")
             return 0
+
+        if args.command in ("remember", "memory", "forget", "embed"):
+            return _memory_command(args, config)
 
         if args.command == "dictate":
             started = call(config.socket_path, "ptt.start", timeout=5.0)

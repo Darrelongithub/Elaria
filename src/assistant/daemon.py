@@ -62,6 +62,9 @@ class Daemon:
         self.organiser = OrganiserService(config, self.store, self.client)
         from .executor import Executor
         self.executor = Executor(config, self.store)
+        from .embeddings import make_embedder
+        from .memory import Memory
+        self.memory = Memory(self.store, make_embedder(config))
         self._plan_tasks: dict[int, asyncio.Task] = {}
         self._subscribers: set = set()          # event-stream writers (§3.1)
         self._dictation_task: asyncio.Task | None = None
@@ -118,6 +121,11 @@ class Daemon:
             "review.decide": self._review_decide,
             "undo": self._undo,
             "verify": self._verify,
+            "memory.remember": self._memory_remember,
+            "memory.list": self._memory_list,
+            "memory.forget": self._memory_forget,
+            "memory.recall": self._memory_recall,
+            "embed.run": self._embed_run,
             "ask": self._ask,
         }
         if method == "events.subscribe":
@@ -391,14 +399,33 @@ class Daemon:
         since = parse_since(str(params["since"])) if params.get("since") else None
         return await asyncio.to_thread(self.executor.verify, since_iso=since)
 
-    async def _ask(self, params: dict) -> dict:
-        """Conversational turn: governor first (local), harness second (§17).
+    async def _memory_remember(self, params: dict) -> dict:
+        fact_id = self.memory.remember(str(params["text"]),
+                                       kind=str(params.get("kind", "profile")))
+        return {"fact_id": fact_id, "stored": "stated — inspect anytime: assist memory"}
 
-        The governor may only *permit* expressive register; the words come
-        from the model call that was happening anyway — never from a
-        template bank (§13.2). In mock mode this returns the replayed or
-        synthetic fixture, so the full path is testable with no key.
-        """
+    async def _memory_list(self, params: dict) -> dict:
+        return {"facts": self.memory.beliefs(params.get("kind"))}
+
+    async def _memory_forget(self, params: dict) -> dict:
+        return {"forgotten": self.memory.forget(str(params["topic"]))}
+
+    async def _memory_recall(self, params: dict) -> dict:
+        hits = await asyncio.to_thread(self.memory.recall, str(params["query"]))
+        return {"hits": [{"source": h.source, "ref": h.ref, "text": h.text,
+                          "score": round(h.score, 4)} for h in hits]}
+
+    async def _embed_run(self, params: dict) -> dict:
+        count = await asyncio.to_thread(self.organiser._embed_new_chunks)
+        return {"embedded": count, "embedder": self.memory.embedder.name}
+
+    async def _ask(self, params: dict) -> dict:
+        """Conversational turn on the §13.4 ladder: governor (local) →
+        exact/grammar intents (local) → memory recall (local) → and only
+        then the cheapest-first harness with assembled context (§17).
+        Local answers cost zero tokens and say so (`via`)."""
+        from .intents import route
+
         text = str(params.get("text", "")).strip()
         if not text:
             raise ValueError("ask needs params.text")
@@ -407,21 +434,89 @@ class Daemon:
             iso_now(), "decision",
             json.dumps({"register": decision.register,
                         "serious_gate": decision.serious_gate,
-                        "pushback": decision.pushback,
-                        "reason": decision.reason}),
-        )
-        result = self.client.generate("chat", text)
+                        "pushback": decision.pushback, "reason": decision.reason}))
+        conversation_id = self.store.get_or_create_conversation(iso_now())
+        self.store.add_message(conversation_id, iso_now(), "user", text)
+
+        reply, via, model, fixture = None, None, None, None
+        intent = route(text)
+        if intent is not None:
+            reply, via = await self._run_intent(intent)
+
+        if reply is None:
+            # Rung 5/6: assemble the exact context the cheap model needs.
+            hits = await asyncio.to_thread(self.memory.recall, text)
+            context = "\n".join(f"- [{h.source} {h.ref}] {h.text}" for h in hits)
+            prompt = text
+            if context:
+                prompt = (f"Context from the user's local memory/index "
+                          f"(cite paths plainly):\n{context}\n\nUser: {text}")
+            if decision.register == "expressive-allowed":
+                prompt += ("\n\nRegister note: the user is bantering; matching "
+                           "their playful-teasing register concisely is welcome "
+                           "if a genuinely situational line exists — otherwise "
+                           "plain. One short line preferred. No canned warmth.")
+            result = await asyncio.to_thread(self.client.generate, "chat", prompt)
+            reply, via, model, fixture = result.text, "gemini", result.model, result.fixture
+
+        self.store.add_message(conversation_id, iso_now(), "assistant", reply, via)
         if params.get("reaction"):
             self.governor.note_user_reaction(str(params["reaction"]))
             self._save_relationship_state()
         return {
-            "reply": result.text,
-            "model": result.model,
+            "reply": reply,
+            "via": via,  # local-intent | local-memory | gemini
+            "model": model,
             "register": decision.register,
             "serious_gate": decision.serious_gate,
             "mode": self.config.gemini_mode,
-            "fixture": result.fixture,
+            "fixture": fixture,
         }
+
+    async def _run_intent(self, intent) -> tuple[str | None, str]:
+        """Execute a local intent. (None, ...) = fall through to the model."""
+        if intent.kind == "halt":
+            await self._halt({})
+            return ("Halted. Nothing will move until you say resume.", "local-intent")
+        if intent.kind == "status":
+            status = await self._status({})
+            return ((f"Running ({status['mode']}), gemini mode "
+                    f"{status['gemini_mode']}, uptime {status['uptime_s']:.0f}s."),
+                    "local-intent")
+        if intent.kind == "cost":
+            from .cost import format_cost_report
+
+            data = await self._cost({})
+            return (format_cost_report(data["month"], data["today"],
+                                       data["quota"], data["tier"]), "local-intent")
+        if intent.kind == "remember" and intent.argument:
+            await self._memory_remember({"text": intent.argument})
+            return (f"Remembered (stated fact): {intent.argument}", "local-intent")
+        if intent.kind == "forget" and intent.argument:
+            count = self.memory.forget(intent.argument)
+            return (f"Forgotten ({count} fact(s) deactivated).", "local-intent")
+        if intent.kind == "where":
+            answer = await asyncio.to_thread(self.memory.answer_where, intent.argument)
+            if answer:
+                return (answer, "local-memory")
+            return (None, "local-memory")  # weak recall: escalate, never bluff
+        if intent.kind == "search" and intent.argument:
+            hits = await asyncio.to_thread(self.memory.recall, intent.argument)
+            if hits:
+                lines = [f"- [{h.source}] {h.ref}: {h.text[:100]}" for h in hits]
+                return ("Local matches:\n" + "\n".join(lines), "local-memory")
+            return (None, "local-memory")
+        if intent.kind == "undo":
+            result = await self._undo({"since": intent.argument} if intent.argument else {})
+            return ((f"Undone {result['undone']} op(s); "
+                    f"{len(result['problems'])} problem(s)."), "local-intent")
+        if intent.kind == "organise":
+            # Plans are cheap and write-free to BUILD — do that, then talk.
+            started = await self._plan_build({})
+            ids = ", ".join(f"#{s['plan_id']}" for s in started["started"])
+            return ((f"Shadow plan(s) {ids} building — nothing moves without "
+                    "your review + apply. Watch `assist events`."), "local-intent")
+        return (None, "local-intent")
 
     # -- lifecycle ---------------------------------------------------------------
     async def run(self) -> None:

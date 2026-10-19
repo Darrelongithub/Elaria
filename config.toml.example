@@ -73,6 +73,11 @@ proactive_max_per_day = 3
 pushback_budget_per_day = 5
 quiet_hours = "23:00-07:00"
 
+[memory]
+embedder = "hashing"                # hashing (stdlib) | sentence-transformers (§10.5)
+embedding_model = "all-MiniLM-L6-v2"
+embed_on_index = true
+
 [privacy]
 tier = "free"                       # free | paid — see §12.2 before changing
 # §10.7 OPEN — decide before any indexing (Phase 3). Placeholder:

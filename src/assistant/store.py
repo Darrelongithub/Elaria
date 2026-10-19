@@ -121,6 +121,32 @@ CREATE TABLE IF NOT EXISTS plan_items (
   decision TEXT NOT NULL           -- auto | review | unsorted | abstain (§4.4)
 );
 
+CREATE TABLE IF NOT EXISTS facts (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  kind TEXT NOT NULL,          -- profile | preference | commitment | relationship
+  text TEXT NOT NULL,
+  source TEXT NOT NULL,        -- stated (fact) | inferred (guess, §16)
+  confidence REAL NOT NULL DEFAULT 1.0,
+  evidence TEXT,               -- inferred facts must be able to show theirs
+  active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS conversations (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  title TEXT
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY,
+  conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+  ts TEXT NOT NULL,
+  role TEXT NOT NULL,          -- user | assistant
+  text TEXT NOT NULL,
+  via TEXT                     -- local-intent | local-memory | gemini (honesty)
+);
+
 CREATE TABLE IF NOT EXISTS state (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -137,6 +163,10 @@ class Store:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            # Additive migration (Phase 5): chunk embeddings alongside text.
+            columns = {r[1] for r in self._conn.execute("PRAGMA table_info(doc_chunks)")}
+            if "embedding" not in columns:
+                self._conn.execute("ALTER TABLE doc_chunks ADD COLUMN embedding BLOB")
             self.fts5_available = self._init_fts5()
             self._conn.commit()
 
@@ -377,6 +407,91 @@ class Store:
             self._conn.execute("UPDATE plans SET status = ? WHERE id = ?",
                                (status, plan_id))
             self._conn.commit()
+
+    # -- embeddings + hybrid retrieval (Phase 5, §3.8/§16) ----------------------
+    def chunks_missing_embeddings(self, limit: int = 500) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, text FROM doc_chunks WHERE embedding IS NULL LIMIT ?",
+                (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_chunk_embedding(self, chunk_id: int, blob: bytes) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE doc_chunks SET embedding = ? WHERE id = ?",
+                               (blob, chunk_id))
+            self._conn.commit()
+
+    def embedded_chunks(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT c.id, c.text, c.embedding, d.path
+                   FROM doc_chunks c JOIN documents d ON d.id = c.doc_id
+                   WHERE c.embedding IS NOT NULL AND d.status != 'missing'"""
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- memory: facts & conversations (§16) ------------------------------------
+    def add_fact(self, *, ts, kind, text, source="stated", confidence=1.0,
+                 evidence=None) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO facts (ts, kind, text, source, confidence, evidence) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (ts, kind, text, source, confidence, evidence))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def list_facts(self, *, kind: str | None = None, active_only: bool = True) -> list[dict]:
+        query = "SELECT * FROM facts WHERE 1=1"
+        params: list = []
+        if active_only:
+            query += " AND active = 1"
+        if kind:
+            query += " AND kind = ?"
+            params.append(kind)
+        with self._lock:
+            rows = self._conn.execute(query + " ORDER BY id", params).fetchall()
+        return [dict(r) for r in rows]
+
+    def forget_facts(self, topic: str) -> int:
+        """`assist forget <topic>` — deletes, no argument (§16). Matches an
+        exact id ('#7' / '7') or a text substring."""
+        with self._lock:
+            if topic.lstrip("#").isdigit():
+                cur = self._conn.execute("UPDATE facts SET active = 0 WHERE id = ?",
+                                         (int(topic.lstrip("#")),))
+            else:
+                cur = self._conn.execute(
+                    "UPDATE facts SET active = 0 WHERE active = 1 AND text LIKE ?",
+                    (f"%{topic}%",))
+            self._conn.commit()
+            return cur.rowcount
+
+    def get_or_create_conversation(self, ts: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM conversations ORDER BY id DESC LIMIT 1").fetchone()
+            if row:
+                return int(row[0])
+            cur = self._conn.execute("INSERT INTO conversations (ts) VALUES (?)", (ts,))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def add_message(self, conversation_id: int, ts: str, role: str, text: str,
+                    via: str | None = None) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO messages (conversation_id, ts, role, text, via) "
+                "VALUES (?, ?, ?, ?, ?)", (conversation_id, ts, role, text, via))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def recent_messages(self, limit: int = 20) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM messages ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in reversed(rows)]
 
     # -- operations journal queries (executor/undo, §4.2/§4.4) -----------------
     def get_operation(self, op_id: int) -> dict | None:

@@ -125,6 +125,13 @@ DEFAULTS: dict = {
         "quiet_hours": "23:00-07:00",
     },
     "privacy": {"tier": "free", "never_send_to_cloud": []},
+    "memory": {
+        # §10.5: local embeddings. 'hashing' = stdlib lexical baseline;
+        # 'sentence-transformers' = real semantics (extra: embeddings).
+        "embedder": "hashing",
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embed_on_index": True,
+    },
     "organise": {
         "mode": "shadow",
         "confidence_auto": 0.90,
