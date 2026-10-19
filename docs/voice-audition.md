@@ -1,85 +1,78 @@
-# Elaria voice audition — Phase 8 shortlist
+# Elaria voice — selected
 
 Elaria has **one speaking voice in every mode**. Gemini supplies text
 (reasoning/transcription); it never supplies her voice. Gemini Live in this
 codebase is text-only, and native Gemini audio output is not routed anywhere.
 
 Flare and Vega in `humour.toml` are **trait references only**: brisk, bite,
-dry, edge — never kind-polished. The runtime voice must be locally owned so it
-is identical online and offline.
+dry, edge — never kind-polished. The runtime voice is locally owned so it is
+identical online and offline.
 
-## Candidates to judge
+## Selected voice
 
-These are real Piper voices. The links are the official Piper sample MP3s.
-All three read the same neutral sentence about rainbows, which is useful for
-timbre and pacing but not for judging how each handles Elaria's clipped acks.
+**`en_GB-southern_english_female-low`** — Piper Southern English Female, low
+quality. Selected by the owner on 2026-10-19 after two audition rounds. The
+roughness is the point: edge won over polish.
 
-| Candidate | Why it is on the shortlist | Official sample |
-|---|---|---|
-| `en_GB-jenny_dioco-medium` | First listen. British medium voice; most plausible route to dry understatement rather than bright US assistant polish. | [speaker_0.mp3](https://github.com/rhasspy/piper-samples/blob/master/samples/en/en_GB/jenny_dioco/medium/speaker_0.mp3) |
-| `en_US-lessac-medium` | The direct medium-quality baseline: likely brisk and intelligible without sounding overly theatrical. | [speaker_0.mp3](https://github.com/rhasspy/piper-samples/blob/master/samples/en/en_US/lessac/medium/speaker_0.mp3) |
-| `en_US-kathleen-low` | Flatter, lower-fidelity delivery. The roughness may give her edge, or may simply sound cheap — the owner's ears decide. | [speaker_0.mp3](https://github.com/rhasspy/piper-samples/blob/master/samples/en/en_US/kathleen/low/speaker_0.mp3) |
+Official sample:
+[speaker_0.mp3](https://github.com/rhasspy/piper-samples/blob/master/samples/en/en_GB/southern_english_female/low/speaker_0.mp3)
 
-No winner has been picked: the shipped config deliberately starts as
-`voice_id = "unselected"`, so Elaria stays text-only rather than acquiring a
-voice nobody auditioned. The owner listens, then selects.
+Audition history, for the record:
 
-## Exact-script audition on the Fedora box
+- Round 1 — `en_GB-jenny_dioco-medium`, `en_US-lessac-medium`,
+  `en_US-kathleen-low`: **all rejected**.
+- Round 2 — `en_GB-cori-high`, `en_GB-alba-medium`,
+  `en_GB-southern_english_female-low`, `en_US-kristin-medium`,
+  `en_US-ljspeech-high`: Southern English Female won. The other four stay in
+  config as alternates only if exact-script checks ever reopen the question.
 
-The build sandbox could retrieve the official sample MP3s, but Piper model
-downloads redirect to storage hosts blocked from that environment, so it
-could not honestly generate the exact-script WAVs there. On the target
-machine:
+## Install the selected voice on the Fedora box
 
 ```bash
 uv sync --extra offline --extra tts
 mkdir -p ~/.local/share/piper
 ```
 
-Download each candidate's `.onnx` and `.onnx.json` pair from the canonical
-Piper voices repository on Hugging Face into the voices directory. The file
-names must be exactly:
+Download the selected voice's `.onnx` and `.onnx.json` pair from the canonical
+Piper voices repository on Hugging Face into `~/.local/share/piper/`:
 
 ```text
-en_GB-jenny_dioco-medium.onnx
-en_GB-jenny_dioco-medium.onnx.json
-en_US-lessac-medium.onnx
-en_US-lessac-medium.onnx.json
-en_US-kathleen-low.onnx
-en_US-kathleen-low.onnx.json
+en_GB-southern_english_female-low.onnx
+en_GB-southern_english_female-low.onnx.json
 ```
 
-Then generate the audition set:
+The shipped config already names this voice as the default. On an existing
+install whose local config predates the pick, select and warm it explicitly:
 
 ```bash
-assist voice audition
-```
-
-This writes WAVs plus `manifest.json` under
-`~/.local/share/assistant/voice-auditions/`; audio stays out of git. The
-default script is deliberately in-register:
-
-> On it. Done. Is that all? No. Not at this hour. Sasa, the March invoice is
-> filed. The six ambiguous ones are parked, not guessed at.
-
-Pick and warm the ack cache:
-
-```bash
-assist voice select en_GB-jenny_dioco-medium   # or whichever wins
+assist voice select en_GB-southern_english_female-low
 assist voice warm
 assist voice status
 ```
 
-The selection persists outside the repo. After selection, online and offline
-spoken replies both report the same `backend`, `voice`, `model`, and native
-`length_scale` in their speech metadata.
+Then verify the exact-script rendering — the standard acks are the real test,
+not the neutral sample sentence:
+
+```bash
+assist voice say "On it. Done. Is that all? No. Not at this hour."
+```
+
+`assist voice audition` can still render the alternate candidates with the
+in-register script:
+
+> On it. Done. Is that all? No. Not at this hour. Sasa, the March invoice is
+> filed. The six ambiguous ones are parked, not guessed at.
+
+Audition WAVs land under `~/.local/share/assistant/voice-auditions/`; model
+files and generated audio stay out of git.
 
 ## Non-negotiables
 
 - **No time-stretching.** Pace comes only from Piper's native
   `--length-scale` (`0.92` by default: slightly faster than neutral).
-- **No cloud voice fallback.** If Piper is unavailable, speech reports an
-  error/deferred result; Elaria does not suddenly acquire a Gemini voice.
+- **No cloud voice fallback.** If Piper or the selected model is unavailable,
+  speech reports an error/deferred result; Elaria does not suddenly acquire a
+  Gemini voice.
 - The standard permission-neutral acks — “On it.”, “Done.”, “Is that all?”,
   “No. Not at this hour.” — are pre-rendered into the local cache so playback
   is a file lookup, not synthesis on the hotkey path.

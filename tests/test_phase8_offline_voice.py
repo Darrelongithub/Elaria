@@ -242,6 +242,20 @@ def test_forced_offline_dictation_never_builds_live_transport(config, tmp_path):
 
 # -- ONE VOICE --------------------------------------------------------------------------
 
+def test_default_voice_is_the_owner_selected_southern_english_female(config):
+    # Owner pick after two audition rounds (Jenny/Lessac/Kathleen rejected;
+    # rough edge won). Guards against the canonical voice drifting silently.
+    tts = config.section("tts")
+    assert tts["voice_id"] == "en_GB-southern_english_female-low"
+    assert tts["model"].endswith("en_GB-southern_english_female-low.onnx")
+    assert tts["config"].endswith("en_GB-southern_english_female-low.onnx.json")
+    candidate_ids = [c["id"] for c in tts["audition_candidates"]]
+    assert candidate_ids[0] == "en_GB-southern_english_female-low"
+    assert "en_GB-jenny_dioco-medium" not in candidate_ids  # round-1 rejects stay out
+    speech = SpeechService(config)
+    assert speech.descriptor().voice_id == "en_GB-southern_english_female-low"
+
+
 def test_speech_cache_audition_and_selection_use_one_local_service(config, tmp_path):
     config.raw["tts"] = {
         **config.raw["tts"], "backend": "mock", "voice_id": "elaria-test",

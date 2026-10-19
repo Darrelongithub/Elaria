@@ -102,7 +102,7 @@ No key yet? Everything still runs — `GEMINI_MODE` defaults to **mock**
 | **Dictation (Phase 1)** | `transcribe.py`, `live_client.py`, `cleanup.py`, `inbox.py`, `clipboard.py` | PTT session: `pw-record` frames → WAV sink (raw always kept) + rolling 30s buffer + VAD gate → Live manual-activity streaming with interim events; disconnect/GoAway → resumption + tail replay; unrecoverable → batch on the saved WAV. Silence ladder emits ONE soft check-in per segment, per-mode thresholds. Cleanup pass with diff-gate + language gate (raw is the record); note lands in the markdown inbox + `wl-copy`. `assist dictate` (terminal PTT), `assist transcribe FILE.wav`, `assist events` (overlay feed). Live-session fixtures are recordable *sequences* (hashes only — no audio in git). |
 
 | **Surfaces (Phase 2)** | `waybar.py`, `overlay.py`, `ui/` | Event-driven Waybar (`assist status --waybar --follow`: idle/listening/transcribing/halted/mock/offline, last-transcript + queue/voice tooltip, click=PTT, right-click=halt) + voice-test LED module. Overlay state machine in tested Python (`assist events --overlay`); `ui/quickshell/shell.qml` is a dumb binder (layer-shell, `WlrKeyboardFocus.None` — tests static-guard the QML). Hyprland binds in both Lua/.conf syntaxes. |
-| **Offline mode + one voice (Phase 8)** | `modes.py`, `tts.py`, `offline_queue.py`, `asr.py` | `assist mode auto|online|offline` distinguishes detected `OFFLINE` from deliberate `FORCED_OFFLINE`; Waybar/status show it and an in-progress session is finished before a parked switch applies. All speech exits through one local Piper-class voice in both modes — Gemini Live is text-only and Gemini native audio is never Elaria's voice. Native Piper length scale only, never time-stretching; standard acks are pre-cached. Offline dictation uses faster-whisper/whisper.cpp behind the §12.7 seam, always saves WAV, and queues low-confidence redo/cleanup. Tier 1/2, chat and other cloud work queue in SQLite; reconnect drains automatic items, gates downloads/external actions behind approval, and speaks a short summary. See [`docs/voice-audition.md`](docs/voice-audition.md). |
+| **Offline mode + one voice (Phase 8)** | `modes.py`, `tts.py`, `offline_queue.py`, `asr.py` | `assist mode auto|online|offline` distinguishes detected `OFFLINE` from deliberate `FORCED_OFFLINE`; Waybar/status show it and an in-progress session is finished before a parked switch applies. All speech exits through one local Piper voice in both modes — the owner-selected `en_GB-southern_english_female-low`; Gemini Live is text-only and Gemini native audio is never Elaria's voice. Native Piper length scale only, never time-stretching; standard acks are pre-cached. Offline dictation uses faster-whisper/whisper.cpp behind the §12.7 seam, always saves WAV, and queues low-confidence redo/cleanup. Tier 1/2, chat and other cloud work queue in SQLite; reconnect drains automatic items, gates downloads/external actions behind approval, and speaks a short summary. See [`docs/voice-audition.md`](docs/voice-audition.md). |
 
 **Definitions of done:** Phase 0 — `assist doctor/status/cost` ✓ · keyless
 tests ✓. Phase 1 — “you dictate a note and it appears” ✓ in mock/simulated
@@ -154,7 +154,7 @@ same configured local voice. Required Phase 8 tests cover a simulated
 network drop mid-dictation (offline transcript + queued Gemini redo),
 forced-offline zero-network behaviour, identical TTS backend+voice in
 both modes, and reconnect drain with external work still approval-gated.
-195 tests, all offline and keyless.
+196 tests, all offline and keyless.
 
 ## §10 open decisions — defaults taken, awaiting your word
 
@@ -208,10 +208,9 @@ never breaks.
 - **Phase 7 done-when:** after the flip, dictate code-switched
   sentences and confirm the mix survives end-to-end (the guards will
   flag loudly if the model normalises — that's them working).
-- **Phase 8 voice pick:** listen to the three real Piper candidates
-  in [`docs/voice-audition.md`](docs/voice-audition.md), download the
-  model/config pairs on Fedora, run `assist voice audition`, then
-  `assist voice select <candidate>` and `assist voice warm`. Judge
-  for brisk/bite/dry/edge — not polished kindness. Finally verify
+- **Phase 8 voice:** the pick is made — `en_GB-southern_english_female-low`
+  (see [`docs/voice-audition.md`](docs/voice-audition.md)). On Fedora,
+  download its model pair, run `assist voice warm`, and judge the
+  exact-script acks, not the sample sentence. Finally verify
   faster-whisper or whisper.cpp on the actual microphone, including
   one forced-offline dictation and one Wi-Fi-drop/reconnect drill.

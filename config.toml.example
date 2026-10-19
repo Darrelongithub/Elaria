@@ -60,9 +60,10 @@ drain_on_reconnect = true
 # it is never Elaria's voice. Flare/Vega are trait references only.
 enabled = true
 backend = "piper"                   # install: uv sync --extra tts
-voice_id = "unselected"             # set by: assist voice select <candidate>
-model = ""
-config = ""
+# Owner-selected after two audition rounds (2026-10-19): rough edge won.
+voice_id = "en_GB-southern_english_female-low"
+model = "~/.local/share/piper/en_GB-southern_english_female-low.onnx"
+config = "~/.local/share/piper/en_GB-southern_english_female-low.onnx.json"
 speaker = 0
 length_scale = 0.92                 # native Piper pace (<1 brisker), never stretch
 command = "piper"
@@ -70,31 +71,47 @@ player = "auto"                     # pw-play/paplay/aplay, or none
 speak_acks = true
 speak_replies = false
 
-# Candidate voice files live outside git. Generate auditions with:
-#   assist voice audition
+# Voice model files live outside git. The selected voice is first; the
+# rest are round-2 alternates if exact-script checks ever reopen this.
 [[tts.audition_candidates]]
-id = "en_GB-jenny_dioco-medium"
-model = "~/.local/share/piper/en_GB-jenny_dioco-medium.onnx"
-config = "~/.local/share/piper/en_GB-jenny_dioco-medium.onnx.json"
+id = "en_GB-southern_english_female-low"
+model = "~/.local/share/piper/en_GB-southern_english_female-low.onnx"
+config = "~/.local/share/piper/en_GB-southern_english_female-low.onnx.json"
 speaker = 0
 length_scale = 0.92
-notes = "Audition: brisk, bite, dry; reject if kind-polished."
+notes = "SELECTED canonical voice: rough edge over polish."
 
 [[tts.audition_candidates]]
-id = "en_US-lessac-medium"
-model = "~/.local/share/piper/en_US-lessac-medium.onnx"
-config = "~/.local/share/piper/en_US-lessac-medium.onnx.json"
+id = "en_GB-cori-high"
+model = "~/.local/share/piper/en_GB-cori-high.onnx"
+config = "~/.local/share/piper/en_GB-cori-high.onnx.json"
 speaker = 0
 length_scale = 0.92
-notes = "Audition: brisk, bite, dry; reject if kind-polished."
+notes = "Round-2 alternate."
 
 [[tts.audition_candidates]]
-id = "en_US-kathleen-low"
-model = "~/.local/share/piper/en_US-kathleen-low.onnx"
-config = "~/.local/share/piper/en_US-kathleen-low.onnx.json"
+id = "en_GB-alba-medium"
+model = "~/.local/share/piper/en_GB-alba-medium.onnx"
+config = "~/.local/share/piper/en_GB-alba-medium.onnx.json"
 speaker = 0
 length_scale = 0.92
-notes = "Lower-fidelity candidate; audition for edge without polish."
+notes = "Round-2 alternate."
+
+[[tts.audition_candidates]]
+id = "en_US-kristin-medium"
+model = "~/.local/share/piper/en_US-kristin-medium.onnx"
+config = "~/.local/share/piper/en_US-kristin-medium.onnx.json"
+speaker = 0
+length_scale = 0.92
+notes = "Round-2 alternate."
+
+[[tts.audition_candidates]]
+id = "en_US-ljspeech-high"
+model = "~/.local/share/piper/en_US-ljspeech-high.onnx"
+config = "~/.local/share/piper/en_US-ljspeech-high.onnx.json"
+speaker = 0
+length_scale = 0.92
+notes = "Round-2 polished contrast; not selected."
 
 [capture]
 source = "mic"                      # §10.1 OPEN — blueprint recommendation:
