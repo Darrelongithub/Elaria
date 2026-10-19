@@ -13,11 +13,19 @@ identical online and offline.
 > **STATUS: PROVISIONAL — NOT CANONICAL.** Re-auditioned 2026-10-19: the owner
 > could not parse this voice in normal playback, and round-3 measurements rank
 > it last of four on intelligibility (see
-> [`voice-audition-round3.md`](voice-audition-round3.md)). The root cause is
-> mechanical, not a matter of taste: this model is **16 kHz**, so it has no
-> 8–11 kHz band at all, and `length_scale`/volume/prompt changes cannot add a
-> band that is not in the file. Do not treat it as final; do not build Hyprland
-> binds or live-Gemini voice routing on it until a replacement is approved.
+> [`voice-audition-round3.md`](voice-audition-round3.md)). The owner is keeping
+> the voice — the job is audibility, not replacement.
+>
+> The 16 kHz sample rate is a real ceiling (no 8–11 kHz band exists in the
+> file), but it is **not** the root cause: the same weight renders the long
+> sentences at 76–84 % ASR-recoverable and one-word acks at **0 %**, at every
+> pace, with or without silence padding, alone or inside a line, on piper 1.2.0
+> and 1.8.0 alike. The failure is short-phrase instability plus high
+> take-to-take variance, not missing bandwidth. Round-4 evidence and the
+> config-only knobs are in
+> [`voice-audition-round3.md`](voice-audition-round3.md) ("Round 4 addendum").
+> Do not treat it as final; do not build Hyprland binds or live-Gemini voice
+> routing on it until the owner approves the repaired setting.
 
 **`en_GB-southern_english_female-low`** — Piper Southern English Female, low
 quality. Chosen by the owner on 2026-10-19 after two audition rounds, on the

@@ -100,12 +100,16 @@ fairly (no penalty for spectrum it never had):
 | `en_GB-jenny_dioco-medium` | 883 Hz | 26.9% | 23.8% | 0.569 |
 
 The incumbent's high HF *share* is an artifact: its spectrum is truncated at
-8 kHz, so energy is concentrated below the cliff. That truncation is the
-mechanical reason it is hard to parse — 16 kHz audio has no 8–11 kHz band where
-sibilant and fricative detail lives, and no `length_scale`, volume or prompt
-change can add a band that is not in the file. The medium/high voices all have
-it. jenny is the dullest of the set (lowest centroid): intelligible and quick,
-but light on edge.
+8 kHz, so energy is concentrated below the cliff. That truncation is real —
+16 kHz audio has no 8–11 kHz band where sibilant and fricative detail lives,
+and no `length_scale`, volume or prompt change can add a band that is not in
+the file. **It is not, however, the explanation for the owner's complaint**;
+see "Round 4 addendum" at the end of this file, which supersedes the sentence
+this paragraph used to end with ("that truncation is the mechanical reason it
+is hard to parse"). The same truncated file renders full sentences at 76–84 %
+ASR-recoverable, so a missing band above the speech range cannot be the whole
+story. The medium/high voices all have that band. jenny is the dullest of the
+set (lowest centroid): intelligible and quick, but light on edge.
 
 ## Pace ladder (native `length_scale` only, no stretching)
 
@@ -286,3 +290,173 @@ mono can fail in some web players).
 
 Not approved, not canonical: owner ear-check required before anything else
 (Hyprland binds, live Gemini) proceeds.
+
+---
+
+# Round 4 addendum — keeping the incumbent, and what config can actually buy
+
+Added 2026-10-19 after the owner rejected the framing of rounds 1–3. Their
+words: *"i dont get why im picking a new voice, i already had one — the problem
+was i couldnt make out what it was saying."* So the task is **audibility of
+`en_GB-southern_english_female-low`**, not a replacement beauty pageant. The
+ranking tables above stay valid as measurement context; they are no longer the
+decision under discussion.
+
+Method unchanged: render, run an independent ASR (vosk `small-en-us-0.15`)
+over the result, score recovered words against the script (numerals expanded
+first). Short phrases are scored with a best-local-window alignment, because
+scoring one 2-word phrase against a hypothesis that contains five phrases
+measures nothing. Multiple takes per setting, always.
+
+## Ruled out for the broken phrases
+
+`Done.` and `Is that all?` stayed unrecoverable in roughly 30 renders across
+every lever available without touching code:
+
+| lever | range tested | result |
+|---|---|---|
+| `length_scale` | 0.80 / 0.92 / 1.00 / 1.15 / 1.30 | `Done.` 0 % at all five |
+| silence padding around the clip | ±0.4 s | `Done.` 0 %; `Twelve need review.` 67 % → 100 % |
+| render alone vs inside the full line | both | no change for either phrase |
+| piper renderer | 1.2.0 (onnx 1.11) vs 1.8.0 | `Done.` 0 % on both |
+| joined as `"Yes. <ack> Thank you."` | — | no change |
+
+`On it.`, `Twelve need review.` and `No. Not at this hour.` are all fine
+(75–100 %). The defect is specific to very short text, and it is deterministic,
+so it is not a sampling accident and not a renderer bug.
+
+## What the clips look like
+
+Envelope anatomy, shipped `length_scale 0.92` (10 ms RMS frame, 18 % of peak
+gate):
+
+| clip | dur | speech | internal gaps | envelope peaks |
+|---|---|---|---|---|
+| `On it.` | 0.72 s | 26.8 % | 1 | 4 |
+| `Done.` | 0.48 s | 53.2 % | 1 | 3 |
+| `Is that all?` | 0.77 s | 40.8 % | 3 | 5 |
+| `Twelve need review.` | 0.96 s | 47.4 % | 4 | 7 |
+| `Done.` at `ls 1.30` | **1.54 s** | 22.9 % | **1 × 0.98 s** | 9 |
+
+Two things are visible here. A three-word question gets 0.77 s (a 0.26 s/word
+grind), and asking the model to go *slower* does not stretch it cleanly — at
+`ls 1.30` it inserts a one-second hole inside a single word and grows spurious
+peaks. That is also why the pace ladder below is non-monotonic in duration
+(11.06 s at `ls 1.00`, 10.74 s at `ls 1.30`): this weight does not honour the
+one knob that is supposed to control it.
+
+## Config variants, measured through the repo pipeline
+
+Rendered with `PiperTtsBackend` itself (not a hand-rolled piper call), 2 takes,
+test line plus the four production acks:
+
+| setting | knobs | line acc | dur | acks exact |
+|---|---|---|---|---|
+| A — as shipped | `ls 0.92` | 70.5 % | 7.39 s | 1/4 |
+| B | `ls 1.15 --sentence-silence 0.35` | 77.3 % | 9.97 s | 1/4 |
+| C | `ls 1.30 --sentence-silence 0.35` | 65.9 % | 11.30 s | 1/4 |
+| D | `--sentence-silence 0.35` only | 72.7 % | 9.09 s | 1/4 |
+| E | `--noise-scale 0.15 --noise-w-scale 0.5 --sentence-silence 0.3` | **84.1 %** | 8.59 s | **2/4** |
+
+E looked like a 13.6 pp win, which with n=2 is exactly the kind of result this
+voice's variance manufactures. Paired replication, 4 takes each:
+
+| setting | line acc per take | mean | sd | worst | dur | `On it.` | `No. Not at this hour.` | `Done.` | `Is that all?` |
+|---|---|---|---|---|---|---|---|---|---|
+| A | 72.7 / 90.9 / 63.6 / 77.3 | 76.1 % | 9.8 pp | 63.6 % | 7.49 s | 3/4 | 3/4 | 0/4 | 0/4 |
+| E | 72.7 / 77.3 / 77.3 / 86.4 | 78.4 % | 5.0 pp | 72.7 % | 8.44 s | 4/4 | 4/4 | 0/4 | 0/4 |
+
+So: **the mean does not move** (+2.3 pp against a ±7–10 pp spread). What moves
+is the floor — variance halves, the worst take goes 63.6 % → 72.7 %, and both
+two-word acks go from sometimes-right to always-right. E is a reliability
+change, not a clarity change, and it costs ~1 s on a sentence. Anyone who
+reports "pace fixes it" or "slowing it down fixes `Done.`" from a single take
+was reading noise; both claims were mine at various points in this round.
+
+## The knobs, and where they legally live
+
+Verified against `src/assistant/tts.py` rather than assumed:
+
+* `[tts] length_scale` → reaches piper as `--length-scale` (`tts.py:162`). This
+  is the sanctioned pace knob and the only pace knob.
+* `[tts] command` is a **command prefix**, `shlex.split` then passed through
+  whenever the first token resolves (`tts.py:132-143`). So extra piper flags
+  that the repo never passes — `--noise-scale`, `--noise-w-scale`,
+  `--sentence-silence` — are reachable from config with no code change. That is
+  how E was applied. It does not violate the "no EQ, no time-stretch" rule
+  (`tts.py:9`): nothing is filtered or resampled.
+* Footgun: if `command` starts with a bare `piper` that is *not* on `PATH`,
+  `command()` falls back to `[sys.executable, "-m", "piper"]` and **silently
+  drops every flag in the prefix**. Use an absolute path to the binary.
+* Second footgun, same function: `command` must be an **absolute** path, not a
+  `~`-prefixed one. `Path(exe).expanduser().exists()` expands for the existence
+  check but the returned argv keeps the literal `~`, so `subprocess.run` dies
+  with `FileNotFoundError: '~/.venv/bin/piper'` on the first synth (measured —
+  `~`-form fails, absolute form renders in 2.74 s). `model` and `config` *do*
+  accept `~` (`expanduser()` is applied at `tts.py:159`-ish and `166`). Anything
+  that makes the acks go silent is worth knowing about, so it is spelled out in
+  the block below rather than trusted to memory.
+* The model's own `<model>.onnx.json` `inference` block is **not** a usable
+  place for pace: piper 1.8's CLI defaults override it (measured —
+  `length_scale` 0.92 vs 1.4 in the JSON gave 3.856 s and 3.872 s for the same
+  text). The repo passes `--config` (`tts.py:164-166`), so the file is read for
+  the voice metadata, but pace must come from `config.toml`.
+
+Recommended `[tts]` block for the owner's box, config-only:
+
+```toml
+[tts]
+enabled = true
+backend = "piper"
+voice_id = "en_GB-southern_english_female-low"
+model = "~/.local/share/piper/en_GB-southern_english_female-low.onnx"
+config = "~/.local/share/piper/en_GB-southern_english_female-low.onnx.json"
+speaker = 0
+length_scale = 0.92
+command = "/home/YOU/.venv/bin/piper --noise-scale 0.15 --noise-w-scale 0.5 --sentence-silence 0.3"
+player = "auto"
+speak_acks = true
+```
+
+(`model` / `config` keep `~`; `command` cannot.)
+
+Then: `systemctl --user restart assistant` (config is read once, `daemon.py:920`)
+→ `assist voice select en_GB-southern_english_female-low` (the `state` table row
+in `~/.local/share/assistant/assistant.db` outranks `[tts] voice_id`) →
+`assist voice warm` → `assist voice say "<test line>"`.
+
+## Where the config-only route ends
+
+Two of the four acks are still broken after every lever. Remaining options are
+deliberately **not** implemented, since this round is diagnostic:
+
+1. `speak_acks = false` — config-only, and it does make the garbage inaudible by
+   removing the material that produces it. Costs the ack feedback channel.
+2. Longer ack strings (`Done.` → `Done, sorted.`). The ack texts are hardcoded
+   in `STANDARD_ACKS` (`tts.py:29-34`), so this is a code change. The three-word
+   acks in the same table are fine, which is the argument for it.
+3. Pad the ack with context at synthesis time and trim — code change, and
+   trimming is a frame operation on an already-marginal clip. Not recommended.
+4. A 22.05 kHz weight from the same speaker family, `southern_english_female`
+   `medium`, exists only as a k2-fsa/sherpa-onnx export
+   (`vits-piper-en_GB-southern_english_female_medium`), not in
+   `rhasspy/piper-voices` (verified: the canonical repo ships that speaker at
+   `low` only). Unreachable from this sandbox and **never heard or measured
+   here**; the export is also a 6-speaker artifact, so it is not a drop-in for
+   the same file. Do not treat it as a fix until it has been rendered and
+   auditioned.
+
+Corrections carried in this addendum, so the record is honest: the earlier
+draft of this file attributed the muffle to the 16 kHz ceiling; that claim is
+superseded above. And while re-checking the owner's `config.toml` I found that
+the `en_GB-southern_english_female-low` audition candidate had been left
+pointing at alba's weights — the 13:47 audition run itself was clean (its
+manifest and the 16 kHz wav both record the correct model), but any
+`voice select`/`audition` done between then and the fix would have played alba
+under the incumbent's name. Paths are corrected; verify with
+`assist voice status`, which must show `"voice_id": "en_GB-southern_english_female-low"`
+**and** a `southern_english_female` model path.
+
+Not approved, not canonical: `Done.` and `Is that all?` remain unrecoverable by
+ASR at every setting tried, so the ear-check in the served preview
+(section 5) is still the gate before any Hyprland bind or live-Gemini work.
