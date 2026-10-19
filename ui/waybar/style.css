@@ -1,0 +1,53 @@
+/* Elaria Waybar states — classes come from assistant/waybar.py format_waybar.
+   Append to ~/.config/waybar/style.css (or @import this file). */
+
+#custom-elaria {
+  padding: 0 10px;
+}
+
+#custom-elaria.listening {
+  color: #ff5555;              /* recording red — unmistakable, on purpose */
+  animation: elaria-pulse 1.2s ease-in-out infinite;
+}
+
+#custom-elaria.transcribing {
+  color: #f1fa8c;
+}
+
+#custom-elaria.halted {
+  color: #ff79c6;
+  font-weight: bold;
+}
+
+#custom-elaria.down {
+  color: #6272a4;
+}
+
+#custom-elaria.mock {
+  font-style: italic;          /* mock is visually distinct, never disguised */
+}
+
+#custom-elaria.offline {
+  color: #ffb86c;              /* detected offline (§13.9) */
+}
+
+#custom-elaria.forced-offline {
+  color: #ff79c6;              /* owner-forced privacy posture */
+  font-weight: bold;
+}
+
+@keyframes elaria-pulse {
+  0%   { opacity: 1; }
+  50%  { opacity: 0.45; }
+  100% { opacity: 1; }
+}
+
+/* assist-voice-test LED (§13.10): lit = keyword + voiceprint matched */
+#custom-elaria-voicetest.voice-test-lit {
+  color: #50fa7b;
+  font-weight: bold;
+}
+
+#custom-elaria-voicetest.voice-test-idle {
+  color: #6272a4;
+}

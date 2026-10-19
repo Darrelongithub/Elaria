@@ -1,0 +1,203 @@
+# config.toml.example — copy to ~/.config/assistant/config.toml and edit.
+# The API key does NOT go here (GETTING-STARTED Step 1):
+#   ~/.config/assistant/gemini.env  (0600, read by systemd EnvironmentFile=)
+# Values marked VERIFY come from blueprint Appendix A / §12.1 and must be
+# confirmed against aistudio.google.com/rate-limit on YOUR account (§11).
+
+[gemini]
+# Models by role (§3.2). Cheapest-first is the default (§17 reasoning harness).
+model_default        = "gemini-flash-lite-latest"   # VERIFY exact ID on your account
+model_organise       = "gemini-flash-lite-latest"   # VERIFY
+model_cleanup        = "gemini-flash-lite-latest"   # VERIFY
+model_chat           = "gemini-flash-latest"        # VERIFY
+model_transcribe_live  = "gemini-3.5-transcribe-live"  # VERIFY (§11.1)
+model_transcribe_batch = "gemini-flash-lite-latest"    # VERIFY
+# Escalation ladder for the reasoning harness: cheapest -> next tier (§17).
+escalation_ladder    = ["gemini-flash-lite-latest", "gemini-flash-latest"]
+escalate_after_failures = 2
+max_scaffold_calls      = 6
+# live | record | mock. Env GEMINI_MODE overrides. No key present => mock.
+mode = "mock"
+
+[quota]
+# ASSUMED free-tier shape (§12.1) — UNVERIFIED until Step 0 is done.
+flash_rpm = 10
+flash_lite_rpm = 15
+max_requests_per_day = 1200
+max_requests_per_minute = 12
+
+[asr]
+primary  = "gemini_live"            # chain: live -> batch -> local (§12.7)
+fallback = ["gemini_batch", "local"]
+# Phase 8 offline ASR: install with `uv sync --extra offline`. English is
+# the supported offline path; Kiswahili remains best-effort locally.
+offline_backend = "faster-whisper"  # faster-whisper | whisper.cpp | mock
+offline_model = "small"
+offline_device = "cpu"
+offline_compute_type = "int8"
+whisper_cpp_command = "whisper-cli"
+whisper_cpp_model = ""
+offline_low_confidence_threshold = 0.65
+offline_queue_cleanup = true
+languages = ["en"]                  # Phase 7 flip: ["sw", "en"] — first entry
+                                    # is the primary pin. Pinned explicitly,
+                                    # never auto-detected (§12.4).
+preserve_code_switching = false     # set true WITH sw+en: bilingual batch
+                                    # prompt, cleanup marker-retention gate,
+                                    # Kiswahili intent ladder (kumbuka/tafuta…)
+assert_output_language  = true
+
+[connectivity]
+mode = "auto"                       # auto | online | offline (forced offline)
+health_host = "generativelanguage.googleapis.com"
+health_port = 443
+health_timeout_s = 1.5
+health_check_interval_s = 20
+drain_on_reconnect = true
+
+[tts]
+# ONE VOICE: local Piper-class speech in every mode. Gemini returns text;
+# it is never Elaria's voice. Flare/Vega are trait references only.
+enabled = true
+backend = "piper"                   # install: uv sync --extra tts
+# Owner-selected after two audition rounds (2026-10-19): rough edge won.
+voice_id = "en_GB-southern_english_female-low"
+model = "~/.local/share/piper/en_GB-southern_english_female-low.onnx"
+config = "~/.local/share/piper/en_GB-southern_english_female-low.onnx.json"
+speaker = 0
+length_scale = 0.92                 # native Piper pace (<1 brisker), never stretch
+command = "piper"
+player = "auto"                     # pw-play/paplay/aplay, or none
+speak_acks = true
+speak_replies = false
+
+# Voice model files live outside git. The selected voice is first; the
+# rest are round-2 alternates if exact-script checks ever reopen this.
+[[tts.audition_candidates]]
+id = "en_GB-southern_english_female-low"
+model = "~/.local/share/piper/en_GB-southern_english_female-low.onnx"
+config = "~/.local/share/piper/en_GB-southern_english_female-low.onnx.json"
+speaker = 0
+length_scale = 0.92
+notes = "SELECTED canonical voice: rough edge over polish."
+
+[[tts.audition_candidates]]
+id = "en_GB-cori-high"
+model = "~/.local/share/piper/en_GB-cori-high.onnx"
+config = "~/.local/share/piper/en_GB-cori-high.onnx.json"
+speaker = 0
+length_scale = 0.92
+notes = "Round-2 alternate."
+
+[[tts.audition_candidates]]
+id = "en_GB-alba-medium"
+model = "~/.local/share/piper/en_GB-alba-medium.onnx"
+config = "~/.local/share/piper/en_GB-alba-medium.onnx.json"
+speaker = 0
+length_scale = 0.92
+notes = "Round-2 alternate."
+
+[[tts.audition_candidates]]
+id = "en_US-kristin-medium"
+model = "~/.local/share/piper/en_US-kristin-medium.onnx"
+config = "~/.local/share/piper/en_US-kristin-medium.onnx.json"
+speaker = 0
+length_scale = 0.92
+notes = "Round-2 alternate."
+
+[[tts.audition_candidates]]
+id = "en_US-ljspeech-high"
+model = "~/.local/share/piper/en_US-ljspeech-high.onnx"
+config = "~/.local/share/piper/en_US-ljspeech-high.onnx.json"
+speaker = 0
+length_scale = 0.92
+notes = "Round-2 polished contrast; not selected."
+
+[capture]
+source = "mic"                      # §10.1 OPEN — blueprint recommendation:
+                                    # mic first (Phase 1), mix in Phase 6.
+sample_rate = 16000
+chunk_ms = 30
+retention_days = 30
+
+[transcribe]
+reconnect_replay_s = 30             # rolling buffer replayed on session reset (§3.5)
+live_session_max_s = 540            # rotate before the ~10min Live lifetime
+save_audio = true                   # always keep raw audio (§12.5)
+inbox_dir = "~/.local/share/assistant/inbox"
+copy_to_clipboard = true            # wl-copy only — X11 tools fail silently
+vad_rms_threshold = 0.01            # never stream silence (§8)
+
+[transcribe.checkin_after_s]        # soft check-in ladder (§13.8): narration waits
+command = 4
+conversation = 6
+narration = 20
+
+[cleanup]
+enabled = true
+max_divergence_pct = 35             # diff-gate: above this, flag for review (§12.5)
+keep_raw = true                     # never destroy the original transcript
+min_chars = 40                      # shorter than this: not worth a model call
+glossary_file = "~/.config/assistant/glossary.toml"  # names, places, jargon
+
+[persona]
+name = "Elaria"                     # also the wake word (§13.10)
+candour = 0.7                       # 0 butler -> 1 brutally honest friend
+verbosity = "normal"                # quiet | normal | chatty
+humour = "witty"                    # calibrated register — humour.toml (§13.7)
+humour_profile = "~/.local/share/assistant/persona/humour.toml"
+proactive = true
+proactive_max_per_day = 3
+pushback_budget_per_day = 5
+quiet_hours = "23:00-07:00"
+
+[memory]
+embedder = "hashing"                # hashing (stdlib) | sentence-transformers (§10.5)
+embedding_model = "all-MiniLM-L6-v2"
+embed_on_index = true
+
+[meeting]
+mic_target = ""                     # pw node name from: assist meeting setup
+system_target = ""                  # usually "<your-sink>.monitor"
+pyannote_refine = false             # extra: diarize + HF_TOKEN
+
+[privacy]
+tier = "free"                       # free | paid — see §12.2 before changing
+# §10.7 OPEN — decide before any indexing (Phase 3). Placeholder:
+never_send_to_cloud = []
+
+[organise]
+mode = "shadow"                     # shadow | live, per-root override (§4.3)
+confidence_auto = 0.90
+confidence_review = 0.60
+tier0_min_confidence = 0.85
+max_ops_per_run = 200
+max_ops_per_hour = 500
+tree_tripwire_pct = 25
+watch = false
+
+# Roots are opt-in: nothing is indexed until you name it here. New roots
+# start in shadow (nothing moves) whatever you write — Phase 3 builds
+# shadow plans only. Propose a taxonomy with:
+#   assist taxonomy suggest ~/Documents
+# [[organise.roots]]
+# path = "~/Documents"
+# mode = "shadow"
+# taxonomy = ["Finance", "Work", "Personal", "Reference"]
+
+[policy]
+protected = ["~/.ssh", "~/.gnupg", "~/.config", "~/.local/share/assistant"]
+recently_modified_guard_minutes = 15
+
+[tools]
+shell = "confirm"                   # §10.4 OPEN — off | confirm | allow.
+                                    # Default: blueprint recommendation.
+
+[voice_test]
+keyword = "Elaria"
+# Strict threshold is affordable at measured consistency 0.96 (§13.10),
+# but this number is UNTUNED until `assist-voice-test report` has labelled
+# impostor data. Tune from the report, never from a default.
+speaker_threshold = 0.75
+keyword_threshold = 0.5
+save_near_miss_clips = false        # privacy: off by default (§13.10)

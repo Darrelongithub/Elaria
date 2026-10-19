@@ -1,0 +1,14 @@
+[Unit]
+Description=Elaria dictation overlay (Quickshell, layer-shell, no focus)
+After=graphical-session.target assistant.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Adjust -p to wherever you checked out / installed the ui/ tree.
+ExecStart=/usr/bin/quickshell -p %h/Elaria/ui/quickshell
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

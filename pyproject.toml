@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "assistant"
+version = "0.0.1"
+description = "Elaria — personal AI assistant daemon for Fedora + Hyprland (blueprint v29, Phase 0)"
+readme = "README.md"
+# Target on Fedora is Python 3.12 via uv (GETTING-STARTED Step 2); the code
+# deliberately stays 3.11-clean so clone-and-run + tests work anywhere.
+requires-python = ">=3.11"
+# Phase 0 core is standard-library only by design: the daemon, IPC, ledger,
+# fixture harness, persona governor and voice-test harness must import and
+# test with NO API key and NO network (blueprint §12.9). The Gemini SDK is
+# only needed for GEMINI_MODE=live|record and is imported lazily.
+dependencies = []
+
+[project.optional-dependencies]
+live = ["google-genai>=1.0", "httpx>=0.27"]
+# Real semantic embeddings (§10.5). The stdlib hashing embedder is the
+# default baseline; this upgrades recall quality, same seam.
+embeddings = ["sentence-transformers"]
+# Speaker diarization post-pass (§12.4, Phase 6). Language-agnostic;
+# channel diarization (mic vs sink) works without it in meeting mode.
+diarize = ["pyannote.audio"]
+# Voice-activation models (§13.10). Heavy and Fedora-machine-only; the
+# assist-voice-test harness itself (ring buffer, event log, LED, report)
+# runs without them via replay/synthetic sources.
+voice = ["openwakeword", "speechbrain", "numpy"]
+# Phase 8: local Whisper for offline dictation/commands. CPU/int8 is the
+# intended Fedora laptop posture; model download happens on first owner run.
+offline = ["faster-whisper>=1.1"]
+# Phase 8 ONE-VOICE rule: the same local Piper-class voice online/offline.
+tts = ["piper-tts"]
+dev = ["pytest>=8", "ruff"]
+
+[project.scripts]
+assist = "assistant.cli:main"
+assistd = "assistant.daemon:main"
+assist-voice-test = "assistant.voicetest:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/assistant"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# BLE001 (blind except) is permitted at deliberate resilience boundaries:
+# doctor checks, the IPC handler and the cost ledger must degrade and
+# report, never crash — each site converts the exception into data.
+ignore = ["BLE001"]
