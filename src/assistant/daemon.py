@@ -19,6 +19,7 @@ import json
 import os
 import signal
 import socket as socket_mod
+import sys
 import time
 
 from . import __version__
@@ -1263,24 +1264,26 @@ class Daemon:
         return {"company": status}
 
     async def _guest_turn_normal(self, text: str, params: dict) -> dict:
-        """A non-owner voice outside show-off: no memory, deflection in character."""
+        """A non-owner voice outside show-off: no memory, deflection in character.
+
+        A guest turn is NOT part of the owner's conversation (BH-J1). Writing it
+        there made the room's words her "user" history: visible in the console,
+        fed back as context on the owner's next turn, and durable in SQLite.
+        The guest audit trail belongs to `disclosure.log_guest`, not to §16.
+        """
         channel = str(params.get("channel") or "voice")
-        conversation_id = self.sessions.active_id(iso_now())
-        self.sessions.append("user", text, channel=channel, ts=iso_now())
         reply = self.disclosure.deflection(guest=True,
                                            action=is_instruction(text))
         decision = self.governor.decide(TurnContext(user_text=text))
         self.disclosure.log_guest("guest_turn", category="non-owner voice",
                                   chars=len(text))
         speech = await self._maybe_speak_reply(reply, params)
-        self.sessions.append("assistant", reply, channel=channel,
-                             via="guest-deflection", ts=iso_now())
         await self.broadcast({"event": "conversation.message",
-                              "conversation_id": conversation_id,
-                              "channel": channel, "role": "assistant"})
+                              "conversation_id": None,
+                              "channel": channel, "role": "guest"})
         return {
             "reply": reply, "speaker": "guest", "via": "guest-deflection",
-            "channel": channel, "conversation_id": conversation_id,
+            "channel": channel, "conversation_id": None,
             "model": None, "register": decision.register, "serious_gate": None,
             "mode": self.config.gemini_mode, "fixture": None,
             "speech": speech, "memory_closed": True, "withheld": None,
@@ -1341,9 +1344,11 @@ class Daemon:
                           status: dict) -> dict:
         """A guest turn in show-off mode: conversation only, authority none."""
         channel = str(params.get("channel") or "voice")
-        conversation_id = self.sessions.active_id(iso_now())
-        self.sessions.append("user", text, channel=channel, ts=iso_now())
         verdict = self.showoff.guest_turn(text)
+        # Same boundary in show-off: the demo is not the owner's history
+        # (BH-J1), and every guest turn leaves an audit row.
+        self.disclosure.log_guest("guest_turn", category="show-off",
+                                  chars=len(text))
         model = None
         if verdict.get("allowed"):
             prompt = self.showoff.build_guest_prompt(text)
@@ -1374,17 +1379,15 @@ class Daemon:
                 "speaker": "guest", "context": "showoff"})
             reply, via = self.disclosure.deflection(guest=True), "withheld"
         speech = await self._maybe_speak_reply(reply, params)
-        self.sessions.append("assistant", reply, channel=channel, via=via,
-                             ts=iso_now())
         await self.broadcast({"event": "conversation.message",
-                              "conversation_id": conversation_id,
-                              "channel": channel, "role": "assistant"})
+                              "conversation_id": None,
+                              "channel": channel, "role": "guest"})
         if verdict.get("exited"):
             await self.broadcast({"event": "showoff.exited",
                                   "summary": verdict.get("summary")})
         return {
             "reply": reply, "speaker": "guest", "via": via,
-            "channel": channel, "conversation_id": conversation_id,
+            "channel": channel, "conversation_id": None,
             "model": model, "register": "expressive-allowed",
             "showoff": verdict, "memory_closed": True,
             "speech": speech, "fixture": None,
@@ -1661,15 +1664,28 @@ class Daemon:
                     "your review + apply. Watch `assist events`."), "local-intent")
         return (None, "local-intent")
 
+    async def _connectivity_tick(self) -> None:
+        # refresh() itself returns immediately without probing when the owner
+        # forced offline; the socket probe runs off-loop in auto.
+        status = await asyncio.to_thread(self.mode_manager.refresh, force=True)
+        await self._note_connectivity_transition(status)
+
     async def _connectivity_loop(self) -> None:
+        """Background posture checks; one failure is logged, never fatal.
+
+        A bare `while True` around an unguarded probe meant any single exception
+        ended the loop silently: the daemon kept running with a frozen
+        connectivity state, never transitioning to/from offline again (BH-J2).
+        """
         interval = float(self.config.section("connectivity").get(
             "health_check_interval_s", 20))
         while True:
             await asyncio.sleep(max(1.0, interval))
-            # refresh() itself returns immediately without probing when the
-            # owner forced offline; the socket probe runs off-loop in auto.
-            status = await asyncio.to_thread(self.mode_manager.refresh, force=True)
-            await self._note_connectivity_transition(status)
+            try:
+                await self._connectivity_tick()
+            except Exception as exc:
+                print(f"[assistd] connectivity check failed: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
 
     async def _warm_speech_cache(self) -> None:
         """One warm cycle for the active voice, off the hot path (§18).
@@ -1784,7 +1800,12 @@ class Daemon:
 
 def main() -> None:
     config = load_config()
-    asyncio.run(Daemon(config).run())
+    try:
+        asyncio.run(Daemon(config).run())
+    except RuntimeError as exc:
+        # Two-daemon refusal is a normal startup outcome, not a crash (BH-J4).
+        print(f"assistd: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
