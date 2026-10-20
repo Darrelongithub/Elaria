@@ -134,6 +134,9 @@ class SessionResult:
     # per session — "captured nothing" must be provable, not guessable.
     capture: dict | None = None
     no_speech: bool = False
+    # A missing Live final is distinct from silence: the saved WAV may still
+    # contain speech and is retained for a later retry/re-transcription.
+    no_final: bool = False
 
 
 def _final_texts(events) -> list[str]:
@@ -155,6 +158,19 @@ def _final_texts(events) -> list[str]:
 
 
 class DictationService:
+    # The Live path must have a terminal state even when the server omits
+    # turn_complete/final after activity_end. Keep all shutdown/post-close
+    # waits finite; capture diagnostics are persisted before these waits.
+    ACTIVITY_END_TIMEOUT_S = 1.5
+    FINAL_TRANSCRIPT_TIMEOUT_S = 2.5
+    COLLECTOR_CANCEL_TIMEOUT_S = 0.5
+    TRANSPORT_CLOSE_TIMEOUT_S = 1.5
+    SOURCE_CLOSE_TIMEOUT_S = 1.5
+    EVENT_EMIT_TIMEOUT_S = 1.0
+    FALLBACK_TIMEOUT_S = 5.0
+    CLEANUP_TIMEOUT_S = 3.0
+    PERSIST_TIMEOUT_S = 6.0
+
     def __init__(self, config, store, client, *, mode_manager=None,
                  offline_queue=None, local_backend=None):
         self.config = config
@@ -252,9 +268,72 @@ class DictationService:
 
     def _log(self, step: str, **fields) -> None:
         try:
-            self.store.log_persona_event(iso_now(), "dictate.lifecycle", __import__("json").dumps({"step": step, **fields}))
+            self.store.log_persona_event(
+                iso_now(), "dictate.lifecycle",
+                json.dumps({"step": step, **fields}))
         except Exception:
-            pass
+            return
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Future) -> None:
+        """Retrieve late task failures after a bounded wait has returned."""
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            return
+
+    async def _await_lifecycle(self, step: str, awaitable, *, timeout_s: float,
+                               session_id: str, **fields):
+        """Name and bound a slow dictate await in the lifecycle journal.
+
+        ``asyncio.wait`` is used instead of ``wait_for`` so a coroutine that
+        ignores cancellation cannot keep the dictation task parked beyond its
+        deadline. Timed-out work is cancelled and its eventual exception is
+        consumed in the background; the caller can still construct a terminal
+        result from the WAV.
+        """
+        timeout_s = max(0.0, float(timeout_s))
+        started = time.monotonic()
+        self._log(f"{step}_start", session_id=session_id,
+                  timeout_s=timeout_s, **fields)
+        task = asyncio.ensure_future(awaitable)
+        timed_out = False
+        try:
+            done, _pending = await asyncio.wait(
+                {task}, timeout=timeout_s,
+                return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                timed_out = True
+                task.cancel()
+                task.add_done_callback(self._consume_task_result)
+                elapsed = round(time.monotonic() - started, 3)
+                self._log(f"{step}_timeout", session_id=session_id,
+                          timeout_s=timeout_s, elapsed_s=elapsed, **fields)
+                raise TimeoutError(f"{step} timed out after {timeout_s:.1f}s")
+            result = task.result()
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(self._consume_task_result)
+            self._log(f"{step}_cancelled", session_id=session_id,
+                      elapsed_s=round(time.monotonic() - started, 3), **fields)
+            raise
+        except TimeoutError as exc:
+            if not timed_out:
+                self._log(f"{step}_failed", session_id=session_id,
+                          elapsed_s=round(time.monotonic() - started, 3),
+                          error=str(exc)[:200], **fields)
+            raise
+        except Exception as exc:
+            self._log(f"{step}_failed", session_id=session_id,
+                      elapsed_s=round(time.monotonic() - started, 3),
+                      error=f"{type(exc).__name__}: {exc}"[:200], **fields)
+            raise
+        self._log(f"{step}_done", session_id=session_id,
+                  elapsed_s=round(time.monotonic() - started, 3), **fields)
+        return result
 
     async def dictate(self, source, *, transport_factory=None,
                       mode: str = "narration",
@@ -285,6 +364,16 @@ class DictationService:
             float(self.checkin_after.get(mode, 20)), speech_rms=self.vad_threshold,
             resume_s=self.resume_s, grace_s=self.grace_s)
         notes: list[str] = []
+
+        async def emit_lifecycle_event(step: str, event: dict) -> None:
+            try:
+                await self._await_lifecycle(
+                    step, emit(event), timeout_s=self.EVENT_EMIT_TIMEOUT_S,
+                    session_id=session_id, event=event.get("event"))
+            except Exception as exc:
+                self._log(f"{step}_delivery_failed", session_id=session_id,
+                          error=f"{type(exc).__name__}: {exc}"[:200])
+
         final_text = ""
         confidence: float | None = None
         connectivity = self._connectivity()
@@ -292,8 +381,14 @@ class DictationService:
         network_drop = False
         backend = "local" if offline_at_start else "gemini_live"
         duration_s = 0.0
+        capture_stats: dict | None = None
+        no_speech = False
+        no_final = False
+        live_terminal_missing = False
+        frame_loop_completed = False
         transport: LiveTransport | None = None
         collector: asyncio.Task | None = None
+        collector_terminal_event: asyncio.Event | None = None
         collected: list[LiveEvent] = []
         live_failed = False
         started = time.monotonic()
@@ -329,36 +424,64 @@ class DictationService:
                 return "live_output_guard"
             return None
 
-        async def collect_events(current: LiveTransport) -> None:
+        async def collect_events(current: LiveTransport,
+                                 terminal_event: asyncio.Event) -> None:
             nonlocal resumption_handle
-            async for event in current.events():
-                # BUG6: only transcribable INPUT belongs in the transcript
-                # record. Output audio/text from the session are her own voice
-                # and are deliberately never appended to `collected`, so they
-                # cannot become a final by any later path.
-                if event.type in ("interim", "final", "go_away", "resumption",
-                                  "error", "turn_complete"):
-                    collected.append(event)
-                if event.type == "interim":
-                    await emit({"event": "transcript.interim", "text": event.text,
-                                "session_id": session_id})
-                elif event.type in ("output_interim", "output_final"):
-                    await emit({"event": "live.output_transcript",
-                                "text": event.text,
-                                "final": event.type == "output_final",
-                                "session_id": session_id})
-                elif event.type == "output_audio":
-                    await emit({"event": "live.output_audio",
-                                "seconds": round(event.duration_s, 3),
-                                "sample_rate": event.sample_rate,
-                                "session_id": session_id})
-                elif event.type == "echo_suppressed":
-                    await emit({"event": "transcript.echo_suppressed",
-                                "reason": event.reason or "live echo",
-                                "text": event.text,
-                                "session_id": session_id})
-                elif event.type == "resumption" and event.handle:
-                    resumption_handle = event.handle
+            try:
+                async for event in current.events():
+                    # BUG6: only transcribable INPUT belongs in the transcript
+                    # record. Output audio/text from the session are her own voice
+                    # and are deliberately never appended to `collected`, so they
+                    # cannot become a final by any later path.
+                    if event.type in ("interim", "final", "go_away", "resumption",
+                                      "error", "turn_complete"):
+                        collected.append(event)
+                    # A final is sufficient to make the transcript terminal; Live
+                    # implementations have also been observed to omit turn_complete.
+                    if event.type in ("final", "error", "turn_complete"):
+                        terminal_event.set()
+                    if event.type == "interim":
+                        await emit({"event": "transcript.interim", "text": event.text,
+                                    "session_id": session_id})
+                    elif event.type in ("output_interim", "output_final"):
+                        await emit({"event": "live.output_transcript",
+                                    "text": event.text,
+                                    "final": event.type == "output_final",
+                                    "session_id": session_id})
+                    elif event.type == "output_audio":
+                        await emit({"event": "live.output_audio",
+                                    "seconds": round(event.duration_s, 3),
+                                    "sample_rate": event.sample_rate,
+                                    "session_id": session_id})
+                    elif event.type == "echo_suppressed":
+                        await emit({"event": "transcript.echo_suppressed",
+                                    "reason": event.reason or "live echo",
+                                    "text": event.text,
+                                    "session_id": session_id})
+                    elif event.type == "resumption" and event.handle:
+                        resumption_handle = event.handle
+            finally:
+                # EOF/error is terminal too, even if no final text was emitted.
+                terminal_event.set()
+
+        async def wait_for_live_terminal(current_collector: asyncio.Task | None,
+                                         terminal_event: asyncio.Event | None) -> None:
+            if (terminal_event is None or terminal_event.is_set()
+                    or current_collector is None or current_collector.done()):
+                if current_collector is not None and current_collector.done():
+                    current_collector.result()
+                return
+            terminal_wait = asyncio.create_task(terminal_event.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    {current_collector, terminal_wait},
+                    return_when=asyncio.FIRST_COMPLETED)
+                if current_collector in done:
+                    current_collector.result()
+            finally:
+                if not terminal_wait.done():
+                    terminal_wait.cancel()
+                    await asyncio.gather(terminal_wait, return_exceptions=True)
 
         def wrap_duplex(current: LiveTransport) -> LiveTransport:
             """One door for both the real and the fake transport (§12.9)."""
@@ -368,11 +491,13 @@ class DictationService:
                 current, external_playback=is_playback_active, clock=clock)
 
         async def open_session(handle: str | None) -> LiveTransport:
-            nonlocal collector
+            nonlocal collector, collector_terminal_event
             current = wrap_duplex(factory())
             await current.connect(handle)
             await current.activity_start()
-            collector = asyncio.create_task(collect_events(current))
+            collector_terminal_event = asyncio.Event()
+            collector = asyncio.create_task(
+                collect_events(current, collector_terminal_event))
             return current
 
         self._log("dictate.transport_open_attempt", session_id=session_id, offline_at_start=str(offline_at_start))
@@ -491,9 +616,20 @@ class DictationService:
                                 "session_id": session_id})
                     if collector:
                         collector.cancel()
-                        await asyncio.gather(collector, return_exceptions=True)
+                        try:
+                            await self._await_lifecycle(
+                                "dictate.rotation_collector_cancel_wait",
+                                asyncio.gather(collector, return_exceptions=True),
+                                timeout_s=self.COLLECTOR_CANCEL_TIMEOUT_S,
+                                session_id=session_id)
+                        except Exception as cleanup_exc:
+                            notes.append(
+                                f"rotated Live collector did not stop cleanly ({cleanup_exc})")
                     try:
-                        await transport.close()
+                        await self._await_lifecycle(
+                            "dictate.rotation_transport_close", transport.close(),
+                            timeout_s=self.TRANSPORT_CLOSE_TIMEOUT_S,
+                            session_id=session_id)
                         if rotations >= 1:
                             raise LiveUnavailable("rotation limit reached for this session")
                         transport = await open_session(resumption_handle)
@@ -516,16 +652,53 @@ class DictationService:
                                                   error=str(retry_exc))
                         transport = None
                         notes.append(f"reconnect failed ({retry_exc}) — saved-audio fallback")
-            # PTT released / source exhausted: close the utterance.
+            frame_loop_completed = True
+            self._log("dictate.frame_loop_done", session_id=session_id,
+                      frames_seen=frames_seen, bytes=captured_bytes,
+                      duration_s=round(duration_s, 3))
+
+            # PTT released / source exhausted: close the utterance. A Live
+            # server may omit its final/turn_complete after activity_end, so
+            # both the signal and the receive-loop wait are explicitly bounded.
             if transport is not None:
-                await transport.activity_end()
-                if collector:
+                activity_end_ok = False
+                try:
+                    await self._await_lifecycle(
+                        "dictate.activity_end",
+                        transport.activity_end(),
+                        timeout_s=self.ACTIVITY_END_TIMEOUT_S,
+                        session_id=session_id)
+                    activity_end_ok = True
+                except Exception as exc:
+                    live_failed = True
+                    live_failures.append(f"activity_end: {exc}")
+                    notes.append(f"Live activity_end failed ({exc}); saved-WAV fallback will run")
+
+                if activity_end_ok and collector is not None:
                     try:
-                        await asyncio.wait_for(collector, timeout=15)
-                    except (TimeoutError, asyncio.CancelledError):
-                        notes.append("timed out waiting for final transcript")
+                        await self._await_lifecycle(
+                            "dictate.transcript_final_wait",
+                            wait_for_live_terminal(collector,
+                                                   collector_terminal_event),
+                            timeout_s=self.FINAL_TRANSCRIPT_TIMEOUT_S,
+                            session_id=session_id)
+                    except TimeoutError:
+                        live_terminal_missing = True
+                        notes.append(
+                            "Live final transcript timed out after activity_end; "
+                            "saved-WAV fallback will run")
+                    except Exception as exc:
+                        live_terminal_missing = True
+                        live_failed = True
+                        live_failures.append(f"final wait: {exc}")
+                        notes.append(f"Live final wait failed ({exc}); saved-WAV fallback will run")
                 finals = _final_texts(collected)
                 final_text = " ".join(finals).strip()
+                if not final_text:
+                    live_terminal_missing = True
+                    self._log("dictate.live_no_final", session_id=session_id,
+                              activity_end_ok=activity_end_ok,
+                              frames_seen=frames_seen)
             duplex = {}
             if transport is not None and getattr(transport, "gate", None) is not None:
                 duplex = transport.gate.snapshot()
@@ -540,100 +713,211 @@ class DictationService:
                             "echo_suppressed": int(duplex.get("echo_suppressed", 0)),
                             "playbacks": int(duplex.get("playbacks", 0)),
                             "output_audio_bytes": int(duplex.get("output_audio_bytes", 0))})
+        except Exception as exc:
+            # A capture/source/event failure is still a terminal session. Keep
+            # whatever final text was already collected and transcribe the WAV
+            # below rather than letting ptt.result turn it into silence.
+            final_text = " ".join(_final_texts(collected)).strip()
+            live_failed = True
+            live_terminal_missing = not bool(final_text)
+            live_failures.append(f"dictate: {type(exc).__name__}: {exc}")
+            notes.append(f"dictation pipeline failed ({exc}); saved-WAV fallback will run")
+            self._log("dictate.pipeline_failed", session_id=session_id,
+                      error=f"{type(exc).__name__}: {exc}"[:200])
         finally:
             self._log("dictate.cleanup_start", session_id=session_id)
+            if not frame_loop_completed:
+                self._log("dictate.frame_loop_incomplete", session_id=session_id,
+                          frames_seen=frames_seen, bytes=captured_bytes)
             if wav_sink:
+                self._log("dictate.wav_close_start", session_id=session_id)
                 try:
                     duration_s = wav_sink.close() or duration_s
-                    self._log("dictate.wav_closed", session_id=session_id, duration_s=round(duration_s,3))
+                    self._log("dictate.wav_closed", session_id=session_id,
+                              duration_s=round(duration_s, 3))
                 except Exception as exc:
-                    self._log("dictate.wav_close_failed", session_id=session_id, error=str(exc)[:120])
+                    self._log("dictate.wav_close_failed", session_id=session_id,
+                              error=str(exc)[:120])
+
+            # Persist capture.stats before ANY cleanup await. If a transport or
+            # source close is wedged, status still reports the bytes/peak and
+            # points at the WAV that contains the owner's speech.
+            self._log("dictate.capture_diagnostics", session_id=session_id,
+                      frames_seen=frames_seen, bytes=captured_bytes)
+            try:
+                stalled = bool(getattr(source, "stalled", False))
+            except Exception:
+                stalled = False
+            no_speech = captured_bytes == 0 or peak_rms < 0.003
+            capture_stats = {
+                "session_id": session_id,
+                "node": capture_label, "bytes": captured_bytes,
+                "peak_rms": round(peak_rms, 4), "frames": frames_seen,
+                "duration_s": round(duration_s, 3), "gated_frames": gated_frames,
+                "stalled": stalled, "no_speech": no_speech,
+            }
+            if stalled:
+                notes.append("capture stalled — the capture process delivered no data")
+            if no_speech:
+                # §8: a transcript from ~zero audio is a hallucination, whatever
+                # produced it. The words are not there to report.
+                if final_text:
+                    notes.append(
+                        "transcript discarded: the session captured no usable audio (§8)")
+                final_text = ""
+                notes.append(
+                    f"no speech captured (node={capture_label}, bytes={captured_bytes}, "
+                    f"peak={peak_rms:.4f})")
+            try:
+                self.store.log_persona_event(
+                    iso_now(), "capture.stats", json.dumps(capture_stats))
+                self._log("dictate.capture_stats_logged", **capture_stats)
+            except Exception as exc:
+                self._log("dictate.capture_stats_log_failed", session_id=session_id,
+                          error=f"{type(exc).__name__}: {exc}"[:200])
+
             if collector is not None and not collector.done():
+                self._log("dictate.collector_cancel_start", session_id=session_id)
                 collector.cancel()
-                await asyncio.gather(collector, return_exceptions=True)
-                self._log("dictate.collector_cancelled", session_id=session_id)
+                try:
+                    await self._await_lifecycle(
+                        "dictate.collector_cancel_wait",
+                        asyncio.gather(collector, return_exceptions=True),
+                        timeout_s=self.COLLECTOR_CANCEL_TIMEOUT_S,
+                        session_id=session_id)
+                    self._log("dictate.collector_cancelled", session_id=session_id)
+                except Exception as exc:
+                    notes.append(f"Live event collector did not stop cleanly ({exc})")
+
             if transport is not None:
                 try:
-                    await transport.close()
+                    await self._await_lifecycle(
+                        "dictate.transport_close", transport.close(),
+                        timeout_s=self.TRANSPORT_CLOSE_TIMEOUT_S,
+                        session_id=session_id)
                     self._log("dictate.transport_closed", session_id=session_id)
                 except Exception as exc:
-                    self._log("dictate.transport_close_failed", session_id=session_id, error=str(exc)[:120])
+                    notes.append(f"Live transport close did not finish cleanly ({exc})")
+                    self._log("dictate.transport_close_failed", session_id=session_id,
+                              error=f"{type(exc).__name__}: {exc}"[:200])
             try:
-                await source.aclose()
-                self._log("dictate.source_closed", session_id=session_id, target=str(getattr(source, "target", None) or "default"))
+                await self._await_lifecycle(
+                    "dictate.source_close", source.aclose(),
+                    timeout_s=self.SOURCE_CLOSE_TIMEOUT_S,
+                    session_id=session_id,
+                    target=str(getattr(source, "target", None) or "default"))
+                self._log("dictate.source_closed", session_id=session_id,
+                          target=str(getattr(source, "target", None) or "default"))
             except Exception as exc:
-                self._log("dictate.source_close_failed", session_id=session_id, error=str(exc)[:120])
+                notes.append(f"capture source close did not finish cleanly ({exc})")
+                self._log("dictate.source_close_failed", session_id=session_id,
+                          error=f"{type(exc).__name__}: {exc}"[:200])
 
-        # BUG 6 capture diagnostics — every session logs the node, bytes and
-        # peak level, so "it captured nothing" is a fact, not a guess.
-        self._log("dictate.capture_diagnostics", session_id=session_id, frames_seen=frames_seen, bytes=captured_bytes)
-        stalled = bool(getattr(source, "stalled", False))
-        # ~zero audio = a dead session: no bytes at all (wedged/dead capture)
-        # or nothing above the digital-noise floor (a silent node). A real
-        # word is brief sometimes but never silent — it has peak. Report in
-        # seconds; never wait a full ptt.result budget on an empty session.
-        no_speech = captured_bytes == 0 or peak_rms < 0.003
-        capture_stats = {
-            "node": capture_label, "bytes": captured_bytes,
-            "peak_rms": round(peak_rms, 4), "frames": frames_seen,
-            "duration_s": round(duration_s, 3), "gated_frames": gated_frames,
-            "stalled": stalled, "no_speech": no_speech,
-        }
-        if stalled:
-            notes.append("capture stalled — the capture process delivered no data")
-        if no_speech:
-            # §8: a transcript from ~zero audio is a hallucination, whatever
-            # produced it. The words are not there to report.
-            if final_text:
-                notes.append(
-                    "transcript discarded: the session captured no usable audio (§8)")
-            final_text = ""
-            notes.append(
-                f"no speech captured (node={capture_label}, bytes={captured_bytes}, "
-                f"peak={peak_rms:.4f})")
-        await emit({"event": "capture.stats", "session_id": session_id,
-                    **capture_stats})
-        self.store.log_persona_event(
-            iso_now(), "capture.stats", json.dumps(capture_stats))
-        self._log("dictate.capture_stats_logged", session_id=session_id, **capture_stats)
+            # Store logging above is authoritative. Event delivery is best-effort
+            # and bounded so a broken subscriber cannot hold ptt.result hostage.
+            try:
+                await self._await_lifecycle(
+                    "dictate.capture_stats_emit",
+                    emit({"event": "capture.stats", "session_id": session_id,
+                          **capture_stats}),
+                    timeout_s=self.EVENT_EMIT_TIMEOUT_S,
+                    session_id=session_id)
+            except Exception as exc:
+                self._log("dictate.capture_stats_emit_failed", session_id=session_id,
+                          error=f"{type(exc).__name__}: {exc}"[:200])
 
         use_offline_chain = offline_at_start or network_drop
-        if (live_failed or not final_text) and not no_speech:
+        needs_fallback = (live_failed or not final_text) and not no_speech
+        if needs_fallback:
             if audio_path is not None:
                 try:
-                    fallback = await asyncio.to_thread(
-                        asr.transcribe_file, self.config, self.client, str(audio_path),
-                        offline=use_offline_chain, local_backend=self.local_backend)
-                    final_text = fallback.text
-                    backend = fallback.backend
-                    confidence = fallback.confidence
-                    language = fallback.language
-                    notes.append(f"transcribed via fallback backend '{backend}'")
+                    fallback = await self._await_lifecycle(
+                        "dictate.saved_wav_fallback",
+                        asyncio.to_thread(
+                            asr.transcribe_file, self.config, self.client,
+                            str(audio_path), offline=use_offline_chain,
+                            local_backend=self.local_backend),
+                        timeout_s=self.FALLBACK_TIMEOUT_S,
+                        session_id=session_id, audio_path=str(audio_path),
+                        offline=use_offline_chain)
+                    fallback_text = str(getattr(fallback, "text", "") or "").strip()
+                    if fallback_text:
+                        final_text = fallback_text
+                        backend = str(getattr(fallback, "backend", backend))
+                        confidence = getattr(fallback, "confidence", None)
+                        language = str(getattr(fallback, "language", language))
+                        notes.append(f"transcribed via fallback backend '{backend}'")
+                    else:
+                        notes.append("saved-WAV fallback returned no transcript")
                 except Exception as exc:
-                    await emit({"event": "error", "error": str(exc), "session_id": session_id})
-                    final_text = final_text or ""
-                    backend = "local" if use_offline_chain else backend
-                    notes.append(f"all backends failed: {exc}")
-            if backend == "gemini_live" and live_failed:
+                    await emit_lifecycle_event(
+                        "dictate.fallback_error_emit",
+                        {"event": "error", "error": str(exc),
+                         "session_id": session_id})
+                    if not final_text:
+                        backend = "local" if use_offline_chain else backend
+                    notes.append(f"saved-WAV fallback failed: {exc}")
+            else:
+                notes.append("saved-WAV fallback unavailable: no audio file was saved")
+            if backend == "gemini_live" and live_failed and not final_text:
                 backend = "local" if use_offline_chain else "gemini_batch"
+
+        no_final = bool(not final_text and not no_speech)
+        if no_final:
+            notes.append(
+                "no final transcript is available; captured audio is retained for retry")
+            self._log("dictate.no_final_terminal", session_id=session_id,
+                      live_final_missing=live_terminal_missing,
+                      audio_path=str(audio_path) if audio_path else None,
+                      bytes=captured_bytes, duration_s=round(duration_s, 3))
 
         cloud_status = self._cloud_status(
             backend=backend, confidence=confidence, raw=final_text,
             audio_path=audio_path, offline=use_offline_chain)
-        result = await self._persist(
-            session_id=session_id, when=when, raw=final_text, backend=backend,
-            language=language, audio_path=audio_path, duration_s=duration_s,
-            model=(self.config.model_for_role(
-                "transcribe_live" if backend == "gemini_live" else "transcribe_batch")
-                if backend != "local" else self.config.section("asr").get(
-                    "offline_model", "small")),
-            notes=notes, confidence=confidence, cloud_status=cloud_status,
-            skip_cleanup=use_offline_chain,
-            connectivity_mode=connectivity.effective_mode if connectivity else None)
-        result = self._enqueue_offline_work(
-            result, offline=use_offline_chain, skip_cleanup=use_offline_chain)
+        model = (self.config.model_for_role(
+            "transcribe_live" if backend == "gemini_live" else "transcribe_batch")
+            if backend != "local" else self.config.section("asr").get(
+                "offline_model", "small"))
+        try:
+            result = await self._await_lifecycle(
+                "dictate.persist",
+                self._persist(
+                    session_id=session_id, when=when, raw=final_text,
+                    backend=backend, language=language, audio_path=audio_path,
+                    duration_s=duration_s, model=model, notes=notes,
+                    confidence=confidence, cloud_status=cloud_status,
+                    skip_cleanup=use_offline_chain,
+                    connectivity_mode=(connectivity.effective_mode
+                                       if connectivity else None),
+                    lifecycle_dictate=True),
+                timeout_s=self.PERSIST_TIMEOUT_S, session_id=session_id,
+                no_final=no_final)
+        except Exception as exc:
+            notes.append(f"transcript persistence failed ({exc}); raw audio retained")
+            self._log("dictate.persist_terminal_fallback", session_id=session_id,
+                      error=f"{type(exc).__name__}: {exc}"[:200])
+            result = SessionResult(
+                session_id=session_id, raw_text=final_text,
+                cleaned_text=None, backend=backend, language=language,
+                audio_path=str(audio_path) if audio_path else None,
+                inbox_path=None,
+                clipboard={"copied": False,
+                           "reason": "transcript persistence failed"},
+                flagged=False, duration_s=duration_s, transcript_id=None,
+                notes=notes, confidence=confidence, cloud_status=cloud_status,
+                connectivity_mode=(connectivity.effective_mode
+                                   if connectivity else None))
+        try:
+            result = self._enqueue_offline_work(
+                result, offline=use_offline_chain,
+                skip_cleanup=use_offline_chain)
+        except Exception as exc:
+            notes.append(f"offline follow-up could not be queued ({exc})")
+            self._log("dictate.offline_queue_failed", session_id=session_id,
+                      error=f"{type(exc).__name__}: {exc}"[:200])
         result.capture = capture_stats
         result.no_speech = no_speech
+        result.no_final = no_final
         # BUG5: filter echo of own TTS — if transcript looks like filler/own speech, treat as empty
         # This uses a simple heuristic: filler phrases + very short echo without user content
         from .persona import FILLER_PHRASES
@@ -654,21 +938,40 @@ class DictationService:
                     inbox_path=None, clipboard={"copied": False, "reason": "echo filtered"},
                     flagged=False, duration_s=duration_s, transcript_id=None, notes=notes,
                     confidence=confidence, cloud_status="complete",
-                    capture=capture_stats, no_speech=no_speech)
-                await emit({"event": "transcript.filtered", "reason": "echo", "session_id": session_id})
-                await emit({"event": "session.ended", "session_id": session_id,
-                            "backend": backend, "duration_s": round(duration_s, 2)})
+                    capture=capture_stats, no_speech=no_speech, no_final=False)
+                await emit_lifecycle_event(
+                    "dictate.transcript_filtered_emit",
+                    {"event": "transcript.filtered", "reason": "echo",
+                     "session_id": session_id})
+                await emit_lifecycle_event(
+                    "dictate.session_ended_emit",
+                    {"event": "session.ended", "session_id": session_id,
+                     "backend": backend, "duration_s": round(duration_s, 2),
+                     "no_speech": no_speech, "no_final": False})
                 return result
         self._ledger_live_session(
             backend, duration_s, ok=bool(final_text),
             error=(" | ".join(live_failures) if live_failures else None))
         shown = result.cleaned_text if (result.cleaned_text and not result.flagged) else result.raw_text
-        await emit({"event": "transcript.final", "text": shown,
-                    "inbox_path": result.inbox_path, "session_id": session_id})
-        await emit({"event": "session.ended", "session_id": session_id,
-                    "backend": backend, "duration_s": round(duration_s, 2),
-                    "no_speech": no_speech,
-                    "capture": capture_stats})
+        if no_final:
+            await emit_lifecycle_event(
+                "dictate.no_final_emit",
+                {"event": "transcript.no_final",
+                 "message": ("No final transcript was returned; captured audio "
+                             "is retained for retry."),
+                 "audio_path": str(audio_path) if audio_path else None,
+                 "session_id": session_id})
+        else:
+            await emit_lifecycle_event(
+                "dictate.transcript_final_emit",
+                {"event": "transcript.final", "text": shown,
+                 "inbox_path": result.inbox_path, "session_id": session_id})
+        await emit_lifecycle_event(
+            "dictate.session_ended_emit",
+            {"event": "session.ended", "session_id": session_id,
+             "backend": backend, "duration_s": round(duration_s, 2),
+             "no_speech": no_speech, "no_final": no_final,
+             "capture": capture_stats})
         return result
 
     async def transcribe_file(self, audio_path: Path) -> SessionResult:
@@ -701,14 +1004,22 @@ class DictationService:
     async def _persist(self, *, session_id, when, raw, backend, language,
                        audio_path, duration_s, model, notes,
                        confidence=None, cloud_status="complete",
-                       skip_cleanup=False, connectivity_mode=None) -> SessionResult:
+                       skip_cleanup=False, connectivity_mode=None,
+                       lifecycle_dictate=False) -> SessionResult:
         # Cleanup is a model call — off the event loop so acks/status on
         # other connections never wait behind it (§18). Offline it is queued,
         # never attempted against Gemini.
         cleanup = None
         if raw and not skip_cleanup:
             try:
-                cleanup = await asyncio.to_thread(self.cleanup.run, raw)
+                cleanup_work = asyncio.to_thread(self.cleanup.run, raw)
+                if lifecycle_dictate:
+                    cleanup = await self._await_lifecycle(
+                        "dictate.cleanup_generation", cleanup_work,
+                        timeout_s=self.CLEANUP_TIMEOUT_S,
+                        session_id=session_id)
+                else:
+                    cleanup = await cleanup_work
             except Exception as exc:
                 cleanup = None
                 notes.append(f"cleanup failed ({exc}); raw transcript preserved")

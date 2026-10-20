@@ -86,6 +86,20 @@ def test_overlay_error_lingers_longer_than_final():
     assert not reducer.tick().visible
 
 
+def test_overlay_no_final_notice_survives_session_ended():
+    clock = FakeClock()
+    reducer = OverlayReducer(now=clock)
+    reducer.apply({"event": "session.started"})
+    state = reducer.apply({
+        "event": "transcript.no_final",
+        "message": "No final transcript received; WAV retained.",
+    })
+    assert state.kind == "error" and state.text.startswith("No final transcript")
+    reducer.apply({"event": "session.ended", "no_final": True})
+    clock.advance(5.0)
+    assert reducer.tick().visible
+
+
 def test_overlay_ignores_unknown_events():
     reducer = OverlayReducer(now=FakeClock())
     reducer.apply({"event": "session.started"})

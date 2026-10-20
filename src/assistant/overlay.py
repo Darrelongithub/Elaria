@@ -83,8 +83,15 @@ class OverlayReducer:
             self.state = OverlayState(True, "final",
                                       str(event.get("text", "")), False)
             self._hide_at = self._now() + self.final_linger_s
+        elif kind == "transcript.no_final":
+            self.state = OverlayState(
+                True, "error",
+                str(event.get("message") or
+                    "No final transcript received; captured audio is retained."),
+                False)
+            self._hide_at = self._now() + self.error_linger_s
         elif kind == "session.ended":
-            if self.state.kind != "final":
+            if self.state.kind not in ("final", "error"):
                 self._hide_at = self._now()  # nothing to read: hide promptly
         elif kind in ("error",) or event.get("error"):
             message = str(event.get("error") or event.get("text") or "something went wrong")

@@ -1792,14 +1792,22 @@ def main(argv: list[str] | None = None) -> int:
                 print(result.get("narration") or "no speech captured")
                 if result.get("error"):
                     print(f"({result['error']})", file=sys.stderr)
-                capture = result.get("capture") or {}
-                if capture:
-                    print(f"[capture: node={capture.get('node')} · "
-                          f"bytes={capture.get('bytes')} · "
-                          f"peak={capture.get('peak_rms')}]", file=sys.stderr)
+            elif result.get("no_final") and not (result.get("text") or "").strip():
+                # Missing Live final is not evidence of a silent microphone:
+                # tell the owner the WAV remains available for a retry.
+                print(result.get("narration") or
+                      "No final transcript received; captured audio is retained for retry.")
+                if result.get("error"):
+                    print(f"({result['error']})", file=sys.stderr)
             else:
                 print(result.get("narration", ""))
                 print(result.get("text") or result.get("error") or "(no transcript)")
+            capture = result.get("capture") or {}
+            if capture and (result.get("no_speech") or result.get("no_final")):
+                print(f"[capture: node={capture.get('node')} · "
+                      f"bytes={capture.get('bytes')} · "
+                      f"peak={capture.get('peak_rms')} · "
+                      f"audio={result.get('audio_path')}]", file=sys.stderr)
             print(f"[inbox: {result.get('inbox_path')} · clipboard: "
                   f"{(result.get('clipboard') or {}).get('copied')}]", file=sys.stderr)
             return 0
