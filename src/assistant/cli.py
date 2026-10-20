@@ -1362,6 +1362,10 @@ def main(argv: list[str] | None = None) -> int:
                         "quota": config.section("quota"),
                         "tier": config.section("privacy").get("tier", "free")}
                 data["today"]["live_calls"] = store.calls_since(day_start_iso())
+                data["today"]["user_turn_calls"] = store.user_turn_calls_since(day_start_iso())
+                data["today"]["housekeeping_calls"] = store.housekeeping_calls_since(day_start_iso())
+                data["today"]["by_purpose"] = store.calls_by_purpose_since(day_start_iso())
+                data["today"]["quota_calls"] = data["today"]["user_turn_calls"]
                 store.close()
             from .cost import format_cost_report
             print(format_cost_report(data["month"], data["today"], data["quota"], data["tier"]))

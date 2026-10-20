@@ -402,6 +402,31 @@ class DictationService:
             connectivity_mode=connectivity.effective_mode if connectivity else None)
         result = self._enqueue_offline_work(
             result, offline=use_offline_chain, skip_cleanup=use_offline_chain)
+        # BUG5: filter echo of own TTS — if transcript looks like filler/own speech, treat as empty
+        # This uses a simple heuristic: filler phrases + very short echo without user content
+        from .persona import FILLER_PHRASES
+        if final_text:
+            lowered = final_text.lower()
+            from pathlib import Path as _P
+            # Also check if daemon is speaking (if we have a reference) — but transcribe doesn't have daemon
+            # So we rely on textual fingerprint of echo
+            is_filler_echo = any(phrase in lowered for phrase in FILLER_PHRASES)
+            if is_filler_echo:
+                final_text = ""
+                backend = "local"
+                notes.append("BUG5: filtered echo/filler transcript (own TTS)")
+                # Re-persist with empty? Return empty result
+                result = SessionResult(
+                    session_id=session_id, raw_text="", cleaned_text=None,
+                    backend=backend, language=language,
+                    audio_path=str(audio_path) if audio_path else None,
+                    inbox_path=None, clipboard={"copied": False, "reason": "echo filtered"},
+                    flagged=False, duration_s=duration_s, transcript_id=None, notes=notes,
+                    confidence=confidence, cloud_status="complete")
+                await emit({"event": "transcript.filtered", "reason": "echo", "session_id": session_id})
+                await emit({"event": "session.ended", "session_id": session_id,
+                            "backend": backend, "duration_s": round(duration_s, 2)})
+                return result
         self._ledger_live_session(backend, duration_s, ok=bool(final_text))
         shown = result.cleaned_text if (result.cleaned_text and not result.flagged) else result.raw_text
         await emit({"event": "transcript.final", "text": shown,
@@ -498,7 +523,8 @@ class DictationService:
             audio_seconds=duration_s,
             cost_usd=shadow_cost_usd(model, 0, 0, duration_s),
             latency_ms=duration_s * 1000, ok=1 if ok else 0, verified=None,
-            attempt=1, fixture_key=None, error=None if ok else "no transcript produced")
+            attempt=1, fixture_key=None, error=None if ok else "no transcript produced",
+            purpose="housekeeping:transcribe_live", is_user_turn=0)
 
 
 async def _noop_sink(event: dict) -> None:
