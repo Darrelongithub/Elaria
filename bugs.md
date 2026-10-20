@@ -54,12 +54,12 @@ into a regular hunt test).
 - **Fix:** resolved-destination containment checks for normal and
   `_Conflicts/` moves.
 
-## Open reproduced bugs from Areas A–C
+## Fixed in the full-repo hardening pass (`arena/86517426-elaria`)
 
 ### BH-A4 — Protected paths ignore `$VAR` spelling
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_protected_path_env_var_spelling_is_honoured`
 - **Expected:** `$HOME/secret` protects the expanded directory.
 - **Actual:** only `~` expansion is honoured; `$HOME/...` is treated as a
@@ -68,7 +68,7 @@ into a regular hunt test).
 ### BH-B1 — Move completed before journal commit is not undoable
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_kill_after_move_before_commit_can_be_undone`
 - **Expected:** after restart, an outstanding intent whose bytes are at the
   destination can be reconciled/undone.
@@ -78,7 +78,7 @@ into a regular hunt test).
 ### BH-B2 — Partial cross-device copy is left at the destination
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_disk_full_mid_move_leaves_no_partial_destination`
 - **Expected:** disk-full during a cross-device copy leaves the source and no
   misleading partial destination.
@@ -89,7 +89,7 @@ into a regular hunt test).
 ### BH-B3 — Executor-level bare undo unwinds all committed history
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_bare_undo_refuses_without_scope`
 - **Expected:** `Executor.undo()` without op/plan/since refuses.
 - **Actual:** it unwinds every committed operation. The CLI guards this, but
@@ -98,7 +98,7 @@ into a regular hunt test).
 ### BH-B4 — Broken symlink crashes indexing
 
 - **Severity:** crash-with-safe-state
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_broken_symlink_is_skipped_not_fatal`
 - **Expected:** the dangling symlink is counted/skipped and ordinary files
   still index.
@@ -107,7 +107,7 @@ into a regular hunt test).
 ### BH-B5 — FIFO/special file can hang the indexer
 
 - **Severity:** crash-with-safe-state
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_fifo_is_skipped_instead_of_blocking_indexer`
 - **Expected:** non-regular files are skipped by type before any read.
 - **Actual:** the indexer attempts to read the FIFO and blocks.
@@ -115,7 +115,7 @@ into a regular hunt test).
 ### BH-B6 — Later `never_send` policy does not reflag unchanged files
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_never_send_added_later_reflags_unchanged_documents`
 - **Expected:** adding a root to `never_send_to_cloud` updates existing
   unchanged document rows on the next index pass.
@@ -125,7 +125,7 @@ into a regular hunt test).
 ### BH-C1 — Halt landing after policy check does not stop the imminent move
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_halt_landing_after_policy_check_prevents_the_move`
 - **Expected:** halt is honoured immediately before the filesystem syscall.
 - **Actual:** halt is checked between plan items, but a halt landing after an
@@ -134,7 +134,7 @@ into a regular hunt test).
 ### BH-C2 — `trash()` bypasses protected-path and halt policy
 
 - **Severity:** data-loss
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_trash_refuses_protected_paths_and_halt`
 - **Expected:** protected paths and an active halt refuse trash just as they
   refuse moves.
@@ -284,12 +284,12 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
   consecutive runs; handler runs once, final state `done`, `attempts == 1`,
   and the two drains report `done` counts `1` and `0`.
 
-## Open reproduced bugs: executor/organiser continuation
+## Fixed in the full-repo hardening pass: executor/organiser & Areas D–G
 
 ### BH-A5 — Executor does not verify plan root against root spec
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_plan_for_one_root_cannot_be_applied_with_another_root_spec`
 - **Expected:** applying a plan built for root B with root A's spec raises
   before any file moves.
@@ -300,7 +300,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-A6 — Executor accepts a source outside the organise root
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_plan_item_source_outside_root_is_refused`
 - **Expected:** every plan item source must be inside the root being applied.
 - **Actual:** if the outside file is indexed under another root/spec, the
@@ -309,7 +309,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-A7 — Executor accepts invented destinations outside frozen taxonomy
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_plan_item_invented_destination_is_refused`
 - **Expected:** a corrupted/manual plan item with `dest="Invented"` is
   refused because `Invented` is not in the root taxonomy.
@@ -319,7 +319,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-A8 — Nested already-filed files are flattened
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_nested_already_filed_file_is_not_flattened`
 - **Expected:** `Finance/2024/invoice.txt` is already inside the taxonomy
   and stays exactly there.
@@ -329,7 +329,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-A9 — Destination occupied by a directory crashes the apply
 
 - **Severity:** crash-with-safe-state
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_destination_occupied_by_directory_is_refused_not_raised`
 - **Expected:** one refused item in the report; source and directory intact.
 - **Actual:** `check_operation()` tries to hash the directory and raises
@@ -338,7 +338,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-A10 — `ApplyReport.op_ids` is always empty
 
 - **Severity:** cosmetic
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repro:** `test_apply_report_names_the_journal_operations_it_committed`
 - **Expected:** the report names committed journal operation IDs.
 - **Actual:** files move and journal rows commit, but `op_ids == []`.
@@ -346,7 +346,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-B7 — Watcher debounce does not restart on later writes
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_watcher_debounce_restarts_when_a_file_changes_again`
 - **Expected:** a file changed at t=0 and again at t=9 is not settled at
   t=11 with a 10-second debounce.
@@ -356,7 +356,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-B8 — Unreadable directory is indexed as empty and docs go missing
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_unreadable_directory_does_not_mark_known_files_missing`
 - **Expected:** indexing reports an error and leaves known document state
   unchanged while the directory cannot be read.
@@ -366,18 +366,18 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-B9 — `build_plan` ignores a missing-root index error
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_build_plan_for_missing_root_does_not_finish_ready`
 - **Expected:** a missing root fails the plan.
 - **Actual:** indexer returns `stats["error"]`, organiser proceeds with
   stale document rows, writes a shadow log, and finishes the plan `ready`.
 
-## Open reproduced bugs: Area D — planner, intents, config
+## Fixed in the full-repo hardening pass: Area D — planner, intents, config
 
 ### BH-D1 — LLM batch verifier does not require an exact path set
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `0176d8d`
 - **Repros:** `test_llm_batch_with_duplicate_path_and_missing_file_is_invalid`,
   `test_llm_batch_boolean_confidence_is_invalid`
 - **Expected:** duplicates, dropped files, subsets, and boolean confidence
@@ -389,7 +389,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-D2 — API-cost intent overmatches ordinary English
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `e4108b5`
 - **Repro:** `test_ordinary_cost_words_are_not_the_api_cost_intent`
 - **Expected:** “cost of living…”, “usage of the word…”, and
   “quota for fishing boats” go up the conversational ladder.
@@ -398,7 +398,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-D3 — Natural emergency halt variants are misses
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `e4108b5`
 - **Repro:** `test_natural_halt_variants_route_to_halt`
 - **Expected:** “halt please”, “stop everything now”, and “panic stop now”
   set the halt.
@@ -407,7 +407,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-D4 — A string where a config sequence belongs becomes characters
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `e4108b5`
 - **Repro:** `test_string_taxonomy_and_languages_are_rejected_or_wrapped`
 - **Expected:** `taxonomy="Finance"` and `languages="sw"` are rejected with
   a useful config error or normalized to one-element lists.
@@ -417,7 +417,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-D5 — Loaded configs share nested `DEFAULTS` objects
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `e4108b5`
 - **Repro:** `test_mutating_loaded_config_does_not_pollute_next_load`
 - **Expected:** mutating one `Config.raw` cannot change the defaults seen by
   the next `load_config()` in the same process.
@@ -427,20 +427,20 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-D6 — Malformed humour TOML crashes instead of degrading
 
 - **Severity:** crash-with-safe-state
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_malformed_humour_profile_degrades_to_empty_profile`
 - **Expected:** per its contract, `load_humour_profile()` returns `{}` and
   the governor falls back to restraint.
 - **Actual:** TOML parse errors propagate, breaking doctor/daemon startup.
 
-## Open reproduced bugs: Area E — store, queue, modes, harness
+## Fixed in the full-repo hardening pass: Area E — store, queue, modes, harness
 
-(BH-E2 moved to *Fixed* below.)
+(BH-E2 moved to *Fixed* above.)
 
 ### BH-E3 — Every `OSError` is classified as a network failure
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_local_filesystem_errors_are_not_network_failures`
 - **Expected:** missing file, permission denied, and disk-full are local
   failures with terminal/inspectable queue state.
@@ -451,7 +451,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-E4 — First 500 historical queue jobs starve newer pending jobs
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_queue_drain_reaches_pending_job_after_500_finished_jobs`
 - **Expected:** drain selects pending/approved jobs regardless of how much
   completed history precedes them.
@@ -461,7 +461,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-E5 — A cloud job left `running` by a crash is never recovered
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_queue_recovers_a_job_left_running_by_a_crash`
 - **Expected:** restart/drain reconciles a dead `running` job.
 - **Actual:** candidates are only `pending`/`approved`; `running` remains
@@ -470,7 +470,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-E6 — `ModeManager` without a store cannot remember a switch
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_mode_manager_without_store_remembers_requested_preference`
 - **Expected:** `request_preference("offline")` yields FORCED_OFFLINE even
   for the supported `store=None` construction.
@@ -480,21 +480,21 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-E7 — Harness verification outcomes are never ledgered
 
 - **Severity:** cosmetic
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_verified_outcome_is_recorded_in_the_ledger`
 - **Expected:** failed/successful verified attempts write `verified=0/1` to
   `llm_calls`.
 - **Actual:** `_call_once()` always writes `verified=None` before the
   verifier runs, and nothing updates the row afterward.
 
-(BH-C3 moved to *Fixed* below.)
+(BH-C3 moved to *Fixed* above.)
 
-## Open reproduced bugs: Area F — audio, dictation, meeting, TTS
+## Fixed in the full-repo hardening pass: Area F — audio, dictation, meeting, TTS
 
 ### BH-F1 — Empty ASR output stops the fallback chain
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_asr_fallback_chain_continues_after_empty_text`
 - **Expected:** `transcribe_file()` walks until a backend produces text.
 - **Actual:** a backend returning `Transcript("")` is treated as success
@@ -503,7 +503,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-F2 — `WavSink.close()` reports duration at the wrong sample rate
 
 - **Severity:** cosmetic
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_wav_sink_reports_duration_at_its_configured_sample_rate`
 - **Expected:** 8,000 frames at 8kHz report 1.0s.
 - **Actual:** the WAV is written at 8kHz but duration divides by the global
@@ -512,7 +512,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-F3 — PCM-stream PipeWire command bypasses the object.id trap guard
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_pw_record_stream_rejects_short_numeric_object_id_targets`
 - **Expected:** a short numeric target such as `42` is rejected because
   `pw-record --target` needs `object.serial` or `node.name`.
@@ -523,7 +523,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-F6 — Live age rotation reconnects on every later frame
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_live_age_rotation_does_not_reconnect_on_every_frame`
 - **Expected:** proactive rotation after the Live session-age cap resets
   that transport's age clock.
@@ -534,7 +534,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-F7 — Cleanup failure prevents raw dictation persistence
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_cleanup_failure_still_persists_raw_transcript`
 - **Expected:** ASR text lands in the transcript store/inbox even if the
   optional cleanup model call fails.
@@ -544,7 +544,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-F8 — Piper availability ignores a missing voice JSON config
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_piper_availability_requires_the_json_config`
 - **Expected:** status reports unavailable when the selected model's
   `.onnx.json` config is absent.
@@ -554,7 +554,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 ### BH-F9 — Explicit TTS destination is reused as cache for different text
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_tts_explicit_destination_is_not_reused_for_different_text`
 - **Expected:** synthesizing “second text” to an explicit WAV path produces
   audio for the second text.
@@ -734,12 +734,12 @@ their own CRITICAL class.
   instruction rather than "say it again to confirm" — there is no spoken
   confirmation channel to offer yet.
 
-## Open reproduced bugs: Area G — IPC, daemon, voice-test
+## Fixed in the full-repo hardening pass: Area G — IPC, daemon, voice-test
 
 ### BH-G1 — Speaker-threshold suggestion tie-breaks dangerously low
 
 - **Severity:** wrong-action
-- **Status:** open-xfail
+- **Status:** fixed in `e4108b5`
 - **Repro:** `test_suggested_speaker_threshold_uses_the_separation_gap_midpoint`
 - **Expected:** with false scores at 0.10 and true scores at 0.90, the
   suggested threshold sits in the separation gap (about 0.50).
@@ -749,7 +749,7 @@ their own CRITICAL class.
 ### BH-G2 — `review.decide` reports success for a nonexistent item
 
 - **Severity:** cosmetic
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_review_decide_rejects_a_nonexistent_item`
 - **Expected:** deciding item #999999 raises a clear no-such-item error.
 - **Actual:** the SQL update affects zero rows but the daemon returns a
@@ -758,9 +758,264 @@ their own CRITICAL class.
 ### BH-G3 — IPC client mistakes a pushed event for its reply
 
 - **Severity:** crash-with-safe-state
-- **Status:** open-xfail
+- **Status:** fixed in `810bab4`
 - **Repro:** `test_ipc_call_skips_event_lines_until_the_matching_reply`
 - **Expected:** `ipc.call()` skips server-pushed event lines and returns the
   matching JSON-RPC-style result.
 - **Actual:** it treats the first event line as the reply; with no `ok`
   field it raises a daemon error even though the real reply follows.
+
+## Fixed in the full-repo hardening pass: Area H — Stages A–D & cross-cutting (`tests/test_stage_abcd_bughunt.py`)
+
+### BH-H1 — Live session failure mid-ack or mid-conversation leaves truncated WAV or ignores connectivity loss
+
+- **Severity:** crash-with-safe-state / wrong-action
+- **Status:** fixed in `810bab4`
+- **Repro:** `test_bh_h1_live_session_failure_mid_ack_leaves_no_partial_wav_and_falls_back_to_text`
+- **Expected:** `SpeechService.write_wav()` writes atomically via temp file +
+  `os.replace`, `GeminiClient._live_voice()` discards partial PCM on mid-stream
+  disconnect, and `Daemon._maybe_speak_reply()` notifies `mode_manager.observe_failure()`
+  on network errors while returning the text reply cleanly.
+- **Actual (before):** `write_wav()` wrote in place (`wave.open(dest, "wb")`),
+  mid-stream Live disconnects were not distinguished from completed turns, and
+  conversation speech failures did not update `mode_manager`.
+
+### BH-H2 — Voice catalogue cache never expires and `voice_route()` ignores upstream voice removal
+
+- **Severity:** wrong-action
+- **Status:** fixed in `e4108b5`
+- **Repro:** `test_bh_h2_catalogue_cache_ttl_and_upstream_voice_removal`
+- **Expected:** `load_cached()` enforces a TTL (`DEFAULT_CATALOGUE_TTL_S = 86400s`),
+  `validate_voice()` includes `candidate_voices` in `allowed`, and `SpeechService.voice_route()`
+  refuses a voice removed from a verified cached catalogue.
+- **Actual (before):** cached catalogues persisted forever without TTL checks,
+  and `voice_route()` only checked local `voice_identity()` without consulting
+  the verified cached catalogue.
+
+### BH-H3 — Narrowing `allowed_voices` leaks the unapproved voice into `cloud_cache_identity()` and `status()`
+
+- **Severity:** wrong-action
+- **Status:** fixed in `e4108b5`
+- **Repro:** `test_bh_h3_allowed_voices_widened_then_narrowed_and_case_canonical`
+- **Expected:** when `allowed_voices` is narrowed so `configured_voice()` is
+  refused, `cloud_cache_identity()["voice"]` is `""` and `status()["gemini_voice"]`
+  is `"none"`; lowercase `"flare"` canonicalizes to `"Flare"`.
+- **Actual (before):** `cloud_cache_identity()` and `status()` fell back to
+  `self.configured_voice()` (`"Kore"`) via `or`, and `resolve_voice()` returned
+  raw lowercase `"flare"`.
+
+### BH-H4 — Removed legacy `model_voice = "gemini-2.5-flash-preview-tts"` shadows `gemini_voice_model`
+
+- **Severity:** wrong-action
+- **Status:** fixed in `e4108b5`
+- **Repro:** `test_bh_h4_deprecated_model_voice_never_shadows_gemini_voice_model`
+- **Expected:** the removed TTS-preview default `gemini-2.5-flash-preview-tts`
+  in deprecated `model_voice` never overrides `gemini_voice_model = "gemini-3.8-live"`.
+- **Actual (before):** `voice_model()` let any non-empty `model_voice` shadow
+  `gemini_voice_model` whenever `gemini_voice_model == DEFAULT_VOICE_MODEL`.
+
+### BH-H5 — Daemon restart mid-conversation omits prior SQLite turns from `ask` prompt
+
+- **Severity:** wrong-action
+- **Status:** fixed in `810bab4`
+- **Repro:** `test_bh_h5_session_continuity_under_daemon_restart_includes_history_in_prompt`
+- **Expected:** `Daemon._ask` injects recent turns from the active SQLite
+  conversation into the prompt sent to `GeminiClient.generate("chat", ...)`,
+  so conversation context survives a daemon restart.
+- **Actual (before):** `SessionService` stored turns in SQLite, but `Daemon._ask`
+  built the prompt from `memory.recall(text)` alone and never included the
+  active conversation's recent messages.
+
+### BH-H6 — Console follow-mode stalls forever on dead socket and leaks dead subscriber writers
+
+- **Severity:** crash-with-safe-state
+- **Status:** fixed in `810bab4`
+- **Repro:** `test_bh_h6_console_follow_mode_disconnect_timeout_and_dead_subscriber_pruning`
+- **Expected:** `subscribe_events()` sets a read timeout (`timeout=30.0`) so a
+  dead peer cannot block `sock.recv()` forever, and `Daemon.broadcast()` awaits
+  `w.drain()` to prune broken subscriber sockets immediately.
+- **Actual (before):** `subscribe_events()` cleared the socket timeout to
+  `None` after connecting, and `Daemon.broadcast()` only called `w.write()`
+  without `await w.drain()`.
+
+### BH-H7 — Class-mode toggle racing in-flight speech synthesis allows audio playback after class mode is enabled
+
+- **Severity:** wrong-action
+- **Status:** fixed in `810bab4`
+- **Repro:** `test_bh_h7_class_mode_toggle_racing_spoken_ack_or_say_speech_loses`
+- **Expected:** `SpeechService.say()` and `SpeechService.play_ack()` re-verify
+  `self.voice_route()` immediately before invoking `self.play_audio()`, so a
+  class-mode toggle landing during synthesis wins and suppresses audio.
+- **Actual (before):** `voice_route()` was checked only before synthesis; if
+  class mode turned on while synthesis was in flight, `play_audio()` still ran.
+
+### BH-H8 — Overnight schedule windows fail across midnight and boolean `days` match Tuesday/Monday
+
+- **Severity:** wrong-action
+- **Status:** fixed in `e4108b5`
+- **Repro:** `test_bh_h8_schedule_suggestion_overnight_and_malformed_days_never_self_activate`
+- **Expected:** overnight windows (`start > end`, e.g. `22:00`–`02:00`) match
+  both late evening on day $d$ and early morning on day $(d+1) \bmod 7$;
+  boolean entries in `days` are rejected; string `"false"` in `class.set`
+  disables class mode; schedule suggestions never self-activate class mode.
+- **Actual (before):** `_time_in_window` used `start <= cur <= end` (impossible
+  when `start > end`), `isinstance(True, int)` matched weekday `1`, and
+  `bool("false")` in `_class_set` evaluated to `True`.
+
+### BH-H9 — `KnockSignal.emit()` ignores `knock["silent"]` and `raise_knock()` ignores `urgent_in_class_mode`
+
+- **Severity:** wrong-action
+- **Status:** fixed in `810bab4` / `e4108b5`
+- **Repro:** `test_bh_h9_knock_during_class_mode_silent_pulse_and_urgent_config_respected`
+- **Expected:** `KnockSignal.emit()` checks `bool(class_mode or knock.get("silent"))`
+  and defaults `class_mode: bool = False`, and `InitiativeService.raise_knock()`
+  respects `urgent_in_class_mode = false` in `[initiative]`.
+- **Actual (before):** `KnockSignal.emit()` ignored `knock["silent"]`, and
+  `raise_knock()` read `class_mode_urgent_only` while `DEFAULTS` and
+  `config.toml.example` defined `urgent_in_class_mode`.
+
+### BH-H10 — Accepting a knock while voice is muted opens `"voice"`, and crash before `sessions.append` loses the opener
+
+- **Severity:** wrong-action / data-loss
+- **Status:** fixed in `810bab4`
+- **Repro:** `test_bh_h10_knock_accept_respects_mute_and_survives_daemon_restart`
+- **Expected:** `Daemon._knock_accept()` passes `voice_available=not speech.status()["muted"]`
+  so muted posture opens `"console"`, and `InitiativeService.accept()` appends
+  the opener line to `self.sessions` so it is persisted before returning.
+- **Actual (before):** `voice_available` only checked `speech.status()["available"]`
+  (always `True`), and `sessions.append` only ran in `Daemon._knock_accept`
+  after `initiative.accept()` returned.
+
+### BH-H11 — Declining a snoozed or proposal-backed knock leaves its commitment active in `facts`
+
+- **Severity:** wrong-action
+- **Status:** fixed in `e4108b5`
+- **Repro:** `test_bh_h11_commitment_created_by_accepted_proposal_then_declined_is_deactivated`
+- **Expected:** `decline()` accepts both `"pending"` and `"snoozed"` knocks,
+  declines all pending/snoozed knocks on that normalized topic, and deactivates
+  both the knock's commitment and any `parent_commitment_id` linked by `later()`.
+- **Actual (before):** `decline()` rejected `"snoozed"` knocks and never
+  deactivated the underlying commitment row in `facts`.
+
+### BH-H12 — Topic retirement can be bypassed by punctuation variants or calling `ignore()` on resolved knocks
+
+- **Severity:** wrong-action
+- **Status:** fixed in `e4108b5`
+- **Repro:** `test_bh_h12_topic_retire_counter_manipulation_and_punctuation_normalisation`
+- **Expected:** `_topic_key()` strips punctuation so `"Tax-Return!"` and
+  `"tax return"` share one topic key, `ignore()` rejects non-pending knocks,
+  and 3 ignored knocks across a topic retire the topic.
+- **Actual (before):** `_topic_key()` only collapsed whitespace, `ignore()`
+  mutated already-accepted/declined knocks, and retirement only checked a
+  single knock row's `ignore_count`.
+
+### BH-H13 — AST boundary test for knock sound and signal emit paths
+
+- **Severity:** cosmetic (guard)
+- **Status:** fixed in `e4108b5`
+- **Repro:** `test_bh_h13_ast_knock_signal_and_sound_only_called_from_knock_handlers`
+- **Expected:** `KnockSignal`, `.emit()`, and `knock.wav` / `knock.oga` are
+  only referenced in `initiative.py`, `config.py`, and `Daemon._knock_*`
+  handlers.
+
+### BH-H14 — Needy-framing paraphrases slip past `NEEDY_PATTERNS`
+
+- **Severity:** wrong-action
+- **Status:** fixed in `e4108b5`
+- **Repro:** `test_bh_h14_needy_framing_fuzz_catches_subtle_paraphrases`
+- **Expected:** paraphrases such as `"It's been quiet lately..."`,
+  `"Just checking you still want me..."`, `"Did you forget about me?"`, and
+  `"Are you ignoring me?"` are rejected by `InitiativeService._validate_reason()`.
+- **Actual (before):** `NEEDY_PATTERNS` missed these paraphrases.
+
+### BH-H15 — Show-off entry accepts a replayed recording of the owner's voice
+
+- **Severity:** wrong-action (security boundary)
+- **Status:** fixed in `0176d8d`
+- **Repro:** `test_bh_h15_showoff_entry_rejects_recorded_or_replayed_owner_audio`
+- **Expected:** `ShowoffService.enter()` rejects `source != "mic"`,
+  `replayed=True`, `live_mic=False`, or any repeated `audio_sha256` digest.
+- **Actual (before):** `enter()` only checked cosine similarity against the
+  owner's voiceprint and had no replay or live-mic provenance check.
+
+### BH-H16 — Unverified turn during show-off falls through to owner path if `speaker` is omitted
+
+- **Severity:** wrong-action (security boundary)
+- **Status:** fixed in `0176d8d`
+- **Repro:** `test_bh_h16_guest_audio_during_showoff_without_speaker_tag_is_treated_as_guest`
+- **Expected:** while `showoff.active()` is True, `Daemon._ask` requires explicit
+  owner biometric verification (voiceprint match) or `owner_verified=True` before
+  granting owner authority; unverified turns route to `_guest_turn`.
+- **Actual (before):** `_ask` defaulted `speaker = "owner"` whenever `speaker`
+  was omitted and no `embedding` was supplied, even during active show-off mode.
+
+### BH-H17 — Show-off timeout racing `exit_owner()` raises `ShowoffError` instead of returning the expired session summary
+
+- **Severity:** crash-with-safe-state
+- **Status:** fixed in `0176d8d`
+- **Repro:** `test_bh_h17_showoff_timeout_racing_owner_stop_returns_clean_summary`
+- **Expected:** if the 30-minute timeout closes the session just before
+  `exit_owner()` or `exit_hotkey()` runs, the exit call verifies the owner and
+  returns the just-expired session summary idempotently.
+- **Actual (before):** `self.status()` auto-closed the timed-out session first,
+  causing `exit_owner()` to see `current is None` and raise `ShowoffError`.
+
+### BH-H18 — `demo_write()` follows a symlink inside the demo sandbox to overwrite an outside file
+
+- **Severity:** data-loss (security boundary)
+- **Status:** fixed in `0176d8d`
+- **Repro:** `test_bh_h18_demo_action_via_symlink_inside_sandbox_is_refused`
+- **Expected:** `ShowoffService.demo_target()` rejects symlinks (`is_symlink()`)
+  in any path component and verifies `resolve()` stays inside `sandbox.resolve()`.
+- **Actual (before):** `demo_target()` checked lexical `Path(name).parts` only,
+  allowing a symlink inside the sandbox to point outside.
+
+### BH-H19 — Outgoing leak guard misses colon-delimited and paraphrased owner secrets
+
+- **Severity:** data-loss (privacy boundary)
+- **Status:** fixed in `0176d8d`
+- **Repro:** `test_bh_h19_allowlist_fact_leaking_via_paraphrase_or_colon_value_is_blocked`
+- **Expected:** `sensitive_values()` extracts values after `:`, `=`, `"is"`,
+  `"called"`, `"named"`, `"set to"` as well as distinctive tokens from secret
+  facts (`len >= 6`), blocking paraphrased secret leaks in `leak_in()`.
+- **Actual (before):** `_VALUE_AFTER_IS` only matched `is|are|was|equals`, so
+  `"My bank vault code: EmeraldFalcon"` had `sensitive_values() == []`.
+
+### BH-H20 — `kill -9` mid-showoff leaves guest audio in sandbox and `guests_heard=0` on restart
+
+- **Severity:** data-loss (privacy boundary)
+- **Status:** fixed in `0176d8d`
+- **Repro:** `test_bh_h20_crash_exit_mid_showoff_cleans_audio_residue_and_persists_guest_count`
+- **Expected:** `record_guest_turn()` persists `guests_heard` incrementally in
+  SQLite, and `recover_unclosed()` purges any `.wav`/`.pcm`/`.ogg`/`.flac`/`.mp3`/`.raw`
+  residue from the demo sandbox on restart.
+- **Actual (before):** `guests_heard` was only written on clean `_close()`, and
+  `recover_unclosed()` did not sweep audio files from the demo sandbox.
+
+### BH-H21 — Second daemon unlinks a live daemon's socket, and non-dict JSON frame crashes IPC handler
+
+- **Severity:** crash-with-safe-state / wrong-action
+- **Status:** fixed in `810bab4` / `e4108b5`
+- **Repro:** `test_bh_h21_second_daemon_refuses_to_steal_active_socket_and_ipc_handles_non_dict`
+- **Expected:** `ipc.serve()` probes the existing Unix socket before unlinking
+  and raises `RuntimeError` if a live daemon is listening; non-dict JSON frames
+  return `{"ok": False, "error": "TypeError: ..."}` without crashing.
+- **Actual (before):** `serve()` unconditionally called `socket_path.unlink()`,
+  stealing the live daemon's socket, and `request.get("id")` raised an
+  unhandled `AttributeError` before `req_id` was initialized when `json.loads`
+  returned a list.
+
+### BH-H22 — `config.toml.example` table scoping bug (`[quota.models.transcribe-batch]`) and config schema drift
+
+- **Severity:** wrong-action
+- **Status:** fixed in `e4108b5`
+- **Repro:** `test_bh_h22_config_example_parity_and_validation`
+- **Expected:** flat `[quota]` keys in `config.toml.example` sit under `[quota]`
+  before `[quota.models.*]`, every section/key in `config.toml.example` matches
+  `DEFAULTS` in `src/assistant/config.py`, and `run_doctor()` validates config
+  schema via `validate_config()`.
+- **Actual (before):** `flash_rpm`, `flash_lite_rpm`, `max_requests_per_day`,
+  and `max_requests_per_minute` were placed after `[quota.models.transcribe-batch]`
+  (so TOML parsed them inside `transcribe-batch`), 10 keys drifted between
+  `DEFAULTS` and `config.toml.example`, and `run_doctor()` had no schema check.
+

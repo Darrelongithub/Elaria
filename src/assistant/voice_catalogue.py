@@ -30,6 +30,7 @@ from pathlib import Path
 
 CATALOGUE_STATE_KEY = "voice.catalogue"
 BASELINE_PATH = Path(__file__).with_name("voice_catalogues.json")
+DEFAULT_CATALOGUE_TTL_S = 86_400  # 24h: upstream voice changes expire stale cache
 
 
 class VoiceCatalogueError(RuntimeError):
@@ -115,7 +116,8 @@ def live_catalogue(model: str, voices: list[str], *,
     }
 
 
-def load_cached(store, model: str) -> dict | None:
+def load_cached(store, model: str, *,
+                max_age_s: float | None = DEFAULT_CATALOGUE_TTL_S) -> dict | None:
     """The warm-time catalogue cached by a previous verified fetch."""
     if store is None:
         return None
@@ -130,6 +132,15 @@ def load_cached(store, model: str) -> dict | None:
         return None
     if not cached.get("verified"):
         return None
+    if max_age_s is not None and cached.get("retrieved"):
+        try:
+            retrieved_dt = datetime.fromisoformat(str(cached["retrieved"]))
+            if retrieved_dt.tzinfo is None:
+                retrieved_dt = retrieved_dt.replace(tzinfo=UTC)
+            if (datetime.now(UTC) - retrieved_dt).total_seconds() > max_age_s:
+                return None
+        except ValueError:
+            return None
     return cached
 
 
@@ -139,7 +150,8 @@ def save_cached(store, catalogue: dict) -> None:
 
 
 def resolve_catalogue(model: str, *, store=None, fetched: dict | None = None,
-                      refresh: bool = False) -> dict:
+                      refresh: bool = False,
+                      max_age_s: float | None = DEFAULT_CATALOGUE_TTL_S) -> dict:
     """Cached-live > freshly fetched > baseline, in that order of authority.
 
     `fetched` is what a transport returned from a real API call; it is persisted
@@ -150,7 +162,7 @@ def resolve_catalogue(model: str, *, store=None, fetched: dict | None = None,
         save_cached(store, fetched)
         return fetched
     if not refresh:
-        cached = load_cached(store, model)
+        cached = load_cached(store, model, max_age_s=max_age_s)
         if cached:
             return cached
     return baseline_catalogue(model)
@@ -182,7 +194,8 @@ def validate_voice(model: str, voice: str, catalogue: dict) -> dict:
         }
     shown = ", ".join([*allowed, *candidates]) if (allowed or candidates) else "(catalogue empty)"
     return {
-        "ok": False, "model": model, "voice": wanted, "allowed": allowed,
+        "ok": False, "model": model, "voice": wanted,
+        "allowed": [*allowed, *candidates],
         "source": catalogue.get("source"),
         "verified": bool(catalogue.get("verified")),
         "error": (f"voice {wanted!r} is not supported by model {model!r} — "

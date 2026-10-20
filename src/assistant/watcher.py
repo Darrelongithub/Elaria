@@ -76,7 +76,7 @@ class PollingWatcher:
         for path in created + modified:
             mtime = current[path][1]
             if now - mtime >= self.recent_guard_s:
-                self._pending.setdefault(path, now)
+                self._pending[path] = now
         settled = []
         for path, first_seen in list(self._pending.items()):
             if path not in current:

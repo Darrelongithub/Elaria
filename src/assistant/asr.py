@@ -37,13 +37,6 @@ from .live_client import (
 )
 
 
-class PhasePending(NotImplementedError):
-    """Honest stub: designed, seamed, scheduled — not secretly fake."""
-    def __init__(self, backend: str, phase: str):
-        super().__init__(f"ASR backend '{backend}' is {phase} (blueprint §9). "
-                         "The seam exists now so filling it never touches callers.")
-
-
 @dataclass
 class Transcript:
     text: str
@@ -62,7 +55,9 @@ def configured_languages(config) -> list[str]:
     """The pinned language set (§12.4: pinned, NEVER auto-detected).
     Phase 7 flips this to ["sw", "en"] in config — nothing else moves."""
     languages = config.section("asr").get("languages") or ["en"]
-    return [str(lang) for lang in languages]
+    if isinstance(languages, str):
+        languages = [languages]
+    return [str(lang) for lang in languages if str(lang).strip()]
 
 
 def code_switching_enabled(config) -> bool:
@@ -239,12 +234,19 @@ def transcribe_file(config, client, audio_path: str, *, offline: bool = False,
     quota exhaustion degrades instead of failing)."""
     language = primary_language(config)
     errors: list[str] = []
+    last_empty: Transcript | None = None
     for backend in batch_chain(config, client, offline=offline,
                                local_backend=local_backend):
         try:
-            return backend.transcribe(audio_path, language)
+            result = backend.transcribe(audio_path, language)
+            if result.text and result.text.strip():
+                return result
+            last_empty = result
+            errors.append(f"{backend.name}: empty transcript")
         except Exception as exc:
             errors.append(f"{backend.name}: {exc}")
+    if last_empty is not None:
+        return last_empty
     raise RuntimeError("all ASR backends failed — " + " | ".join(errors))
 
 

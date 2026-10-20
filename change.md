@@ -342,3 +342,112 @@ regression and no gate starting before the previous one was green.
   window, real PipeWire orphan behaviour after `kill -9`, and the comfort of
   `speech_resume_s` / `checkin_grace_s` on real narration. See the needs-live
   list in `VOICE-BUGTEST.md`.
+
+---
+
+## 2026-10-20 — Full-repo hardening pass (Stages A–D & Phases 0–8, `arena/86517426-elaria`)
+
+### Part 1 — Hunt (`tests/test_stage_abcd_bughunt.py`, `BH-H1`..`BH-H22`)
+
+Added 35 adversarial tests in `tests/test_stage_abcd_bughunt.py` covering Stage A
+(voice), Stage B (console & class mode), Stage C (knock & initiative), Stage D
+(show-off & disclosure), and cross-cutting invariants (executor tree-hash fuzzing
+under collisions/nested dirs/Unicode, IPC malformed frames, two-daemon socket
+protection, config schema parity, clock jumps, SQLite corrupt state & concurrent
+WAL writes, `ENOSPC` disk-full atomic WAV recovery, clean daemon/collector
+cancellation, and README CLI command verification).
+
+### Part 2 — Strengthen Weak Code & Resolve All 39 Open `xfail` Bugs + `BH-H1`..`BH-H22`
+
+Fixed in severity order across three commits:
+
+1. **Class 1 (`0176d8d` — CRITICAL/HIGH: data-loss, security/privacy boundary, wrong-action)**:
+   - `src/assistant/safety.py`: expanded `$VAR` in `expand()` (`BH-A4`); rejected
+     directory-occupied destinations in `check_operation()` (`BH-A9`).
+   - `src/assistant/executor.py`: enforced plan-root vs spec-root identity (`BH-A5`),
+     source-within-root containment (`BH-A6`), frozen taxonomy validation (`BH-A7`),
+     nested already-filed preservation (`BH-A8`), `ApplyReport.op_ids` tracking (`BH-A10`),
+     crash-interrupted `intent`/`copied` undo reconciliation (`BH-B1`), partial copy
+     unlink on error (`BH-B2`), mandatory scope on `Executor.undo()` (`BH-B3`),
+     pre-syscall `is_halted()` check (`BH-C1`), and `is_halted()`/`is_protected()`
+     enforcement in `trash()` (`BH-C2`). Added empty-taxonomy-dir cleanup on undo
+     when a plan created the directory.
+   - `src/assistant/planner_llm.py`: rejected duplicate/missing paths and `bool`
+     confidence in `_parse_batch()` (`BH-D1`).
+   - `src/assistant/showoff.py`, `src/assistant/disclosure.py`, `src/assistant/daemon.py`,
+     `src/assistant/store.py`: hardened show-off entry against replayed/non-live
+     owner recordings (`BH-H15`), required biometric verification for owner turns
+     during show-off (`BH-H16`), made `exit_owner()`/`exit_hotkey()` idempotent
+     across timeout races (`BH-H17`), blocked symlinks in `demo_target()` (`BH-H18`),
+     expanded `sensitive_values()` to catch colon/paraphrase leaks (`BH-H19`), and
+     persisted `guests_heard` incrementally while purging demo audio residue in
+     `recover_unclosed()` (`BH-H20`).
+2. **Class 2 (`810bab4` — HIGH/MEDIUM: crash-unsafe, resource/socket/DB recovery, races)**:
+   - `src/assistant/indexer.py`, `src/assistant/organiser.py`, `src/assistant/watcher.py`:
+     used `lstat()`/`is_symlink()` first to skip broken symlinks and FIFOs (`BH-B4`, `BH-B5`),
+     refreshed `never_send` on unchanged files (`BH-B6`), preserved known documents
+     under unreadable directories (`BH-B8`), failed plans on missing/unreadable
+     roots (`BH-B9`), and restarted watcher debounce on subsequent writes (`BH-B7`).
+   - `src/assistant/config.py`, `src/assistant/modes.py`, `src/assistant/offline_queue.py`,
+     `src/assistant/gemini_client.py`: caught `TOMLDecodeError` in `load_humour_profile()`
+     (`BH-D6`), excluded local filesystem `OSError`s from `looks_like_network_failure()`
+     (`BH-E3`), queried `pending`/`approved` jobs directly and recovered crashed
+     `running` jobs in `CloudQueue.drain()` (`BH-E4`, `BH-E5`), supported in-memory
+     state in `ModeManager(store=None)` (`BH-E6`), and recorded `verified=1`/`0` on
+     `llm_calls` (`BH-E7`).
+   - `src/assistant/asr.py`, `src/assistant/capture.py`, `src/assistant/transcribe.py`,
+     `src/assistant/tts.py`, `src/assistant/ipc.py`, `src/assistant/daemon.py`,
+     `src/assistant/initiative.py`: continued ASR fallback on empty text (`BH-F1`),
+     used `self.sample_rate` in `WavSink.close()` (`BH-F2`), rejected numeric
+     `object.id` targets in `pw_record_pcm_stream_command()` (`BH-F3`), reset
+     session-age clock on rotation (`BH-F6`), persisted raw transcript before
+     cleanup (`BH-F7`), checked `.onnx.json` in `PiperTtsBackend.availability_error()`
+     (`BH-F8`), avoided reusing explicit `dest` across different texts (`BH-F9`),
+     validated review item existence in `_review_decide()` (`BH-G2`), skipped event
+     lines in `ipc.call()` (`BH-G3`), wrote WAVs atomically and reported Live
+     disconnects (`BH-H1`), injected active conversation history into `Daemon._ask()`
+     (`BH-H5`), added read timeout in `subscribe_events()` and `await w.drain()` in
+     `broadcast()` (`BH-H6`), re-checked `voice_route()` before `play_audio()`
+     (`BH-H7`), respected `speech.status()["muted"]` and persisted openers in
+     `InitiativeService.accept()` (`BH-H10`), and prevented a second daemon from
+     unlinking a live socket while handling non-dict JSON frames (`BH-H21`).
+3. **Class 3 (`e4108b5` — MEDIUM/LOW: wrong-behaviour, logic, catalogue TTL, config schema)**:
+   - `src/assistant/intents.py`, `src/assistant/voicetest.py`, `src/assistant/asr.py`,
+     `src/assistant/config.py`: narrowed `cost` intent regex (`BH-D2`), added polite/emphatic
+     `halt` variants (`BH-D3`), normalized string `taxonomy`/`languages` (`BH-D4`),
+     deep-copied `DEFAULTS` in `_deep_merge()` (`BH-D5`), and selected the separation
+     midpoint in `suggest_threshold()` (`BH-G1`).
+   - `src/assistant/voice_catalogue.py`, `src/assistant/tts.py`, `src/assistant/presence.py`,
+     `src/assistant/initiative.py`, `src/assistant/cli.py`, `config.toml.example`:
+     enforced catalogue cache TTL and upstream voice removal checks (`BH-H2`),
+     canonicalized voice case and prevented unapproved voice leakage (`BH-H3`),
+     stopped legacy `model_voice` default from shadowing `gemini_voice_model` (`BH-H4`),
+     handled overnight schedules and rejected `bool` days (`BH-H8`), enforced
+     `urgent_in_class_mode` and `knock["silent"]` (`BH-H9`), deactivated commitments
+     (including `parent_commitment_id`) on `decline()` (`BH-H11`), normalized
+     punctuation in `_topic_key()` and retired topics across 3 ignored knocks (`BH-H12`),
+     expanded `NEEDY_PATTERNS` (`BH-H14`), and fixed `config.toml.example` `[quota]`
+     scoping + added `validate_config()` in `run_doctor()` (`BH-H22`).
+
+### Part 3 — Remove Dead Code
+
+Removed 12 unused definitions across 10 modules (proven with 0 external references
+and `vulture src/ --min-confidence 80` clean):
+- `src/assistant/asr.py`: `PhasePending`
+- `src/assistant/capture.py`: `pw_record_command`, `FileCapture`
+- `src/assistant/disclosure.py`: `is_owner_probe`, `_PROBE_PATTERNS`, `DisclosureService.guest_prompt`
+- `src/assistant/executor.py`: `Executor.assert_demo_path`
+- `src/assistant/initiative.py`: `InitiativeService.find_commitment`
+- `src/assistant/offline_queue.py`: `capability_for`
+- `src/assistant/proc.py`: `supported`
+- `src/assistant/store.py`: `Store.update_holding`
+- `src/assistant/transcribe.py`: `SilenceLadder.asked`
+- `src/assistant/voicetest.py`: `FrameSource`
+
+### Final Verification
+
+- `pytest -q --tb=line`: **1,275 passed, 6 skipped, 0 xfailed, 0 failed, 0 warnings**
+  (baseline `36f0618`: 1,194 passed, 6 skipped, 46 xfailed, 9 warnings).
+- `ruff check .`: **All checks passed!**
+- `vulture src/ --min-confidence 80`: **0 unused definitions.**
+

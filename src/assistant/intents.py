@@ -24,14 +24,14 @@ class Intent:
 
 
 _PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("halt", re.compile(r"^\s*(halt|stop everything|panic stop)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("halt", re.compile(r"^\s*(?:halt|stop everything|panic stop)(?:\s+(?:now|please))*\s*[!.]*\s*$", re.IGNORECASE)),
     ("status", re.compile(r"^\s*(status|are you (up|running|alive)|health)\s*\??\s*$", re.IGNORECASE)),
     ("mode_offline", re.compile(r"^\s*(go offline|offline mode|force offline|disconnect)\s*[!.]*\s*$", re.IGNORECASE)),
     ("mode_online", re.compile(r"^\s*(go online|online mode|reconnect)\s*[!.]*\s*$", re.IGNORECASE)),
     ("mode_auto", re.compile(r"^\s*(auto mode|connectivity auto|automatic mode)\s*[!.]*\s*$", re.IGNORECASE)),
     ("queue_status", re.compile(r"^\s*(queue status|what'?s queued|what is queued|show (the )?queue)\s*\??\s*$", re.IGNORECASE)),
     ("queue_drain", re.compile(r"^\s*(drain (the )?queue|process (the )?queue)\s*[!.]*\s*$", re.IGNORECASE)),
-    ("cost", re.compile(r"^\s*(cost|spend|quota|how much (have|did) (i|we) (spend|use)|usage)\b.*$", re.IGNORECASE)),
+    ("cost", re.compile(r"^\s*(?:cost|spend|quota|usage|(?:api|gemini|token|my)\s+(?:cost|spend|quota|usage)|how much (?:have|did) (?:i|we) (?:spend|use)(?:\s+today|\s+this\s+month)?)\s*[?.!]*\s*$", re.IGNORECASE)),
     ("undo", re.compile(r"^\s*undo(?:\s+since\s+(\S+))?\s*[!.]*\s*$", re.IGNORECASE)),
     ("remember", re.compile(r"^\s*remember\s+(?:that\s+)?(.+?)\s*$", re.IGNORECASE | re.DOTALL)),
     ("forget", re.compile(r"^\s*forget\s+(?:about\s+)?(.+?)\s*$", re.IGNORECASE)),
@@ -49,7 +49,7 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("mode_auto", re.compile(r"^\s*(hali ya kiotomatiki|kiotomatiki)\s*[!.]*\s*$", re.IGNORECASE)),
     ("queue_status", re.compile(r"^\s*(hali ya foleni|foleni ikoje|onyesha foleni)\s*\??\s*$", re.IGNORECASE)),
     ("queue_drain", re.compile(r"^\s*(tenda foleni|chakata foleni)\s*[!.]*\s*$", re.IGNORECASE)),
-    ("cost", re.compile(r"^\s*(gharama|nimetumia kiasi gani|quota)\b.*$", re.IGNORECASE)),
+    ("cost", re.compile(r"^\s*(?:gharama|nimetumia kiasi gani|quota)\s*[?.!]*\s*$", re.IGNORECASE)),
     ("undo", re.compile(r"^\s*(rudisha|tenda upya)(?:\s+tangu\s+(\S+))?\s*[!.]*\s*$", re.IGNORECASE)),
     ("remember", re.compile(r"^\s*kumbuka\s+(?:kwamba\s+)?(.+?)\s*$", re.IGNORECASE | re.DOTALL)),
     ("forget", re.compile(r"^\s*sahau\s+(?:kuhusu\s+)?(.+?)\s*$", re.IGNORECASE)),

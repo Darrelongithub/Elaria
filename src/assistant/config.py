@@ -72,10 +72,10 @@ def canonical_voices(config) -> tuple[str, ...]:
 def resolve_voice(config, requested: str | None = None) -> tuple[str, bool]:
     """(effective voice, allowed). An unapproved voice resolves to "" — refused."""
     gemini = config.section("gemini") if config else {}
-    configured = str(requested or gemini.get("voice") or "Flare")
+    configured = str(requested or gemini.get("voice") or "Flare").strip()
     canonical = canonical_voices(config)
-    allowed = configured.lower() in {name.lower() for name in canonical}
-    return (configured if allowed else ""), allowed
+    matched = next((name for name in canonical if name.lower() == configured.lower()), None)
+    return (matched or ""), (matched is not None)
 
 
 # The Live model that owns native audio, validated against the real catalogue at
@@ -93,16 +93,15 @@ def voice_model(config) -> str:
 
     `model_voice` used to point at a TTS-preview model, which is exactly the bug
     that made Flare unsupported. It is still read (so an owner's existing file
-    does not silently revert to a default) but new configs use the explicit key.
+    does not silently revert to a default) but new configs use the explicit key,
+    and the removed old default (`gemini-2.5-flash-preview-tts`) never shadows
+    `gemini_voice_model` (BH-H4).
     """
     gemini = config.section("gemini") if config else {}
     explicit = gemini.get("gemini_voice_model")
     legacy = gemini.get("model_voice")
-    # Deprecated alias precedence: an existing `model_voice` keeps working until
-    # the owner renames it, but `gemini_voice_model` wins when it was deliberately
-    # changed away from the shipped default. (Both are validated at warm time, so
-    # a stale alias can never silently pick a TTS model behind a Live key.)
-    if legacy and (not explicit or str(explicit) == DEFAULT_VOICE_MODEL):
+    if legacy and legacy != "gemini-2.5-flash-preview-tts" and (
+            not explicit or str(explicit) == DEFAULT_VOICE_MODEL):
         return str(legacy)
     return str(explicit or legacy or DEFAULT_VOICE_MODEL)
 
@@ -168,12 +167,14 @@ def quota_rows(quota: dict) -> list[dict]:
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
-    out = dict(base)
+    import copy
+
+    out = copy.deepcopy(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(out.get(key), dict):
             out[key] = _deep_merge(out[key], value)
         else:
-            out[key] = value
+            out[key] = copy.deepcopy(value)
     return out
 
 
@@ -201,6 +202,7 @@ DEFAULTS: dict = {
         # "Voice name Flare is not supported" (Stage A live repro).
         "gemini_voice_model": DEFAULT_VOICE_MODEL,
         "voice": "Flare",
+        "voice_sample_rate": 24000,
         # The one-voice rule, expressed in config (VB-4): `[gemini] voice` must be
         # one of these or she refuses to speak and `assist doctor` fails. Widening
         # this list is the ONLY way to change her voice — no code edit, and no
@@ -415,7 +417,7 @@ DEFAULTS: dict = {
         # A knock has its OWN notification identity and its OWN short sound.
         # Nothing else ever uses these (§19.2: not errors, not completions).
         "notify_identity": "Elaria · knock",
-        "sound": "~/.local/share/assistant/sounds/knock.oga",
+        "sound": "~/.local/share/assistant/sounds/knock.wav",
         "notify": True,
         "play_sound": True,
     },
@@ -517,7 +519,10 @@ class Config:
         organise = self.section("organise")
         roots = []
         for entry in organise.get("roots") or []:
-            taxonomy = [str(t) for t in entry.get("taxonomy") or []]
+            raw_taxonomy = entry.get("taxonomy") or []
+            if isinstance(raw_taxonomy, str):
+                raw_taxonomy = [raw_taxonomy]
+            taxonomy = [str(t) for t in raw_taxonomy if str(t).strip()]
             for required in ("_Unsorted", "_Conflicts"):
                 if required not in taxonomy:
                     taxonomy.append(required)
@@ -644,11 +649,100 @@ def _file_sections(config_path: Path) -> set[str]:
 def load_humour_profile(config: Config) -> dict:
     """Parse humour.toml (the calibrated taste profile, §13.7).
 
-    Returns {} when absent — the governor must degrade to safe restraint,
-    never crash, and never invent a personality the owner didn't approve.
+    Returns {} when absent or malformed — the governor must degrade to safe
+    restraint, never crash, and never invent a personality the owner didn't approve.
     """
     path = config.humour_profile_path()
     if path is None:
         return {}
-    with path.open("rb") as handle:
-        return tomllib.load(handle)
+    try:
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+    except (tomllib.TOMLDecodeError, OSError):
+        return {}
+
+
+_KNOWN_DEPRECATED_KEYS: dict[tuple[str, str], str] = {
+    ("gemini", "model_voice"): "deprecated alias for [gemini] gemini_voice_model",
+    ("initiative", "class_mode_urgent_only"): "deprecated alias for [initiative] urgent_in_class_mode",
+    ("voice_test", "embedding_model"): "optional voiceprint model pin",
+}
+
+
+def validate_config(config: Config) -> dict:
+    """Validate `config.raw` against `DEFAULTS` for unknown keys, deprecated
+    aliases, negative quotas, and invalid mode/posture values (BH-H22)."""
+    warnings: list[str] = []
+    errors: list[str] = []
+    raw = config.raw if config else {}
+    for sec, sec_val in raw.items():
+        if sec not in DEFAULTS:
+            warnings.append(f"unknown section [{sec}]")
+            continue
+        default_sec = DEFAULTS[sec]
+        if not isinstance(sec_val, dict) or not isinstance(default_sec, dict):
+            continue
+        for key in sec_val:
+            if key.startswith("_"):
+                continue
+            if (sec, key) in _KNOWN_DEPRECATED_KEYS:
+                warnings.append(f"[{sec}] {key}: {_KNOWN_DEPRECATED_KEYS[(sec, key)]}")
+            elif key not in default_sec:
+                warnings.append(f"unknown key [{sec}] {key}")
+
+    quota = raw.get("quota") or {}
+    if isinstance(quota, dict):
+        for qkey in ("max_requests_per_day", "max_requests_per_minute",
+                     "flash_rpm", "flash_tpm", "flash_rpd",
+                     "flash_lite_rpm", "flash_lite_tpm", "flash_lite_rpd"):
+            val = quota.get(qkey)
+            if val is not None and (
+                isinstance(val, bool) or not isinstance(val, (int, float)) or val < 0
+            ):
+                errors.append(f"[quota] {qkey}={val!r} must be a non-negative number")
+        models = quota.get("models")
+        if isinstance(models, dict):
+            for mname, mrow in models.items():
+                if not isinstance(mrow, dict):
+                    continue
+                for rkey in ("rpm", "tpm", "rpd"):
+                    rval = mrow.get(rkey)
+                    if rval not in (None, "unlimited") and (
+                        isinstance(rval, bool)
+                        or not isinstance(rval, (int, float))
+                        or rval < 0
+                    ):
+                        errors.append(
+                            f"[quota.models.{mname}] {rkey}={rval!r} must be >= 0"
+                        )
+
+    conn_mode = str((raw.get("connectivity") or {}).get("mode", "auto")).lower()
+    if conn_mode not in ("auto", "online", "offline"):
+        errors.append(
+            f"[connectivity] mode={conn_mode!r} must be auto, online, or offline"
+        )
+    tts = raw.get("tts") or {}
+    if str(tts.get("online_voice", "gemini")).lower() not in ("gemini", "local", "none"):
+        errors.append(
+            f"[tts] online_voice={tts.get('online_voice')!r} must be gemini, local, or none"
+        )
+    if str(tts.get("offline_voice", "none")).lower() not in ("none", "local"):
+        errors.append(
+            f"[tts] offline_voice={tts.get('offline_voice')!r} must be none or local"
+        )
+    org_mode = str((raw.get("organise") or {}).get("mode", "shadow")).lower()
+    if org_mode not in ("shadow", "live"):
+        errors.append(f"[organise] mode={org_mode!r} must be shadow or live")
+
+    if errors:
+        detail = "INVALID: " + "; ".join(errors + warnings)
+    elif warnings:
+        detail = "warnings: " + "; ".join(warnings)
+    else:
+        detail = "all sections, keys, and quota bounds match schema"
+    return {
+        "ok": not errors and not warnings,
+        "errors": errors,
+        "warnings": warnings,
+        "detail": detail,
+    }

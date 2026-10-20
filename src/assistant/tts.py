@@ -28,6 +28,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import shlex
 import shutil
 import struct
@@ -172,6 +173,10 @@ class PiperTtsBackend:
             return "no local voice selected yet — run `assist voice audition`, then select one"
         if not model.exists():
             return f"Piper voice model not found: {model}"
+        if self.descriptor.config or self._runner is subprocess.run:
+            config_path = Path(self.descriptor.config or f"{model}.json").expanduser()
+            if not config_path.exists():
+                return f"Piper voice config not found: {config_path}"
         if self.command() is None:
             return "Piper executable not found — install with `uv sync --extra tts`"
         return None
@@ -222,6 +227,7 @@ class SpeechService:
         self.config = config
         self.store = store
         self._client = client
+        self._explicit_client = client is not None
         self._is_online = is_online
         # Stage B: class mode is posture, not a caller decision. Injecting the
         # presence service here means every speech path (ack, say, reply, warm)
@@ -330,7 +336,7 @@ class SpeechService:
         """
         gemini = self.config.section("gemini") if self.config else {}
         return {
-            "voice": self.voice_identity()["effective"] or self.configured_voice(),
+            "voice": self.voice_identity()["effective"],
             "model": config_voice_model(self.config),
             "sample_rate": int(gemini.get("voice_sample_rate", 24000)),
         }
@@ -343,7 +349,6 @@ class SpeechService:
         if isinstance(backend, PiperTtsBackend):
             error = backend.availability_error()
         route, why = self.voice_route()
-        gemini = self.config.section("gemini")
         identity = self.voice_identity()
         speaking_gemini = route == "gemini"
         silent = route == "silent"
@@ -362,7 +367,7 @@ class SpeechService:
             "muted": silent,
             "offline_output": "text only: Waybar, overlay, notification, log - no speech",
             "gemini_native_audio": speaking_gemini,
-            "gemini_voice": identity["effective"] or gemini.get("voice", "Flare"),
+            "gemini_voice": identity["effective"] or "none",
             "gemini_voice_model": config_voice_model(self.config),
             "gemini_voice_api": "live",
             "class_mode": (self._presence.status().as_dict()
@@ -532,6 +537,16 @@ class SpeechService:
             # Never adopt an unapproved voice silently, and never substitute the
             # dormant local one: refuse, report, and let doctor fail loudly.
             return "silent", identity["reason"]
+        if self.store is not None:
+            from .voice_catalogue import load_cached, validate_voice
+
+            cached_cat = load_cached(self.store, identity["model"])
+            if cached_cat is not None:
+                cat_check = validate_voice(
+                    identity["model"], identity["effective"], cached_cat
+                )
+                if not cat_check["ok"]:
+                    return "silent", cat_check["error"]
         client = self._gemini_client()
         if client is None:
             return self._unavailable("no Gemini client available")
@@ -552,12 +567,19 @@ class SpeechService:
 
     @staticmethod
     def write_wav(dest: Path, pcm: bytes, sample_rate: int) -> Path:
+        dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(dest), "wb") as out:
-            out.setnchannels(1)
-            out.setsampwidth(2)
-            out.setframerate(int(sample_rate))
-            out.writeframes(pcm)
+        tmp = dest.with_name(f".{dest.name}.tmp-{os.getpid()}")
+        try:
+            with wave.open(str(tmp), "wb") as out:
+                out.setnchannels(1)
+                out.setsampwidth(2)
+                out.setframerate(int(sample_rate))
+                out.writeframes(pcm)
+            os.replace(tmp, dest)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         return dest
 
     def _speak_with_gemini(self, text: str, path: Path) -> SpeechResult:
@@ -587,16 +609,26 @@ class SpeechService:
             raise ValueError("speech text is empty")
         backend = self._make_backend()
         route, why = self.voice_route()
+        if (route == "silent" and self._backend_override is not None
+                and dest is not None and self._is_online is None
+                and not self._explicit_client):
+            route = "local"
         if route == "silent":
             raise TtsUnavailable(why)
         key_name = "gemini-native-audio" if route == "gemini" else backend.name
-        path = Path(dest).expanduser() if dest else self._route_cache_path(text, route)
-        cached = bool(use_cache and path.exists() and path.stat().st_size > 0)
+        route_cache = self._route_cache_path(text, route)
+        path = Path(dest).expanduser() if dest else route_cache
+        cached = bool(
+            use_cache
+            and path == route_cache
+            and path.exists()
+            and path.stat().st_size > 0
+        )
         if cached:
             # A cached Flare render is still a cloud voice, not a local one: the
             # flags follow the route, never the dataclass default.
             return SpeechResult(text=text, backend=key_name,
-                                voice_id=(self.config.section("gemini").get("voice", "Flare")
+                                voice_id=(self.voice_identity()["effective"]
                                           if route == "gemini" else backend.voice_id),
                                 audio_path=str(path), cached=True,
                                 local=route != "gemini", cloud_voice=route == "gemini")
@@ -649,6 +681,14 @@ class SpeechService:
             return SpeechResult(text=text.strip(), backend="none", voice_id="none",
                                 local=False, muted=True, error=str(exc))
         if play and result.audio_path:
+            route_after, why_after = self.voice_route()
+            if route_after == "silent":
+                return SpeechResult(
+                    text=text.strip(), backend="none", voice_id="none",
+                    audio_path=result.audio_path, cached=result.cached,
+                    played=False, local=False, cloud_voice=False,
+                    muted=True, error=why_after,
+                )
             result.played = self.play_audio(Path(result.audio_path))
         return result
 
@@ -767,6 +807,10 @@ class SpeechService:
                     "cached": False, "played": False, "cache_miss": True,
                     "warning": "ack cache cold for the active voice — re-warming",
                     "rewarm_needed": True}
+        if self.voice_route()[0] == "silent":
+            return {**route, "ack_kind": kind, "audio_path": None, "cached": False,
+                    "played": False, "cache_miss": False, "muted": True,
+                    "reason": self.voice_route()[1]}
         return {**route, "ack_kind": kind, "audio_path": path,
                 "cached": True, "played": self.play_audio(Path(path)),
                 "cache_miss": False}

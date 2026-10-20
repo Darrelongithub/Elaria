@@ -58,5 +58,12 @@ def running_daemon(config):
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
     yield daemon, server
-    loop.call_soon_threadsafe(server.close)
+
+    async def _shutdown():
+        server.close()
+        await daemon.aclose()
+
+    asyncio.run_coroutine_threadsafe(_shutdown(), loop).result(timeout=3)
     loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=3)
+    loop.close()

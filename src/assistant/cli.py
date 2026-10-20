@@ -92,7 +92,12 @@ def run_doctor(config) -> dict:
     # Once the owner's verified numbers are in [quota], the old assumed figures
     # must not be printed again: crying wolf after verification trains the user
     # to ignore the check.
-    from .config import quota_is_verified, quota_rows
+    from .config import quota_is_verified, quota_rows, validate_config
+
+    schema = validate_config(config)
+    checks.append(_check(
+        "config schema", schema["ok"], schema["detail"],
+        warn_only=not schema["errors"]))
 
     quota = config.section("quota")
     if quota_is_verified(quota):

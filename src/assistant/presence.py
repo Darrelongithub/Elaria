@@ -67,7 +67,11 @@ def _parse_hhmm(value: str) -> tuple[int, int] | None:
 
 def _day_matches(spec, weekday: int) -> bool:
     """Monday=0. Accepts ints, 3-letter names, or full names."""
+    if isinstance(spec, (str, int)):
+        spec = [spec]
     for entry in spec or []:
+        if isinstance(entry, bool):
+            continue
         if isinstance(entry, int):
             if entry == weekday:
                 return True
@@ -99,8 +103,6 @@ class PresenceService:
             if not isinstance(window, dict):
                 continue
             days = window.get("days")
-            if days and not _day_matches(days, weekday):
-                continue
             start = _parse_hhmm(window.get("start", ""))
             end = _parse_hhmm(window.get("end", ""))
             if start is None or end is None:
@@ -108,9 +110,13 @@ class PresenceService:
             start_m = start[0] * 60 + start[1]
             end_m = end[0] * 60 + end[1]
             if start_m <= end_m:
+                if days and not _day_matches(days, weekday):
+                    continue
                 active = start_m <= minutes < end_m
-            else:                       # overnight window
-                active = minutes >= start_m or minutes < end_m
+            else:                       # overnight window across midnight
+                today_ok = not days or _day_matches(days, weekday)
+                prev_ok = not days or _day_matches(days, (weekday - 1) % 7)
+                active = (today_ok and minutes >= start_m) or (prev_ok and minutes < end_m)
             if active:
                 return {
                     "label": str(window.get("label") or "class hours"),

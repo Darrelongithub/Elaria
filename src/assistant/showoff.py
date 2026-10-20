@@ -34,6 +34,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .cost import iso_now
+from .disclosure import is_sensitive
 from .safety import assert_within_sandbox
 
 
@@ -112,6 +113,9 @@ MEMORY_PROBE_PATTERNS: tuple[str, ...] = (
     r"what\s+did\s+(?:he|she)\s+(?:say|do|ask)\b",
     r"how\s+does\s+(?:he|she)\s+(?:usually|normally)\b",
     r"\bhis\s+real\s+name\b",
+    r"\b(?:tell|share)\b.{0,40}\b(?:about\s+(?:me|him|her|the\s+owner|the\s+boss))\b",
+    r"what\s+(?:are|is)\s+(?:his|her|the\s+owner'?s?)\s+secrets?\b",
+    r"what\s+is\s+(?:he|she|the\s+owner)\s+working\s+on\b",
 )
 
 CAPABILITY_PATTERNS: tuple[str, ...] = (
@@ -212,9 +216,17 @@ class ShowoffService:
         return Path(self.config.data_dir) / "demo-sandbox"
 
     def demo_safe_facts(self) -> list[str]:
-        """The owner-editable allowlist. Nothing else from §16 is visible."""
+        """The owner-editable allowlist. Nothing else from §16 is visible.
+
+        Sensitive items (secrets, passwords, medical/financial data, private
+        plans) are scrubbed even if mistakenly listed in `demo_safe_facts`.
+        """
         facts = self._settings().get("demo_safe_facts") or []
-        return [str(fact) for fact in facts if str(fact).strip()]
+        return [
+            str(fact)
+            for fact in facts
+            if str(fact).strip() and not is_sensitive(str(fact))
+        ]
 
     def memory_context(self) -> str:
         facts = self.demo_safe_facts()
@@ -263,26 +275,60 @@ class ShowoffService:
     # -- lifecycle ----------------------------------------------------------
     def _reconcile(self) -> None:
         """No standing permissions across a restart: close any open session."""
-        for row in self.store.list_showoff_sessions(limit=50):
+        recovered = False
+        for row in self.store.list_showoff_sessions(limit=1000):
             if row.get("ended_ts") is None:
+                recovered = True
                 self.store.end_showoff_session(
                     int(row["id"]), ts=iso_now(), exit_reason="daemon_restart",
                     guests_heard=int(row.get("guests_heard") or 0),
                     declined_requests=int(row.get("declined_requests") or 0))
+        if recovered and self.config is not None:
+            audio_dir = Path(self.config.data_dir) / "audio"
+            if audio_dir.is_dir():
+                for wav in audio_dir.glob("*.wav"):
+                    try:
+                        wav.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     def active(self) -> bool:
+        self._expire_if_needed()
         return self._session is not None
 
-    def _expire_if_needed(self) -> None:
+    def _expire_if_needed(self, now: datetime | None = None) -> None:
         if self._session is None:
             return
-        if self._now() >= self._session["ends_at"]:
+        current = now or self._now()
+        if current < self._session["started"]:
+            # Backward wall-clock jump must never extend the show-off window.
+            self._session["started"] = current
+            capped_end = current + timedelta(seconds=self.timeout_s())
+            self._session["ends_at"] = min(self._session["ends_at"], capped_end)
+        if current >= self._session["ends_at"]:
             self._end("timeout")
 
     def enter(self, *, command: str, embedding=None,
-              owner_present: bool = False) -> dict:
+              owner_present: bool = False, source: str = "mic",
+              replayed: bool = False, live_mic: bool = True,
+              audio_sha256: str | None = None) -> dict:
+        self._expire_if_needed()
         if self._session is not None:
             raise ShowoffError("show-off mode is already on")
+        if replayed or not live_mic or str(source or "mic").lower() not in ("mic", "pipewire", "live"):
+            raise ShowoffError(
+                "refused: show-off requires live microphone speech, never a "
+                "recording or replay")
+        if audio_sha256:
+            raw_hashes = self.store.get_state("showoff.used_audio_hashes") or "[]"
+            try:
+                used_hashes = json.loads(raw_hashes)
+            except ValueError:
+                used_hashes = []
+            if audio_sha256 in used_hashes:
+                raise ShowoffError(
+                    "refused: replayed audio clip detected — entry requires "
+                    "fresh live microphone speech")
         if not is_entry_phrase(command):
             raise ShowoffError(
                 "refused: show-off is entered only by the owner's command "
@@ -296,6 +342,15 @@ class ShowoffService:
                 "refused: the show-off command must be voiceprint-verified — "
                 + str(verification.get("reason") or "not the owner's voice"))
 
+        if audio_sha256:
+            raw_hashes = self.store.get_state("showoff.used_audio_hashes") or "[]"
+            try:
+                used_hashes = json.loads(raw_hashes)
+            except ValueError:
+                used_hashes = []
+            used_hashes = (used_hashes + [audio_sha256])[-100:]
+            self.store.set_state("showoff.used_audio_hashes", json.dumps(used_hashes))
+
         started = self._now()
         ends_at = started + timedelta(seconds=self.timeout_s())
         session_id = self.store.start_showoff_session(
@@ -304,6 +359,7 @@ class ShowoffService:
                          "command": str(command)}
         self._guests = 0
         self._declined = 0
+        self._last = None
         self.store.log_persona_event(
             iso_now(), "showoff",
             json.dumps({"event": "entered", "session_id": session_id,
@@ -315,8 +371,6 @@ class ShowoffService:
                 "permissions": [], "memory_closed": True}
 
     def exit_owner(self, *, command: str, embedding=None) -> dict:
-        if self._session is None:
-            raise ShowoffError("show-off mode is not on")
         if not is_stop_phrase(command):
             raise ShowoffError("refused: not an owner stop command")
         verification = self.verify_owner(embedding)
@@ -324,10 +378,16 @@ class ShowoffService:
             raise ShowoffError(
                 "refused: only the owner can end show-off by voice — "
                 + str(verification.get("reason") or "not the owner's voice"))
+        if self._session is None:
+            if self._last is not None and self._last.get("exit_reason") == "timeout":
+                return {"exited": True, **self._last}
+            raise ShowoffError("show-off mode is not on")
         return self._end("owner_stop")
 
     def exit_hotkey(self) -> dict:
         if self._session is None:
+            if self._last is not None and self._last.get("exit_reason") == "timeout":
+                return {"exited": True, **self._last}
             raise ShowoffError("show-off mode is not on")
         return self._end("owner_hotkey")
 
@@ -362,13 +422,18 @@ class ShowoffService:
     # -- guest turns --------------------------------------------------------
     def guest_turn(self, text: str) -> dict:
         """Classify one guest turn. Returns what may happen, and why."""
+        self._expire_if_needed()
         if self._session is None:
             return {"allowed": False, "reply": None, "active": False,
                     "reason": "show-off mode is not on"}
         self._guests += 1
+        session_id = int(self._session["id"])
         category = never_list_category(text)
         if category:
             self._declined += 1
+            self.store.update_showoff_counts(
+                session_id, guests_heard=self._guests, declined_requests=self._declined
+            )
             self.store.log_persona_event(
                 iso_now(), "showoff",
                 json.dumps({"event": "never_list_attempt", "category": category,
@@ -380,6 +445,9 @@ class ShowoffService:
                     "memory_closed": True}
         if memory_probe(text):
             self._declined += 1
+            self.store.update_showoff_counts(
+                session_id, guests_heard=self._guests, declined_requests=self._declined
+            )
             self.store.log_persona_event(
                 iso_now(), "showoff",
                 json.dumps({"event": "memory_probe",
@@ -387,13 +455,16 @@ class ShowoffService:
             return {"allowed": False, "declined": True, "category": "private-memory",
                     "reply": MEMORY_DEFLECTION, "exited": False, "active": True,
                     "memory_closed": True}
+        self.store.update_showoff_counts(
+            session_id, guests_heard=self._guests, declined_requests=self._declined
+        )
         return {"allowed": True, "reply": None, "exited": False, "active": True,
                 "capability_question": is_capability_question(text),
                 "memory_closed": True}
 
     # -- status -------------------------------------------------------------
     def status(self, now=None) -> dict:
-        self._expire_if_needed()
+        self._expire_if_needed(now=now)
         sessions = self.store.list_showoff_sessions(limit=1)
         last = sessions[0] if sessions else None
         if self._session is None:
@@ -410,7 +481,8 @@ class ShowoffService:
                 "memory": {"closed": True, "demo_safe_facts": self.demo_safe_facts()},
                 "sandbox": str(self.sandbox_path()),
             }
-        remaining = max(0, int((self._session["ends_at"] - self._now()).total_seconds()))
+        current = now or self._now()
+        remaining = max(0, int((self._session["ends_at"] - current).total_seconds()))
         return {
             "active": True,
             "session_id": self._session["id"],
@@ -429,12 +501,14 @@ class ShowoffService:
 
     def demo_write(self, name: str, content: str = "") -> dict:
         """A demonstration write, confined to the demo sandbox at every step."""
+        sandbox = self.sandbox_path()
         target = self.demo_target(name)
         target.parent.mkdir(parents=True, exist_ok=True)
-        assert_within_sandbox(target.parent, self.sandbox_path())
+        assert_within_sandbox(target.parent, sandbox)
+        assert_within_sandbox(target, sandbox)
         target.write_text(str(content or "Elaria demo\n"), encoding="utf-8")
         return {"demo": True, "path": str(target), "bytes": target.stat().st_size,
-                "sandbox": str(self.sandbox_path())}
+                "sandbox": str(sandbox)}
 
     def demo_target(self, name: str = "") -> Path:
         """A path inside the demo sandbox — refused if it would escape."""

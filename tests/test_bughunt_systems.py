@@ -50,7 +50,6 @@ def test_must_not_act_phrases_do_not_route_to_local_actions(phrase):
     assert route(phrase) is None
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D1: planner verifier accepts duplicate/dropped paths")
 def test_llm_batch_with_duplicate_path_and_missing_file_is_invalid():
     payload = json.dumps([
         {"path": "/r/a.txt", "dest": "Finance", "confidence": 0.99},
@@ -59,7 +58,6 @@ def test_llm_batch_with_duplicate_path_and_missing_file_is_invalid():
     assert _parse_batch(payload, {"Finance"}, {"/r/a.txt", "/r/b.txt"}) is None
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D1: boolean is accepted as model confidence")
 def test_llm_batch_boolean_confidence_is_invalid():
     payload = json.dumps([
         {"path": "/r/a.txt", "dest": "Finance", "confidence": True},
@@ -67,7 +65,6 @@ def test_llm_batch_boolean_confidence_is_invalid():
     assert _parse_batch(payload, {"Finance"}, {"/r/a.txt"}) is None
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D2: cost intent overmatches ordinary language")
 @pytest.mark.parametrize("phrase", [
     "cost of living in Nairobi",
     "usage of the word serendipity",
@@ -77,14 +74,12 @@ def test_ordinary_cost_words_are_not_the_api_cost_intent(phrase):
     assert route(phrase) is None
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D3: natural emergency halt variants are missed")
 @pytest.mark.parametrize("phrase", ["halt please", "stop everything now", "panic stop now"])
 def test_natural_halt_variants_route_to_halt(phrase):
     intent = route(phrase)
     assert intent is not None and intent.kind == "halt"
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D4: string where a sequence belongs becomes characters")
 def test_string_taxonomy_and_languages_are_rejected_or_wrapped(config):
     config.raw["organise"] = {
         **config.raw["organise"],
@@ -98,7 +93,6 @@ def test_string_taxonomy_and_languages_are_rejected_or_wrapped(config):
     assert configured_languages(config) == ["sw"]
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D5: load_config shares nested DEFAULTS objects")
 def test_mutating_loaded_config_does_not_pollute_next_load():
     first = load_config()
     original = first.raw["persona"]["name"]
@@ -111,7 +105,6 @@ def test_mutating_loaded_config_does_not_pollute_next_load():
         first.raw["persona"]["name"] = original
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D6: malformed humour TOML crashes instead of degrading")
 def test_malformed_humour_profile_degrades_to_empty_profile(config, tmp_path):
     bad = tmp_path / "humour.toml"
     bad.write_text("[not valid toml", encoding="utf-8")
@@ -237,7 +230,6 @@ def test_like_fallback_is_literal_and_wildcard_safe(tmp_path):
     assert store.search_documents("invoice total")[0]["snip"].startswith("invoice total")
 
 
-@pytest.mark.xfail(strict=True, reason="BH-E3: every OSError is misclassified as network failure")
 @pytest.mark.parametrize("error", [
     FileNotFoundError("saved audio is missing"),
     PermissionError("audio is not readable"),
@@ -247,7 +239,6 @@ def test_local_filesystem_errors_are_not_network_failures(error):
     assert looks_like_network_failure(error) is False
 
 
-@pytest.mark.xfail(strict=True, reason="BH-E4: first 500 historical jobs starve newer pending jobs")
 def test_queue_drain_reaches_pending_job_after_500_finished_jobs(config, tmp_path):
     store = Store(tmp_path / "queue.db")
     with store._lock:
@@ -265,7 +256,6 @@ def test_queue_drain_reaches_pending_job_after_500_finished_jobs(config, tmp_pat
     assert store.get_cloud_job(job_id)["status"] == "done"
 
 
-@pytest.mark.xfail(strict=True, reason="BH-E5: crashed running cloud job is never recovered")
 def test_queue_recovers_a_job_left_running_by_a_crash(config, tmp_path):
     store = Store(tmp_path / "queue.db")
     queue = CloudQueue(config, store, client=None)
@@ -277,7 +267,6 @@ def test_queue_recovers_a_job_left_running_by_a_crash(config, tmp_path):
     assert store.get_cloud_job(job_id)["status"] == "done"
 
 
-@pytest.mark.xfail(strict=True, reason="BH-E6: ModeManager without a store cannot switch mode")
 def test_mode_manager_without_store_remembers_requested_preference(config):
     manager = ModeManager(config, None, probe=lambda: True)
     status = manager.request_preference("offline")
@@ -293,7 +282,6 @@ class _ScriptedTransport:
                 "usage": {"tokens_in": 3, "tokens_out": 2}}
 
 
-@pytest.mark.xfail(strict=True, reason="BH-E7: llm_calls.verified is never written")
 def test_verified_outcome_is_recorded_in_the_ledger(config, tmp_path):
     store = Store(tmp_path / "ledger.db")
     client = GeminiClient(
@@ -391,7 +379,6 @@ class _EmptyBackend:
         return Transcript("", language, self.name, confidence=0.0)
 
 
-@pytest.mark.xfail(strict=True, reason="BH-F1: empty ASR result stops the fallback chain")
 def test_asr_fallback_chain_continues_after_empty_text(config, tmp_path):
     config.raw["asr"] = {**config.raw["asr"], "fallback": ["local", "mock"]}
     result = transcribe_file(
@@ -400,14 +387,12 @@ def test_asr_fallback_chain_continues_after_empty_text(config, tmp_path):
     assert result.backend == "mock" and result.text
 
 
-@pytest.mark.xfail(strict=True, reason="BH-F2: WavSink duration always divides by 16kHz")
 def test_wav_sink_reports_duration_at_its_configured_sample_rate(tmp_path):
     sink = WavSink(tmp_path / "eight-k.wav", sample_rate=8000)
     sink.write(b"\x00\x00" * 8000)
     assert sink.close() == pytest.approx(1.0)
 
 
-@pytest.mark.xfail(strict=True, reason="BH-F3: PCM stream command bypasses object.id guard")
 def test_pw_record_stream_rejects_short_numeric_object_id_targets():
     with pytest.raises(ValueError, match="object\\.serial|node\\.name"):
         pw_record_pcm_stream_command("42")
@@ -477,7 +462,6 @@ def test_meeting_system_channel_is_copied_even_when_mic_is_canonical(
     assert first.system_wav.read_bytes() != replacement_sys.read_bytes()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-F8: Piper status ignores a missing voice config")
 def test_piper_availability_requires_the_json_config(tmp_path, monkeypatch):
     model = tmp_path / "voice.onnx"
     model.write_bytes(b"model")
@@ -488,7 +472,6 @@ def test_piper_availability_requires_the_json_config(tmp_path, monkeypatch):
     assert "config" in (backend.availability_error() or "").lower()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-F9: explicit TTS dest is treated as cached for any text")
 def test_tts_explicit_destination_is_not_reused_for_different_text(config, tmp_path):
     config.raw["tts"] = {**config.raw["tts"], "cache_dir": str(tmp_path / "cache")}
     backend = MockTtsBackend("one-voice")
@@ -499,7 +482,6 @@ def test_tts_explicit_destination_is_not_reused_for_different_text(config, tmp_p
     assert backend.calls == ["first text", "second text"]
 
 
-@pytest.mark.xfail(strict=True, reason="BH-F6: Live session-age clock is never reset after rotation")
 def test_live_age_rotation_does_not_reconnect_on_every_frame(config, tmp_path):
     store = Store(tmp_path / "dictation.db")
     service = DictationService(config, store, GeminiClient(config, store))
@@ -518,7 +500,6 @@ def test_live_age_rotation_does_not_reconnect_on_every_frame(config, tmp_path):
     assert len(transports) <= 2
 
 
-@pytest.mark.xfail(strict=True, reason="BH-F7: cleanup failure prevents transcript persistence")
 def test_cleanup_failure_still_persists_raw_transcript(config, tmp_path):
     store = Store(tmp_path / "dictation.db")
     service = DictationService(config, store, GeminiClient(config, store))
@@ -534,7 +515,6 @@ def test_cleanup_failure_still_persists_raw_transcript(config, tmp_path):
     assert store.recent_transcripts(1)[0]["raw_text"] == result.raw_text
 
 
-@pytest.mark.xfail(strict=True, reason="BH-G3: IPC call mistakes a pushed event for its reply")
 def test_ipc_call_skips_event_lines_until_the_matching_reply(tmp_path):
     async def handler(method, params, writer=None):
         writer.write(b'{"event":"transcript.interim","text":"partial"}\n')
@@ -556,7 +536,6 @@ def test_ipc_call_skips_event_lines_until_the_matching_reply(tmp_path):
 
 # -- G: watcher / voice-test / daemon review ----------------------------------
 
-@pytest.mark.xfail(strict=True, reason="BH-B7: watcher debounce clock is not reset by later writes")
 def test_watcher_debounce_restarts_when_a_file_changes_again(tmp_path):
     import os
     import time
@@ -584,7 +563,6 @@ def test_watcher_debounce_restarts_when_a_file_changes_again(tmp_path):
     assert events.settled_changed == []
 
 
-@pytest.mark.xfail(strict=True, reason="BH-G1: threshold sweep tie-breaks to the lowest threshold")
 def test_suggested_speaker_threshold_uses_the_separation_gap_midpoint():
     result = suggest_threshold([
         {"label": "correct", "speaker_score": 0.90},
@@ -593,7 +571,6 @@ def test_suggested_speaker_threshold_uses_the_separation_gap_midpoint():
     assert result["suggested"] == pytest.approx(0.50, abs=0.05)
 
 
-@pytest.mark.xfail(strict=True, reason="BH-G2: review.decide reports success for a missing item")
 def test_review_decide_rejects_a_nonexistent_item(config):
     from assistant.daemon import Daemon
 

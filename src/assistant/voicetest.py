@@ -218,10 +218,6 @@ class RingBuffer:
 # --------------------------------------------------------------------------
 # Sources (frame iterators) and scorers (pluggable models)
 # --------------------------------------------------------------------------
-class FrameSource(Protocol):
-    def frames(self) -> Iterator[bytes]: ...
-
-
 @dataclass
 class ScoredEvent:
     """One detection moment — exactly what the log may contain, no audio."""
@@ -530,13 +526,18 @@ def suggest_threshold(events: list[dict]) -> dict:
                           "(TV, other voices, tired morning voice) and label with "
                           "f/m keys. UNTUNED strict default stands meanwhile; "
                           "consistency 0.96 says strict is affordable, not where."}
-    best_threshold, best_errors = None, None
+    best_thresholds: list[float] = []
+    best_errors: int | None = None
     for step in range(1001):
         threshold = step / 1000
         errors = (sum(1 for s in true_scores if s < threshold)
                   + sum(1 for s in false_scores if s >= threshold))
         if best_errors is None or errors < best_errors:
-            best_threshold, best_errors = threshold, errors
+            best_thresholds = [threshold]
+            best_errors = errors
+        elif errors == best_errors:
+            best_thresholds.append(threshold)
+    best_threshold = round((best_thresholds[0] + best_thresholds[-1]) / 2, 4)
     return {
         "suggested": best_threshold,
         "separation_errors_at_suggestion": best_errors,

@@ -71,14 +71,22 @@ NEEDY_PATTERNS: tuple[str, ...] = (
     r"\bi\s+need\s+you\b",
     r"\bi\s+get\s+lonely\b",
     r"\bnobody\s+talks\s+to\s+me\b",
-    r"\bdo\s+you\s+still\s+(?:like|care\s+about)\s+me\b",
-    r"\b(?:you\s+)?forgot\s+about\s+me\b",
+    r"\bdo\s+you\s+still\s+(?:like|want|need|care\s+about)\s+me\b",
+    r"\b(?:still\s+)?want\s+me(?:\s+around|\s+here|\s+to\s+help)?\b",
+    r"\b(?:you\s+|did\s+you\s+)?forg[eo]t\s+about\s+me\b",
     r"\bi\s+exist\b",
     r"\byou\s+should\s+talk\s+to\s+me\b",
     r"\bi\s+(?:feel|felt)\b",
     r"\bthinking\s+about\s+you\b",
     r"\byou\s+haven'?t\s+talked\s+to\s+me\b",
     r"\byou\s+haven'?t\s+spoken\s+to\s+me\b",
+    r"\b(?:things\s+have\s+been|it'?s\s+been)\s+quiet\b",
+    r"\bquiet\s+(?:around\s+here|lately)\b",
+    r"\bradio\s+silence\b",
+    r"\bam\s+i\s+bothering\s+you\b",
+    r"\bfeel(?:ing)?\s+ignored\b",
+    r"\ball\s+by\s+myself\b",
+    r"\btalking\s+to\s+myself\b",
 )
 
 # Time passing is not a reason. These are refused even when the sentence is
@@ -121,6 +129,11 @@ CONSOLE_OPENER_PROMPT = (
 
 def _normalise(text: str) -> str:
     return str(text or "").replace("\u2019", "'").lower()
+
+
+def _topic_key(topic: str) -> str:
+    cleaned = re.sub(r"[^\w\s]", " ", _normalise(topic))
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def needy_framing(text: str) -> list[str]:
@@ -172,6 +185,7 @@ class InitiativeService:
     store: object
     presence: object = None
     disclosure: object = None
+    sessions: object = None
     now: object = None
 
     def __post_init__(self):
@@ -195,7 +209,8 @@ class InitiativeService:
     # -- commitments: the user's, never hers -------------------------------
     def create_commitment(self, text: str, *, origin: str,
                           detail: str | None = None,
-                          ts: str | None = None) -> dict:
+                          ts: str | None = None,
+                          parent_commitment_id: int | None = None) -> dict:
         """Record an obligation. Only the user (or an accepted proposal) may."""
         if origin not in COMMITMENT_ORIGINS:
             raise InitiativeError(
@@ -205,8 +220,12 @@ class InitiativeService:
         text = str(text or "").strip()
         if not text:
             raise InitiativeError("refused: a commitment needs text")
-        evidence = json.dumps({"origin": origin, "detail": detail or sorted_citation(text)},
-                              sort_keys=True)
+        evidence_payload: dict[str, object] = {
+            "origin": origin, "detail": detail or sorted_citation(text),
+        }
+        if parent_commitment_id is not None:
+            evidence_payload["parent_commitment_id"] = int(parent_commitment_id)
+        evidence = json.dumps(evidence_payload, sort_keys=True)
         fact_id = self.store.add_fact(
             ts=ts or iso_now(), kind="commitment", text=text, source="stated",
             confidence=1.0, evidence=evidence)
@@ -216,15 +235,6 @@ class InitiativeService:
     def commitment(self, commitment_id: int) -> dict | None:
         for fact in self.store.list_facts(kind="commitment"):
             if int(fact["id"]) == int(commitment_id):
-                return fact
-        return None
-
-    def find_commitment(self, topic: str) -> dict | None:
-        needle = str(topic or "").lower().strip()
-        if not needle:
-            return None
-        for fact in self.store.list_facts(kind="commitment"):
-            if needle in str(fact["text"]).lower():
                 return fact
         return None
 
@@ -308,8 +318,9 @@ class InitiativeService:
         return raised
 
     def _topic_retired(self, topic: str) -> dict | None:
+        key = _topic_key(topic)
         for knock in self.store.list_knocks(status=None, limit=200):
-            if str(knock["topic"]).lower() != str(topic).lower():
+            if _topic_key(knock["topic"]) != key:
                 continue
             if knock["status"] == "declined":
                 return knock            # decline = no follow-up on this topic
@@ -329,7 +340,7 @@ class InitiativeService:
                     urgency: str = "normal", referent: str | None = None,
                     commitment_id: int | None = None) -> dict:
         topic = str(topic or "").strip()
-        if not topic:
+        if not topic or not _topic_key(topic):
             raise InitiativeError("refused: a knock needs a topic to be about")
         if urgency not in URGENCY_LEVELS:
             raise InitiativeError(f"refused: urgency must be one of {URGENCY_LEVELS}")
@@ -343,9 +354,15 @@ class InitiativeService:
                 f"(ignored {retired['ignore_count']}× / declined) — no follow-up "
                 "on that topic unless the user asks again.")
 
-        # CLASS MODE: initiative is urgent-only. A non-urgent knock is not
-        # created at all; its holding stays on the shelf for later.
-        if self.class_mode() and urgency != "urgent":
+        # CLASS MODE: initiative is urgent-only (or completely suppressed when
+        # `urgent_in_class_mode` / `class_mode_urgent_only` is false). A suppressed
+        # knock is not created at all; its holding stays on the shelf for later.
+        settings = self._settings()
+        urgent_only = bool(
+            settings.get("urgent_in_class_mode", True)
+            and settings.get("class_mode_urgent_only", True)
+        )
+        if self.class_mode() and (not urgent_only or urgency != "urgent"):
             raise InitiativeError(
                 "refused: class mode restricts initiative to urgent-only. The "
                 "holding remains on the shelf; nothing is announced.")
@@ -355,10 +372,11 @@ class InitiativeService:
             urgency=urgency, referent=referent, commitment_id=commitment_id)
         # A new knock on a topic that already has a pending one counts as the
         # previous one being ignored. Three and the topic retires.
+        topic_k = _topic_key(topic)
         for older in self.store.list_knocks("pending", limit=200):
             if older["id"] == knock_id:
                 continue
-            if str(older["topic"]).lower() == topic.lower():
+            if _topic_key(older["topic"]) == topic_k:
                 self.ignore(older["id"])
         return self.get(knock_id)
 
@@ -378,10 +396,14 @@ class InitiativeService:
         knock = self.get(knock_id)
         if knock["status"] != "pending":
             raise InitiativeError(f"knock #{knock_id} is {knock['status']}")
+        ts = iso_now()
         self.store.update_knock(knock_id, status="accepted",
-                                resolved_ts=iso_now())
+                                resolved_ts=ts)
         class_now = self.class_mode() if class_mode is None else bool(class_mode)
         mode = ("console" if class_now or not voice_available else "voice")
+        if self.sessions is not None:
+            self.sessions.append("assistant", knock["reason"],
+                                 channel=mode, via="knock", ts=ts)
         return {
             "knock": {**knock, "status": "accepted"},
             "open": mode,
@@ -391,25 +413,71 @@ class InitiativeService:
 
     def decline(self, knock_id: int) -> dict:
         knock = self.get(knock_id)
-        self.store.update_knock(knock_id, status="declined", resolved_ts=iso_now())
-        # No follow-up on that topic: decline every other pending knock with the
-        # same topic too, and refuse future raises on it.
-        for other in self.pending():
-            if str(other["topic"]).lower() == str(knock["topic"]).lower():
-                self.store.update_knock(other["id"], status="declined",
-                                        resolved_ts=iso_now())
+        if knock["status"] not in ("pending", "snoozed"):
+            raise InitiativeError(f"knock #{knock_id} is {knock['status']}")
+        ts = iso_now()
+        self.store.update_knock(knock_id, status="declined", resolved_ts=ts)
+        topic_k = _topic_key(knock["topic"])
+        commitment_ids: set[int] = set()
+        if knock.get("commitment_id") is not None:
+            commitment_ids.add(int(knock["commitment_id"]))
+        # No follow-up on that topic: decline every other pending or snoozed knock
+        # with the same topic too, and deactivate their commitments so check_due()
+        # or future follow-ups cannot resurrect them (BH-H11).
+        for other in self.store.list_knocks(status=None, limit=200):
+            if _topic_key(other["topic"]) == topic_k:
+                if other.get("commitment_id") is not None:
+                    commitment_ids.add(int(other["commitment_id"]))
+                if other["status"] in ("pending", "snoozed"):
+                    self.store.update_knock(other["id"], status="declined",
+                                            resolved_ts=ts)
+        # Follow parent_commitment_id links created by `later()` so declining a
+        # snoozed knock also deactivates the underlying commitment (BH-H11).
+        if commitment_ids:
+            all_facts = {
+                int(f["id"]): f
+                for f in self.store.list_facts(kind="commitment", active_only=False)
+            }
+            queue = list(commitment_ids)
+            while queue:
+                cid = queue.pop()
+                fact = all_facts.get(cid)
+                if fact and fact.get("evidence"):
+                    try:
+                        ev = json.loads(fact["evidence"])
+                        parent_id = (
+                            int(ev["parent_commitment_id"])
+                            if isinstance(ev, dict)
+                            and ev.get("parent_commitment_id") is not None
+                            else None
+                        )
+                        if parent_id is not None and parent_id not in commitment_ids:
+                            commitment_ids.add(parent_id)
+                            queue.append(parent_id)
+                    except (ValueError, TypeError):
+                        pass
+            with self.store._lock:
+                placeholders = ", ".join("?" * len(commitment_ids))
+                self.store._conn.execute(
+                    f"UPDATE facts SET active = 0 WHERE id IN ({placeholders})",
+                    tuple(commitment_ids),
+                )
+                self.store._conn.commit()
         return {"knock": self.get(knock_id), "no_followup": True,
                 "note": "declined — no follow-up on this topic"}
 
     def later(self, knock_id: int, *, hours: float | None = None) -> dict:
         knock = self.get(knock_id)
+        if knock["status"] != "pending":
+            raise InitiativeError(f"knock #{knock_id} is {knock['status']}")
         hours = float(hours if hours is not None
                       else self._settings().get("snooze_hours", 24))
         until = (self._now() + timedelta(hours=hours)).isoformat(timespec="seconds")
         self.store.update_knock(knock_id, status="snoozed", snooze_until=until)
         commitment = self.create_commitment(
             f"follow up with the user: {knock['topic']}", origin="user-later",
-            detail=knock["reason"])
+            detail=knock["reason"],
+            parent_commitment_id=knock.get("commitment_id"))
         self.store.update_knock(knock_id, commitment_id=commitment["commitment_id"])
         return {"knock": self.get(knock_id), "snoozed_until": until,
                 "commitment": commitment,
@@ -417,12 +485,32 @@ class InitiativeService:
 
     def ignore(self, knock_id: int) -> dict:
         knock = self.get(knock_id)
+        if knock["status"] != "pending":
+            raise InitiativeError(f"knock #{knock_id} is {knock['status']}")
         count = int(knock["ignore_count"]) + 1
-        threshold = int(self._settings().get("retire_after_ignores", 3))
-        status = "retired" if count >= threshold else knock["status"]
-        self.store.update_knock(knock_id, ignore_count=count, status=status,
-                                resolved_ts=(iso_now() if status == "retired"
-                                             else None))
+        threshold = max(1, int(self._settings().get("retire_after_ignores", 3)))
+        self.store.update_knock(knock_id, ignore_count=count)
+        topic_k = _topic_key(knock["topic"])
+        same_topic = [
+            k for k in self.store.list_knocks(status=None, limit=200)
+            if _topic_key(k["topic"]) == topic_k
+        ]
+        ignored_knocks = sum(
+            1 for k in same_topic if int(k.get("ignore_count") or 0) > 0
+        )
+        should_retire = (
+            count >= threshold
+            or ignored_knocks >= threshold
+            or any(k["status"] == "retired" for k in same_topic)
+        )
+        status = "retired" if should_retire else knock["status"]
+        if should_retire:
+            ts = iso_now()
+            for k in same_topic:
+                if k["status"] == "pending" and int(k["id"]) <= int(knock_id):
+                    self.store.update_knock(
+                        k["id"], status="retired", resolved_ts=ts
+                    )
         return {"knock": self.get(knock_id), "ignore_count": count,
                 "retired": status == "retired",
                 "threshold": threshold}

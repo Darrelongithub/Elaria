@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import os
 import re
 import shutil
+import stat as stat_mod
 import subprocess
 import zipfile
 from pathlib import Path
@@ -111,29 +113,52 @@ class Indexer:
             str(expand(p)) for p in
             (config.section("privacy").get("never_send_to_cloud") or [])]
 
+    def _refresh_policy(self) -> None:
+        organise = self.config.section("organise")
+        policy = self.config.section("policy")
+        self.protected = policy.get("protected") or []
+        self.max_extract_chars = int(organise.get("max_extract_chars", 200_000))
+        self.never_send_roots = [
+            str(expand(p)) for p in
+            (self.config.section("privacy").get("never_send_to_cloud") or [])]
+
     def _never_send(self, path: Path) -> bool:
         return is_protected(path, self.never_send_roots) if self.never_send_roots else False
 
-    def iter_files(self, root: Path):
+    def iter_files(self, root: Path, walk_errors: list[tuple[str, str]] | None = None):
         """Yield (path, skip_reason|None). Dirs pruned in-place so ignored
         trees are never descended (a 40GB node_modules shouldn't even be
         stat-walked)."""
-        import os
+        self._refresh_policy()
 
-        for dirpath, dirnames, filenames in os.walk(root):
+        def _on_error(exc: OSError) -> None:
+            if walk_errors is not None:
+                bad_path = str(getattr(exc, "filename", "") or root)
+                walk_errors.append((bad_path, f"{type(exc).__name__}: {exc}"))
+
+        for dirpath, dirnames, filenames in os.walk(root, onerror=_on_error):
             directory = Path(dirpath)
             if (directory / ".assistant-ignore").exists():
                 dirnames[:] = []
                 yield directory, ".assistant-ignore"
                 continue
-            dirnames[:] = [
-                d for d in dirnames
-                if not d.startswith(".") and d not in ("_Conflicts",)
-                and not is_protected(directory / d, self.protected)
-            ]
+            kept_dirs: list[str] = []
+            for d in dirnames:
+                sub = directory / d
+                if sub.is_symlink():
+                    yield sub, "symlink"
+                    continue
+                if d.startswith(".") or d in ("_Conflicts",):
+                    continue
+                if is_protected(sub, self.protected):
+                    continue
+                kept_dirs.append(d)
+            dirnames[:] = kept_dirs
             for name in filenames:
                 path = directory / name
-                if name.startswith(".") or name.endswith(TEMP_SUFFIXES):
+                if path.is_symlink():
+                    yield path, "symlink"
+                elif name.startswith(".") or name.endswith(TEMP_SUFFIXES):
                     yield path, "temp/hidden"
                 elif is_protected(path, self.protected):
                     yield path, "protected"
@@ -141,6 +166,7 @@ class Indexer:
                     yield path, None
 
     def index_root(self, root_spec: dict) -> dict:
+        self._refresh_policy()
         root = Path(root_spec["path"])
         stats = {"root": str(root), "indexed": 0, "unchanged": 0, "changed": 0,
                  "missing_marked": 0, "skipped": {}, "no_text": 0,
@@ -149,16 +175,35 @@ class Indexer:
             stats["error"] = f"root does not exist: {root}"
             return stats
         seen: set[str] = set()
-        for path, skip_reason in self.iter_files(root):
+        walk_errors: list[tuple[str, str]] = []
+        for path, skip_reason in self.iter_files(root, walk_errors=walk_errors):
             if skip_reason:
                 stats["skipped"][skip_reason] = stats["skipped"].get(skip_reason, 0) + 1
                 continue
+            try:
+                stat = path.lstat()
+            except OSError as exc:
+                walk_errors.append((str(path), f"{type(exc).__name__}: {exc}"))
+                continue
+            if stat_mod.S_ISLNK(stat.st_mode):
+                stats["skipped"]["symlink"] = stats["skipped"].get("symlink", 0) + 1
+                continue
+            if not stat_mod.S_ISREG(stat.st_mode):
+                stats["skipped"]["special"] = stats["skipped"].get("special", 0) + 1
+                continue
             seen.add(str(path))
-            stat = path.stat()
+            never_send = self._never_send(path)
             existing = self.store.document_by_path(str(path))
             if (existing and existing["status"] == "indexed"
                     and existing["size"] == stat.st_size
                     and abs(existing["mtime"] - stat.st_mtime) < 1e-6):
+                if int(existing["never_send"]) != int(never_send):
+                    with self.store._lock:
+                        self.store._conn.execute(
+                            "UPDATE documents SET never_send = ? WHERE id = ?",
+                            (int(never_send), existing["id"]))
+                        self.store._conn.commit()
+                stats["never_send"] += int(never_send)
                 stats["unchanged"] += 1
                 continue
             data_hash = sha256_bytes(path.read_bytes()) if stat.st_size <= 64_000_000 \
@@ -167,7 +212,6 @@ class Indexer:
             stats["extractors"][extractor] = stats["extractors"].get(extractor, 0) + 1
             if not text:
                 stats["no_text"] += 1
-            never_send = self._never_send(path)
             stats["never_send"] += int(never_send)
             self.store.upsert_document(
                 path=str(path), root=str(root), sha256=data_hash,
@@ -176,10 +220,18 @@ class Indexer:
                 indexed_ts=iso_now(), never_send=int(never_send),
                 text_chunks=chunk_text(text))
             stats["changed" if existing else "indexed"] += 1
+        if walk_errors:
+            stats["error"] = "; ".join(msg for _, msg in walk_errors)
         # Files in the index but gone from disk: mark, never delete records —
         # the journal of what was known is part of the safety story.
+        unreadable_prefixes = tuple(
+            p.rstrip(os.sep) + os.sep for p, _ in walk_errors if p
+        )
         known = {d["path"] for d in self.store.documents_in_root(str(root))}
-        missing = sorted(known - seen)
+        missing = sorted(
+            p for p in (known - seen)
+            if not (unreadable_prefixes and p.startswith(unreadable_prefixes))
+        )
         if missing:
             self.store.mark_missing(missing)
             stats["missing_marked"] = len(missing)

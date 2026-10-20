@@ -458,13 +458,17 @@ class Store:
             self._conn.commit()
             return int(cur.lastrowid)
 
-    def list_cloud_jobs(self, status: str | None = None,
+    def list_cloud_jobs(self, status: str | Sequence[str] | None = None,
                         limit: int = 100) -> list[dict]:
         query = "SELECT * FROM cloud_jobs"
         params: list = []
-        if status:
+        if isinstance(status, str):
             query += " WHERE status = ?"
             params.append(status)
+        elif status:
+            placeholders = ", ".join("?" * len(status))
+            query += f" WHERE status IN ({placeholders})"
+            params.extend(status)
         query += " ORDER BY id LIMIT ?"
         params.append(limit)
         with self._lock:
@@ -677,12 +681,13 @@ class Store:
             rows = self._conn.execute(query + " ORDER BY src", params).fetchall()
         return [dict(r) for r in rows]
 
-    def set_item_decision(self, item_id: int, decision: str) -> None:
+    def set_item_decision(self, item_id: int, decision: str) -> bool:
         """Review queue mutations (§4.4): approve → auto, reject → rejected."""
         with self._lock:
-            self._conn.execute("UPDATE plan_items SET decision = ? WHERE id = ?",
-                               (decision, item_id))
+            cur = self._conn.execute("UPDATE plan_items SET decision = ? WHERE id = ?",
+                                     (decision, item_id))
             self._conn.commit()
+            return cur.rowcount == 1
 
     def set_plan_status(self, plan_id: int, status: str) -> None:
         with self._lock:
@@ -821,15 +826,6 @@ class Store:
             rows = self._conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
-    def update_holding(self, holding_id: int, *, status: str,
-                       updated_ts: str | None = None) -> bool:
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE holdings SET status = ?, updated_ts = ? WHERE id = ?",
-                (status, updated_ts, holding_id))
-            self._conn.commit()
-            return cur.rowcount == 1
-
     # -- knocks (Stage C, schema now so B can render the shelf) --------------
     def create_knock(self, *, ts: str, topic: str, reason: str, kind: str,
                      urgency: str = "normal", referent: str | None = None,
@@ -901,6 +897,16 @@ class Store:
                 (ts, exit_reason, guests_heard, declined_requests, session_id))
             self._conn.commit()
 
+    def update_showoff_counts(self, session_id: int, *, guests_heard: int,
+                              declined_requests: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                """UPDATE showoff_sessions
+                   SET guests_heard = ?, declined_requests = ?, audio_retained = 0
+                   WHERE id = ?""",
+                (guests_heard, declined_requests, session_id))
+            self._conn.commit()
+
     def list_showoff_sessions(self, limit: int = 20) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
@@ -918,6 +924,20 @@ class Store:
     def committed_operations(self, *, plan_id: int | None = None,
                              since_iso: str | None = None) -> list[dict]:
         query = "SELECT * FROM operations WHERE status = 'committed'"
+        params: list = []
+        if plan_id is not None:
+            query += " AND plan_id = ?"
+            params.append(plan_id)
+        if since_iso:
+            query += " AND ts >= ?"
+            params.append(since_iso)
+        with self._lock:
+            rows = self._conn.execute(query + " ORDER BY id", params).fetchall()
+        return [dict(r) for r in rows]
+
+    def undoable_operations(self, *, plan_id: int | None = None,
+                            since_iso: str | None = None) -> list[dict]:
+        query = "SELECT * FROM operations WHERE status IN ('committed', 'copied', 'intent')"
         params: list = []
         if plan_id is not None:
             query += " AND plan_id = ?"

@@ -13,6 +13,7 @@ Protocol: one JSON object per line.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import socket
@@ -26,26 +27,55 @@ async def serve(socket_path: Path, handler: Handler,
                 event_sink: Callable[[asyncio.StreamWriter], None] | None = None):
     """Start the daemon's Unix server. Returns the asyncio Server."""
     socket_path.parent.mkdir(parents=True, exist_ok=True)
-    socket_path.unlink(missing_ok=True)  # stale socket from a crashed daemon
+    if socket_path.exists():
+        live_peer = False
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.5)
+                probe.connect(str(socket_path))
+                live_peer = True
+        except OSError:
+            live_peer = False
+        if live_peer:
+            raise RuntimeError(
+                f"another daemon is already running and listening on {socket_path}"
+            )
+        socket_path.unlink(missing_ok=True)  # stale socket from a crashed daemon
+
+    accepts_writer = len(inspect.signature(handler).parameters) >= 3
 
     async def _client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         if event_sink:
             event_sink(writer)
         try:
             while line := await reader.readline():
+                req_id = None
                 try:
                     request = json.loads(line)
-                    result = await handler(request.get("method", ""),
-                                           request.get("params") or {}, writer)
-                    reply = {"id": request.get("id"), "ok": True, "result": result}
+                    if not isinstance(request, dict):
+                        raise TypeError("IPC request must be a JSON object")
+                    req_id = request.get("id")
+                    params = request.get("params") or {}
+                    if not isinstance(params, dict):
+                        raise TypeError("IPC params must be a JSON object")
+                    method_name = str(request.get("method", ""))
+                    if accepts_writer:
+                        result = await handler(method_name, params, writer)
+                    else:
+                        result = await handler(method_name, params)
+                    reply = {"id": req_id, "ok": True, "result": result}
                 except Exception as exc:
-                    reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                    reply = {"id": req_id, "ok": False,
+                             "error": f"{type(exc).__name__}: {exc}"}
                 writer.write((json.dumps(reply) + "\n").encode())
                 await writer.drain()
-        except (ConnectionResetError, BrokenPipeError):
+        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
             pass
         finally:
-            writer.close()
+            try:
+                writer.close()
+            except RuntimeError:
+                pass
 
     server = await asyncio.start_unix_server(_client, path=str(socket_path))
     os.chmod(socket_path, 0o600)  # owner-only: the socket *is* the auth boundary
@@ -85,6 +115,7 @@ def call(socket_path: Path, method: str, params: dict | None = None, timeout: fl
             f"daemon socket not found at {socket_path} — is assistd running? "
             "(systemctl --user status assistant)"
         )
+    reply: dict | None = None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
@@ -92,14 +123,29 @@ def call(socket_path: Path, method: str, params: dict | None = None, timeout: fl
             payload = json.dumps({"id": 1, "method": method, "params": params or {}}) + "\n"
             sock.sendall(payload.encode())
             buffer = b""
-            while b"\n" not in buffer:
+            while reply is None:
+                while b"\n" in buffer:
+                    raw_line, buffer = buffer.split(b"\n", 1)
+                    if not raw_line.strip():
+                        continue
+                    parsed = json.loads(raw_line)
+                    if isinstance(parsed, dict) and "ok" in parsed:
+                        reply = parsed
+                        break
+                if reply is not None:
+                    break
                 chunk = sock.recv(65536)
                 if not chunk:
+                    if buffer.strip():
+                        parsed = json.loads(buffer.splitlines()[0])
+                        if isinstance(parsed, dict) and "ok" in parsed:
+                            reply = parsed
                     break
                 buffer += chunk
     except OSError as exc:
         raise DaemonUnavailable(f"cannot reach daemon at {socket_path}: {exc}") from exc
-    reply = json.loads(buffer.splitlines()[0]) if buffer.strip() else {"ok": False, "error": "empty reply"}
+    if reply is None:
+        reply = {"ok": False, "error": "empty reply"}
     if not reply.get("ok"):
         raise RuntimeError(reply.get("error", "daemon error"))
     return reply["result"]
