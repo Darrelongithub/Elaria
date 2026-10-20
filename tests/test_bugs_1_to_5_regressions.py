@@ -55,12 +55,16 @@ def test_bug1_console_say_returns_promptly_with_slow_live_transport(config, runn
     """BUG 1: When Gemini Live transport hangs or is very slow, console.say must
     return a turn result promptly within a few seconds, persisting the turn in
     the console conversation, rather than hanging until the 120s CLI timeout.
+    BUG 8b update (2026-10-20): blocking transports that complete within the
+    total bound (e.g. 8s) are now DELIVERED (first-token deadline applies only
+    to streaming transports). The old <6s fallback expectation is updated to
+    allow a late-delivered reply.
     """
     daemon, _server = running_daemon
 
     class _SlowHangingTransport:
         def generate(self, model: str, contents, gen_config: dict) -> dict:
-            time.sleep(8.0)  # Simulates a hung/stalled Live transport
+            time.sleep(8.0)  # Simulates a hung/stalled Live transport (blocking)
             return {"text": "eventual reply", "usage": {"tokens_in": 5, "tokens_out": 5}}
 
         def list_models(self) -> list[str]:
@@ -69,8 +73,11 @@ def test_bug1_console_say_returns_promptly_with_slow_live_transport(config, runn
         def list_voices(self) -> list[str]:
             return ["Flare"]
 
-    # Replace daemon client with slow transport
+    # Replace daemon client with slow transport (blocking: no on_first_token)
     daemon.client = GeminiClient(config, daemon.store, transport=_SlowHangingTransport())
+    # BUG 8b: blocking transports use total bound (30s), so 8s completes and is delivered
+    daemon._chat_first_token_s = 5.0
+    daemon._chat_timeout_s = 30.0
 
     start = time.monotonic()
     # Call console.say via real Unix socket
@@ -78,12 +85,13 @@ def test_bug1_console_say_returns_promptly_with_slow_live_transport(config, runn
                   {"text": "Elaria, are you awake?"}, timeout=15.0)
     elapsed = time.monotonic() - start
 
-    # Must return promptly: well under 6.0 seconds, nowhere near 120s CLI timeout
-    assert elapsed < 6.0, f"console.say hung for {elapsed:.2f}s, expected < 6.0s"
+    # BUG 8b: blocking 8s generation is delivered (late) within total bound, not fallback.
+    # Must return well before the 120s CLI timeout, but may take ~8s for blocking transport.
+    assert elapsed < 10.0, f"console.say hung for {elapsed:.2f}s, expected < 10s (blocking late delivery)"
     assert result["channel"] == "console"
     assert result["reply"]  # Must return a real reply
-    # Acceptable terse fallback for check-in: "I am now. What do you need?"
-    assert "awake" in result["reply"].lower() or "what do you need" in result["reply"].lower()
+    # Blocking late delivery: the eventual reply is delivered verbatim
+    assert result["reply"] == "eventual reply" or "awake" in result["reply"].lower() or "what do you need" in result["reply"].lower()
 
     # The completed turn must be visible in the console conversation
     state = call(config.socket_path, "console.state", timeout=3.0)
