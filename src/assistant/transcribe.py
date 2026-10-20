@@ -407,7 +407,6 @@ class DictationService:
         from .persona import FILLER_PHRASES
         if final_text:
             lowered = final_text.lower()
-            from pathlib import Path as _P
             # Also check if daemon is speaking (if we have a reference) — but transcribe doesn't have daemon
             # So we rely on textual fingerprint of echo
             is_filler_echo = any(phrase in lowered for phrase in FILLER_PHRASES)

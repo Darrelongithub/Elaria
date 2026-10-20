@@ -27,6 +27,7 @@ memory. Ignoring the same topic three times retires it.
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -87,6 +88,16 @@ NEEDY_PATTERNS: tuple[str, ...] = (
     r"\bfeel(?:ing)?\s+ignored\b",
     r"\ball\s+by\s+myself\b",
     r"\btalking\s+to\s+myself\b",
+    # Paraphrases that made it past the first list (BH-I11). Each one still
+    # makes HER feelings or the absence of the user the initiator.
+    r"\bwithout\s+(?:you|me)\b",
+    r"\bwhere\s+(?:have\s+)?you\s+(?:been|gone)\b",
+    r"\b(?:it'?s|it\s+is)\s+(?:so\s+)?(?:quiet|empty)\b",
+    r"\bquieter\s+(?:without|these\s+days|lately)\b",
+    r"\bfeels?\s+(?:empty|lonely)\b",
+    r"\bchecking\s+(?:if|whether)\s+you\s+still\b",
+    r"\bnothing\s+but\s+(?:silence|quiet)\b",
+    r"\b(?:you'?ve|you\s+have)\s+been\s+(?:away|gone|distant)\b",
 )
 
 # Time passing is not a reason. These are refused even when the sentence is
@@ -310,7 +321,15 @@ class InitiativeService:
                     kind=snoozed["kind"], urgency=snoozed["urgency"],
                     referent=snoozed.get("referent"),
                     commitment_id=int(commitment_id))
-            except InitiativeError:
+            except InitiativeError as exc:
+                # The row stays snoozed (the user's follow-up is not thrown
+                # away), but a due knock that can never be raised is a fact,
+                # not silence: record why every cycle refuses it.
+                self.store.log_persona_event(
+                    iso_now(), "knock_due_refused",
+                    json.dumps({"knock_id": snoozed["id"],
+                                "topic": snoozed["topic"],
+                                "reason": str(exc)[:300]}))
                 continue
             self.store.update_knock(snoozed["id"], status="accepted",
                                     resolved_ts=iso_now())
@@ -456,13 +475,7 @@ class InitiativeService:
                             queue.append(parent_id)
                     except (ValueError, TypeError):
                         pass
-            with self.store._lock:
-                placeholders = ", ".join("?" * len(commitment_ids))
-                self.store._conn.execute(
-                    f"UPDATE facts SET active = 0 WHERE id IN ({placeholders})",
-                    tuple(commitment_ids),
-                )
-                self.store._conn.commit()
+            self.store.deactivate_facts(commitment_ids)
         return {"knock": self.get(knock_id), "no_followup": True,
                 "note": "declined — no follow-up on this topic"}
 
@@ -472,6 +485,9 @@ class InitiativeService:
             raise InitiativeError(f"knock #{knock_id} is {knock['status']}")
         hours = float(hours if hours is not None
                       else self._settings().get("snooze_hours", 24))
+        if not math.isfinite(hours) or hours < 0:
+            raise InitiativeError(
+                "refused: snooze hours must be a finite, non-negative number")
         until = (self._now() + timedelta(hours=hours)).isoformat(timespec="seconds")
         self.store.update_knock(knock_id, status="snoozed", snooze_until=until)
         commitment = self.create_commitment(
@@ -520,7 +536,8 @@ class InitiativeService:
         pending = self.pending()
         return {
             "pending": len(pending),
-            "latest": pending[-1] if pending else None,
+            # `list_knocks()` orders id DESC, so pending[0] is the NEWEST.
+            "latest": pending[0] if pending else None,
             "budget": "none — the reason gate is the only control",
             "class_mode_urgent_only": self.class_mode(),
         }
