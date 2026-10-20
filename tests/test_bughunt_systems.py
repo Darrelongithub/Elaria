@@ -65,7 +65,6 @@ def test_llm_batch_boolean_confidence_is_invalid():
     assert _parse_batch(payload, {"Finance"}, {"/r/a.txt"}) is None
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D2: cost intent overmatches ordinary language")
 @pytest.mark.parametrize("phrase", [
     "cost of living in Nairobi",
     "usage of the word serendipity",
@@ -75,14 +74,12 @@ def test_ordinary_cost_words_are_not_the_api_cost_intent(phrase):
     assert route(phrase) is None
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D3: natural emergency halt variants are missed")
 @pytest.mark.parametrize("phrase", ["halt please", "stop everything now", "panic stop now"])
 def test_natural_halt_variants_route_to_halt(phrase):
     intent = route(phrase)
     assert intent is not None and intent.kind == "halt"
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D4: string where a sequence belongs becomes characters")
 def test_string_taxonomy_and_languages_are_rejected_or_wrapped(config):
     config.raw["organise"] = {
         **config.raw["organise"],
@@ -96,7 +93,6 @@ def test_string_taxonomy_and_languages_are_rejected_or_wrapped(config):
     assert configured_languages(config) == ["sw"]
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D5: load_config shares nested DEFAULTS objects")
 def test_mutating_loaded_config_does_not_pollute_next_load():
     first = load_config()
     original = first.raw["persona"]["name"]
@@ -567,7 +563,6 @@ def test_watcher_debounce_restarts_when_a_file_changes_again(tmp_path):
     assert events.settled_changed == []
 
 
-@pytest.mark.xfail(strict=True, reason="BH-G1: threshold sweep tie-breaks to the lowest threshold")
 def test_suggested_speaker_threshold_uses_the_separation_gap_midpoint():
     result = suggest_threshold([
         {"label": "correct", "speaker_score": 0.90},

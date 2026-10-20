@@ -677,14 +677,20 @@ class Daemon:
 
     async def _class_set(self, params: dict) -> dict:
         if "enabled" in params:
-            status = self.presence.set_enabled(bool(params["enabled"]))
+            raw_enabled = params["enabled"]
+            enabled = (
+                raw_enabled.strip().lower() in ("1", "true", "yes", "on")
+                if isinstance(raw_enabled, str)
+                else bool(raw_enabled)
+            )
+            status = self.presence.set_enabled(enabled)
         elif str(params.get("action") or "").lower() == "toggle":
             status = self.presence.toggle()
         else:
             raise ValueError("class.set needs params.enabled (bool) or action=toggle")
         await self.broadcast({"event": "class.changed",
                               "class_mode": status.as_dict()})
-        return {"class_mode": status.as_dict()}
+        return {"class_mode": status.as_dict(), "enabled": status.enabled}
 
     async def _class_toggle(self, params: dict) -> dict:
         status = self.presence.toggle()

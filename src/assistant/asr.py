@@ -62,7 +62,9 @@ def configured_languages(config) -> list[str]:
     """The pinned language set (§12.4: pinned, NEVER auto-detected).
     Phase 7 flips this to ["sw", "en"] in config — nothing else moves."""
     languages = config.section("asr").get("languages") or ["en"]
-    return [str(lang) for lang in languages]
+    if isinstance(languages, str):
+        languages = [languages]
+    return [str(lang) for lang in languages if str(lang).strip()]
 
 
 def code_switching_enabled(config) -> bool:

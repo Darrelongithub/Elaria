@@ -13,6 +13,7 @@ Protocol: one JSON object per line.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import socket
@@ -41,6 +42,8 @@ async def serve(socket_path: Path, handler: Handler,
             )
         socket_path.unlink(missing_ok=True)  # stale socket from a crashed daemon
 
+    accepts_writer = len(inspect.signature(handler).parameters) >= 3
+
     async def _client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         if event_sink:
             event_sink(writer)
@@ -55,8 +58,11 @@ async def serve(socket_path: Path, handler: Handler,
                     params = request.get("params") or {}
                     if not isinstance(params, dict):
                         raise TypeError("IPC params must be a JSON object")
-                    result = await handler(str(request.get("method", "")),
-                                           params, writer)
+                    method_name = str(request.get("method", ""))
+                    if accepts_writer:
+                        result = await handler(method_name, params, writer)
+                    else:
+                        result = await handler(method_name, params)
                     reply = {"id": req_id, "ok": True, "result": result}
                 except Exception as exc:
                     reply = {"id": req_id, "ok": False,
