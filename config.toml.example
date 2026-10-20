@@ -40,6 +40,12 @@ allowed_voices             = ["Flare"]
 escalation_ladder    = ["gemini-flash-lite-latest", "gemini-flash-latest"]
 escalate_after_failures = 2
 max_scaffold_calls      = 6
+# BUG F / Bug 8: two deadlines, not one. The FIRST-TOKEN deadline catches a
+# dead transport (nothing streamed = fail fast with a turn-aware fallback);
+# the TOTAL bound is generous so a generation that started is delivered
+# VERBATIM. A successful reply is never replaced by a canned line.
+chat_first_token_s   = 5.0
+chat_timeout_s       = 30.0
 # live | record | mock. Env GEMINI_MODE overrides. No key present => mock.
 mode = "mock"
 
@@ -222,9 +228,48 @@ notes = "Round-2 polished contrast; not selected."
 [capture]
 source = "mic"                      # §10.1 OPEN — blueprint recommendation:
                                     # mic first (Phase 1), mix in Phase 6.
+# BUG 6: dictate/ptt capture resolves pw-record --target from here first
+# (then [meeting] mic_target). Node.name / object.serial — NOT object.id.
+# Find it with `wpctl status` + `wpctl inspect <id>`. Empty = default source.
+mic_target = ""
 sample_rate = 16000
 chunk_ms = 30
+# No bytes at all for this long = a dead capture process (pw-record emits
+# samples even in digital silence). The session ends "no speech captured".
+stall_timeout_s = 8.0
 retention_days = 30
+
+# Wake-knock package (2026-10-20). The always-on acoustic path is armed ONLY
+# by a real .onnx keyword model — `assist hotword start` refuses cleanly
+# without one, and there is no energy/loudness fallback. A phrase hit never
+# grants command authority: the voiceprint verdict or a human accept does.
+[hotword]
+phrase = "Elaria"
+ring_window_s = 2.0                 # pre-wake ring, RAM only (hard cap 2.0s)
+pending_window_s = 2.5              # post-trigger buffer, 2-3s band
+pending_speech_threshold_s = 0.5    # below this speechful audio: wake-clip-only
+speech_rms = 0.01                   # frame gate for "speechful" detection
+keyword_model = ""                  # path to the real .onnx keyword model
+keyword_threshold = 0.5
+# ECAPA backend (hardware-side): command `cmd <clip.wav>` printing either
+# {"embedding": [...]} (cosine vs ecapa_reference) or {"score": 0..1}.
+ecapa_cmd = ""
+ecapa_reference = ""                # owner enrollment embedding (JSON)
+ecapa_high = 0.75                   # >= this + verified = ATTENDING
+ecapa_uncertain = 0.5               # in between = uncertain -> wake-knock
+missing_embedding_action = "wake_knock"   # or "ignore"; NEVER listen
+stall_timeout_s = 2.0               # watchdog: no frames -> disarm + "stalled"
+save_wake_clips = false             # opt-in; <=5s clips, 0700 dir, 24h purge
+clip_dir = ""
+clip_max_s = 5.0
+clip_retention_h = 24.0
+debug_save_failed = false           # failed-verify audio stays unsaved unless
+                                    # this explicit debug flag is on
+# Endpointing parameters of the SHARED SilenceLadder (one ladder for
+# dictation and the wake path — no second copy).
+checkin_after_s = 30.0
+resume_s = 0.4
+grace_s = 8.0
 
 [transcribe]
 reconnect_replay_s = 30             # rolling buffer replayed on session reset (§3.5)

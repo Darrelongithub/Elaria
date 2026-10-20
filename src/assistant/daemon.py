@@ -16,6 +16,7 @@ governor and client are resident from boot.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -45,7 +46,9 @@ from .persona import (
     PersonaGovernor,
     TurnContext,
     build_chat_prompt,
-    is_valid_chat_reply,
+    chat_reply_violation,
+    checkin_reply,
+    timeout_fallback_reply,
 )
 from .presence import PresenceService
 from .safety import clear_halt, is_halted, set_halt
@@ -53,6 +56,21 @@ from .showoff import ShowoffError, ShowoffService
 from .store import Store
 from .transcribe import DictationService
 from .tts import STANDARD_ACKS, SpeechResult, SpeechService
+
+
+class ChatTimeout(TimeoutError):
+    """A chat turn that hit a deadline — with WHICH deadline attached.
+
+    BUG F / Bug 8: the fallback path must be able to say why it fired, and a
+    logged substitution must name the deadline kind ('first_token' = the
+    transport produced nothing; 'total' = the generation started but did not
+    finish). A TimeoutError without this shape is treated as 'total'.
+    """
+
+    def __init__(self, reason: str, waited_s: float):
+        super().__init__(f"chat {reason} deadline after {waited_s:.1f}s")
+        self.reason = reason
+        self.waited_s = waited_s
 
 
 def _sd_notify(message: str) -> None:
@@ -126,6 +144,23 @@ class Daemon:
             config, self.store, presence=self.presence,
             disclosure=self.disclosure, sessions=self.sessions)
         self.knock_signal = KnockSignal(config)
+        # Wake-knock package: the always-on gate. A phrase hit NEVER grants
+        # command authority; the guard holds that line (wake_guard.py). The
+        # scorer is the hardware-side ECAPA seam; missing = fail closed.
+        from .voiceprint import EcapaCommandScorer, load_reference
+        from .wake_guard import WakeGuard
+        self.wake_guard = WakeGuard(
+            settings=config.section("hotword"),
+            store=self.store,
+            initiative=self.initiative,
+            class_mode=lambda: self.presence.status().enabled,
+            showoff=self.showoff,
+            scorer=EcapaCommandScorer(
+                config.section("hotword").get("ecapa_cmd"),
+                load_reference(config.section("hotword").get("ecapa_reference")),
+                sample_rate=int(config.section("hotword").get("sample_rate", 16000))),
+            phrase=str(config.section("hotword").get("phrase", "Elaria")))
+        self._hotword_task: asyncio.Task | None = None
         self.console = ConsoleService(
             config, self.store, presence=self.presence, sessions=self.sessions,
             initiative=self.initiative, showoff=self.showoff,
@@ -165,7 +200,14 @@ class Daemon:
         # BUG5 half-duplex: capture muted while she is speaking (+ guard)
         self._speaking_until: float = 0.0
         self._speaking_text: str | None = None
-        self._chat_timeout_s = 4.0
+        # BUG F / Bug 8 (2026-10-20): the single 4 s total-turn bound is gone.
+        # Two deadlines from [gemini]: a streaming first-token deadline (a
+        # transport with no first token is dead) and a generous total bound (a
+        # generation that started is delivered VERBATIM). Overridable per
+        # instance by tests.
+        _gem = config.section("gemini")
+        self._chat_timeout_s = float(_gem.get("chat_timeout_s", 30.0))
+        self._chat_first_token_s = float(_gem.get("chat_first_token_s", 5.0))
         self._load_relationship_state()
 
     async def broadcast(self, event: dict) -> None:
@@ -225,6 +267,14 @@ class Daemon:
         def __init__(self, inner, daemon):
             self._inner = inner
             self._daemon = daemon
+
+        def __getattr__(self, name):
+            # Diagnostics see through the wrapper (BUG 6): `.target`,
+            # `.stalled` and friends describe the REAL capture process.
+            if name.startswith("_"):
+                raise AttributeError(name)
+            return getattr(self._inner, name)
+
         async def frames(self):
             async for frame in self._inner.frames():
                 # Half-duplex: mic muted while she speaks + guard after
@@ -380,8 +430,17 @@ class Daemon:
         )
 
     # -- handlers --------------------------------------------------------------
-    async def handle(self, method: str, params: dict, writer=None) -> dict:
-        handlers = {
+    def _handlers(self) -> dict:
+        """The real IPC dispatch table — one place, inspectable by tests.
+
+        BUG A (external submission, 2026-10-20): an instance attribute with
+        the same name as a handler method (their `self._hotword_stop` Event
+        shadowing `_hotword_stop`) silently resolved `hotword.stop` to a
+        non-callable and died with TypeError at dispatch. Every entry here
+        must be a *bound method of this instance*; the integrity test calls
+        each one by name and fails on exactly that collision.
+        """
+        return {
             "ping": self._ping,
             "status": self._status,
             "cost": self._cost,
@@ -431,6 +490,10 @@ class Daemon:
             "knock.ignore": self._knock_ignore,
             "knock.due": self._knock_due,
             "initiative.status": self._initiative_status,
+            "hotword.status": self._hotword_status,
+            "hotword.start": self._hotword_start,
+            "hotword.stop": self._hotword_stop,
+            "hotword.purge": self._hotword_purge,
             "privacy.status": self._privacy_status,
             "privacy.set": self._privacy_set,
             "privacy.toggle": self._privacy_toggle,
@@ -444,6 +507,9 @@ class Daemon:
             "class.toggle": self._class_toggle,
             "ask": self._ask,
         }
+
+    async def handle(self, method: str, params: dict, writer=None) -> dict:
+        handlers = self._handlers()
         if method == "events.subscribe":
             if writer is not None:
                 self._subscribers.add(writer)
@@ -478,8 +544,21 @@ class Daemon:
             last = {"snippet": snippet[:80] + ("…" if len(snippet) > 80 else ""),
                     "ts": recent[0]["ts"], "backend": recent[0]["backend"]}
         capture = None
+        capture_target = None
         if self._capture_source is not None:
             capture = type(self._capture_source).__name__.replace("Capture", "").lower()
+            capture_target = str(getattr(self._capture_source, "target", None)
+                                 or "default")
+        # BUG 6: the last session's capture facts (node/bytes/peak) and the
+        # resolved mic node — "it captured nothing" must be visible here.
+        last_capture = None
+        try:
+            for event in self.store.list_persona_events(kind="capture.stats", limit=1):
+                last_capture = json.loads(event.get("detail") or "{}")
+                last_capture["ts"] = event.get("ts")
+                break
+        except Exception:
+            last_capture = None
         return {
             "running": True,
             "name": self.config.section("persona").get("name", "Elaria"),
@@ -494,6 +573,12 @@ class Daemon:
             "dictation_processing": self._ptt_processing,
             "ptt_session_id": self._ptt_session_id,
             "capture": capture,
+            "capture_target": capture_target,
+            "last_capture": last_capture,
+            "reply_substitutions": self._reply_substitution_records(limit=5),
+            "hotword": {"armed": self.wake_guard.armed,
+                        "state": self.wake_guard.state,
+                        "watchdog": self.wake_guard.watchdog.state},
             "last_transcript": last,
             "quota_today_live_calls": self.store.user_turn_calls_since(day_start_iso()),
             "quota_today_housekeeping": self.store.housekeeping_calls_since(day_start_iso()),
@@ -530,6 +615,9 @@ class Daemon:
         # key/voice errors from a silent Live failure. Every failed row is
         # listed with its purpose and error.
         month["failures_detail"] = self.store.failure_summary_since(month_start_iso())
+        # Bug 8: generated replies that never reached the user — the ledger
+        # must show the discards too, or a working ledger hides them.
+        today["reply_substitutions"] = self._reply_substitution_records(limit=10)
         return {"month": month, "today": today,
                 "quota": self.config.section("quota"),
                 "tier": self.config.section("privacy").get("tier", "free")}
@@ -719,6 +807,9 @@ class Daemon:
 
     async def _knock_accept(self, params: dict) -> dict:
         knock_id = int(params.get("id"))
+        knock_row = self.store.get_knock(knock_id)
+        if knock_row is not None and knock_row.get("kind") == "wake":
+            return await self._wake_knock_accept(knock_id, params)
         class_now = self.presence.status().enabled
         speech_status = self.speech.status()
         voice_muted = bool(
@@ -765,14 +856,51 @@ class Daemon:
                               "channel": opened, "role": "assistant"})
         return payload
 
-    async def _knock_decline(self, params: dict) -> dict:
+    async def _wake_knock_accept(self, knock_id: int, params: dict) -> dict:
+        """Wake-knock accept: owner authentication, then listening (or the
+        console in class mode). voice-accept must itself be voiceprint
+        verified; hotkey/console carry the same trust as PTT. The guest door
+        stays show-off's alone."""
+        from .wake_guard import WakeGuardError
+
+        channel = str(params.get("channel") or "console")
+        voiceprint_score = params.get("voiceprint_score")
+        if voiceprint_score is not None:
+            voiceprint_score = float(voiceprint_score)
         try:
-            result = self.initiative.decline(int(params.get("id")))
+            gate = self.wake_guard.wake_knock_accepted(
+                knock_id=knock_id, channel=channel,
+                voiceprint_score=voiceprint_score)
+        except WakeGuardError as exc:
+            raise ValueError(str(exc)) from exc
+        class_now = self.presence.status().enabled
+        result = self.initiative.accept(
+            knock_id, class_mode=class_now,
+            voice_available=(gate.get("open") == "listening"))
+        opened = gate.get("open", result.get("open"))
+        payload = {**result, "open": opened, "wake": gate}
+        await self.broadcast({"event": "knock.accepted",
+                              "knock": result["knock"],
+                              "open": opened, "first_line": result["first_line"]})
+        return payload
+
+    async def _knock_decline(self, params: dict) -> dict:
+        knock_id = int(params.get("id"))
+        try:
+            result = self.initiative.decline(knock_id)
         except InitiativeError as exc:
             raise ValueError(str(exc)) from exc
+        self._wake_knock_denied(knock_id, "declined")
         await self.broadcast({"event": "knock.changed", "knock": result["knock"],
                               "action": "declined"})
         return result
+
+    def _wake_knock_denied(self, knock_id: int, action: str) -> None:
+        """Decline/ignore of a wake-knock returns the gate to sleep."""
+        row = self.store.get_knock(knock_id)
+        if (row is not None and row.get("kind") == "wake"
+                and self.wake_guard.state == "wake_knock"):
+            self.wake_guard.wake_knock_denied(knock_id=knock_id, action=action)
 
     async def _knock_later(self, params: dict) -> dict:
         try:
@@ -785,10 +913,12 @@ class Daemon:
         return result
 
     async def _knock_ignore(self, params: dict) -> dict:
+        knock_id = int(params.get("id"))
         try:
-            result = self.initiative.ignore(int(params.get("id")))
+            result = self.initiative.ignore(knock_id)
         except InitiativeError as exc:
             raise ValueError(str(exc)) from exc
+        self._wake_knock_denied(knock_id, "ignored")
         await self.broadcast({"event": "knock.changed", "knock": result["knock"],
                               "action": "retired" if result["retired"] else "ignored"})
         return result
@@ -820,6 +950,81 @@ class Daemon:
     async def _initiative_status(self, params: dict) -> dict:
         return {"initiative": self.initiative.status(),
                 "class_mode": self.presence.status().as_dict()}
+
+    # -- hotword: wake-knock model (never straight hit->listening) ----------
+    def _hotword_capture_factory(self):
+        """Always-on capture for the wake path (production mic path)."""
+        from .capture import PipeWireCapture
+
+        capture_cfg = self.config.section("capture")
+        target = (capture_cfg.get("mic_target")
+                  or self.config.section("meeting").get("mic_target") or None)
+        return PipeWireCapture(
+            target=target or None,
+            sample_rate=int(capture_cfg.get("sample_rate", 16000)),
+            chunk_ms=int(capture_cfg.get("chunk_ms", 30)))
+
+    async def _hotword_loop(self) -> None:
+        """Feed always-on frames through the guard + watchdog.
+
+        Stall semantics: no frames for `stall_timeout_s` disarms, zeroes both
+        RAM buffers and leaves a visible "stalled" state. Never a silent
+        forever-recording.
+        """
+        guard = self.wake_guard
+        source = None
+        try:
+            source = self._hotword_capture_factory()
+            async for frame in source.frames():
+                if not guard.armed:
+                    break
+                guard.feed(frame)
+                if guard.watchdog.check():
+                    guard.disarm(reason="stalled")
+                    await self.broadcast({"event": "hotword.stalled",
+                                          "state": "stalled"})
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            guard.disarm(reason="error")
+            await self.broadcast({"event": "hotword.stalled",
+                                  "state": "stalled", "error": str(exc)[:200]})
+        finally:
+            close = getattr(source, "close", None)
+            if callable(close):
+                close()
+
+    async def _hotword_start(self, params: dict) -> dict:
+        from .wake_guard import KeywordModelUnavailable
+
+        unsafe = bool(params.get("unsafe_energy_test"))
+        try:
+            status = self.wake_guard.arm(unsafe_energy_test=unsafe)
+        except KeywordModelUnavailable as exc:
+            raise ValueError(str(exc)) from exc
+        if self._hotword_task is None or self._hotword_task.done():
+            self._hotword_task = asyncio.create_task(self._hotword_loop())
+        return {"hotword": status,
+                "note": ("UNSAFE ENERGY TEST — plumbing only; this trigger "
+                         "can never open command listening"
+                         if unsafe else "armed with the real keyword model")}
+
+    async def _hotword_stop(self, params: dict) -> dict:
+        task = self._hotword_task
+        self._hotword_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        return {"hotword": self.wake_guard.disarm(reason="manual")}
+
+    async def _hotword_status(self, params: dict) -> dict:
+        return {"hotword": self.wake_guard.status()}
+
+    async def _hotword_purge(self, params: dict) -> dict:
+        removed = self.wake_guard.clips.purge()
+        return {"purged": removed}
 
     async def _class_status(self, params: dict) -> dict:
         return {"class_mode": self.presence.status().as_dict()}
@@ -920,6 +1125,16 @@ class Daemon:
         capture_cfg = self.config.section("capture")
         frame_ms = int(capture_cfg.get("chunk_ms", 30))
         source_kind = params.get("source") or capture_cfg.get("source", "mic")
+        # BUG 6 (2026-10-20): dictate used to spawn pw-record with NO --target
+        # (params["target"] was never set by `assist dictate`) while the owner's
+        # working microphone sat in config. Resolution order: explicit param →
+        # [capture] mic_target → [meeting] mic_target → default source. The
+        # resolved node is reported and logged — never a mystery capture.
+        target = (params.get("target")
+                  or capture_cfg.get("mic_target")
+                  or self.config.section("meeting").get("mic_target")
+                  or None)
+        stall_timeout_s = float(capture_cfg.get("stall_timeout_s", 8.0))
         simulated = False
         if source_kind == "simulated":
             self._capture_source = SimulatedCapture(speech_frames=100_000,
@@ -928,7 +1143,7 @@ class Daemon:
         else:
             try:
                 self._capture_source = PipeWireCapture(
-                    params.get("target"), frame_ms=frame_ms)
+                    target, frame_ms=frame_ms, stall_timeout_s=stall_timeout_s)
             except RuntimeError:
                 # No PipeWire (headless/containers): simulated frames keep
                 # the full pipeline exercisable; status reports it honestly.
@@ -969,6 +1184,9 @@ class Daemon:
         return {"listening": True, **ack, "simulated_capture": simulated,
                 "session_mode": self._dictation_session_mode,
                 "session_id": session_id,
+                # BUG 6 diagnostics: which node this session captures from.
+                "capture_target": str(getattr(self._capture_source, "target", None)
+                                      or "default"),
                 "connectivity": connectivity.as_dict()}
 
     async def _ptt_stop(self, params: dict) -> dict:
@@ -1044,6 +1262,7 @@ class Daemon:
         result: dict | None = None
         try:
             session = await asyncio.wait_for(task, timeout=60)
+            no_speech = bool(getattr(session, "no_speech", False))
             result = {
                 "text": (session.cleaned_text
                          if (session.cleaned_text and not session.flagged)
@@ -1060,11 +1279,17 @@ class Daemon:
                 "connectivity_mode": session.connectivity_mode,
                 "notes": session.notes,
                 "session_id": session.session_id,
+                # BUG 6: the capture facts for this session (node/bytes/peak)
+                # and the fail-fast verdict — ptt.result callers see WHY a
+                # session is empty instead of waiting out their full budget.
+                "capture": getattr(session, "capture", None),
+                "no_speech": no_speech,
                 # Factual narration from real state (§13.1) — no model call.
-                "narration": self.governor.narrate_fact(
-                    "transcribe.done",
-                    {"words": len(session.raw_text.split()),
-                     "seconds": session.duration_s}),
+                "narration": ("no speech captured" if no_speech else
+                              self.governor.narrate_fact(
+                                  "transcribe.done",
+                                  {"words": len(session.raw_text.split()),
+                                   "seconds": session.duration_s})),
             }
             # The mode is captured at release time: a new dictation started
             # while this one is finishing must not reroute these words.
@@ -1097,8 +1322,17 @@ class Daemon:
                 result["narration"] = "echo suppressed — own TTS captured as input"
                 result["echo_suppressed"] = True
         except Exception as exc:
-            result = {"error": f"dictation did not finish cleanly: {exc}",
-                      "session_id": session_id}
+            timed_out = isinstance(exc, TimeoutError)
+            error = ("session never finished — treating as no speech captured"
+                     if timed_out else f"dictation did not finish cleanly: {exc}")
+            result = {"error": error,
+                      "session_id": session_id,
+                      # BUG 6: a session that cannot even finish is a dead
+                      # session. ptt.result must say so NOW, not after the
+                      # caller's wait budget expires.
+                      "no_speech": True,
+                      "capture": None,
+                      "narration": "no speech captured"}
         finally:
             self._ptt_last_result = result
             self._ptt_last_session_id = session_id
@@ -1546,28 +1780,146 @@ class Daemon:
             "serious_gate": None, "mode": self.config.gemini_mode,
         }
 
+    # -- Bug 8: every reply that is NOT delivered is recorded --------------------
+    def _log_reply_substitution(self, *, reason: str,
+                                original_len: int | None = None,
+                                rule: str | None = None,
+                                replacement: str | None = None,
+                                turn: str | None = None) -> dict:
+        """Record a generated reply being replaced or discarded (Bug 8).
+
+        Silent replacement is how the canned-fallback bug hid behind a working
+        ledger — the calls landed, the answers never reached the user. Every
+        substitution carries WHY (validator rule hit / deadline kind), the
+        original text length (None = the abandoned generation has not resolved
+        yet; the late-completion record fills it in) and what stood in for it.
+        Surfaced by `assist cost` and `status`.
+        """
+        record = {
+            "ts": iso_now(),
+            "reason": reason,
+            "original_len": original_len,
+            "rule": rule,
+            "replacement_len": len(replacement or ""),
+            "turn": (turn or "")[:60],
+        }
+        try:
+            self.store.log_persona_event(
+                record["ts"], "reply_substituted", json.dumps(record))
+        except Exception:  # noqa: S110 - diagnostics never break the turn
+            pass
+        return record
+
+    def _reply_substitution_records(self, limit: int = 20) -> list[dict]:
+        try:
+            rows = self.store.list_persona_events(kind="reply_substituted",
+                                                  limit=limit)
+        except Exception:
+            return []
+        out = []
+        for row in rows:
+            try:
+                detail = json.loads(row.get("detail") or "{}")
+            except ValueError:
+                detail = {"reason": "unreadable", "detail": row.get("detail")}
+            detail["ts"] = row.get("ts")
+            out.append(detail)
+        return out
+
     async def _generate(self, prompt: str, *, gen_config=None, verify=None,
                         purpose: str = "user_turn", is_user_turn=True):
         """One bounded chat call. The test-double fallback lives here only.
 
-        `asyncio.to_thread(...)` cannot raise `TypeError` while the coroutine is
-        being built, so the previous nested try/except could only observe the
-        error after awaiting - and then duplicated the whole timeout path for
-        the retry. One helper, one behaviour, one bound (BH-I12).
+        BUG F / Bug 8 (2026-10-20): the old single 4 s total bound cancelled
+        the `asyncio.to_thread(...)` await — which does NOT stop the worker
+        thread. The generation ran to success, hit the cost ledger, and its
+        text was discarded for a canned reply. Deadlines are split now:
+
+        * first-token deadline — a transport that has produced NOTHING by
+          then is dead (streaming transports signal `on_first_token`; a
+          non-streaming double counts only its completion as progress);
+        * generous total bound — a generation that started is awaited to
+          completion and delivered verbatim.
+
+        A deadline raise is an actual failure (ChatTimeout with `.reason`),
+        and any generation that completes after we gave up is logged as a
+        discarded reply with its real text length — never silently lost.
         """
-        timeout = self._chat_timeout_s
-        kwargs = {"gen_config": gen_config, "verify": verify,
-                  "purpose": purpose, "is_user_turn": is_user_turn}
-        try:
-            coro = asyncio.to_thread(self.client.generate, "chat", prompt, **kwargs)
-            return await asyncio.wait_for(coro, timeout=timeout)
-        except TypeError as exc:
-            # Only a test double with an older signature is retried; a genuine
+        first_token_s = min(float(self._chat_first_token_s),
+                            float(self._chat_timeout_s))
+        total_s = float(self._chat_timeout_s)
+        first_token = asyncio.Event()
+        signalled = {"done": False}
+
+        def _on_first_token() -> None:
+            if not signalled["done"]:
+                signalled["done"] = True
+                first_token.set()
+
+        base_kwargs = {"gen_config": gen_config, "verify": verify,
+                       "purpose": purpose, "is_user_turn": is_user_turn,
+                       "max_attempts": 2}   # REJECT-2: regenerate once, best attempt
+        full_kwargs = {**base_kwargs, "on_first_token": _on_first_token}
+
+        def run():
+            # Older doubles predate on_first_token / max_attempts; retry with
+            # fewer kwargs (BH-I12: one helper, one behaviour). A genuine
             # TypeError raised inside the client must surface.
-            if "unexpected keyword" not in str(exc):
-                raise
-        coro = asyncio.to_thread(self.client.generate, "chat", prompt)
-        return await asyncio.wait_for(coro, timeout=timeout)
+            attempts = (full_kwargs, base_kwargs,
+                        {"gen_config": gen_config}, {})
+            for i, kwargs in enumerate(attempts):
+                try:
+                    return self.client.generate("chat", prompt, **kwargs)
+                except TypeError as exc:
+                    if "unexpected keyword" not in str(exc) or i == len(attempts) - 1:
+                        raise
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        abandoned = {"flag": False, "reason": "first_token"}
+
+        def _late_completion(done_task: asyncio.Task) -> None:
+            # The generation we gave up on may still succeed in its thread.
+            # Its text is the original that was replaced — record its length
+            # so the discard is auditable (Bug 8).
+            if not abandoned["flag"] or done_task.cancelled():
+                return
+            try:
+                result = done_task.result()
+                text = getattr(result, "text", "") or ""
+            except Exception:
+                return
+            self._log_reply_substitution(
+                reason=f"deadline:{abandoned['reason']}:late",
+                original_len=len(text), replacement="",
+                turn=prompt[-60:])
+
+        task = self._track_task(asyncio.ensure_future(asyncio.to_thread(run)))
+        task.add_done_callback(_late_completion)
+        progress = asyncio.ensure_future(first_token.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {task, progress}, timeout=first_token_s,
+                return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                return task.result()      # success: delivered verbatim
+            if progress in done:
+                # The generation started — it gets the generous total bound.
+                remaining = max(0.0, total_s - first_token_s)
+                return await asyncio.wait_for(asyncio.shield(task),
+                                              timeout=remaining)
+            abandoned["flag"] = True
+            abandoned["reason"] = "first_token"
+            raise ChatTimeout("first_token", first_token_s)
+        except TimeoutError as exc:
+            abandoned["flag"] = True
+            if not isinstance(exc, ChatTimeout):
+                abandoned["reason"] = "total"
+                raise ChatTimeout("total", total_s) from exc
+            raise
+        finally:
+            if not progress.done():
+                progress.cancel()
+                await asyncio.gather(progress, return_exceptions=True)
 
     async def _ask(self, params: dict) -> dict:
         """Conversational turn on the §13.4 ladder: governor (local) →
@@ -1575,11 +1927,18 @@ class Daemon:
         then the cheapest-first harness with assembled context (§17).
         Offline, that final rung becomes a durable queue entry instead of
         a network attempt. Any spoken form is local TTS only (§13.8)."""
+        from .hotword import match_wake
         from .intents import route
 
         text = str(params.get("text", "")).strip()
         if not text:
             raise ValueError("ask needs params.text")
+        # ADOPT-1 phrase hotword (start-anchored): the wake phrase ADDRESSES
+        # her, it is not content. "Elaria, status" routes as "status" — a
+        # local intent, zero Gemini calls. "Elaria" alone is a check-in.
+        # Mid-sentence mentions never match (match_wake is start-anchored).
+        wake = match_wake(text)
+        route_text = wake.remainder if wake is not None else text
         speaker = str(params.get("speaker") or "owner").lower()
         channel = str(params.get("channel") or "voice")
         showoff_now = self.showoff.status()
@@ -1626,13 +1985,17 @@ class Daemon:
                      "Noted — alone again. Secrets and private plans are back "
                      "on the table.")
             via = "local-awareness"
-        intent = None if company_command is not None else route(text)
+        intent = None if company_command is not None else route(route_text)
         if intent is not None:
             reply, via = await self._run_intent(intent)
+        if reply is None and wake is not None and wake.is_checkin:
+            # "Elaria" / "hey Elaria" alone: a check-in. The settled terse line
+            # IS the turn-aware answer — zero Gemini calls (ADOPT-1).
+            reply, via = checkin_reply(), "local-hotword-checkin"
 
         if reply is None:
             # Rung 5/6: assemble the exact context the cheap model needs.
-            hits = await asyncio.to_thread(self.memory.recall, text)
+            hits = await asyncio.to_thread(self.memory.recall, route_text)
             restricted = self.disclosure.company() or speaker != "owner"
             kept = self.disclosure.filter_hits(hits, guest=speaker != "owner")
             context = "\n".join(f"- [{h.source} {h.ref}] {h.text}" for h in kept)
@@ -1651,19 +2014,21 @@ class Daemon:
                     history_lines = "\n".join(
                         f"- {m['role']}: {m['text']}" for m in safe_turns
                     )
-            # Build user-facing prompt body (context + history + user text)
-            body = text
+            # Build user-facing prompt body (context + history + user text).
+            # route_text: the wake phrase addresses her and is stripped before
+            # the model sees the turn ("Elaria, …" is not content).
+            body = route_text
             if history_lines and context:
                 body = (f"Context from the user's local memory/index "
                           f"(cite paths plainly):\n{context}\n\n"
                           f"Recent conversation in this session:\n{history_lines}\n\n"
-                          f"User: {text}")
+                          f"User: {route_text}")
             elif context:
                 body = (f"Context from the user's local memory/index "
-                          f"(cite paths plainly):\n{context}\n\nUser: {text}")
+                          f"(cite paths plainly):\n{context}\n\nUser: {route_text}")
             elif history_lines:
                 body = (f"Recent conversation in this session:\n{history_lines}\n\n"
-                          f"User: {text}")
+                          f"User: {route_text}")
             # System prompt carries the persona governor: no roleplay, terse, no asterisks
             disclosure_note = (self.disclosure.prompt_note(guest=speaker != "owner")
                                if restricted else None)
@@ -1679,13 +2044,23 @@ class Daemon:
                          f"(job #{queued_job_id}). It will drain on reconnect.")
                 via = "local-queue"
             else:
-                # Verify that the reply respects delivery spec: no asterisk narration,
-                # terse for simple turns. A violation is a harness failure that earns
-                # a retry with feedback (and escalation if needed).
+                # Verify that the reply respects delivery spec: no asterisk
+                # narration, terse for simple turns. A rejection is regenerated
+                # ONCE (max_attempts=2), and the best attempt is DELIVERED —
+                # never silently binned (REJECT-2 / Bug 8). Every rejection is
+                # logged with the rule that hit, so a substitution is auditable.
                 def _verify(reply_text: str) -> bool:
-                    return is_valid_chat_reply(reply_text, original_user_text=text)
-                # Bounded Live work: console.say must return within N seconds
-                # even with a slow transport (BUG1).
+                    rule = chat_reply_violation(reply_text,
+                                                original_user_text=route_text)
+                    if rule is not None:
+                        self._log_reply_substitution(
+                            reason=f"validator:{rule}", rule=rule,
+                            original_len=len(reply_text), replacement="",
+                            turn=route_text)
+                    return rule is None
+
+                # Bounded Live work: first-token deadline for a dead transport,
+                # generous total bound for one that started (BUG F / Bug 8).
                 try:
                     result = await self._generate(
                         full_prompt, gen_config=gen_config, verify=_verify,
@@ -1694,15 +2069,26 @@ class Daemon:
                                                   result.model, result.fixture)
                     if reply:
                         self.mode_manager.observe_success("gemini")
-                except TimeoutError:
-                    # Live transport hung — return a terse fallback promptly,
-                    # never hang the caller. The turn is still persisted as
-                    # completed; speech (if any) is async.
-                    reply = "I am now. What do you need?"
+                except TimeoutError as exc:
+                    # A timed-out turn gets a TURN-AWARE fallback (Bug 8): it
+                    # must never answer a different question than the one
+                    # asked. The substitution is logged with the deadline kind.
+                    reply = timeout_fallback_reply(route_text)
                     via = "local-timeout-fallback"
                     model = None
                     fixture = None
+                    self._log_reply_substitution(
+                        reason=f"deadline:{getattr(exc, 'reason', 'total')}",
+                        original_len=None, replacement=reply, turn=route_text)
                     await self.broadcast({"event": "live.timeout", "text": text[:40]})
+                # Bug 8: a successful generation is delivered VERBATIM — but an
+                # empty one is a failure, not a reply. Fall back turn-aware.
+                if reply is not None and not str(reply).strip():
+                    self._log_reply_substitution(
+                        reason="empty-generation", original_len=0,
+                        replacement="", turn=route_text)
+                    reply = timeout_fallback_reply(route_text)
+                    via = "local-timeout-fallback"
 
         # The outgoing guard: a model that ignores the prompt still cannot read a
         # stored secret, plan or owner fact back to the room.

@@ -187,6 +187,21 @@ def format_cost_report(month: dict, today: dict, quota: dict, tier: str = "free"
     if today.get("by_purpose") and isinstance(today["by_purpose"], dict):
         # dict case from _cost
         pass
+    # Bug 8: generated replies that never reached the user must be VISIBLE —
+    # silent replacement hid the canned-fallback bug behind a working ledger.
+    substitutions = today.get("reply_substitutions") or []
+    if substitutions:
+        lines.append(
+            f"Reply substitutions (generated text NOT delivered): "
+            f"{len(substitutions)} recorded")
+        for sub in substitutions[:5]:
+            reason = sub.get("reason") or "?"
+            rule = f" rule={sub['rule']}" if sub.get("rule") else ""
+            length = ("original_len=pending"
+                      if sub.get("original_len") is None
+                      else f"original_len={sub['original_len']}")
+            turn = f" · turn={str(sub.get('turn') or '')[:40]!r}" if sub.get("turn") else ""
+            lines.append(f"  {sub.get('ts', '')} [{reason}]{rule} {length}{turn}")
     from .config import quota_is_verified, quota_rows
 
     if quota_is_verified(quota):

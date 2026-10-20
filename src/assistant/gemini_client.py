@@ -71,8 +71,16 @@ def _run_coroutine_sync(factory):
 class Transport(Protocol):
     """One request/response round-trip. Implementations: SDK, fixtures, tests."""
 
-    def generate(self, model: str, contents, config: dict) -> dict:
-        """Return {"text": str, "usage": {"tokens_in": int, "tokens_out": int}}."""
+    def generate(self, model: str, contents, config: dict,
+                 on_first_token: Callable[[], None] | None = None) -> dict:
+        """Return {"text": str, "usage": {"tokens_in": int, "tokens_out": int}}.
+
+        `on_first_token` (optional) is invoked the moment the first output
+        token/chunk exists — the streaming first-token deadline (BUG F) hangs
+        off it, so a transport that streams must call it early. A transport
+        that cannot stream may ignore it (the caller treats completion as the
+        first token) or omit the parameter entirely (older test doubles).
+        """
         ...
 
     def generate_audio(self, model: str, text: str, voice_name: str) -> dict:
@@ -111,8 +119,11 @@ class _FixtureTransport:
     def __init__(self, store: FixtureStore):
         self._store = store
 
-    def generate(self, model: str, contents, config: dict) -> dict:
+    def generate(self, model: str, contents, config: dict,
+                 on_first_token: Callable[[], None] | None = None) -> dict:
         key = fixture_key(model, contents, config)
+        if on_first_token is not None:
+            on_first_token()   # fixtures are instant: the first token is now
         return self._store.replay(key, {"model": model, "contents": contents, "config": config})
 
 
@@ -130,7 +141,31 @@ class _SdkTransport:
             ) from exc
         self._client = genai.Client(api_key=api_key)
 
-    def generate(self, model: str, contents, config: dict) -> dict:
+    def generate(self, model: str, contents, config: dict,
+                 on_first_token: Callable[[], None] | None = None) -> dict:
+        if on_first_token is not None:
+            # BUG F: stream so the first-token deadline can tell a slow-but-alive
+            # transport from a dead one. A generation that starts is allowed its
+            # full (generous) total bound and is delivered verbatim.
+            chunks = []
+            usage = None
+            saw_text = False
+            for chunk in self._client.models.generate_content_stream(
+                    model=model, contents=contents, config=config or None):
+                text = getattr(chunk, "text", "") or ""
+                if text and not saw_text:
+                    on_first_token()
+                    saw_text = True
+                chunks.append(text)
+                if getattr(chunk, "usage_metadata", None) is not None:
+                    usage = chunk.usage_metadata
+            return {
+                "text": "".join(chunks),
+                "usage": {
+                    "tokens_in": getattr(usage, "prompt_token_count", 0) or 0,
+                    "tokens_out": getattr(usage, "candidates_token_count", 0) or 0,
+                },
+            }
         response = self._client.models.generate_content(
             model=model, contents=contents, config=config or None
         )
@@ -316,7 +351,8 @@ class GeminiClient:
     # -- one raw call: limiter + backoff + ledger -----------------------------
     def _call_once(self, role: str, model: str, contents, gen_config: dict, *,
                    correlation_id: str, attempt: int, audio_seconds: float = 0.0,
-                   purpose: str | None = None, is_user_turn: bool | None = None) -> dict:
+                   purpose: str | None = None, is_user_turn: bool | None = None,
+                   on_first_token: Callable[[], None] | None = None) -> dict:
         key = fixture_key(model, contents, gen_config)
         request = {"model": model, "contents": contents, "config": gen_config}
         started = time.monotonic()
@@ -326,11 +362,13 @@ class GeminiClient:
             if self.mode != "mock":
                 self._check_daily_cap()
                 self._limiter.acquire(model, sleep=self._sleep)
-                response = self._with_backoff(model, contents, gen_config)
+                response = self._with_backoff(model, contents, gen_config,
+                                              on_first_token)
                 if self.mode == "record":
                     self._fixtures.record(key, request, response)
             else:
-                response = self._transport.generate(model, contents, gen_config)
+                response = self._transport_generate(model, contents, gen_config,
+                                                    on_first_token)
         except Exception as exc:  # ledger must see failures too (§3.2)
             error = f"{type(exc).__name__}: {exc}"
             response = {"text": "", "usage": {"tokens_in": 0, "tokens_out": 0}}
@@ -562,12 +600,14 @@ class GeminiClient:
             raise RuntimeError(error)
         return response
 
-    def _with_backoff(self, model: str, contents, gen_config: dict) -> dict:
+    def _with_backoff(self, model: str, contents, gen_config: dict,
+                      on_first_token: Callable[[], None] | None = None) -> dict:
         delay = 1.0
         last: Exception | None = None
         for try_no in range(4):
             try:
-                return self._transport.generate(model, contents, gen_config)
+                return self._transport_generate(model, contents, gen_config,
+                                                on_first_token)
             except Exception as exc:
                 last = exc
                 if not _is_retryable(exc) or try_no == 3:
@@ -575,6 +615,24 @@ class GeminiClient:
                 self._sleep(delay)
                 delay *= 2
         raise last  # pragma: no cover
+
+    def _transport_generate(self, model: str, contents, gen_config: dict,
+                            on_first_token: Callable[[], None] | None = None) -> dict:
+        """One transport round-trip; tolerates doubles without the streaming kwarg.
+
+        An older test double that predates `on_first_token` is retried without
+        it (mirrors the daemon's _generate fallback). Its turns simply have no
+        early first-token signal — completion still counts as progress.
+        """
+        if on_first_token is None:
+            return self._transport.generate(model, contents, gen_config)
+        try:
+            return self._transport.generate(model, contents, gen_config,
+                                            on_first_token=on_first_token)
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc):
+                raise
+            return self._transport.generate(model, contents, gen_config)
 
     def _check_daily_cap(self) -> None:
         from .cost import day_start_iso
@@ -591,12 +649,19 @@ class GeminiClient:
     def generate(self, role: str, contents, *, gen_config: dict | None = None,
                  verify: Callable[[str], bool] | None = None,
                  audio_seconds: float = 0.0,
-                 purpose: str | None = None, is_user_turn: bool | None = None) -> HarnessResult:
+                 purpose: str | None = None, is_user_turn: bool | None = None,
+                 on_first_token: Callable[[], None] | None = None,
+                 max_attempts: int | None = None) -> HarnessResult:
         """Generate with verification-driven escalation.
 
         `verify` is deterministic code checking the proposal (schema,
         policy, exists?). Without a verifier there is nothing to escalate
         *on*, so a single cheapest-model call is made (§17.2).
+
+        `max_attempts` caps the scaffold (REJECT-2 / Bug 8: a chat reply is
+        regenerated ONCE on a verification rejection; the best attempt is then
+        DELIVERED, never silently binned — the caller logs the rule hit).
+        `on_first_token` threads the streaming first-token signal (BUG F).
         """
         gen_config = gen_config or {}
         correlation_id = uuid.uuid4().hex[:12]
@@ -613,7 +678,8 @@ class GeminiClient:
         tier = 0
         prompt = contents
         last_text, last_verified = "", None
-        while attempts < self._max_scaffold:
+        attempt_cap = self._max_scaffold if max_attempts is None else max(1, int(max_attempts))
+        while attempts < attempt_cap:
             model = ladder[min(tier, len(ladder) - 1)]
             attempts += 1
             response = self._call_once(
@@ -622,6 +688,7 @@ class GeminiClient:
                 audio_seconds=audio_seconds,
                 purpose=purpose or ("user_turn" if role == "chat" and is_user_turn else role),
                 is_user_turn=is_user_turn,
+                on_first_token=on_first_token,
             )
             last_text = response.get("text", "")
             if verify is None:

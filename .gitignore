@@ -17,3 +17,9 @@ near-miss/
 !ui/sounds/knock.wav
 # NOTE: fixtures/ IS committed on purpose — it is the shared debugging
 # artifact that lets mentors reproduce behaviour in mock mode (§12.9).
+
+# Wake-knock capture tooling: samples and wake clips live OUTSIDE the repo
+# (~/elaria-wake-samples/). These lines are a seatbelt, not a home.
+elaria-wake-samples/
+wake-clips/
+*.pcm
