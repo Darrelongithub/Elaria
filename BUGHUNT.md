@@ -171,6 +171,20 @@ and `ui/` to have zero callers before deletion:
 11. `src/assistant/transcribe.py` — `SilenceLadder.asked` property: 0 callers in `src/` or `tests/` (`_asked` is internal state).
 12. `src/assistant/voicetest.py` — `class FrameSource(Protocol)`: 0 references in `src/` or `tests/` (`AsyncFrameSource` is the active protocol).
 
+### Pass 2 removals (2026-10-20)
+
+Proven with `ruff` F401, `vulture src/ --min-confidence 80`, and a repo-wide
+`grep` returning zero references outside git history:
+
+13. `src/assistant/config.py` — `_file_sections()`: 0 callers after `validate_config()` was rewritten.
+14. `src/assistant/daemon.py` — `_speak_reply_async()`: superseded by `_speak_once()`; 0 callers.
+15. `src/assistant/daemon.py` — `persona.is_simple_turn` import: unused (ruff F401).
+16. `src/assistant/transcribe.py` — `from pathlib import Path as _P` (inside `_finalize`): unused (vulture 90 %).
+17. `src/assistant/waybar.py` — `json` import: unused after `parse_event_line()`.
+18. `src/assistant/console.py` — `json` import: unused after `parse_event_line()`.
+19. `tests/test_bugs_1_to_5_regressions.py` — 7 unused imports and 1 unused unpack (ruff F401/RUF059); no assertion changed.
+20. `tests/test_hardening_pass2.py` — unused `os` import and one bare expression.
+
 ## Verdict — Running Unattended in Shadow Mode
 
 **SAFE TO RUN UNATTENDED IN SHADOW MODE** (`[organise] mode = "shadow"`).
@@ -193,3 +207,65 @@ and `ui/` to have zero callers before deletion:
      `BH-H9`), knock reason/retirement gates (`BH-H10`..`BH-H14`), and show-off
      sandbox/biometric/leak boundaries (`BH-H15`..`BH-H20`) are all enforced and
      covered by regression tests.
+
+## Second hardening pass — `arena/8952fe51-elaria` (2026-10-20)
+
+Baseline measured in this checkout at `25179c8`, immediately before any edit:
+**1,280 passed / 6 skipped / 0 failed / 0 xfailed / 0 warnings**, ruff **17
+errors**, vulture **1 finding**.
+
+| Metric | Baseline `25179c8` | After pass 2 |
+|---|---:|---:|
+| Collected | 1,286 | 1,315 |
+| Passed | 1,280 | 1,309 |
+| Skipped | 6 | 6 (unchanged; all environmental) |
+| XFailed | 0 | 0 |
+| Failed | 0 | 0 |
+| Ruff | 17 errors | **0** |
+| Vulture (`--min-confidence 80`) | 1 | **0** |
+
+The previous table in this file records 1,281 collected at its "final"
+checkpoint; this checkout measured 1,286 before pass 2 (1,280 passed + 6
+skipped). Recorded rather than silently rewritten.
+
+### Fixed in pass 2 (all were reproduced red first)
+
+- **BH-I1** — explicit `gemini_voice_model` is no longer shadowed by the
+  deprecated `model_voice` alias (`Config.explicit_keys` records user intent).
+- **BH-I2** — `validate_config()` names poisoned enums/types/ranges/sections;
+  `Config.section()`, `organise_roots()` and `humour_profile_path()` degrade
+  safely; unknown keys warn in doctor.
+- **BH-I3** — `[console] history_limit` now reaches the daemon's sessions.
+- **BH-I4** — a reply that outlives the 1.5 s inline wait is spoken once
+  (`_speak_once()` + shielded task), not twice.
+- **BH-I5** — short real replies (`"No."`) are no longer discarded as echo after
+  the speaking guard expires.
+- **BH-I6** — show-off crash recovery purges only the demo sandbox; it no longer
+  deletes dictation and meeting recordings from `data_dir/audio`.
+- **BH-I7 / BH-I7b** — `initiative.status()["latest"]` is the newest pending
+  knock; a due knock that cannot be raised logs `knock_due_refused`.
+- **BH-I8** — `ipc.serve()` serialises check-unlink-bind with an exclusive
+  `<sock>.lock` flock and releases it on close.
+- **BH-I9** — malformed IPC replies raise `DaemonUnavailable`; event consumers
+  skip bad frames; reply drain is bounded; player timeouts are reported.
+- **BH-I10** — a failed catalogue refresh falls back to the verified cache
+  (stale cache preferred over the never-verified baseline); timestamp-less cache
+  rows are untrusted.
+- **BH-I11** — 8 new needy-framing paraphrases are refused.
+- **BH-I12** — guest turns are bounded by the same 4 s chat ceiling as owner
+  turns; the timeout speaks a fallback instead of freezing the demo.
+- **BH-I13** — Waybar/console event streams survive malformed lines.
+
+Guard tests: `tests/test_hardening_pass2.py` (29 cases). Pre-fix: 24 failed /
+4 passed (the 29th was added when the stale-cache fallback was tightened).
+Corrected test: `test_bh_h20_showoff_crash_exit_residue_cleaned_on_restart` had
+encoded BH-I6 (deleting `data_dir/audio`) as the contract; its remaining BH-H20
+assertions were preserved and a meeting recording now proves the fix.
+
+### Verdict — unchanged direction, pass 2
+
+Shadow mode remains **safe to run unattended**. Pass 2 added no new blocking
+defects; it removed the only data-loss path introduced by the previous pass
+(BH-I6) and closed the last two-daemon race (BH-I8). Live mode, dictation
+cleanup, and unattended show-off remain **not** approved for unattended use
+(the voice/ASR stack still depends on the network and on a real device).

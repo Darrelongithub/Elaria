@@ -451,3 +451,136 @@ and `vulture src/ --min-confidence 80` clean):
 - `ruff check .`: **All checks passed!**
 - `vulture src/ --min-confidence 80`: **0 unused definitions.**
 
+
+## 2026-10-20 — Hardening pass 2 (BH-I1…BH-I13, `arena/8952fe51-elaria`)
+
+Baseline measured before any edit (`25179c8`): **1,280 passed, 6 skipped,
+0 failed**; `ruff check .` **17 errors**; `vulture src/ --min-confidence 80`
+**1 finding**.
+
+### Config (BH-I1, BH-I2)
+
+- `Config.explicit_keys` / `Config.explicit(section, key)`: `load_config()`
+  records which keys the owner's TOML actually named, so precedence decisions
+  can use intent instead of value equality. `voice_model()` now gives an
+  explicit `gemini_voice_model` priority over a stale `model_voice`; the alias
+  is still read when it is the only key. Removed the legacy default is named by
+  a constant (`REMOVED_TTS_MODEL`) rather than an inline literal.
+- `Config.section()` returns `{}` for a non-table section; `humour_profile_path()`
+  no longer assumes `str`; `organise_roots()` validates every entry and raises a
+  named `TypeError`/`ValueError` (`path` required, `mode` in shadow|live,
+  taxonomy shape).
+- `validate_config()` rewritten from scratch. It now enumerates the known
+  sections/keys (unknown keys and deprecated keys are named warnings, not
+  silence), rejects non-table sections, validates enums (`gemini.mode`,
+  `connectivity.mode`, `tts.online_voice`, `tts.offline_voice`, `tts.backend`,
+  `organise.mode`), types (`allowed_voices` list, booleans), ranges (speaker,
+  length_scale, sample rates, chunk_ms, confidences, health_port,
+  console.history_limit, snooze_hours, retire_after_ignores, showoff.timeout_s,
+  transcribe timings), `[class_schedule]` days and `HH:MM` times, audition ids,
+  and `[quota]` rows (`rpm|tpm|rpd` numeric or `"unlimited"`). The doctor's
+  `config schema` check consumes the same function.
+- Deleted `config._file_sections`: after the rewrite it had zero callers
+  (`grep -rn _file_sections` → 0 hits outside git history).
+
+### Daemon, speech, sessions (BH-I3, BH-I4, BH-I5, BH-I12)
+
+- Daemon constructs `SessionService(..., history_limit=<console.history_limit>)`
+  (poisoned value falls back to 200; `validate_config()` names the key).
+- Replaced the duplicated speech paths with `_speak_once()` (one synthesis, one
+  half-duplex flag, `finally` clears it) and made `_maybe_speak_reply()`
+  `await asyncio.wait_for(asyncio.shield(task), 1.5)`, so a timeout keeps
+  waiting on the same task instead of starting a second `speak()`.
+  Deleted `_speak_reply_async()` — zero references remained after the merge.
+- `_is_echo()` reverse containment now requires ≥3 words.
+- Added `Daemon._chat_timeout_s = 4.0` and `_generate()`: every chat call
+  (owner turn and guest turn) is bounded, and the test-double `TypeError`
+  fallback lives in one place. `_guest_turn` returns a spoken fallback on
+  timeout; `_ask` uses `_generate()` and raises `live.timeout`.
+- `_broadcast` no longer swallows subscriber failures with `pass`: it drops the
+  subscriber and prints why. Corrupt relationship-state rows print their error
+  instead of vanishing.
+
+### Store and initiative (BH-I7, BH-I7b)
+
+- `Store.deactivate_facts(ids)`: one public transaction for declined
+  commitments. `InitiativeService.decline()` no longer touches `store._lock` /
+  `store._conn`.
+- `initiative.status()["latest"]` is `pending[0]` (newest; the query is id DESC).
+- A due knock that cannot be raised writes a `knock_due_refused` persona event
+  (id, topic, reason) instead of `except InitiativeError: continue`.
+- `snooze()` rejects non-finite/negative hours (`math.isfinite`), which could
+  previously produce an unsatisfiable `until` or a past deadline.
+- Added `math` import; removed the raw SQL that duplicated `deactivate_facts`.
+
+### IPC, Waybar, console (BH-I8, BH-I9, BH-I13)
+
+- `ipc.serve()` takes an exclusive `flock` on `<socket>.lock` (module-level
+  `_acquire_daemon_lock`/`_release_daemon_lock`), releases it on any bind
+  failure, and releases it from the server's `close()` wrapper. Second daemons
+  raise `RuntimeError("another daemon is already running …")`; a stale lock file
+  from a dead process is harmless because the kernel drops the lock.
+- `call()` parses replies through `_parse_reply_frame()`, which raises
+  `DaemonUnavailable` with the offending frame prefix instead of leaking
+  `JSONDecodeError`/`AttributeError`. `_write_reply()` bounds `drain()` at 5 s
+  and treats a missed deadline as a disconnect.
+- Added `ipc.parse_event_line()`; `subscribe_events()`, `waybar.stream_waybar()`
+  and `console.follow()` share it and skip non-object frames.
+- Waybar module docstring class list now includes `company` and `showoff`
+  (both emitted by `format_waybar()` and styled in `ui/waybar/style.css`).
+- Removed now-unused `json` imports in `waybar.py` and `console.py` (ruff F401).
+
+### Show-off (BH-I6)
+
+- `_reconcile()` no longer globs `data_dir/audio`. It calls
+  `_purge_sandbox_audio()`, which walks only `self.sandbox_path()` (never if it
+  is a symlink), removes `DEMO_AUDIO_SUFFIXES`, logs `residue_purged` /
+  `residue_purge_failed` persona events, and leaves dictation/meeting WAVs
+  untouched.
+- Corrected `test_bh_h20_showoff_crash_exit_residue_cleaned_on_restart`:
+  the old test asserted deletion of `data_dir/audio/*.wav`, i.e. it encoded
+  BH-I6 as the expected contract. It now plants a demo file in the sandbox and a
+  meeting recording in `data_dir/audio`, and asserts the first is purged and the
+  second survives. Corrected (not deleted) because the remaining BH-H20
+  assertions — session closed, `exit_reason="daemon_restart"`, `audio_retained=0`,
+  `guests_heard=1` — are still the contract.
+
+### TTS and voice catalogue (BH-I2, BH-I9, BH-I10)
+
+- `tts._as_int()` / `_as_float()` coerce descriptor fields with clamps
+  (`speaker >= 0`, `length_scale > 0`, default 0.92) on both
+  `VoiceDescriptor.from_dict()` and `descriptor()`; poisoned values no longer
+  raise `ValueError: invalid literal for int()` inside status/speak.
+- `play_audio()` catches `subprocess.TimeoutExpired` and `OSError`, records the
+  reason in `last_voice_error`, and returns `False`.
+- `voice_catalogue.load_cached()` refuses rows without `retrieved` when a max
+  age is requested; `resolve_catalogue()` treats `refresh=True` with
+  `fetched=None` as "attempted but failed" and returns the verified cache,
+  annotating the baseline only when no cache exists.
+- `initiative.NEEDY_PATTERNS` gained 8 paraphrases (BH-I11).
+- One test was added *with* its tightening rather than before it:
+  `test_catalogue_refresh_uses_stale_verified_cache_before_baseline`
+  (BH-I10). The original BH-I10 contract ("a failed refresh must fall back
+  to the verified cache") was pinned red-first; the stale-beyond-TTL case
+  is a deliberate strengthening of that same contract.
+
+### Dead code removed (proof: `ruff F401`, `vulture`, or `grep` = 0 references)
+
+- `src/assistant/config.py`: `_file_sections` (0 callers after rewrite).
+- `src/assistant/daemon.py`: `_speak_reply_async` (duplicate speech path; 0 refs),
+  `is_simple_turn` import (ruff F401).
+- `src/assistant/transcribe.py`: `from pathlib import Path as _P` inside
+  `_finalize` (unused; vulture 90 %).
+- `src/assistant/waybar.py`, `src/assistant/console.py`: `json` imports (F401).
+- `tests/test_bugs_1_to_5_regressions.py`: 7 unused imports plus one unused
+  unpack (ruff F401/RUF059). No assertions changed.
+- `tests/test_hardening_pass2.py`: unused `os` import and a bare expression.
+
+### Tests
+
+- Added `tests/test_hardening_pass2.py` (28 cases, sandbox-only, fake UNIX
+  sockets and fake transports; no real key, voiceprint, or user folder).
+  Pre-fix run: **24 failed, 4 passed**.
+- Suite after fixes: **1,308 passed, 6 skipped, 0 failed, 0 xfailed, 0 warnings**
+  (`pytest -q --tb=line`, 45.2 s). `ruff check .`: **All checks passed!**
+  `vulture src/ --min-confidence 80`: **0 findings**.
