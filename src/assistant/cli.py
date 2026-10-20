@@ -5,11 +5,15 @@ Kept deliberately light (stdlib + ipc) so Hyprland binds can exec it at
 first thing you run when something breaks, so it must not depend on the
 thing that might be broken (GETTING-STARTED Step 5.8).
 
-`assist doctor` converts "I think it's set up" into facts, including the
-two facts this environment could NOT establish for the owner:
+`assist doctor` converts "I think it's set up" into facts. Since Stage A
+(2026-10-20) the quota shape is read from `[quota]` in config: when the owner's
+verified marker is present the real figures are printed and the old assumed
+numbers are gone; without the marker the warning comes back deliberately.
+
+Two facts still need the owner's machine:
   - Hyprland version -> Lua (0.55+) vs legacy .conf bind syntax (§3.3)
-  - Free-tier quota shape -> reported as ASSUMED-UNVERIFIED until checked
-    at aistudio.google.com/rate-limit on the owner's account (§11, Step 0)
+  - the exact Live model id -> `assist voice models` runs a real models.list
+    and shows the voice catalogue the warm path will validate against
 """
 
 from __future__ import annotations
@@ -84,22 +88,58 @@ def run_doctor(config) -> dict:
         "gemini mode", True,
         f"{config.gemini_mode} (source: {config.gemini_mode_source})"))
 
-    # Quota shape — the load-bearing assumption (§12.3, Step 0).
+    # Quota shape — read from config, never re-invented (Step 0, 2026-10-20).
+    # Once the owner's verified numbers are in [quota], the old assumed figures
+    # must not be printed again: crying wolf after verification trains the user
+    # to ignore the check.
+    from .config import quota_is_verified, quota_rows
+
     quota = config.section("quota")
-    checks.append(_check(
-        "quota shape", False,
-        f"ASSUMED, UNVERIFIED: Flash {quota.get('flash_rpm')} RPM / 250k TPM / ~1500 RPD; "
-        f"Flash-Lite {quota.get('flash_lite_rpm')} RPM / ~1000 RPD; Live 3 concurrent / 1M TPM. "
-        "VERIFY on YOUR account at aistudio.google.com/rate-limit: (1) Live models free-tier "
-        "eligible, (2) exact RPM/TPM/RPD, (3) exact model IDs — then fix config.toml. "
-        "If free Live is NOT available, stop: transcription falls back to batch (§12.7) "
-        "and Phase 1 changes shape."))
+    if quota_is_verified(quota):
+        rows = quota_rows(quota)
+        def _fmt(row: dict) -> str:
+            rpm = ("unlimited" if row["unlimited_rpm"] else
+                   f"{row['rpm']} RPM" if row.get("rpm") not in (None, "")
+                   else "RPM n/a")
+            tpm = (f"{int(row['tpm']):,} TPM" if row.get("tpm") not in (None, "")
+                   else "TPM n/a")
+            rpd = ("unlimited" if row["unlimited_rpd"] else
+                   f"{row['rpd']} RPD" if row.get("rpd") not in (None, "")
+                   else "RPD n/a")
+            return f"{row['model']}: {rpm} / {tpm} / {rpd}"
+        checks.append(_check(
+            "quota shape", True,
+            f"VERIFIED {quota.get('verified_at', '')} ({quota.get('verified_source', 'owner')}): "
+            + " · ".join(_fmt(row) for row in rows)
+            + " — read from [quota] in config; no assumed figures printed"))
+    else:
+        checks.append(_check(
+            "quota shape", False,
+            "ASSUMED, UNVERIFIED: no verified numbers in [quota] — run the Step 0 "
+            "check at aistudio.google.com/rate-limit on YOUR account, then set "
+            "[quota] verified = true with rpm/tpm/rpd per model. Until then these "
+            "figures are guesses and treated as such."))
+    voice_model = config.voice_model()
     checks.append(_check(
         "model ids", False,
         "configured: " + ", ".join(sorted({
             config.model_for_role(r) for r in
-            ("default", "organise", "cleanup", "chat", "transcribe_live", "transcribe_batch")}))
-        + " — unverified until a live models.list (names churn, §11.3)"))
+            ("default", "organise", "cleanup", "chat", "transcribe_live",
+             "transcribe_batch", "voice")}))
+        + f" · voice route: {voice_model} (Live native audio)"
+        + " — unverified until a live models.list (names churn, §11.3); "
+          "run `assist voice models` on the owner's machine"))
+    # Stage A: Flare is a LIVE voice. A TTS-preview model in this key is the
+    # exact configuration that produced "Voice name Flare is not supported".
+    checks.append(_check(
+        "voice model", "tts" not in voice_model.lower() and "live" in voice_model.lower(),
+        (f"{voice_model} — a Live model routes Flare through native audio"
+         if "live" in voice_model.lower() and "tts" not in voice_model.lower() else
+         f"{voice_model} is NOT a Live native-audio model. Flare is a Live voice; "
+         "set [gemini] gemini_voice_model to a Live model (default "
+         "gemini-3.8-live). A TTS-preview model rejects Flare with 'Voice name "
+         "Flare is not supported'."),
+        warn_only=False))
 
     hypr = hyprland_info()
     checks.append(_check(
@@ -417,6 +457,8 @@ def _voice_command(args, config) -> int:
         return 0 if not report["remaining"] and not report["failed"] else 1
     if action == "status":
         method, params = "speech.status", {}
+    elif action == "models":
+        method, params = "speech.models", {}
     elif action == "warm":
         method, params = "speech.warm", {}
     elif action == "audition":
@@ -427,13 +469,17 @@ def _voice_command(args, config) -> int:
         method, params = "speech.say", {"text": args.text, "play": not args.no_play}
     try:
         out = call(config.socket_path, method, params,
-                   timeout=600.0 if action in ("audition", "warm", "say") else 15.0)
+                   timeout=600.0 if action in ("audition", "warm", "say") else 30.0)
     except (DaemonUnavailable, RuntimeError, OSError):
         store = _local_store(config)
         speech = SpeechService(config, store)
         try:
             if action == "status":
                 out = {"voice": speech.status()}
+            elif action == "models":
+                from .gemini_client import GeminiClient
+
+                out = GeminiClient(config, store).list_models()
             elif action == "warm":
                 out = {"warmed": speech.warm_ack_cache(), "voice": speech.status()}
             elif action == "audition":
@@ -663,6 +709,10 @@ def build_parser() -> argparse.ArgumentParser:
     say_p = voice_sub.add_parser("say", help="speak text through the one local voice")
     say_p.add_argument("text")
     say_p.add_argument("--no-play", action="store_true", help="synthesize only")
+    voice_sub.add_parser(
+        "models",
+        help="real models.list + voice catalogue: the exact Live model id and "
+             "allowed voices (owner's machine; key needed for VERIFIED)")
     voice_sub.add_parser("warm", help="pre-synthesize the four standard acks")
     voice_sub.add_parser("cleanup",
                          help="release the mic/sink from audio processes a killed daemon left")

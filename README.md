@@ -32,15 +32,24 @@ the owner agrees with.
 This code was built and tested in a headless container (no Hyprland, no
 PipeWire, no API key — `assist doctor` says so honestly). On your Fedora box:
 
-### 1. Step 0 — quota shape (the load-bearing assumption, blueprint §12.3/§11)
+### 1. Step 0 — quota shape (**now verified in config**)
 
-1. Go to **`aistudio.google.com/rate-limit`** on your account.
-2. Confirm **Live** models are free-tier eligible. If they are not, **stop** —
+The owner-verified shape (2026-10-20) is committed in `[quota]`:
+Flash **5 RPM / 250K TPM / 20 RPD**, Flash-Lite **15 / 250K / 500**,
+Transcribe Live **unlimited / 20K TPM**, batch Transcribe **25 RPD**.
+`[quota] verified = true` makes `assist doctor` print these real figures and
+stops the old assumed-number warning; remove the marker and the warning comes
+back deliberately.
+
+Still confirm, once, on your own account:
+1. **Live** models are free-tier eligible. If they are not, **stop** —
    transcription falls back to batch (§12.7) and Phase 1 changes shape.
-3. Note the real **RPM / TPM / RPD** for Flash and Flash-Lite and the **exact
-   model IDs** offered. Fix the `VERIFY` values in your `config.toml`
-   (from `config.toml.example`). Until then `assist doctor` correctly
-   reports the quota shape as **ASSUMED, UNVERIFIED**.
+2. The **exact Live model id** offered to your project:
+   ```bash
+   assist voice models     # real models.list + the voice catalogue warm will use
+   ```
+   Stage A defaults to `gemini-3.8-live` (GA, Live native audio). The key is
+   `[gemini] gemini_voice_model`; a TTS-preview model there is a doctor FAILURE.
 4. One project, one key (§12.8 — key rotation gets projects zeroed):
    ```bash
    mkdir -p ~/.config/assistant
@@ -174,6 +183,22 @@ correct `voice` or widen `allowed_voices` on purpose. Changing her
 voice therefore means editing both keys and running `assist voice warm`:
 spoken audio and the ack cache are keyed on the voice and model that are
 actually live, so old audio can never be served under a new identity.
+
+**Stage A (2026-10-20) — Flare is a Live voice, so native audio rides a Live
+model.** The live repro (`Voice name Flare is not supported`) came from
+`gemini-2.5-flash-preview-tts`. Now:
+- `[gemini] gemini_voice_model = "gemini-3.8-live"` (replaces that TTS id).
+- ack warm, `voice say`, command replies and conversational speech all open a
+  **Live** session (`response_modalities: ["AUDIO"]`), never a TTS-preview call;
+- at warm time the model is checked against a real `models.list` and the voice
+  against that model's **real catalogue** (`voices.list()`, cached in the
+  store). A mismatch fails with the allowed list in the error — never a
+  substitution and never a mid-sentence 400;
+- `voice_identity()` now says *verified* when it passes (the old code claimed
+  `allowed=true` while its `reason` still said "refused … not canonical");
+- `assist doctor` reads quota from config and prints `VERIFIED`, not assumptions.
+- `model_transcribe_batch = "gemini-3.5-transcribe"` (dedicated batch STT, not
+  Flash-Lite).
 
 ## §10 open decisions — defaults taken, awaiting your word
 

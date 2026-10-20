@@ -19,7 +19,9 @@ This client is NEVER on the ack path (§18): acks are local (persona.ack).
 
 from __future__ import annotations
 
+import asyncio
 import re
+import threading
 import time
 import uuid
 from collections import deque
@@ -27,8 +29,43 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from .config import voice_model as configured_voice_model
 from .cost import estimate_tokens, iso_now, shadow_cost_usd
 from .fixtures import FixtureStore, fixture_key
+from .voice_catalogue import (
+    live_catalogue,
+    resolve_catalogue,
+    validate_or_raise,
+)
+
+
+def _run_coroutine_sync(factory):
+    """Run an async SDK call from sync code, safely from any thread.
+
+    TTS calls arrive on a worker thread (asyncio.to_thread), so there is no
+    running loop there and asyncio.run() is correct. If a caller ever has a loop
+    running, a private thread keeps the event loop contract intact instead of
+    exploding with "asyncio.run() cannot be called from a running event loop".
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(factory())
+
+    box: dict = {}
+
+    def runner():
+        try:
+            box["value"] = asyncio.run(factory())
+        except BaseException as exc:  # re-raised in the caller's thread
+            box["error"] = exc
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 class Transport(Protocol):
@@ -107,36 +144,100 @@ class _SdkTransport:
         }
 
     def generate_audio(self, model: str, text: str, voice_name: str) -> dict:
+        """Native audio from a LIVE model (Stage A fix).
+
+        The previous implementation used `models.generate_content` with a
+        TTS-preview model. Flare is a Live voice, so that request failed with
+        "Voice name Flare is not supported". A Live session is opened instead,
+        the text is sent as one user turn, and the returned 24 kHz PCM parts are
+        concatenated. The voice name is exactly the configured one — never a
+        substitute.
+        """
         from google.genai import types
 
-        config = types.GenerateContentConfig(
+        config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
                 )
             ),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
         )
-        response = self._client.models.generate_content(model=model, contents=text, config=config)
-        part = response.candidates[0].content.parts[0].inline_data
-        rate = 24000
-        mime = str(getattr(part, "mime_type", "") or "")
-        match = re.search(r"rate=(\d+)", mime)
-        if match:
-            rate = int(match.group(1))
-        usage = getattr(response, "usage_metadata", None)
-        return {
-            "pcm": bytes(part.data),
-            "sample_rate": rate,
-            "voice_name": voice_name,
-            "usage": {
-                "tokens_in": getattr(usage, "prompt_token_count", 0) or 0,
-                "tokens_out": getattr(usage, "candidates_token_count", 0) or 0,
-            },
-        }
+
+        async def render() -> dict:
+            pcm = bytearray()
+            rate = 24000
+            tokens_in = 0
+            tokens_out = 0
+            async with self._client.aio.live.connect(model=model, config=config) as session:
+                sent = False
+                if hasattr(session, "send_client_content"):
+                    try:
+                        await session.send_client_content(
+                            turns={"role": "user", "parts": [{"text": text}]},
+                            turn_complete=True)
+                        sent = True
+                    except TypeError:
+                        sent = False
+                if not sent:
+                    # Older SDK shape: realtime text input ends the turn itself.
+                    await session.send_realtime_input(text=text)
+                async for message in session.receive():
+                    usage = getattr(message, "usage_metadata", None)
+                    if usage is not None:
+                        tokens_in = max(tokens_in,
+                                        int(getattr(usage, "prompt_token_count", 0) or 0))
+                        tokens_out = max(tokens_out,
+                                         int(getattr(usage, "candidates_token_count", 0) or 0))
+                    content = getattr(message, "server_content", None)
+                    if content is None:
+                        continue
+                    turn = getattr(content, "model_turn", None)
+                    for part in getattr(turn, "parts", None) or []:
+                        inline = getattr(part, "inline_data", None)
+                        data = getattr(inline, "data", None) if inline is not None else None
+                        if data:
+                            pcm.extend(data)
+                            mime = str(getattr(inline, "mime_type", "") or "")
+                            match = re.search(r"rate=(\d+)", mime)
+                            if match:
+                                rate = int(match.group(1))
+                    if getattr(content, "turn_complete", False):
+                        break
+            return {"pcm": bytes(pcm), "sample_rate": rate,
+                    "voice_name": voice_name,
+                    "usage": {"tokens_in": tokens_in, "tokens_out": tokens_out}}
+
+        result = _run_coroutine_sync(render)
+        if not result.get("pcm"):
+            raise RuntimeError(
+                f"the Live model {model} returned no audio for voice {voice_name!r}; "
+                "nothing is spoken rather than substituting another voice")
+        return result
 
     def list_models(self) -> list[str]:
-        return [m.name for m in self._client.models.list()]
+        return [str(getattr(m, "name", m)).removeprefix("models/")
+                for m in self._client.models.list()]
+
+    def list_voices(self) -> list[str]:
+        """Ids from the Voices API (`voices.list`), prebuilt + stored.
+
+        Prebuilt catalogue voices use the speaker name as their id (docs,
+        2026-10-16), which is exactly the string `voice_name` expects. A project
+        that has access to Flare through the Live roster returns it here; if the
+        API does not expose it, the live catalogue honestly omits it and warm
+        refuses with the allowed list instead of failing mid-sentence.
+        """
+        names: list[str] = []
+        voices = getattr(self._client, "voices", None)
+        for voice in voices.list() if voices is not None else []:
+            for attr in ("id", "name", "display_name"):
+                value = getattr(voice, attr, None)
+                if value:
+                    names.append(str(value).removeprefix("voices/"))
+                    break
+        return sorted({name for name in names if name})
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -203,6 +304,7 @@ class GeminiClient:
         self._escalate_after = int(gemini.get("escalate_after_failures", 2))
         self._max_scaffold = int(gemini.get("max_scaffold_calls", 6))
         self._daily_cap = int(quota.get("max_requests_per_day", 1200))
+        self._catalogue_memo: dict | None = None
 
     # -- one raw call: limiter + backoff + ledger -----------------------------
     def _call_once(self, role: str, model: str, contents, gen_config: dict, *,
@@ -259,18 +361,107 @@ class GeminiClient:
         configured = str(voice or gemini.get("voice") or "Flare")
         effective, allowed = resolve_voice(self.config, configured)
         return {
-            "model": str(gemini.get("model_voice") or "gemini-2.5-flash-preview-tts"),
+            "model": self.voice_model(),
             "voice_name": effective or configured,
             "voice_requested": configured,
             "voice_allowed": allowed,
             "canonical_voices": list(canonical_voices(self.config)),
             "response_modalities": ["AUDIO"],
+            "api": "live",
             "text": text,
         }
 
     def can_speak(self) -> bool:
         """Native audio needs a real transport; mock fixtures cannot synthesise it."""
         return self.mode != "mock" and hasattr(self._transport, "generate_audio")
+
+    # -- Stage A: model + voice catalogue validation --------------------------
+    def voice_model(self) -> str:
+        """`[gemini] gemini_voice_model` — the Live model that offers Flare."""
+        return configured_voice_model(self.config)
+
+    def resolve_voice_model(self) -> dict:
+        """Check the configured Live model against a REAL models.list.
+
+        Live mode: one `models.list` call, filtered to the model the config
+        names. A model that is absent is a refusal with the live model names in
+        the error, never a guess. Mock: configured-only, honestly unverified.
+        """
+        configured = self.voice_model()
+        if not isinstance(self._transport, _SdkTransport) or self.mode == "mock":
+            return {
+                "model": configured, "verified": False,
+                "live_models": [], "reason": (
+                    "mock/no-key — the Live model id is unverified until a live "
+                    "models.list runs on the owner's machine (`assist voice models`)"),
+            }
+        try:
+            names = self._transport.list_models()
+        except Exception as exc:
+            return {
+                "model": configured, "verified": False, "live_models": [],
+                "reason": f"models.list failed: {type(exc).__name__}: {exc}",
+            }
+        live_models = [name for name in names if "live" in name.lower()]
+        matched = next((name for name in names
+                        if name == configured or name.split("/")[-1] == configured), None)
+        if matched is None:
+            raise RuntimeError(
+                f"[gemini] gemini_voice_model = {configured!r} is not in the live "
+                f"model list. Live models this key can see: "
+                f"{', '.join(live_models) or '(none)'}. Fix the key deliberately; "
+                f"never fall back to a TTS-preview model (Flare is a Live voice).")
+        return {"model": matched, "verified": True, "live_models": live_models,
+                "reason": f"{matched!r} is present in the real models.list"}
+
+    def voice_catalogue(self, *, refresh: bool = False) -> dict:
+        """The real voice catalogue for the configured model, cached at warm.
+
+        One live fetch per warm cycle, memoised for the rest of the process so a
+        conversational turn does not spend an extra API call on every sentence.
+        """
+        model = self.voice_model()
+        if (not refresh and self._catalogue_memo is not None
+                and self._catalogue_memo.get("model") == model):
+            return self._catalogue_memo
+        fetched = None
+        if isinstance(self._transport, _SdkTransport) and self.mode != "mock":
+            try:
+                voices = self._transport.list_voices()
+            except Exception:
+                voices = []
+            if voices:
+                from .voice_catalogue import _read_baseline
+
+                fetched = live_catalogue(model, voices, baseline=_read_baseline())
+        catalogue = resolve_catalogue(model, store=self.store, fetched=fetched,
+                                     refresh=refresh)
+        self._catalogue_memo = catalogue
+        return catalogue
+
+    def validate_speech_config(self) -> dict:
+        """Warm-time gate: model in models.list AND voice in its catalogue.
+
+        This is the check the user's machine was missing: it fails with the
+        allowed list before any ack is rendered, so silence is explained and
+        `assist doctor` can name the fix.
+        """
+        request = self.voice_request("warm")
+        if not request["voice_allowed"]:
+            raise RuntimeError(
+                f"voice {request['voice_requested']!r} is not canonical "
+                f"(allowed: {', '.join(request['canonical_voices'])}); refusing "
+                f"to warm audio in an unapproved voice")
+        model_check = self.resolve_voice_model()
+        catalogue = self.voice_catalogue(refresh=True)
+        validation = validate_or_raise(self.voice_model(), request["voice_name"],
+                                       catalogue)
+        return {"model": model_check, "catalogue": {
+            "source": catalogue.get("source"),
+            "verified": bool(catalogue.get("verified")),
+            "retrieved": catalogue.get("retrieved"),
+            "voices": catalogue.get("voices", []),
+        }, "voice": validation}
 
     def generate_voice(self, text: str, *, voice: str | None = None,
                        correlation_id: str = "-") -> dict:
@@ -291,6 +482,10 @@ class GeminiClient:
                 "spoken (the local voice is dormant by amendment 2026-10-20)"
             )
         model = request["model"]
+        # Validate before the transport sees a request. A wrong voice is a
+        # refusal naming the allowed list, not a 400 halfway through a sentence.
+        catalogue = self.voice_catalogue()
+        validate_or_raise(model, request["voice_name"], catalogue)
         key = fixture_key(model, text, {"voice_name": request["voice_name"]})
         started = time.monotonic()
         error: str | None = None
@@ -314,7 +509,19 @@ class GeminiClient:
                                       {"text": "", "usage": response.get("usage", {}),
                                        "note": "pcm audio is not stored in json fixtures"})
         except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+            detail = f"{type(exc).__name__}: {exc}"
+            # The API's own rejection of a voice is the final word. Append the
+            # catalogue so the operator sees the allowed list, not just "not
+            # supported", and never substitute a different voice to get audio.
+            if "voice" in str(exc).lower():
+                try:
+                    allowed = self.voice_catalogue(refresh=True).get("voices", [])
+                except Exception:
+                    allowed = []
+                if allowed:
+                    detail += (f" — allowed voices for {model}: "
+                               f"{', '.join(allowed)}")
+            error = detail
         latency_ms = (time.monotonic() - started) * 1000
         usage = response.get("usage") or {}
         seconds = len(response.get("pcm", b"")) / 2 / max(1, int(response.get("sample_rate", 24000)))
@@ -480,18 +687,42 @@ class GeminiClient:
         return text
 
     def list_models(self) -> dict:
-        """For `assist doctor`: live list when possible, else configured set."""
+        """For `assist voice models`/doctor: the real list, with voice routing.
+
+        The configured set now includes the voice role: a TTS-preview model here
+        would reintroduce the Flare bug, so it is displayed alongside the Live
+        model rather than hidden among chat models.
+        """
         configured = sorted({self.config.model_for_role(r) for r in
                              ("default", "organise", "cleanup", "chat",
-                              "transcribe_live", "transcribe_batch")})
+                              "transcribe_live", "transcribe_batch", "voice")})
+        catalogue = self.voice_catalogue()
+        request = self.voice_request("inspect")
+        result = {
+            "configured": configured,
+            "voice_model": self.voice_model(),
+            "voice": request["voice_name"],
+            "voice_allowed_by_policy": request["voice_allowed"],
+            "catalogue": {
+                "model": catalogue.get("model"),
+                "source": catalogue.get("source"),
+                "verified": bool(catalogue.get("verified")),
+                "retrieved": catalogue.get("retrieved"),
+                "count": len(catalogue.get("voices") or []),
+                "allowed": catalogue.get("voices") or [],
+            },
+        }
         if isinstance(self._transport, _SdkTransport) and self.mode != "mock":
             try:
                 live = self._transport.list_models()
-                return {"verified": True, "models": live,
-                        "configured_missing": [m for m in configured
-                                               if not any(m in name for name in live)]}
+                missing = [m for m in configured
+                           if not any(m == name or m in name for name in live)]
+                return {**result, "verified": True, "models": live,
+                        "live_models": [m for m in live if "live" in m.lower()],
+                        "configured_missing": missing}
             except Exception as exc:
-                return {"verified": False, "models": configured,
+                return {**result, "verified": False, "models": configured,
                         "error": f"{type(exc).__name__}: {exc}"}
-        return {"verified": False, "models": configured,
-                "error": "mock/no-key — model IDs unverified until a live call (see §11)"}
+        return {**result, "verified": False, "models": configured,
+                "error": ("mock/no-key — model IDs unverified until a live "
+                          "models.list (see §11)")}

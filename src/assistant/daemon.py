@@ -244,6 +244,7 @@ class Daemon:
             "mode.set": self._mode_set,
             "mode.refresh": self._mode_refresh,
             "speech.status": self._speech_status,
+            "speech.models": self._speech_models,
             "speech.say": self._speech_say,
             "speech.warm": self._speech_warm,
             "speech.audition": self._speech_audition,
@@ -440,6 +441,10 @@ class Daemon:
 
     async def _speech_status(self, params: dict) -> dict:
         return {"voice": self.speech.status()}
+
+    async def _speech_models(self, params: dict) -> dict:
+        """`assist voice models`: the real list, never a remembered model name."""
+        return await asyncio.to_thread(self.client.list_models)
 
     async def _speech_say(self, params: dict) -> dict:
         text = str(params.get("text") or "").strip()

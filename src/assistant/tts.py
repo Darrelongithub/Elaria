@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import canonical_voices, resolve_voice
+from .config import voice_model as config_voice_model
 from .proc import child_kwargs
 
 # The ack strings are load-bearing for audibility, not style. This voice cannot
@@ -298,13 +299,21 @@ class SpeechService:
         """
         configured, canonical = self.configured_voice(), canonical_voices(self.config)
         effective, allowed = resolve_voice(self.config)
+        model = config_voice_model(self.config)
+        if allowed:
+            # Regression (Stage A): `allowed` used to be True while `reason` still
+            # read "refused ... not canonical". A pass must read as a pass.
+            reason = (f"voice identity verified: [gemini] voice = {configured!r} is "
+                      f"canonical (allowed: {', '.join(canonical)}) and routes through "
+                      f"the Live model {model!r}")
+        else:
+            reason = (f"voice identity refused: [gemini] voice = {configured!r} is not "
+                      f"canonical (allowed: {', '.join(canonical)}); she will not speak "
+                      f"in an unapproved voice — correct [gemini] voice, or widen "
+                      f"[gemini] allowed_voices deliberately")
         return {
             "configured": configured, "canonical": list(canonical), "allowed": allowed,
-            "effective": effective,
-            "reason": (f"voice identity refused: [gemini] voice = {configured!r} is not "
-                       f"canonical (allowed: {', '.join(canonical)}); she will not speak "
-                       f"in an unapproved voice — correct [gemini] voice, or widen "
-                       f"[gemini] allowed_voices deliberately"),
+            "effective": effective, "model": model, "reason": reason,
         }
 
     def cloud_cache_identity(self) -> dict:
@@ -317,7 +326,7 @@ class SpeechService:
         gemini = self.config.section("gemini") if self.config else {}
         return {
             "voice": self.voice_identity()["effective"] or self.configured_voice(),
-            "model": str(gemini.get("model_voice") or "gemini-2.5-flash-preview-tts"),
+            "model": config_voice_model(self.config),
             "sample_rate": int(gemini.get("voice_sample_rate", 24000)),
         }
 
@@ -349,7 +358,8 @@ class SpeechService:
             "offline_output": "text only: Waybar, overlay, notification, log - no speech",
             "gemini_native_audio": speaking_gemini,
             "gemini_voice": identity["effective"] or gemini.get("voice", "Flare"),
-            "gemini_voice_model": gemini.get("model_voice", "gemini-2.5-flash-preview-tts"),
+            "gemini_voice_model": config_voice_model(self.config),
+            "gemini_voice_api": "live",
             "voice_identity": identity,
             "cache_identity": (self.cloud_cache_identity() if speaking_gemini else
                                {"voice": backend.voice_id,
@@ -704,6 +714,18 @@ class SpeechService:
     def warm_ack_cache(self) -> dict[str, dict]:
         if self.voice_route()[0] == "silent":
             return {}  # nothing speaks, so nothing to pre-render
+        if self.voice_route()[0] == "gemini":
+            client = self._gemini_client()
+            # Stage A: validate the model + voice against the real catalogue ONCE
+            # before rendering four acks. A mismatch fails here, with the allowed
+            # list, instead of four separate mid-sentence 400s.
+            validator = getattr(client, "validate_speech_config", None)
+            if callable(validator):
+                try:
+                    validator()
+                except Exception as exc:
+                    self.last_voice_error = f"voice validation failed: {exc}"
+                    raise TtsUnavailable(f"no speech: {exc}") from exc
         warmed = {}
         for kind, text in STANDARD_ACKS.items():
             warmed[kind] = self.synthesize(text, self._ack_path(kind)).as_dict()

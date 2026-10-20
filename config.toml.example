@@ -10,13 +10,15 @@ model_default        = "gemini-flash-lite-latest"   # VERIFY exact ID on your ac
 model_organise       = "gemini-flash-lite-latest"   # VERIFY
 model_cleanup        = "gemini-flash-lite-latest"   # VERIFY
 model_chat           = "gemini-flash-latest"        # VERIFY
-model_transcribe_live  = "gemini-3.5-transcribe-live"  # VERIFY (§11.1)
-model_transcribe_batch = "gemini-flash-lite-latest"    # VERIFY
+model_transcribe_live  = "gemini-3.5-transcribe-live"
+model_transcribe_batch = "gemini-3.5-transcribe"   # dedicated batch STT model
 # Her ONE voice (owner decisions 2026-10-19 and 2026-10-20). Flare is the ONLY
 # voice Elaria speaks with while online; OFFLINE HAS NO VOICE AT ALL (text-only
-# surfaces). model_voice must be native-audio capable.
-voice                      = "Flare"           # VERIFY the exact name on your account
-model_voice                = "gemini-2.5-flash-preview-tts"   # VERIFY
+# surfaces). Native audio MUST ride a LIVE model: Flare is a Live voice, and a
+# TTS-preview model rejects it with "Voice name Flare is not supported".
+# Validate the model id + allowed voices on your machine: `assist voice models`.
+voice                      = "Flare"
+gemini_voice_model         = "gemini-3.8-live"   # Live native audio (GA)
 voice_sample_rate          = 24000   # 22050 for a local Piper voice; changing it
                                      # invalidates cached audio ON PURPOSE (never
                                      # play 24 kHz audio through a 22 kHz player)
@@ -42,8 +44,33 @@ max_scaffold_calls      = 6
 mode = "mock"
 
 [quota]
-# ASSUMED free-tier shape (§12.1) — UNVERIFIED until Step 0 is done.
-flash_rpm = 10
+# OWNER-VERIFIED free-tier shape (Step 0, 2026-10-20). `verified = true` makes
+# doctor/cost read these figures instead of printing assumed numbers; remove the
+# marker and the loud ASSUMED warning returns deliberately.
+verified      = true
+verified_at   = "2026-10-20"
+verified_source = "owner's AI Studio rate-limit page"
+
+[quota.models.flash]
+rpm = 5
+tpm = 250000
+rpd = 20
+
+[quota.models.flash-lite]
+rpm = 15
+tpm = 250000
+rpd = 500
+
+[quota.models.transcribe-live]
+rpm = 0            # 0 = unlimited
+tpm = 20000
+rpd = 0
+
+[quota.models.transcribe-batch]
+rpd = 25
+
+# Flat aliases read by the limiter/older code.
+flash_rpm = 5
 flash_lite_rpm = 15
 max_requests_per_day = 1200
 max_requests_per_minute = 12

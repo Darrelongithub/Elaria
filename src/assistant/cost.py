@@ -82,8 +82,23 @@ def format_cost_report(month: dict, today: dict, quota: dict, tier: str = "free"
                 f"  {row['model']} [{row['mode']}]: {row['calls']} call(s), "
                 f"{row['tokens']:,} tokens, shadow ${row['cost_usd']:.4f}"
             )
-    lines.append(
-        "Reminder: quota shape in config is ASSUMED until verified at "
-        "aistudio.google.com/rate-limit (blueprint §11)."
-    )
+    from .config import quota_is_verified, quota_rows
+
+    if quota_is_verified(quota):
+        rows = quota_rows(quota)
+        summary = " · ".join(
+            f"{row['model']}: "
+            + ("unlimited RPM" if row["unlimited_rpm"] else f"{row['rpm']} RPM")
+            + " / "
+            + (f"{int(row['tpm']):,} TPM" if row.get("tpm") not in (None, "")
+               else "TPM n/a")
+            + " / "
+            + ("unlimited RPD" if row["unlimited_rpd"] else f"{row['rpd']} RPD")
+            for row in rows)
+        lines.append(f"Quota: VERIFIED {quota.get('verified_at', '')} — {summary} "
+                     "(from [quota] in config; not assumed).")
+    else:
+        lines.append(
+            "Reminder: quota shape in config is ASSUMED until verified at "
+            "aistudio.google.com/rate-limit (blueprint §11).")
     return "\n".join(lines)
