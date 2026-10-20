@@ -70,6 +70,26 @@ class TtsUnavailable(RuntimeError):
     pass
 
 
+def _as_int(value, default: int) -> int:
+    """Coerce a config value without letting a poisoned file kill speech.
+
+    `validate_config()`/`doctor` names the key (BH-I2); these readers keep the
+    hot path alive in the meantime. Clamping happens at the call site so an
+    out-of-range value cannot reach a subprocess argv.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class VoiceDescriptor:
     voice_id: str
@@ -82,12 +102,14 @@ class VoiceDescriptor:
 
     @classmethod
     def from_dict(cls, data: dict, *, default_backend: str = "piper") -> VoiceDescriptor:
+        speaker = _as_int(data.get("speaker") or 0, 0)
+        length_scale = _as_float(data.get("length_scale") or 0.92, 0.92)
         return cls(
             voice_id=str(data.get("id") or data.get("voice_id") or "unselected"),
             model=str(data.get("model") or ""),
             config=str(data.get("config") or ""),
-            speaker=int(data.get("speaker") or 0),
-            length_scale=float(data.get("length_scale") or 0.92),
+            speaker=max(0, speaker),
+            length_scale=length_scale if length_scale > 0 else 0.92,
             backend=str(data.get("backend") or default_backend),
             notes=str(data.get("notes") or ""),
         )
@@ -261,12 +283,14 @@ class SpeechService:
                         json.loads(raw), default_backend=settings.get("backend", "piper"))
                 except (ValueError, TypeError):
                     pass
+        speaker = max(0, _as_int(settings.get("speaker", 0), 0))
+        length_scale = _as_float(settings.get("length_scale", 0.92), 0.92)
         return VoiceDescriptor(
             voice_id=str(settings.get("voice_id", "unselected")),
             model=str(settings.get("model", "")),
             config=str(settings.get("config", "")),
-            speaker=int(settings.get("speaker", 0)),
-            length_scale=float(settings.get("length_scale", 0.92)),
+            speaker=speaker,
+            length_scale=length_scale if length_scale > 0 else 0.92,
             backend=str(settings.get("backend", "piper")),
         )
 
@@ -659,8 +683,16 @@ class SpeechService:
         # An injected test runner keeps the plain signature — it must not have to
         # know about prctl to stand in for a player.
         protect = self._player_runner is subprocess.run
-        result = self._player_runner([*command, str(path)], capture_output=True,
-                                     timeout=120, **child_kwargs() if protect else {})
+        try:
+            result = self._player_runner([*command, str(path)], capture_output=True,
+                                         timeout=120,
+                                         **(child_kwargs() if protect else {}))
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            # A hung or missing player is reported silence, like any other
+            # speech failure - it must not escape a fire-and-forget task and
+            # print "exception was never retrieved" into the daemon log.
+            self.last_voice_error = f"audio player failed: {type(exc).__name__}: {exc}"
+            return False
         return getattr(result, "returncode", 0) == 0
 
     def speak(self, text: str, *, play: bool = True) -> SpeechResult:

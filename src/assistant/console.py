@@ -19,13 +19,12 @@ decisions stay here (tested headless); QML only binds.
 
 from __future__ import annotations
 
-import json
 import socket
 from dataclasses import dataclass
 from datetime import datetime
 
 from .cost import iso_now
-from .ipc import DaemonUnavailable, call
+from .ipc import DaemonUnavailable, call, parse_event_line
 
 ACTIVE_JOB_STATUSES = ("pending", "running", "approved", "awaiting_approval")
 ACTIVE_PLAN_STATUSES = ("building", "ready")
@@ -194,11 +193,8 @@ def stream_console(socket_path, *, interval_s: float = 5.0):
                         line, buffer = buffer.split(b"\n", 1)
                         if not line.strip():
                             continue
-                        try:
-                            message = json.loads(line)
-                        except ValueError:
-                            continue
-                        if isinstance(message, dict) and "event" in message:
+                        message = parse_event_line(line)
+                        if message is not None and "event" in message:
                             yield _safe_snapshot(socket_path)
         except (OSError, DaemonUnavailable):
             yield _safe_snapshot(socket_path)
