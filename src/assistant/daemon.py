@@ -5,8 +5,10 @@ Phase 0 handlers: ping, status, cost, doctor (via CLI-local checks),
 halt/resume, ack (the §18 <300ms local acknowledgement — pure in-process
 code, zero network), ptt.start/stop/result (the release is acknowledged
 immediately; the transcript finishes in the background and is fetched with
-ptt.result — BUG 6), ask (governor + cheapest-first harness; fully
-functional in mock mode).
+ptt.result — BUG 6; ptt.result resolves on ANY terminal state of the
+requested session, including "superseded / finished without a result",
+with an explicit error payload — BUG 6d), ask (governor + cheapest-first
+harness; fully functional in mock mode).
 
 Startup recovery (§4.2): outstanding journal intents are reported, never
 silently dropped. Cold starts are a Phase-0 bug (§18.6): config, store,
@@ -185,14 +187,21 @@ class Daemon:
         self._stop_event: asyncio.Event | None = None
         # BUG6: ptt.stop answers on the release and the session finishes in the
         # background. Processing state is observable through ptt.result/status.
+        # BUG 6d (hardware report 2026-10-20): result state is PER SESSION —
+        # one terminal event per session id and one slot in _ptt_results. The
+        # old single global event was set only while the finishing session was
+        # still the daemon's current one, so a finish landing under a changed
+        # session id completed silently and its ptt.result waiter parked on an
+        # orphaned event (the hardware hang). `_ptt_processing` is derived:
+        # True exactly while some released session still has a finisher.
         self._ptt_session_id: str | None = None
-        self._ptt_processing = False
         self._ptt_last_session_id: str | None = None
         self._ptt_last_result: dict | None = None
-        self._ptt_results: dict[str, dict | None] = {}
-        self._ptt_result_event = asyncio.Event()
-        self._ptt_result_event.set()
+        self._ptt_results: dict[str, dict] = {}
+        self._ptt_result_events: dict[str, asyncio.Event] = {}
+        self._ptt_finishing: set[str] = set()
         self._ptt_started_at: float | None = None
+        self._ptt_released_at: float | None = None
         self._ptt_capture_target: str | None = None
         self._last_connectivity_mode = self.mode_manager.status(refresh=False).effective_mode
         self._background_tasks: set[asyncio.Task] = set()
@@ -1108,6 +1117,15 @@ class Daemon:
             dict(params.get("payload") or {}))
         return {"job_id": job_id, "status": "awaiting_approval"}
 
+    @property
+    def _ptt_processing(self) -> bool:
+        """True while any released session still has its finisher in flight.
+
+        Derived (BUG 6d) so a superseded session's late finish can never
+        clear — or fail to clear — another session's processing state.
+        """
+        return bool(self._ptt_finishing)
+
     def _ptt_log(self, step: str, **fields) -> None:
         """BUG 6c instrumentation: ptt.start -> session create -> capture spawn.
 
@@ -1193,13 +1211,32 @@ class Daemon:
         # daemon's half-duplex state, instead of relying on the wrapper alone.
         muted_source = self._wrap_muted(self._capture_source)
         session_id = uuid.uuid4().hex[:12]
+        old_session_id = self._ptt_session_id
         self._ptt_session_id = session_id
         self._ptt_last_session_id = session_id
         self._ptt_last_result = None
         self._ptt_results.pop(session_id, None)
-        self._ptt_processing = False
+        self._ptt_result_events.pop(session_id, None)
+        self._ptt_finishing.discard(session_id)
         self._ptt_started_at = time.monotonic()
+        self._ptt_released_at = None
         self._ptt_capture_target = str(getattr(self._capture_source, "target", None) or "default")
+        # BUG 6d: a session replaced before it produced a result is TERMINAL.
+        # Mark it now — "superseded, finished without a result" — so any
+        # ptt.result waiter on the old id resolves at once instead of parking
+        # on an event only a matching session id would ever set. A session
+        # that is still finishing keeps its real result coming (its finisher
+        # resolves its own waiters unconditionally).
+        if (old_session_id is not None and old_session_id != session_id
+                and old_session_id not in self._ptt_finishing
+                and old_session_id not in self._ptt_results):
+            self._ptt_log("ptt.start.superseded_without_result",
+                          session_id=session_id,
+                          superseded_session_id=old_session_id)
+            self._ptt_mark_terminal(
+                old_session_id,
+                self._ptt_unfinished_payload(old_session_id,
+                                             superseded_by=session_id))
         self._ptt_log("ptt.start.session_create", session_id=session_id, capture_target=self._ptt_capture_target, mode=self._dictation_session_mode)
         try:
             self._dictation_task = self._track_task(asyncio.create_task(
@@ -1250,9 +1287,11 @@ class Daemon:
         self._dictation_task = None
 
         if task is not None:
-            self._ptt_processing = True
-            self._ptt_result_event.clear()
+            self._ptt_released_at = time.monotonic()
             self._ptt_log("ptt.stop.finish_spawn", session_id=str(session_id or ""))
+            if session_id is not None:
+                self._ptt_finishing.add(session_id)
+                self._ptt_event_for(session_id)  # waiters can park before the finish
             self._track_task(asyncio.create_task(
                 self._finish_dictation(task, params, session_id,
                                        self._dictation_session_mode)))
@@ -1264,6 +1303,15 @@ class Daemon:
             await self.broadcast({"event": "status.changed", "mode": self.mode})
             await self._apply_pending_mode_switch()
             self._ptt_log("ptt.stop.no_task_idle", session_id=str(session_id or ""))
+            # BUG 6d: a release with no task and nothing finishing means the
+            # session state ended without a result (state reset, restart).
+            # That is a terminal state — answer it explicitly from now on.
+            if (session_id is not None and session_id not in self._ptt_results
+                    and session_id not in self._ptt_finishing):
+                self._ptt_log("ptt.stop.finished_without_result",
+                              session_id=str(session_id or ""))
+                self._ptt_mark_terminal(
+                    session_id, self._ptt_unfinished_payload(session_id))
 
         response = {"listening": False, **ack, "result": None,
                     "processing": task is not None or self._ptt_processing,
@@ -1273,75 +1321,171 @@ class Daemon:
         # The hotkey path never sets it; nothing here waits by default.
         wait_s = float(params.get("wait_s") or 0)
         if wait_s > 0:
-            # BUG 6c: fail fast when session is dead — don't wait full budget
-            # when we know the capture never produced stats. Check before wait.
-            dead = self._ptt_is_dead_state(session_id)
-            if dead.get("dead"):
-                self._ptt_log("ptt.stop.dead_fast", session_id=str(session_id or ""), reason=dead.get("reason"))
-                # Create a fast no-speech result instead of waiting 60s
-                fast = {"error": dead["reason"], "session_id": session_id, "no_speech": True, "capture": {"node": self._ptt_capture_target or "unknown", "bytes": 0, "peak_rms": 0.0, "no_speech": True, "stalled": True}, "narration": "no speech captured", "text": "", "raw_text": ""}
-                self._ptt_last_result = fast
-                self._ptt_results[session_id] = fast
-                self._ptt_processing = False
-                self._ptt_result_event.set()
-                response["result"] = fast
+            # BUG 6c/6d: bounded wait for THIS session's terminal answer —
+            # the real result, a fail-fast dead capture, or an explicit
+            # "finished without a result". Never an orphaned-event wait.
+            answer = await self._ptt_wait_for(session_id, wait_s)
+            if answer is not None:
+                response["result"] = answer
                 response["processing"] = False
-                return response
-            # Wait on the session id, not the processing flag: a very fast
-            # finish could clear the flag between task creation and this line.
-            if session_id not in self._ptt_results:
-                try:
-                    await asyncio.wait_for(self._ptt_result_event.wait(),
-                                           timeout=wait_s)
-                except TimeoutError:
-                    # BUG 6c: if still processing after wait, check dead again and fail fast for caller
-                    dead2 = self._ptt_is_dead_state(session_id)
-                    if dead2.get("dead") and session_id not in self._ptt_results:
-                        fast2 = {"error": dead2["reason"], "session_id": session_id, "no_speech": True, "capture": {"node": self._ptt_capture_target or "unknown", "bytes": 0, "peak_rms": 0.0, "no_speech": True, "stalled": True}, "narration": "no speech captured", "text": "", "raw_text": ""}
-                        self._ptt_results[session_id] = fast2
-                        self._ptt_last_result = fast2
-                        self._ptt_last_session_id = session_id
-                        self.mode = "idle"
-                        self._ptt_processing = False
-                        self._ptt_result_event.set()
-                    pass
-            response["result"] = self._ptt_results.get(session_id)
-            response["processing"] = self._ptt_processing
+                if answer.get("dead_fast"):
+                    response["dead_fast"] = True
+            else:
+                # Budget spent with the finisher still in flight: report the
+                # pre-stored result if one exists, honestly processing=True.
+                response["result"] = self._ptt_results.get(session_id)
+                response["processing"] = (session_id is not None
+                                          and session_id in self._ptt_finishing)
             response["connectivity"] = self.mode_manager.status(refresh=False).as_dict()
         return response
 
-    def _ptt_is_dead_state(self, session_id: str | None) -> dict:
-        """BUG 6c: detect a dead capture session that will never produce stats.
+    def _ptt_event_for(self, session_id: str | None) -> asyncio.Event:
+        """The terminal event for ONE session (BUG 6d: per session, never a
+        single global event a finishing-but-superseded session forgets to set)."""
+        if session_id is None:  # pragma: no cover - defensive
+            session_id = ""
+        ev = self._ptt_result_events.get(session_id)
+        if ev is None:
+            ev = asyncio.Event()
+            self._ptt_result_events[session_id] = ev
+        return ev
 
-        Hardware: ptt.result blocked 60s, status showed capture_target=Mic1
-        but last_capture=null and journal had NO capture/dictate lines — the
-        session never reached the capture-stats point. The caller needs a
-        fail-fast "no speech captured" instead of the full wait.
+    def _ptt_mark_terminal(self, session_id: str | None,
+                           result: dict | None = None) -> dict | None:
+        """Record the terminal state of a session and wake EVERY waiter.
+
+        BUG 6d: terminal is per session and unconditional. The finisher of a
+        session that was superseded mid-flight still resolves its waiters.
+        When `result` is None the session already has a pre-stored result and
+        only the terminal transition (finishing cleared, event set) remains.
         """
-        if not self._ptt_processing:
+        if session_id is None:
+            return result
+        if result is not None:
+            self._ptt_results[session_id] = result
+            while len(self._ptt_results) > 8:
+                evicted = next(iter(self._ptt_results))
+                self._ptt_results.pop(evicted, None)
+                self._ptt_result_events.pop(evicted, None)
+        self._ptt_finishing.discard(session_id)
+        self._ptt_event_for(session_id).set()
+        return result
+
+    def _ptt_unfinished_payload(self, session_id: str | None, *,
+                                superseded_by: str | None = None) -> dict:
+        """The explicit terminal answer for a session that ended with NO
+        result (BUG 6d): superseded by a newer session, or its session state
+        reset before a transcript existed. ptt.result must say so — never a
+        silent None and never an unbounded wait for an event nobody will set.
+        """
+        if superseded_by is not None:
+            error = (f"session {session_id} was superseded by session "
+                     f"{superseded_by} and finished without a result")
+        elif session_id == self._ptt_session_id:
+            error = (f"session {session_id} finished without a result "
+                     "(session state ended before a transcript was stored)")
+        else:
+            error = (f"session {session_id} finished without a result "
+                     "(superseded, or unknown to this daemon)")
+        return {"error": error,
+                "session_id": session_id,
+                "terminal": True,
+                "finished_without_result": True,
+                "superseded": superseded_by is not None,
+                "text": "", "raw_text": "",
+                "no_speech": False,
+                "narration": "session finished without a result"}
+
+    def _ptt_terminal_result(self, session_id: str | None) -> dict | None:
+        """The terminal answer for a session, or None while one can still come.
+
+        BUG 6d: terminal means either (a) a stored result — real, fail-fast
+        dead-capture, or synthesized — or (b) a session that can no longer
+        produce one (superseded / state reset / unknown), which answers with
+        an explicit error payload. A session whose dictate task is still
+        alive (listening, or a completed dictate awaiting release) is NOT
+        terminal: `ptt.stop` can still harvest its real result.
+        """
+        if session_id is None:
+            return None
+        if session_id in self._ptt_finishing:
+            return None
+        if session_id in self._ptt_results:
+            return self._ptt_results[session_id]
+        if session_id == self._ptt_session_id and self._dictation_task is not None:
+            return None
+        self._ptt_log("ptt.result.finished_without_result",
+                      session_id=str(session_id or ""))
+        return self._ptt_mark_terminal(
+            session_id, self._ptt_unfinished_payload(session_id))
+
+    async def _ptt_wait_for(self, session_id: str | None,
+                            wait_s: float) -> dict | None:
+        """Wait for ONE session's terminal answer, bounded by wait_s.
+
+        BUG 6d: waits on that session's own terminal event and re-checks
+        terminal state on every wake — a real finish (even under a changed
+        session id), a fail-fast dead capture, a supersede and a session
+        state reset all resolve the waiter. An orphaned or missed signal can
+        never park it past its budget.
+        """
+        deadline = time.monotonic() + max(wait_s, 0.0)
+        while True:
+            terminal = self._ptt_terminal_result(session_id)
+            if terminal is not None:
+                return terminal
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if session_id is not None and session_id == self._ptt_session_id:
+                dead = self._ptt_is_dead_state(session_id)
+                if dead.get("dead"):
+                    self._ptt_log("ptt.result.dead_fast",
+                                  session_id=str(session_id or ""),
+                                  reason=dead.get("reason"))
+                    fast = {"error": dead["reason"], "session_id": session_id,
+                            "no_speech": True, "terminal": True,
+                            "dead_fast": True,
+                            "capture": {"node": self._ptt_capture_target or "unknown",
+                                        "bytes": 0, "peak_rms": 0.0,
+                                        "no_speech": True, "stalled": True},
+                            "narration": "no speech captured",
+                            "text": "", "raw_text": ""}
+                    return self._ptt_mark_terminal(session_id, fast)
+            ev = (self._ptt_result_events.get(session_id)
+                  if session_id is not None else None)
+            if ev is not None and not ev.is_set():
+                try:
+                    await asyncio.wait_for(ev.wait(), timeout=remaining)
+                except TimeoutError:
+                    return self._ptt_terminal_result(session_id)
+                continue
+            await asyncio.sleep(min(0.25, remaining))
+
+    def _ptt_is_dead_state(self, session_id: str | None) -> dict:
+        """BUG 6c: a released session whose capture will never produce stats.
+
+        Fail-fast only — BUG 6d's terminal machinery owns every other outcome.
+        The verdict is scoped to the daemon's *current* capture (the one
+        `_capture_source` describes) and is measured from RELEASE: a long
+        dictation is not a dead capture. This used to also run a synchronous
+        store query on the event loop (and its result was never used).
+        """
+        if session_id is None or session_id != self._ptt_session_id:
             return {"dead": False}
-        # If the dictate task is already done but no result yet, dead if last_capture still null after a grace
-        if self._ptt_started_at is not None and (time.monotonic() - self._ptt_started_at) > 4.0:
-            # No dictate result and no capture stats logged for this session
-            try:
-                # Check if any capture.stats arrived since start; if none, consider dead
-                recent = self.store.list_persona_events(kind="capture.stats", limit=5)
-                # If last_capture in status is still None, dead
-                has_stats = any("capture.stats" in (e.get("kind") or "") for e in recent) if recent else False
-                # Also check ptt.lifecycle to see if dictate_spawned but never reached capture
-                # Simplest: if we have waited > stall_timeout+2 and task still processing with no result, dead
-                stall = float(self.config.section("capture").get("stall_timeout_s", 8.0))
-                if (time.monotonic() - self._ptt_started_at) > (stall + 3.0):
-                    # Capture should have either produced or stalled by now
-                    # If no result and beyond stall window, dead
-                    if session_id and session_id not in self._ptt_results:
-                        return {"dead": True, "reason": f"capture dead — no stats {stall+3:.0f}s after start (target={self._ptt_capture_target})"}
-            except Exception:
-                pass
-        # Explicit stalled flag on capture source
+        if session_id not in self._ptt_finishing:
+            return {"dead": False}
         src = getattr(self, "_capture_source", None)
         if src is not None and getattr(src, "stalled", False):
-            return {"dead": True, "reason": "capture stalled — no bytes within stall timeout"}
+            return {"dead": True,
+                    "reason": "capture stalled — no bytes within stall timeout"}
+        released_at = self._ptt_released_at or self._ptt_started_at
+        if released_at is not None:
+            stall = float(self.config.section("capture").get("stall_timeout_s", 8.0))
+            if (time.monotonic() - released_at) > (stall + 3.0):
+                return {"dead": True,
+                        "reason": (f"capture dead — no stats {stall + 3:.0f}s "
+                                   f"after release (target={self._ptt_capture_target})")}
         return {"dead": False}
 
     async def _finish_dictation(self, task: asyncio.Task, params: dict,
@@ -1433,28 +1577,42 @@ class Daemon:
                       "narration": "no speech captured"}
         finally:
             self._ptt_log("ptt.finish.finally", session_id=str(session_id or ""), has_result=str(result is not None))
-            self._ptt_last_result = result
-            self._ptt_last_session_id = session_id
-            self._ptt_results[session_id] = result
-            while len(self._ptt_results) > 8:
-                self._ptt_results.pop(next(iter(self._ptt_results)), None)
+            if session_id is not None:
+                self._ptt_last_result = result
+                self._ptt_last_session_id = session_id
+                self._ptt_results[session_id] = result
+                while len(self._ptt_results) > 8:
+                    evicted = next(iter(self._ptt_results))
+                    self._ptt_results.pop(evicted, None)
+                    self._ptt_result_events.pop(evicted, None)
+                # The session is OVER here — which is exactly what lets a
+                # parked mode switch apply below (_session_active consults
+                # _ptt_processing). The result is already retrievable by
+                # session id; the terminal event comes after the switch.
+                self._ptt_finishing.discard(session_id)
             # A result may finish after the owner has already started the next
             # dictation. It is still retrievable by session id, but it must not
-            # set the mode to idle, clear the new session's processing flag, or
-            # release a parked mode switch under the new session's feet.
-            if self._ptt_session_id == session_id:
+            # set the mode to idle or release a parked mode switch under the
+            # new session's feet.
+            if session_id is not None and self._ptt_session_id == session_id:
                 self.mode = "idle"
                 # Ordering matters: the session is over (so a parked mode
-                # switch may apply), and only then is ptt.result released. A
-                # waiter that woke before the switch would report the
+                # switch may apply), and only then is its waiter released —
+                # a waiter that woke before the switch would report the
                 # pre-switch connectivity and look like the parked switch was
                 # lost.
-                self._ptt_processing = False
                 try:
                     await self._apply_pending_mode_switch()
                 except Exception:  # noqa: S110 - a switch never blocks a result
                     pass
-                self._ptt_result_event.set()
+            if session_id is not None:
+                # BUG 6d: unconditional. The old code set the (single, global)
+                # result event only while this session was still the daemon's
+                # current one — a finish landing under a changed session id
+                # completed silently and its ptt.result waiter hung on an
+                # orphaned event. Every session's waiters wake on its own
+                # terminal transition, superseded or not.
+                self._ptt_event_for(session_id).set()
             try:
                 await self.broadcast({"event": "ptt.result",
                                       "session_id": session_id,
@@ -1466,46 +1624,41 @@ class Daemon:
                 pass
 
     async def _ptt_result(self, params: dict) -> dict:
-        """Fetch the transcript of a released session, optionally waiting.
+        """Fetch the terminal answer for ONE session, optionally waiting.
 
-        `wait_s` is bounded polling for the CLI; the hotkey path never needs it.
-        BUG 6c: if the session is in a dead state (no capture stats after stall
-        window), fail fast instead of waiting the full budget.
+        BUG 6d (hardware report 2026-10-20): this resolves on ANY terminal
+        state of the requested session — the real transcript, a fail-fast
+        dead capture, or an explicit "finished without a result" payload when
+        the session was superseded or its state restarted. The old code
+        waited on one global event that only the *current* session's finish
+        ever set, so a finish landing under a changed session id orphaned the
+        waiter (the hardware hang); a session that ended without a result
+        just returned a silent None. Both now answer explicitly and promptly.
         """
+        requested = params.get("session_id") or None
+        if requested is None:
+            requested = self._ptt_session_id or self._ptt_last_session_id
         wait_s = float(params.get("wait_s") or 0)
-        if wait_s > 0 and self._ptt_processing:
-            dead = self._ptt_is_dead_state(self._ptt_session_id)
-            if dead.get("dead"):
-                self._ptt_log("ptt.result.dead_fast", session_id=str(self._ptt_session_id or ""), reason=dead["reason"])
-                # Synthesize a fast no-speech result so caller doesn't wait
-                fast = {"error": dead["reason"], "session_id": self._ptt_session_id, "no_speech": True, "capture": {"node": self._ptt_capture_target or "unknown", "bytes": 0, "peak_rms": 0.0, "no_speech": True, "stalled": True}, "narration": "no speech captured", "text": "", "raw_text": ""}
-                return {"session_id": self._ptt_session_id, "processing": False, "result": fast, "found": True, "connectivity": self.mode_manager.status(refresh=False).as_dict(), "dead_fast": True}
-            try:
-                await asyncio.wait_for(self._ptt_result_event.wait(), timeout=wait_s)
-            except TimeoutError:
-                # Second chance after wait: check dead state and synthesize if needed
-                dead2 = self._ptt_is_dead_state(self._ptt_session_id)
-                if dead2.get("dead") and self._ptt_session_id not in self._ptt_results:
-                    fast2 = {"error": dead2["reason"], "session_id": self._ptt_session_id, "no_speech": True, "capture": {"node": self._ptt_capture_target or "unknown", "bytes": 0, "peak_rms": 0.0, "no_speech": True, "stalled": True}, "narration": "no speech captured", "text": "", "raw_text": ""}
-                    self._ptt_results[self._ptt_session_id] = fast2
-                    self._ptt_last_result = fast2
-                    self._ptt_last_session_id = self._ptt_session_id
-                    return {"session_id": self._ptt_session_id, "processing": False, "result": fast2, "found": True, "connectivity": self.mode_manager.status(refresh=False).as_dict(), "dead_fast": True}
-                pass
-        requested = params.get("session_id")
-        if requested is not None and requested in self._ptt_results:
-            return {"session_id": requested, "processing": False,
-                    "result": self._ptt_results[requested], "found": True,
-                    "connectivity": self.mode_manager.status(refresh=False).as_dict()}
-        result = None
-        found = requested is None or requested == self._ptt_last_session_id
-        if found:
-            result = self._ptt_last_result
-        return {"session_id": self._ptt_last_session_id,
-                "processing": self._ptt_processing,
-                "result": result,
-                "found": found,
-                "connectivity": self.mode_manager.status(refresh=False).as_dict()}
+        answer = None
+        if requested is not None and wait_s > 0:
+            answer = await self._ptt_wait_for(requested, wait_s)
+        if answer is None:
+            answer = self._ptt_terminal_result(requested)
+        response = {
+            "session_id": requested,
+            "processing": (requested is not None
+                           and requested in self._ptt_finishing),
+            "result": answer,
+            "found": (answer is not None or requested is None
+                      or requested == self._ptt_last_session_id
+                      or requested == self._ptt_session_id),
+            "connectivity": self.mode_manager.status(refresh=False).as_dict(),
+        }
+        if answer is not None:
+            response["terminal"] = True
+            if answer.get("dead_fast"):
+                response["dead_fast"] = True
+        return response
 
     async def _transcribe_file(self, params: dict) -> dict:
         from pathlib import Path

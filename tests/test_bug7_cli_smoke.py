@@ -111,6 +111,7 @@ def _smoke_table(tmp_path: Path) -> list[list[str]]:
         ["hotword", "purge"],
         ["dictate"],
         ["events"],
+        ["events", "--recent", "5", "--kind", "ptt.lifecycle"],
     ]
 
 

@@ -1458,9 +1458,20 @@ def build_parser() -> argparse.ArgumentParser:
                            help="route the final transcript through the local intent ladder")
     dictate_p.add_argument("--speak", action="store_true",
                            help="speak a command reply through the one local voice")
-    events_p = sub.add_parser("events", help="stream daemon events (overlay/Waybar feed)")
+    events_p = sub.add_parser(
+        "events",
+        help="stream daemon events (overlay/Waybar feed); --recent replays "
+             "stored persona events after the fact")
     events_p.add_argument("--overlay", action="store_true",
                           help="stream pre-computed overlay states for the Quickshell pill")
+    events_p.add_argument("--recent", type=int, metavar="N",
+                          help="instead of streaming: print the last N stored "
+                               "persona events, oldest first — step-log lines "
+                               "(ptt.lifecycle, dictate.lifecycle, …) stay "
+                               "readable after the run without a live tail")
+    events_p.add_argument("--kind",
+                          help="with --recent: only events of this kind "
+                               "(e.g. ptt.lifecycle, capture.stats)")
     return parser
 
 
@@ -1794,6 +1805,31 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "events":
+            if args.recent:
+                # BUG 6d (hardware report 2026-10-20): the persona step-log
+                # lines (ptt.start.received …) were unreachable after a
+                # hardware run — the live stream has no history replay and
+                # the journal never showed them. They are in storage; print
+                # them. No daemon needed: a post-mortem must work after the
+                # daemon is gone.
+                from .store import Store
+
+                store = Store(config.db_path)
+                try:
+                    rows = store.list_persona_events(
+                        kind=args.kind or None, limit=max(1, args.recent))
+                finally:
+                    store.close()
+                for row in reversed(rows):   # chronological: oldest first
+                    detail = row.get("detail")
+                    try:
+                        detail = json.loads(detail) if detail else None
+                    except ValueError:
+                        pass
+                    print(json.dumps({"ts": row.get("ts"),
+                                      "kind": row.get("kind"),
+                                      "detail": detail}))
+                return 0
             try:
                 if args.overlay:
                     from .overlay import stream_overlay_states
