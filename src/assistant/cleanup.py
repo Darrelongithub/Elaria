@@ -150,6 +150,7 @@ class CleanupPass:
             glossary=", ".join(self.glossary) or "(none)", raw=raw)
         result = self._client.generate(
             "cleanup", prompt,
+            purpose="housekeeping:cleanup", is_user_turn=0,
             verify=lambda text: bool(text.strip())
             and language_mix_preserved(raw, text, self.markers),
         )

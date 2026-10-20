@@ -85,7 +85,9 @@ CREATE TABLE IF NOT EXISTS llm_calls (
   verified INTEGER,               -- harness verification outcome (§17), NULL if n/a
   attempt INTEGER NOT NULL DEFAULT 1,
   fixture_key TEXT,
-  error TEXT
+  error TEXT,
+  purpose TEXT,                   -- attribution: user_turn | housekeeping:ack_warm | housekeeping:catalogue | etc (BUG3)
+  is_user_turn INTEGER             -- 1 if this is a user-initiated turn, 0 if housekeeping
 );
 
 CREATE TABLE IF NOT EXISTS operations (
@@ -279,6 +281,12 @@ class Store:
             columns = {r[1] for r in self._conn.execute("PRAGMA table_info(doc_chunks)")}
             if "embedding" not in columns:
                 self._conn.execute("ALTER TABLE doc_chunks ADD COLUMN embedding BLOB")
+            # BUG3 migration: purpose attribution for every live call
+            llm_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(llm_calls)")}
+            if "purpose" not in llm_cols:
+                self._conn.execute("ALTER TABLE llm_calls ADD COLUMN purpose TEXT")
+            if "is_user_turn" not in llm_cols:
+                self._conn.execute("ALTER TABLE llm_calls ADD COLUMN is_user_turn INTEGER")
             # Additive migration (Phase 8): offline transcript provenance.
             transcript_columns = {
                 r[1] for r in self._conn.execute("PRAGMA table_info(transcripts)")
@@ -324,6 +332,7 @@ class Store:
             "ts", "correlation_id", "role", "model", "mode", "tokens_in",
             "tokens_out", "tokens_estimated", "audio_seconds", "cost_usd",
             "latency_ms", "ok", "verified", "attempt", "fixture_key", "error",
+            "purpose", "is_user_turn",
         ]
         values = [fields.get(c) for c in columns]
         with self._lock:
@@ -357,6 +366,14 @@ class Store:
                     GROUP BY model, mode ORDER BY calls DESC""",
                 params,
             ).fetchall()
+            by_purpose = self._conn.execute(
+                f"""SELECT COALESCE(purpose, role) AS purpose, COUNT(*) AS calls,
+                           COALESCE(SUM(tokens_in+tokens_out),0) AS tokens,
+                           COALESCE(SUM(cost_usd),0) AS cost_usd
+                    FROM llm_calls {where}
+                    GROUP BY COALESCE(purpose, role) ORDER BY calls DESC""",
+                params,
+            ).fetchall()
         return {
             "calls": row["calls"],
             "tokens_in": row["tokens_in"],
@@ -365,16 +382,40 @@ class Store:
             "cost_usd": row["cost_usd"],
             "failures": row["failures"],
             "by_model": [dict(r) for r in by_model],
+            "by_purpose": [dict(r) for r in by_purpose],
         }
 
-    def calls_since(self, since_iso: str, model: str | None = None) -> int:
+    def calls_since(self, since_iso: str, model: str | None = None, purpose: str | None = None) -> int:
         query = "SELECT COUNT(*) AS n FROM llm_calls WHERE ts >= ? AND mode != 'mock'"
-        params: tuple = (since_iso,)
+        params: list = [since_iso]
         if model:
             query += " AND model = ?"
-            params = (since_iso, model)
+            params.append(model)
+        if purpose:
+            query += " AND purpose = ?"
+            params.append(purpose)
         with self._lock:
-            return int(self._conn.execute(query, params).fetchone()["n"])
+            return int(self._conn.execute(query, tuple(params)).fetchone()["n"])
+
+    def calls_by_purpose_since(self, since_iso: str) -> dict:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT COALESCE(purpose, role) AS purpose, COUNT(*) AS n FROM llm_calls WHERE ts >= ? AND mode != 'mock' GROUP BY COALESCE(purpose, role)",
+                (since_iso,),
+            ).fetchall()
+        return {r["purpose"]: r["n"] for r in rows}
+
+    def user_turn_calls_since(self, since_iso: str) -> int:
+        with self._lock:
+            return int(self._conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_calls WHERE ts >= ? AND mode != 'mock' AND is_user_turn = 1",
+                (since_iso,)).fetchone()["n"])
+
+    def housekeeping_calls_since(self, since_iso: str) -> int:
+        with self._lock:
+            return int(self._conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_calls WHERE ts >= ? AND mode != 'mock' AND (is_user_turn = 0 OR is_user_turn IS NULL) AND purpose != 'user_turn'",
+                (since_iso,)).fetchone()["n"])
 
     # -- transcripts (raw + cleaned side by side, §12.5) ----------------------
     _TRANSCRIPT_COLUMNS: ClassVar[list[str]] = [

@@ -292,7 +292,7 @@ class CloudQueue:
                 "new_plan_id": result["plan_id"], "root": root}
 
     def _chat(self, payload: dict) -> dict:
-        result = self.client.generate("chat", str(payload.get("prompt") or payload.get("text") or ""))
+        result = self.client.generate("chat", str(payload.get("prompt") or payload.get("text") or ""), purpose="housekeeping:drain_chat", is_user_turn=0)
         conversation_id = payload.get("conversation_id")
         if conversation_id:
             self.store.add_message(int(conversation_id), iso_now(), "assistant",

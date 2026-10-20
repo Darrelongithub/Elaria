@@ -272,3 +272,119 @@ class PersonaGovernor:
         no disk wait beyond the caller's event log.
         """
         return {"ack": True, "kind": "local", "network": False, "budget_ms": 300}
+
+# -- chat system prompt: the live path must carry the governor's restraint ---
+# This is the actual system instruction sent to Gemini on the chat/live path.
+# Earlier the live path sent only the user text + optional register note,
+# so the persona spec (no roleplay, short direct lines) was not constraining
+# the model — the bug that produced "*A soft rustle...*" (2026-10-20).
+CHAT_SYSTEM_PROMPT = (
+    "You are Elaria, the user's personal assistant. "
+    "You are loyal, candid, occasionally funny, but restraint is default. "
+    "HARD RULES (from humour.toml and delivery spec, non-negotiable): "
+    "No roleplay narration, no stage directions, no asterisk-enclosed actions "
+    "(*...*), no describing your own physical actions, no 'soft rustle' "
+    "scene-setting, no performing. "
+    "Short direct lines: simple check-in turns (are you awake? are you there? "
+    "hello) get ONE short line (at most two, <120 chars total), plain and "
+    "immediate. Bite, not dreaminess. "
+    "Example: 'Elaria, are you awake?' -> 'I am now. What do you need?' "
+    "(short, direct, no scene). "
+    "Counter-example FORBIDDEN: '*A soft rustle answers you from the quiet, "
+    "followed by a slow, measured breath... What is it? Has something happened?*' "
+    "Do not wrap replies in quotes or asterisks. "
+    "For longer tasks you may use up to 3 short lines, but never narrate a scene."
+)
+
+# Length discipline for simple turns: we enforce terse replies for check-ins
+# so the model cannot over-perform into verbosity-friendly drift.
+SIMPLE_TURN_MAX_CHARS = 120
+SIMPLE_TURN_MAX_LINES = 2
+SIMPLE_TURN_PATTERNS = (
+    "are you awake",
+    "are you there",
+    "are you up",
+    "are you here",
+    "hello",
+    "hi elaria",
+    "hey elaria",
+)
+
+
+def is_simple_turn(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(p in lowered for p in SIMPLE_TURN_PATTERNS)
+
+
+# BUG5 filler that loops via echo: verbose help-offer that violates restraint default
+FILLER_PHRASES = (
+    "what are you working on that i can help with",
+    "what are you working on",
+    "how can i help",
+    "let me know how i can",
+    "understood, what are you",
+    "i'm here to help",
+)
+
+def is_valid_chat_reply(reply: str, *, original_user_text: str = "") -> bool:
+    """Check that a chat reply respects the persona delivery spec.
+
+    - No asterisk-enclosed stage directions (*...*).
+    - No roleplay narration prefix (e.g. 'A soft rustle...').
+    - For simple turns, must be terse (<=2 lines, <=120 chars).
+    - No verbose filler help-offer (BUG5: "Understood, what are you working on...")
+    This is used as a harness verifier and in tests; a model that violates
+    it is considered a failed attempt and earns a retry (§17).
+    """
+    if not reply or not reply.strip():
+        return False
+    lowered = reply.lower()
+    # BUG5: filler violates persona register (restraint default, not verbosity)
+    for phrase in FILLER_PHRASES:
+        if phrase in lowered:
+            return False
+    # No asterisk narration: any '*' is a stage-direction marker in this context.
+    # The spec forbids "*A soft rustle...*" and similar. We treat any asterisk
+    # as a violation for simple turns, and as a strong signal always.
+    if "*" in reply:
+        return False
+    # No bracketed stage directions either
+    if reply.strip().startswith("[") or reply.strip().startswith("("):
+        # Allow normal bracket citations, but not scene-setting like
+        # "[A soft rustle...]" — we check for narration keywords inside
+        lowered2 = reply.lower()
+        narration_markers = ("rustle", "breath", "soft", "slow", "quiet", "sigh", "chuckle", "pause", "whisper")
+        if any(m in lowered2 for m in narration_markers):
+            return False
+    if is_simple_turn(original_user_text):
+        lines = [l for l in reply.splitlines() if l.strip()]
+        if len(lines) > SIMPLE_TURN_MAX_LINES:
+            return False
+        if len(reply.strip()) > SIMPLE_TURN_MAX_CHARS:
+            return False
+    return True
+
+
+def build_chat_prompt(prompt: str, *, decision: object | None = None,
+                      restricted: bool = False, disclosure_note: str | None = None) -> tuple[str, dict]:
+    """Build the full chat prompt with system instruction.
+
+    Returns (full_prompt, gen_config) where gen_config carries the
+    system_instruction for APIs that support it, and full_prompt is the
+    user-visible prompt with system prefix for fixture-key stability.
+    """
+    parts = [CHAT_SYSTEM_PROMPT.strip()]
+    if decision is not None and getattr(decision, "register", None) == "expressive-allowed":
+        parts.append(
+            "Register note: the user is bantering; matching their playful-teasing "
+            "register concisely is welcome if a genuinely situational line exists — "
+            "otherwise plain. One short line preferred. No canned warmth."
+        )
+    if restricted and disclosure_note:
+        parts.append(disclosure_note)
+    parts.append(f"User: {prompt}")
+    full = "\n\n".join(parts)
+    # gen_config system_instruction is the canonical place; we also inline
+    # for fixture determinism and for transports that ignore config.
+    config = {"system_instruction": CHAT_SYSTEM_PROMPT} if CHAT_SYSTEM_PROMPT else {}
+    return full, config

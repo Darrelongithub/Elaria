@@ -82,6 +82,22 @@ def format_cost_report(month: dict, today: dict, quota: dict, tier: str = "free"
                 f"  {row['model']} [{row['mode']}]: {row['calls']} call(s), "
                 f"{row['tokens']:,} tokens, shadow ${row['cost_usd']:.4f}"
             )
+    # BUG3: breakdown by purpose — user turns vs housekeeping
+    purpose_rows = month.get("by_purpose") or today.get("by_purpose")
+    if purpose_rows:
+        lines.append("By purpose:")
+        for row in purpose_rows:
+            lines.append(f"  {row['purpose']}: {row['calls']} call(s), {row['tokens']:,} tokens, shadow ${row['cost_usd']:.4f}")
+    elif today.get("by_purpose"):
+        lines.append("By purpose:")
+        for k, v in today["by_purpose"].items():
+            lines.append(f"  {k}: {v} call(s)")
+    # Explicit user vs housekeeping split
+    if "user_turn_calls" in today:
+        lines.append(f"Today breakdown: {today.get('user_turn_calls',0)} user turn(s) · {today.get('housekeeping_calls',0)} housekeeping call(s) (housekeeping does not count toward quota)")
+    if today.get("by_purpose") and isinstance(today["by_purpose"], dict):
+        # dict case from _cost
+        pass
     from .config import quota_is_verified, quota_rows
 
     if quota_is_verified(quota):

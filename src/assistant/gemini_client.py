@@ -315,7 +315,8 @@ class GeminiClient:
 
     # -- one raw call: limiter + backoff + ledger -----------------------------
     def _call_once(self, role: str, model: str, contents, gen_config: dict, *,
-                   correlation_id: str, attempt: int, audio_seconds: float = 0.0) -> dict:
+                   correlation_id: str, attempt: int, audio_seconds: float = 0.0,
+                   purpose: str | None = None, is_user_turn: bool | None = None) -> dict:
         key = fixture_key(model, contents, gen_config)
         request = {"model": model, "contents": contents, "config": gen_config}
         started = time.monotonic()
@@ -342,6 +343,19 @@ class GeminiClient:
             tokens_in = estimate_tokens(str(contents))
             tokens_out = estimate_tokens(response.get("text", ""))
             estimated = 1
+        # BUG3: attribute every live call by purpose
+        purpose_val = purpose or role
+        is_user = 1 if is_user_turn else (1 if purpose_val == "user_turn" or role == "chat" and purpose_val == "user_turn" else 0)
+        # More precise: if purpose explicitly user_turn, mark true; otherwise false for housekeeping
+        if purpose_val in ("user_turn", "user_chat"):
+            is_user = 1
+        elif purpose is not None and purpose.startswith("housekeeping"):
+            is_user = 0
+        elif is_user_turn is not None:
+            is_user = 1 if is_user_turn else 0
+        else:
+            # default: chat with is_user_turn True is user, else housekeeping
+            is_user = 1 if role == "chat" and purpose_val == "user_turn" else 0
         self.store.log_llm_call(
             ts=iso_now(), correlation_id=correlation_id, role=role, model=model,
             mode=self.mode, tokens_in=tokens_in, tokens_out=tokens_out,
@@ -349,6 +363,7 @@ class GeminiClient:
             cost_usd=shadow_cost_usd(model, tokens_in, tokens_out, audio_seconds),
             latency_ms=latency_ms, ok=0 if error else 1, verified=None,
             attempt=attempt, fixture_key=key, error=error,
+            purpose=purpose_val, is_user_turn=is_user,
         )
         if error:
             raise RuntimeError(error)
@@ -541,6 +556,7 @@ class GeminiClient:
                                      int(usage.get("tokens_out") or 0), seconds),
             latency_ms=latency_ms, ok=0 if error else 1, verified=None,
             attempt=0, fixture_key=key, error=error,
+            purpose="housekeeping:voice_speech", is_user_turn=0,
         )
         if error:
             raise RuntimeError(error)
@@ -574,7 +590,8 @@ class GeminiClient:
     # -- the harness (§17): cheapest first, escalate on verified failure -------
     def generate(self, role: str, contents, *, gen_config: dict | None = None,
                  verify: Callable[[str], bool] | None = None,
-                 audio_seconds: float = 0.0) -> HarnessResult:
+                 audio_seconds: float = 0.0,
+                 purpose: str | None = None, is_user_turn: bool | None = None) -> HarnessResult:
         """Generate with verification-driven escalation.
 
         `verify` is deterministic code checking the proposal (schema,
@@ -603,6 +620,8 @@ class GeminiClient:
                 role, model, prompt, gen_config,
                 correlation_id=correlation_id, attempt=attempts,
                 audio_seconds=audio_seconds,
+                purpose=purpose or ("user_turn" if role == "chat" and is_user_turn else role),
+                is_user_turn=is_user_turn,
             )
             last_text = response.get("text", "")
             if verify is None:
@@ -673,6 +692,7 @@ class GeminiClient:
         response = self._call_once(
             "transcribe_batch", model, contents, {},
             correlation_id=correlation_id, attempt=1, audio_seconds=duration,
+            purpose="housekeeping:transcribe_batch", is_user_turn=0,
         )
         return {"text": response.get("text", ""), "model": model,
                 "duration_s": duration, "backend": "gemini_batch",
@@ -694,7 +714,8 @@ class GeminiClient:
             tokens_estimated=1, audio_seconds=duration,
             cost_usd=shadow_cost_usd(model, 0, estimate_tokens(text), duration),
             latency_ms=(time.monotonic() - started) * 1000, ok=0 if error else 1,
-            verified=None, attempt=1, fixture_key=None, error=error)
+            verified=None, attempt=1, fixture_key=None, error=error,
+            purpose="housekeeping:transcribe_batch", is_user_turn=0)
         if error:
             raise RuntimeError(error)
         return text

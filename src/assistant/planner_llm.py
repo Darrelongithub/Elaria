@@ -111,6 +111,7 @@ class LlmPlanner:
             try:
                 result = self.client.generate(
                     role, prompt,
+                    purpose=f"housekeeping:organise:{role}", is_user_turn=0,
                     verify=lambda text, _e=expected: _parse_batch(text, allowed, _e) is not None)
             except Exception:  # noqa: S112 — abstain stands; error already ledgered by client
                 continue  # quota/transport trouble: abstain stands (§12.7 patience)
