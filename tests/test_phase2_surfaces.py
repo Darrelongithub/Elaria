@@ -132,7 +132,7 @@ def test_overlay_stream_over_real_daemon(config, running_daemon):
     time.sleep(0.3)
     call(config.socket_path, "ptt.start", {"source": "simulated"})
     time.sleep(0.4)
-    call(config.socket_path, "ptt.stop", timeout=30.0)
+    call(config.socket_path, "ptt.stop", {"wait_s": 30.0}, timeout=30.0)
     time.sleep(0.5)
     kinds = [s["kind"] for s in states]
     assert "listening" in kinds and "final" in kinds
@@ -157,7 +157,7 @@ def test_waybar_follow_reacts_to_status_changed(config, running_daemon):
     time.sleep(0.3)
     call(config.socket_path, "ptt.start", {"source": "simulated"})
     time.sleep(0.5)
-    call(config.socket_path, "ptt.stop", timeout=30.0)
+    call(config.socket_path, "ptt.stop", {"wait_s": 30.0}, timeout=30.0)
     time.sleep(0.5)
     alts = [line.get("alt") for line in lines]
     assert "listening" in alts  # event-driven: no 30s poll could produce this
