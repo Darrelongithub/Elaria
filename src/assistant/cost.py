@@ -63,6 +63,66 @@ def day_start_iso(now: datetime | None = None) -> str:
     return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
 
 
+# Failure categories, matched in order. The point is not taxonomy for its own
+# sake: "5 failures" must be attributable to a known key/voice problem or show
+# up as a Live transport failure, never remain a mystery count (BUG6).
+FAILURE_CATEGORIES: list[tuple[str, tuple[str, ...]]] = [
+    ("key", ("api key", "api_key", "api-key", "unauthenticated", "permission denied",
+             "401", "403", "invalid_argument: api key", "credentials")),
+    ("voice", ("voice name", "voice is not supported", "voice not supported",
+               "prebuilt_voice", "speech_config")),
+    ("quota", ("429", "resource_exhausted", "rate limit", "quota", "too-many-requests",
+               "daily soft cap")),
+    ("network", ("network is unreachable", "network unreachable", "timed out", "timeout",
+                 "connection reset", "connection refused", "name resolution",
+                 "temporary failure in name resolution", "ssl")),
+    ("live_transport", ("live connect", "live send", "live reconnect", "goaway",
+                        "go away", "no transcript produced", "rotation limit",
+                        "session resume", "live session")),
+    ("parse", ("json", "decode", "parse", "schema")),
+]
+
+
+def classify_failure(error: str | None) -> str:
+    """Coarse, stable category for a ledger failure row."""
+    lowered = (error or "").lower()
+    for label, needles in FAILURE_CATEGORIES:
+        if any(needle in lowered for needle in needles):
+            return label
+    return "unknown"
+
+
+def summarise_failures(rows: list[dict] | None) -> dict:
+    """Counts by category plus whether anything Live failed.
+
+    `rows` are `Store.failure_summary_since` rows. An untagged row is reported
+    as such — it is a ledger bug, not a category.
+    """
+    rows = rows or []
+    by_category: dict[str, int] = {}
+    untagged: list[dict] = []
+    live_failures: list[dict] = []
+    for row in rows:
+        category = classify_failure(row.get("error"))
+        count = int(row.get("n") or 0)
+        by_category[category] = by_category.get(category, 0) + count
+        if not row.get("purpose") or row.get("purpose") == "(untagged)":
+            untagged.append(row)
+        purpose = str(row.get("purpose") or "")
+        model = str(row.get("model") or "")
+        if (category == "live_transport"
+                or "transcribe_live" in purpose
+                or "transcribe-live" in model):
+            live_failures.append(row)
+    return {
+        "total": sum(int(r.get("n") or 0) for r in rows),
+        "by_category": by_category,
+        "live_failures": sum(int(r.get("n") or 0) for r in live_failures),
+        "untagged": sum(int(r.get("n") or 0) for r in untagged),
+        "rows": rows,
+    }
+
+
 def format_cost_report(month: dict, today: dict, quota: dict, tier: str = "free") -> str:
     """Human `assist cost` output. Free tier: billed $0, quota is the story."""
     cap_day = quota.get("max_requests_per_day", 1200)
@@ -92,6 +152,35 @@ def format_cost_report(month: dict, today: dict, quota: dict, tier: str = "free"
         lines.append("By purpose:")
         for k, v in today["by_purpose"].items():
             lines.append(f"  {k}: {v} call(s)")
+    # BUG6 cost audit: failures must be attributable, not just counted.
+    failure_rows = month.get("failures_detail") or []
+    if month.get("failures") or failure_rows:
+        summary = summarise_failures(failure_rows)
+        if summary["total"]:
+            parts = ", ".join(f"{label} {n}" for label, n in
+                              sorted(summary["by_category"].items(),
+                                     key=lambda item: (-item[1], item[0])))
+            lines.append(f"Failures this month: {summary['total']} ({parts})")
+            if summary["live_failures"]:
+                lines.append(
+                    f"  LIVE failures: {summary['live_failures']} — these are not "
+                    "key/voice housekeeping; see rows below")
+            else:
+                lines.append("  none from the Live dictation path")
+            for row in failure_rows:
+                error = " ".join(str(row.get("error") or "").split())
+                if len(error) > 140:
+                    error = error[:137] + "…"
+                lines.append(
+                    f"  {row.get('purpose')} [{row.get('mode')}] "
+                    f"{classify_failure(row.get('error'))}: {row.get('n')}× {error}")
+            if summary["untagged"]:
+                lines.append(
+                    f"  WARNING: {summary['untagged']} failure(s) carry no purpose tag "
+                    "— ledger bug, not a call category")
+        else:
+            lines.append(f"Failures this month: {month.get('failures')} "
+                         "(no error detail recorded — pre-BUG6 ledger rows)")
     # Explicit user vs housekeeping split
     if "user_turn_calls" in today:
         lines.append(f"Today breakdown: {today.get('user_turn_calls',0)} user turn(s) · {today.get('housekeeping_calls',0)} housekeeping call(s) (housekeeping does not count toward quota)")

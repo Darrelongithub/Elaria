@@ -18,8 +18,14 @@ Failure handling is the design, not an afterthought:
 
 Events (dicts) emitted to the caller's sink: session.started,
 transcript.interim, session.checkin, session.reconnecting,
-transcript.final, session.ended, error. The daemon forwards these over
-IPC to Waybar/overlay subscribers (§3.1 event stream).
+transcript.final, session.ended, error, plus the BUG 6 duplex events
+(live.uplink_gated, live.output_transcript, transcript.echo_suppressed).
+The daemon forwards these over IPC to Waybar/overlay subscribers (§3.1).
+
+Half-duplex lives INSIDE the Live session (BUG 6): output audio closes the
+mic uplink for its duration plus a 400 ms guard, and output transcription is
+never eligible to become a final. The BUG5 capture mute still applies around
+local TTS; this is the other half of the same rule, not a replacement.
 """
 
 from __future__ import annotations
@@ -38,7 +44,12 @@ from .cleanup import CleanupPass
 from .clipboard import copy_text
 from .cost import iso_now, shadow_cost_usd
 from .inbox import write_inbox_note
-from .live_client import LiveEvent, LiveTransport, LiveUnavailable
+from .live_client import (
+    DuplexLiveTransport,
+    LiveEvent,
+    LiveTransport,
+    LiveUnavailable,
+)
 
 EventSink = Callable[[dict], Awaitable[None]]
 
@@ -204,8 +215,11 @@ class DictationService:
     async def dictate(self, source, *, transport_factory=None,
                       mode: str = "narration",
                       sink: EventSink | None = None,
-                      stop_event: asyncio.Event | None = None) -> SessionResult:
-        session_id = uuid.uuid4().hex[:12]
+                      stop_event: asyncio.Event | None = None,
+                      is_playback_active: Callable[[], bool] | None = None,
+                      session_id: str | None = None,
+                      clock: Callable[[], float] | None = None) -> SessionResult:
+        session_id = session_id or uuid.uuid4().hex[:12]
         emit = sink or _noop_sink
         language = asr.primary_language(self.config)
         factory = transport_factory or (lambda: asr.make_live_transport(self.config))
@@ -238,20 +252,71 @@ class DictationService:
         started = time.monotonic()
         rotations = 0
         resumption_handle: str | None = None
+        # BUG6: frames the Live path refused (output playback or the local-TTS
+        # guard). They reach neither the uplink, the replay buffer, the ladder
+        # nor the archive: her own voice is not the user's dictation.
+        gated_frames = 0
+        gate_announced = False
+        live_failures: list[str] = []
+
+        def uplink_blocked(current: LiveTransport | None) -> str | None:
+            """Why the mic must stay shut right now, or None when it may open."""
+            if is_playback_active is not None:
+                try:
+                    if is_playback_active():
+                        return "local_playback"
+                except Exception:
+                    return "local_playback_probe_failed"
+            gate_ = getattr(current, "gate", None)
+            if gate_ is None:
+                return None
+            if gate_.playing():
+                return "live_output_audio"
+            if gate_.gate_closed():
+                return "live_output_guard"
+            return None
 
         async def collect_events(current: LiveTransport) -> None:
             nonlocal resumption_handle
             async for event in current.events():
-                collected.append(event)
+                # BUG6: only transcribable INPUT belongs in the transcript
+                # record. Output audio/text from the session are her own voice
+                # and are deliberately never appended to `collected`, so they
+                # cannot become a final by any later path.
+                if event.type in ("interim", "final", "go_away", "resumption",
+                                  "error", "turn_complete"):
+                    collected.append(event)
                 if event.type == "interim":
                     await emit({"event": "transcript.interim", "text": event.text,
+                                "session_id": session_id})
+                elif event.type in ("output_interim", "output_final"):
+                    await emit({"event": "live.output_transcript",
+                                "text": event.text,
+                                "final": event.type == "output_final",
+                                "session_id": session_id})
+                elif event.type == "output_audio":
+                    await emit({"event": "live.output_audio",
+                                "seconds": round(event.duration_s, 3),
+                                "sample_rate": event.sample_rate,
+                                "session_id": session_id})
+                elif event.type == "echo_suppressed":
+                    await emit({"event": "transcript.echo_suppressed",
+                                "reason": event.reason or "live echo",
+                                "text": event.text,
                                 "session_id": session_id})
                 elif event.type == "resumption" and event.handle:
                     resumption_handle = event.handle
 
+        def wrap_duplex(current: LiveTransport) -> LiveTransport:
+            """One door for both the real and the fake transport (§12.9)."""
+            if isinstance(current, DuplexLiveTransport):
+                return current
+            return DuplexLiveTransport(
+                current, external_playback=is_playback_active, clock=clock)
+
         async def open_session(handle: str | None) -> LiveTransport:
             nonlocal collector
-            current = factory()
+            current = wrap_duplex(factory())
             await current.connect(handle)
             await current.activity_start()
             collector = asyncio.create_task(collect_events(current))
@@ -272,6 +337,12 @@ class DictationService:
                 network_drop = looks_like_network_failure(exc)
                 if network_drop and self.mode_manager is not None:
                     self.mode_manager.observe_failure(exc, "gemini_live")
+                # BUG6 cost audit: a Live failure is a ledger row with a
+                # purpose tag, even when the fallback succeeds. A silent
+                # failure is exactly what "5 failures, all key/voice" cannot
+                # rule out by inspection.
+                live_failures.append(f"connect: {exc}")
+                self._ledger_live_failure(stage="connect", error=str(exc))
                 notes.append(f"live connect failed ({exc}) — will transcribe the saved audio")
                 await emit({"event": "session.reconnecting", "reason": str(exc),
                             "fallback": "local" if network_drop else "gemini_batch",
@@ -282,6 +353,31 @@ class DictationService:
                 if stop_event and stop_event.is_set():
                     break
                 frame_s = len(frame) / 2 / 16000
+                # BUG6: half-duplex inside the Live session. While her output
+                # is playing (or inside the ~400 ms guard), a frame is her own
+                # voice through the speakers. It is not buffered (a rotation
+                # would replay it as "user" audio), not fed to the silence
+                # ladder, and never uploaded. Discarded, not held: holding
+                # would send the echo the moment playback ends.
+                #
+                # It does not reach the archive either: the saved WAV is the
+                # source of the §12.7 batch fallback, so writing her own line
+                # there would re-enter it as "user" text whenever Live fails —
+                # the same bug through a slower door.
+                blocked_reason = uplink_blocked(transport)
+                if blocked_reason is not None:
+                    gated_frames += 1
+                    if not gate_announced:
+                        gate_announced = True
+                        await emit({"event": "live.uplink_gated", "state": "closed",
+                                    "reason": blocked_reason,
+                                    "session_id": session_id})
+                    continue
+                if gate_announced:
+                    gate_announced = False
+                    await emit({"event": "live.uplink_gated", "state": "open",
+                                "dropped_frames": gated_frames,
+                                "session_id": session_id})
                 duration_s += frame_s
                 if wav_sink:
                     wav_sink.write(frame)
@@ -345,6 +441,9 @@ class DictationService:
                                         or looks_like_network_failure(retry_exc))
                         if network_drop and self.mode_manager is not None:
                             self.mode_manager.observe_failure(retry_exc, "gemini_live")
+                        live_failures.append(f"reconnect: {retry_exc}")
+                        self._ledger_live_failure(stage="reconnect",
+                                                  error=str(retry_exc))
                         transport = None
                         notes.append(f"reconnect failed ({retry_exc}) — saved-audio fallback")
             # PTT released / source exhausted: close the utterance.
@@ -357,6 +456,20 @@ class DictationService:
                         notes.append("timed out waiting for final transcript")
                 finals = _final_texts(collected)
                 final_text = " ".join(finals).strip()
+            duplex = {}
+            if transport is not None and getattr(transport, "gate", None) is not None:
+                duplex = transport.gate.snapshot()
+                gated_frames = max(gated_frames, int(duplex.get("frames_dropped", 0)))
+            if gated_frames or duplex.get("echo_suppressed"):
+                notes.append(
+                    "Live half-duplex: "
+                    f"{gated_frames} mic frame(s) not uploaded while output played; "
+                    f"{int(duplex.get('echo_suppressed', 0))} self-audio segment(s) refused")
+                await emit({"event": "live.duplex", "session_id": session_id,
+                            "gated_frames": gated_frames,
+                            "echo_suppressed": int(duplex.get("echo_suppressed", 0)),
+                            "playbacks": int(duplex.get("playbacks", 0)),
+                            "output_audio_bytes": int(duplex.get("output_audio_bytes", 0))})
         finally:
             if wav_sink:
                 duration_s = wav_sink.close() or duration_s
@@ -407,7 +520,6 @@ class DictationService:
         from .persona import FILLER_PHRASES
         if final_text:
             lowered = final_text.lower()
-            from pathlib import Path as _P
             # Also check if daemon is speaking (if we have a reference) — but transcribe doesn't have daemon
             # So we rely on textual fingerprint of echo
             is_filler_echo = any(phrase in lowered for phrase in FILLER_PHRASES)
@@ -427,7 +539,9 @@ class DictationService:
                 await emit({"event": "session.ended", "session_id": session_id,
                             "backend": backend, "duration_s": round(duration_s, 2)})
                 return result
-        self._ledger_live_session(backend, duration_s, ok=bool(final_text))
+        self._ledger_live_session(
+            backend, duration_s, ok=bool(final_text),
+            error=(" | ".join(live_failures) if live_failures else None))
         shown = result.cleaned_text if (result.cleaned_text and not result.flagged) else result.raw_text
         await emit({"event": "transcript.final", "text": shown,
                     "inbox_path": result.inbox_path, "session_id": session_id})
@@ -510,7 +624,8 @@ class DictationService:
             transcript_id=transcript_id, notes=notes, confidence=confidence,
             cloud_status=cloud_status, connectivity_mode=connectivity_mode)
 
-    def _ledger_live_session(self, backend: str, duration_s: float, *, ok: bool) -> None:
+    def _ledger_live_session(self, backend: str, duration_s: float, *, ok: bool,
+                             error: str | None = None) -> None:
         """Live sessions are calls too (§3.2): audio-second accounting at
         25 tokens/s (§7), one row per session so `assist cost` sees them."""
         if backend != "gemini_live":
@@ -523,7 +638,26 @@ class DictationService:
             audio_seconds=duration_s,
             cost_usd=shadow_cost_usd(model, 0, 0, duration_s),
             latency_ms=duration_s * 1000, ok=1 if ok else 0, verified=None,
-            attempt=1, fixture_key=None, error=None if ok else "no transcript produced",
+            attempt=1, fixture_key=None,
+            error=error or (None if ok else "no transcript produced"),
+            purpose="housekeeping:transcribe_live", is_user_turn=0)
+
+    def _ledger_live_failure(self, *, stage: str, error: str) -> None:
+        """A Live connect/rotation failure is never silent (BUG 6 cost note).
+
+        The batch fallback is recorded by the client, and the session row is
+        only written when the live path produced a transcript — so without this
+        row a 429/key/transport failure looks like a quiet, cheap day. Tagged
+        with the same purpose as successful live sessions, so `assist cost` can
+        say what failed and not merely how many.
+        """
+        model = self.config.model_for_role("transcribe_live")
+        self.store.log_llm_call(
+            ts=iso_now(), correlation_id=uuid.uuid4().hex[:12],
+            role="transcribe_live", model=model, mode=self.config.gemini_mode,
+            tokens_in=0, tokens_out=0, tokens_estimated=1, audio_seconds=0.0,
+            cost_usd=0.0, latency_ms=0.0, ok=0, verified=None, attempt=1,
+            fixture_key=None, error=f"live {stage}: {error}",
             purpose="housekeeping:transcribe_live", is_user_turn=0)
 
 

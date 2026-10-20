@@ -438,7 +438,7 @@ def test_mode_switch_is_parked_until_dictation_finishes(config, running_daemon):
     parked = call(config.socket_path, "mode.set", {"mode": "offline"}, timeout=10)
     assert parked["connectivity"]["switch_parked"] is True
     assert parked["connectivity"]["effective_mode"] == ONLINE
-    stopped = call(config.socket_path, "ptt.stop", timeout=90)
+    stopped = call(config.socket_path, "ptt.stop", {"wait_s": 90}, timeout=90)
     assert stopped["result"]["text"]
     assert stopped["connectivity"]["effective_mode"] == FORCED_OFFLINE
 
@@ -502,7 +502,8 @@ def test_forced_offline_daemon_paths_make_zero_gemini_calls(config, tmp_path, ru
                        {"source": "simulated", "mode": "command"}, timeout=10)
     assert started_ptt["connectivity"]["effective_mode"] == FORCED_OFFLINE
     time.sleep(0.3)
-    stopped = call(config.socket_path, "ptt.stop", {"speak": True}, timeout=90)
+    stopped = call(config.socket_path, "ptt.stop", {"speak": True, "wait_s": 90},
+                    timeout=90)
     assert stopped["result"]["backend"] == "local"
     assert stopped["result"]["cloud_status"] == "pending_cloud_transcription"
     # VB-8 (owner decision 2026-10-20, voice hunt): a command transcript is gated
