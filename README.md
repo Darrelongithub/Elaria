@@ -102,7 +102,7 @@ No key yet? Everything still runs — `GEMINI_MODE` defaults to **mock**
 | **Dictation (Phase 1)** | `transcribe.py`, `live_client.py`, `cleanup.py`, `inbox.py`, `clipboard.py` | PTT session: `pw-record` frames → WAV sink (raw always kept) + rolling 30s buffer + VAD gate → Live manual-activity streaming with interim events; disconnect/GoAway → resumption + tail replay; unrecoverable → batch on the saved WAV. Silence ladder emits ONE soft check-in per segment, per-mode thresholds. Cleanup pass with diff-gate + language gate (raw is the record); note lands in the markdown inbox + `wl-copy`. `assist dictate` (terminal PTT), `assist transcribe FILE.wav`, `assist events` (overlay feed). Live-session fixtures are recordable *sequences* (hashes only — no audio in git). |
 
 | **Surfaces (Phase 2)** | `waybar.py`, `overlay.py`, `ui/` | Event-driven Waybar (`assist status --waybar --follow`: idle/listening/transcribing/halted/mock/offline, last-transcript + queue/voice tooltip, click=PTT, right-click=halt) + voice-test LED module. Overlay state machine in tested Python (`assist events --overlay`); `ui/quickshell/shell.qml` is a dumb binder (layer-shell, `WlrKeyboardFocus.None` — tests static-guard the QML). Hyprland binds in both Lua/.conf syntaxes. |
-| **Offline mode + one voice (Phase 8)** | `modes.py`, `tts.py`, `offline_queue.py`, `asr.py` | `assist mode auto|online|offline` distinguishes detected `OFFLINE` from deliberate `FORCED_OFFLINE`; Waybar/status show it and an in-progress session is finished before a parked switch applies. All speech exits through one local Piper voice in both modes — the owner-selected `en_GB-southern_english_female-low`; Gemini Live is text-only and Gemini native audio is never Elaria's voice. Native Piper length scale only, never time-stretching; standard acks are pre-cached. Offline dictation uses faster-whisper/whisper.cpp behind the §12.7 seam, always saves WAV, and queues low-confidence redo/cleanup. Tier 1/2, chat and other cloud work queue in SQLite; reconnect drains automatic items, gates downloads/external actions behind approval, and speaks a short summary. See [`docs/voice-audition.md`](docs/voice-audition.md). |
+| **Offline mode + one voice (Phase 8)** | `modes.py`, `tts.py`, `offline_queue.py`, `asr.py` | `assist mode auto|online|offline` distinguishes detected `OFFLINE` from deliberate `FORCED_OFFLINE`; Waybar/status show it and an in-progress session is finished before a parked switch applies. **INTERIM + AMENDED (owner decisions 2026-10-20 — the one-voice rule is deferred, not cancelled):** online conversation and replies are voiced by **Gemini native audio, `[gemini] voice = "Flare"`** — the only voice Elaria ever speaks with in normal operation. **Offline mode has no voice output at all**: replies land as text on the Waybar, overlay, notification and log surfaces. The owned local Piper voice (`en_GB-southern_english_female-low`) stays wired but **dormant** behind config, so the endgame — one locally owned voice in every mode, adopted in a single switch — needs no re-plumbing: `[tts] online_voice = "local"` (every mode) or `offline_voice = "local"` (offline speech back). A missing key, `GEMINI_MODE=mock`, or any cloud failure produces **reported silence** (`muted: true` plus the reason in `assist voice status`), never a hidden fallback and never a mystery. Nothing routes speech to a second cloud voice. Acks keep the §18 shape — one cached file lookup — warmed off the hot path, and online that file is Flare audio. Native Piper length scale only, never time-stretching; the dormant path is untouched. Offline dictation uses faster-whisper/whisper.cpp behind the §12.7 seam, always saves WAV, and queues low-confidence redo/cleanup. Tier 1/2, chat and other cloud work queue in SQLite; reconnect drains automatic items, gates downloads/external actions behind approval, and speaks a short summary. See [`docs/voice-audition.md`](docs/voice-audition.md). |
 
 **Definitions of done:** Phase 0 — `assist doctor/status/cost` ✓ · keyless
 tests ✓. Phase 1 — “you dictate a note and it appears” ✓ in mock/simulated
@@ -149,12 +149,31 @@ accuracy on your voice is a live-key Step-0 measurement.
 Phase 8 — offline competence without a second personality: local
 search/memory/Tier 0/undo keep working; dictation and meetings use
 local Whisper with raw audio retained; cloud judgement queues
-instead of vanishing; and both online/offline spoken replies use the
-same configured local voice. Required Phase 8 tests cover a simulated
+instead of vanishing; and offline mode is TEXT-ONLY by owner amendment
+(2026-10-20) — online replies are voiced by Flare, offline replies are
+never voiced. Required Phase 8 tests cover a simulated
 network drop mid-dictation (offline transcript + queued Gemini redo),
-forced-offline zero-network behaviour, identical TTS backend+voice in
-both modes, and reconnect drain with external work still approval-gated.
-196 tests, all offline and keyless.
+forced-offline zero-network behaviour, the single-voice route plus
+reported silence in both modes, and reconnect drain with external work
+still approval-gated. 196 tests, all offline and keyless.
+
+### Her voice: one name, pinned, with documented precedence
+
+`[gemini] voice` is the whole story while online (Flare, the owner's
+pick). The legacy `assist voice select` row (`tts.selected_voice`) and
+`[tts] voice_id`/`model` belong to the **dormant local path only** and
+are ignored online — `assist voice status` reports
+`legacy_selection_ignored_online: true` instead of leaving it to be
+guessed, and `assist doctor` names which voice is actually live.
+
+Two keys, deliberately: `[gemini] allowed_voices` (default
+`["Flare"]`) is the one-voice rule as data. A `voice` that is not in
+that list is never silently adopted — she refuses to speak, says the
+reason in `voice status`, and `assist doctor` FAILS until you either
+correct `voice` or widen `allowed_voices` on purpose. Changing her
+voice therefore means editing both keys and running `assist voice warm`:
+spoken audio and the ack cache are keyed on the voice and model that are
+actually live, so old audio can never be served under a new identity.
 
 ## §10 open decisions — defaults taken, awaiting your word
 
@@ -208,9 +227,16 @@ never breaks.
 - **Phase 7 done-when:** after the flip, dictate code-switched
   sentences and confirm the mix survives end-to-end (the guards will
   flag loudly if the model normalises — that's them working).
-- **Phase 8 voice:** the pick is made — `en_GB-southern_english_female-low`
-  (see [`docs/voice-audition.md`](docs/voice-audition.md)). On Fedora,
-  download its model pair, run `assist voice warm`, and judge the
-  exact-script acks, not the sample sentence. Finally verify
-  faster-whisper or whisper.cpp on the actual microphone, including
-  one forced-offline dictation and one Wi-Fi-drop/reconnect drill.
+- **Phase 8 voice:** the online pick is made — **Flare** (`[gemini]
+  voice`), and it is pinned by `[gemini] allowed_voices`. The local pick
+  (`en_GB-southern_english_female-low`, see
+  [`docs/voice-audition.md`](docs/voice-audition.md)) stays dormant
+  behind config; download its model pair only if you mean to switch the
+  endgame in (`online_voice = "local"`). Either way run
+  `assist voice warm` and judge the exact-script acks, not the sample
+  sentence — and after any voice change, confirm `assist doctor` is
+  green on `voice routing` and that the acks you hear are the NEW voice
+  (by ear: the cache key changed, so a stale file cannot answer).
+  Finally verify faster-whisper or whisper.cpp on the actual
+  microphone, including one forced-offline dictation and one
+  Wi-Fi-drop/reconnect drill.

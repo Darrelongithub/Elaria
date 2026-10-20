@@ -95,6 +95,90 @@ def mean_pairwise_cosine(vectors: list[list[float]]) -> float:
     return sum(scores) / len(scores)
 
 
+# A biometric template is not a config file: it is only ever 0600 (§13.10).
+BIOMETRIC_FILE_MODE = 0o600
+
+
+def voiceprint_path(config) -> Path:
+    """Where the speaker template lives — configurable, default `~/voiceprint.json`."""
+    settings = config.section("voice_test") if config else {}
+    return Path(str(settings.get("voiceprint_path") or "~/voiceprint.json")).expanduser()
+
+
+def voiceprint_health(path: Path, *, expected_dimension: int | None = None,
+                      expected_model: str | None = None) -> dict:
+    """Is the speaker template usable, and stored like the biometric it is? (VB-9)
+
+    `assist doctor` used to ask one question — does the file exist — and answer
+    "ok" for a zero-byte file, a file that is not JSON, a centroid that does not
+    match its own declared dimension, a template from a different model, or a copy
+    the whole machine can read. Absent is still only a warning (enrolment is the
+    user's call); anything present-but-wrong is a failure, because `load_voiceprint`
+    would raise at the first real score and the user would meet that later, mid-
+    sentence, with no explanation.
+    """
+    path = Path(path).expanduser()
+    problems: list[str] = []
+    if not path.exists():
+        return {"state": "absent", "ok": True, "problems": [], "path": str(path),
+                "detail": "absent — enrolment pending; `assist-voice-test enroll` builds it"}
+    try:
+        size = path.stat().st_size
+    except OSError as exc:                        # unreadable path, broken link
+        return {"state": "unusable", "ok": False, "problems": [f"cannot stat: {exc}"],
+                "path": str(path), "detail": f"cannot be inspected: {exc}"}
+    if size == 0:
+        problems.append("the file is 0 bytes (a truncated or interrupted enrolment)")
+    mode = path.stat().st_mode & 0o777
+    if mode & ~BIOMETRIC_FILE_MODE:
+        problems.append(f"permissions are 0{mode:o}, not 0{BIOMETRIC_FILE_MODE:o}: a "
+                        f"biometric template must not be readable by group or others")
+    data: dict = {}
+    if not problems:                              # nothing worth parsing yet
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            problems.append(f"not parseable JSON: {type(exc).__name__}: {exc}")
+    if not problems and not isinstance(data, dict):
+        problems.append(f"expected a JSON object, found {type(data).__name__}")
+    if not problems:
+        for key in ("model", "dimension", "centroid"):
+            if key not in data:
+                problems.append(f"missing '{key}'")
+        centroid_ = data.get("centroid")
+        if "centroid" in data:
+            if not isinstance(centroid_, list) or not centroid_:
+                problems.append("'centroid' is not a non-empty list of numbers")
+                centroid_ = []
+            else:
+                try:
+                    numbers = [float(v) for v in centroid_]
+                except (TypeError, ValueError) as exc:
+                    problems.append(f"'centroid' holds non-numeric values: {exc}")
+                    numbers = []
+                if numbers:
+                    if not all(math.isfinite(v) for v in numbers):
+                        problems.append("'centroid' contains a NaN or infinity")
+                    declared = data.get("dimension")
+                    if isinstance(declared, int) and len(numbers) != declared:
+                        problems.append(f"centroid length {len(numbers)} != declared "
+                                        f"dimension {declared}")
+                    if expected_dimension and len(numbers) != int(expected_dimension):
+                        problems.append(
+                            f"template dimension {len(numbers)} does not match "
+                            f"[voice_test] embedding_dim {int(expected_dimension)} — "
+                            f"it was enrolled by a different model")
+        model = data.get("model")
+        if expected_model and model and str(model) != str(expected_model):
+            problems.append(f"template model {model!r} != configured "
+                            f"{expected_model!r}")
+    state = "present" if not problems else "unusable"
+    detail = (f"{path} — {len(data.get('centroid', []) or [])}-d vector from "
+              f"{data.get('model', 'unknown model')}, mode 0{mode:o}")
+    return {"state": state, "ok": not problems, "problems": problems, "path": str(path),
+            "detail": detail if not problems else f"UNUSABLE: {'; '.join(problems)}"}
+
+
 def load_voiceprint(path: Path) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     for key in ("model", "dimension", "centroid"):
@@ -548,6 +632,9 @@ def enroll(embeddings_dir: Path, out_path: Path, model: str) -> dict:
         "total_speech_seconds": total_speech_s,
     }
     out_path.write_text(json.dumps(voiceprint, indent=2), encoding="utf-8")
+    # Written 0600 from the first moment: a template that lands world-readable in a
+    # shared /home is a leak the owner cannot take back (VB-9).
+    out_path.chmod(BIOMETRIC_FILE_MODE)
     return {k: v for k, v in voiceprint.items() if k != "centroid"}
 
 

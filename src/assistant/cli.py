@@ -166,11 +166,46 @@ def run_doctor(config) -> dict:
         "connectivity mode", True,
         f"preference={connectivity.preference}, effective={connectivity.effective_mode} "
         f"— {connectivity.reason}; switch with `assist mode offline|online|auto`"))
+    identity = voice.get("voice_identity", {})
+    acks = voice.get("ack_cache", {})
+    # A voice that is not the canonical one is a FAILURE, not a footnote: she stays
+    # silent rather than speak in it, so the doctor says so loudly (VB-4).
+    voice_ok = bool(voice["available"]) and bool(identity.get("allowed", True))
+    voice_detail = (
+        (f"VOICE IDENTITY REFUSED — {identity.get('reason')} "
+         f"(configured={identity.get('configured')}, canonical={identity.get('canonical')})\n"
+         if not voice_ok else "")
+        + f"{voice['voice_mode'].replace('-', ' ')} — backend={voice['backend']}, "
+          f"voice={voice['voice_id']}, cached acks={voice['cached_acks'] or 'none'}: "
+          f"{voice['reason']}. "
+          + ("" if voice_ok else "SILENT until that is fixed — nothing is spoken.\n")
+          + f"acks: {acks.get('reason', 'unknown')}\n"
+          + ("legacy `tts.selected_voice` row is IGNORED while online: [gemini] voice is "
+             "the only voice that speaks (the stored row describes the dormant local "
+             "path)\n" if voice.get("legacy_selection_ignored_online") else ""))
     checks.append(_check(
-        "one local voice", voice["available"],
-        f"backend={voice['backend']}, voice={voice['voice_id']}, "
-        f"cached acks={voice['cached_acks'] or 'none'} — {voice['reason']}. "
-        "Gemini native audio is disabled (Live is TEXT-only); no cloud-voice fallback exists"))
+        # A refused voice identity is a FAIL, not a warning: she is silent until
+        # it is fixed, so it has to read like one (§12.9 icons).
+        "voice routing", voice_ok, voice_detail + " " + (
+        f"One-voice rule DEFERRED, not cancelled: {voice.get('gemini_voice')} via Gemini "
+        f"native audio is the only voice; offline: {voice.get('offline_output')}; a cloud "
+        f"failure is reported silence, never local audio. Local voice dormant - "
+        f"{voice.get('dormant_local_voice', {}).get('enable_with', '')} to un-dormant; "
+        f"endgame switch: {voice.get('switch_back')}"),
+        warn_only=bool(voice["available"]) and bool(identity.get("allowed", True))))
+    # VB-10: a player or recorder that outlived its daemon holds the sink and the
+    # microphone, and the symptom is "the hotkey does nothing". Name the pids.
+    from .proc import audio_child_names, orphaned_audio_children
+
+    names = audio_child_names(config)
+    orphans = orphaned_audio_children(names=names)
+    checks.append(_check(
+        "orphaned audio", not orphans,
+        ("none — no audio process is parentless" if not orphans else
+         "LEAKED CHILDREN: " + ", ".join(f"{o['name']}({o['pid']}) {o['cmdline'][:60]}"
+                                        for o in orphans)
+         + " — run `assist voice cleanup` (or restart the unit) to release the mic"),
+        warn_only=False))
     offline_asr = local_asr_status(config)
     checks.append(_check(
         "offline ASR", offline_asr["available"],
@@ -188,12 +223,27 @@ def run_doctor(config) -> dict:
         (f"{profile_path} — voiceprint consistency {spoken.get('voiceprint_consistency')}, "
          f"negative corpus {spoken.get('false_trigger_corpus_hours')}h (measured baseline, §13.10)"
          if profile_path else "humour.toml not found — governor falls back to restraint")))
-    voiceprint = Path.home() / "voiceprint.json"
+    from .voicetest import voiceprint_health, voiceprint_path
+
+    # VB-9: a biometric template gets a real inspection, not `exists()`. Absent is
+    # a warning (enrolment is the user's call); present-but-wrong is a FAILURE —
+    # `load_voiceprint` would otherwise raise mid-sentence and the user would have
+    # no idea the file had been broken for weeks.
+    voice_test_cfg = config.section("voice_test")
+    health = voiceprint_health(
+        voiceprint_path(config),
+        expected_dimension=voice_test_cfg.get("embedding_dim"),
+        expected_model=voice_test_cfg.get("embedding_model"))
     checks.append(_check(
-        "voiceprint.json", voiceprint.exists(),
-        ("present (path only — biometric template stays out of git, §13.10)"
-         if voiceprint.exists() else
-         "absent — enrolment pending; assist-voice-test needs it for speaker scores")))
+        "voiceprint.json", health["state"] != "absent" and health["ok"],
+        (f"{health['path']}: {health['detail']}; template stays out of git (§13.10)"
+         if health["state"] == "absent" else
+         (f"{health['detail']}. Fix: `assist-voice-test enroll` rebuilds it and writes "
+          f"0600; nothing scores against a template it cannot read."
+          if not health["ok"] else
+          f"{health['detail']} — parseable, dimension agrees with [voice_test] "
+          f"embedding_dim, mode 0600")),
+        warn_only=health["ok"]))
 
     try:
         status = call(config.socket_path, "status", timeout=2.0)
@@ -206,7 +256,9 @@ def run_doctor(config) -> dict:
     blockers = [c for c in checks if c["status"] == "fail"]
     return {"checks": checks, "blockers": len(blockers),
             "summary": f"{sum(c['status'] == 'ok' for c in checks)}/{len(checks)} ok, "
-                       f"{sum(c['status'] == 'warn' for c in checks)} warning(s)"}
+                       f"{sum(c['status'] == 'warn' for c in checks)} warning(s)"
+                       + (f", {sum(c['status'] == 'fail' for c in checks)} FAILURE(S)"
+                          if any(c["status"] == "fail" for c in checks) else "")}
 
 
 def _print_doctor(report: dict) -> None:
@@ -344,6 +396,25 @@ def _voice_command(args, config) -> int:
     from .tts import SpeechService
 
     action = args.voice_action
+    if action == "cleanup":
+        # Deliberately NOT a daemon call: reaping leftovers matters exactly when
+        # the daemon is the thing that died (VB-10).
+        from .proc import audio_child_names, reap_orphans
+
+        names = audio_child_names(config)
+        report = reap_orphans(names=names)
+        print(json.dumps(report, indent=2))
+        if report["killed"]:
+            print(f"released {len(report['killed'])} orphaned audio process(es): "
+                  + ", ".join(report["detail"])
+                  + " — the PipeWire sink/microphone is free again")
+        elif report["failed"]:
+            print("could not signal: " + ", ".join(
+                f"{f['name']}({f['pid']}): {f['error']}" for f in report["failed"]))
+        else:
+            print("no orphaned audio children: nothing is holding the sink or the mic "
+                  f"(checked {'/'.join(names)})")
+        return 0 if not report["remaining"] and not report["failed"] else 1
     if action == "status":
         method, params = "speech.status", {}
     elif action == "warm":
@@ -584,14 +655,17 @@ def build_parser() -> argparse.ArgumentParser:
     ask_p = sub.add_parser("ask", help="one conversational turn (governor + harness)")
     ask_p.add_argument("text")
     ask_p.add_argument("--speak", action="store_true",
-                       help="speak the reply through the ONE local voice")
-    voice_p = sub.add_parser("voice", help="one local voice: status, acks, auditions")
+                       help="speak the reply through the configured voice for this mode")
+    voice_p = sub.add_parser(
+        "voice", help="speech routing: status, acks, auditions (online voice is interim)")
     voice_sub = voice_p.add_subparsers(dest="voice_action", required=True)
     voice_sub.add_parser("status", help="show the single local TTS routing")
     say_p = voice_sub.add_parser("say", help="speak text through the one local voice")
     say_p.add_argument("text")
     say_p.add_argument("--no-play", action="store_true", help="synthesize only")
     voice_sub.add_parser("warm", help="pre-synthesize the four standard acks")
+    voice_sub.add_parser("cleanup",
+                         help="release the mic/sink from audio processes a killed daemon left")
     audition_p = voice_sub.add_parser("audition", help="generate candidate voice samples")
     audition_p.add_argument("--text", help="custom audition script")
     select_p = voice_sub.add_parser("select", help="select the ONE canonical voice")

@@ -19,6 +19,7 @@ This client is NEVER on the ack path (§18): acks are local (persona.ack).
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from collections import deque
@@ -36,6 +37,16 @@ class Transport(Protocol):
     def generate(self, model: str, contents, config: dict) -> dict:
         """Return {"text": str, "usage": {"tokens_in": int, "tokens_out": int}}."""
         ...
+
+    def generate_audio(self, model: str, text: str, voice_name: str) -> dict:
+        """Optional: native-audio speech for `text`.
+
+        Returns {"pcm": bytes (s16le mono), "sample_rate": int, "voice_name": str,
+        "usage": {...}}. A transport that cannot produce audio omits this method;
+        the caller then reports silence with the reason (amendment 2026-10-20: the
+        dormant local voice is NOT a fallback), never a bare absence.
+        """
+        raise NotImplementedError
 
 
 class RateLimitError(RuntimeError):
@@ -89,6 +100,35 @@ class _SdkTransport:
         usage = getattr(response, "usage_metadata", None)
         return {
             "text": response.text or "",
+            "usage": {
+                "tokens_in": getattr(usage, "prompt_token_count", 0) or 0,
+                "tokens_out": getattr(usage, "candidates_token_count", 0) or 0,
+            },
+        }
+
+    def generate_audio(self, model: str, text: str, voice_name: str) -> dict:
+        from google.genai import types
+
+        config = types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+                )
+            ),
+        )
+        response = self._client.models.generate_content(model=model, contents=text, config=config)
+        part = response.candidates[0].content.parts[0].inline_data
+        rate = 24000
+        mime = str(getattr(part, "mime_type", "") or "")
+        match = re.search(r"rate=(\d+)", mime)
+        if match:
+            rate = int(match.group(1))
+        usage = getattr(response, "usage_metadata", None)
+        return {
+            "pcm": bytes(part.data),
+            "sample_rate": rate,
+            "voice_name": voice_name,
             "usage": {
                 "tokens_in": getattr(usage, "prompt_token_count", 0) or 0,
                 "tokens_out": getattr(usage, "candidates_token_count", 0) or 0,
@@ -200,6 +240,93 @@ class GeminiClient:
             cost_usd=shadow_cost_usd(model, tokens_in, tokens_out, audio_seconds),
             latency_ms=latency_ms, ok=0 if error else 1, verified=None,
             attempt=attempt, fixture_key=key, error=error,
+        )
+        if error:
+            raise RuntimeError(error)
+        return response
+
+    def voice_request(self, text: str, *, voice: str | None = None) -> dict:
+        """The exact request that would go out - inspectable without a network call.
+
+        The voice is resolved against `[gemini] allowed_voices` (the one-voice rule
+        as data). `voice_allowed: False` means this request would be REFUSED: a
+        voice name that is not canonical is never sent out, and never quietly
+        replaced by another one.
+        """
+        from .config import canonical_voices, resolve_voice
+
+        gemini = self.config.section("gemini")
+        configured = str(voice or gemini.get("voice") or "Flare")
+        effective, allowed = resolve_voice(self.config, configured)
+        return {
+            "model": str(gemini.get("model_voice") or "gemini-2.5-flash-preview-tts"),
+            "voice_name": effective or configured,
+            "voice_requested": configured,
+            "voice_allowed": allowed,
+            "canonical_voices": list(canonical_voices(self.config)),
+            "response_modalities": ["AUDIO"],
+            "text": text,
+        }
+
+    def can_speak(self) -> bool:
+        """Native audio needs a real transport; mock fixtures cannot synthesise it."""
+        return self.mode != "mock" and hasattr(self._transport, "generate_audio")
+
+    def generate_voice(self, text: str, *, voice: str | None = None,
+                       correlation_id: str = "-") -> dict:
+        """One rate-limited, ledgered native-audio call. Interim online voice."""
+        request = self.voice_request(text, voice=voice)
+        if not request["voice_allowed"]:
+            # The pin, enforced at the last moment: no transport will ever be told
+            # to speak a voice the owner did not approve (VB-4).
+            raise RuntimeError(
+                f"voice {request['voice_requested']!r} is not canonical "
+                f"(allowed: {', '.join(request['canonical_voices'])}); refusing to "
+                f"speak in an unapproved voice - set [gemini] voice back to a "
+                f"canonical name or widen [gemini] allowed_voices deliberately"
+            )
+        if not self.can_speak():
+            raise RuntimeError(
+                f"GEMINI_MODE={self.mode} cannot produce native audio - nothing is "
+                "spoken (the local voice is dormant by amendment 2026-10-20)"
+            )
+        model = request["model"]
+        key = fixture_key(model, text, {"voice_name": request["voice_name"]})
+        started = time.monotonic()
+        error: str | None = None
+        response: dict = {}
+        try:
+            self._check_daily_cap()
+            self._limiter.acquire(model, sleep=self._sleep)
+            delay = 1.0
+            for try_no in range(4):
+                try:
+                    response = self._transport.generate_audio(model, text, request["voice_name"])
+                    break
+                except Exception as exc:  # same backoff posture as text calls
+                    if try_no == 3 or not _is_retryable(exc):
+                        raise
+                    time.sleep(delay) if self._sleep is time.sleep else self._sleep(delay)
+                    delay *= 2
+            if self.mode == "record":
+                self._fixtures.record(key, {"model": model, "text": text,
+                                            "voice_name": request["voice_name"]},
+                                      {"text": "", "usage": response.get("usage", {}),
+                                       "note": "pcm audio is not stored in json fixtures"})
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        latency_ms = (time.monotonic() - started) * 1000
+        usage = response.get("usage") or {}
+        seconds = len(response.get("pcm", b"")) / 2 / max(1, int(response.get("sample_rate", 24000)))
+        self.store.log_llm_call(
+            ts=iso_now(), correlation_id=correlation_id, role="voice", model=model,
+            mode=self.mode, tokens_in=int(usage.get("tokens_in") or 0),
+            tokens_out=int(usage.get("tokens_out") or 0), tokens_estimated=0,
+            audio_seconds=round(seconds, 3),
+            cost_usd=shadow_cost_usd(model, int(usage.get("tokens_in") or 0),
+                                     int(usage.get("tokens_out") or 0), seconds),
+            latency_ms=latency_ms, ok=0 if error else 1, verified=None,
+            attempt=0, fixture_key=key, error=error,
         )
         if error:
             raise RuntimeError(error)

@@ -16,6 +16,7 @@ import struct
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -257,8 +258,12 @@ def test_default_voice_is_the_owner_selected_southern_english_female(config):
 
 
 def test_speech_cache_audition_and_selection_use_one_local_service(config, tmp_path):
+    # The local voice is dormant in normal operation (offline is text-only), so
+    # this test of the local plumbing opts into it explicitly - the same two keys
+    # an owner sets for the one-owned-voice endgame.
     config.raw["tts"] = {
         **config.raw["tts"], "backend": "mock", "voice_id": "elaria-test",
+        "online_voice": "local", "offline_voice": "local",
         "player": "none", "cache_dir": str(tmp_path / "cache"),
         "audition_dir": str(tmp_path / "auditions"),
         "audition_candidates": [
@@ -287,6 +292,26 @@ def test_speech_cache_audition_and_selection_use_one_local_service(config, tmp_p
     assert status["gemini_native_audio"] is False
 
 
+
+
+def test_standard_acks_stay_in_the_measured_audible_range():
+    """Ack copy is an audibility contract for the shipped voice, not a taste call.
+
+    The selected weight renders one-word utterances as unrecoverable audio - 0 of
+    6 takes came back through an independent ASR at every length_scale from 0.80
+    to 1.30, on two Piper versions - while three-word phrasings of the same
+    meaning recovered 6 of 6 with zero variance. Re-tidying these to "Done."
+    re-introduces the mangled-ack bug. See docs/voice-audition-round3.md,
+    "Round 4 addendum".
+    """
+    assert STANDARD_ACKS == {
+        "on_it": "On it.",
+        "done": "That is done.",
+        "checkin": "Is that everything?",
+        "not_at_this_hour": "No. Not at this hour.",
+    }
+    assert all(len(text.split()) >= 2 for text in STANDARD_ACKS.values())
+
 def test_piper_backend_uses_native_length_scale_only(tmp_path):
     model = tmp_path / "voice.onnx"
     model.write_bytes(b"model")
@@ -313,11 +338,14 @@ def test_live_session_disables_gemini_audio_out():
     assert "Modality.AUDIO" not in source
 
 
-def test_online_and_offline_ask_route_to_same_tts_voice(config, running_daemon):
+def test_local_voice_mode_routes_online_and_offline_to_the_same_backend(config, running_daemon):
+    """Endgame posture, made explicit: with the local voice switched on in both
+    modes, online and offline speak through one and the same backend."""
     from assistant.ipc import call
 
     daemon, _server = running_daemon
     config.raw["tts"] = {**config.raw["tts"], "player": "none",
+                         "online_voice": "local", "offline_voice": "local",
                          "cache_dir": str(config.data_dir / "voice-cache-test")}
     backend = MockTtsBackend("one-elaria-voice")
     daemon.speech = SpeechService(config, daemon.store, backend=backend)
@@ -446,7 +474,11 @@ def test_forced_offline_daemon_paths_make_zero_gemini_calls(config, tmp_path, ru
     assert mode["connectivity"]["effective_mode"] == FORCED_OFFLINE
     status = call(config.socket_path, "status", timeout=10)
     assert status["connectivity_mode"] == FORCED_OFFLINE
-    assert status["voice"]["local"] is True
+    # Amended posture: offline has NO voice at all, so speech is muted rather
+    # than "local". Still no cloud call, which is what this test is about.
+    assert status["voice"]["muted"] is True
+    assert status["voice"]["cloud_voice"] is False
+    assert status["voice"]["local"] is False
 
     local_reply = call(config.socket_path, "ask", {"text": "remember that tea is at four"},
                        timeout=20)
@@ -473,7 +505,19 @@ def test_forced_offline_daemon_paths_make_zero_gemini_calls(config, tmp_path, ru
     stopped = call(config.socket_path, "ptt.stop", {"speak": True}, timeout=90)
     assert stopped["result"]["backend"] == "local"
     assert stopped["result"]["cloud_status"] == "pending_cloud_transcription"
-    assert stopped["result"]["command"]["via"] == "local-intent"
+    # VB-8 (owner decision 2026-10-20, voice hunt): a command transcript is gated
+    # on ASR confidence before anything is routed. This offline local-ASR pass
+    # reports 0.30 — below [transcribe] command_min_confidence — and the audio is
+    # pending cloud transcription, so the words are kept but NOTHING runs. The
+    # previous contract ("local ASR at any confidence climbs the intent ladder")
+    # is the one that let a mumble move files; it is replaced deliberately.
+    command = stopped["result"]["command"]
+    assert command["via"] == "refused" and command["executed"] is False, command
+    assert command["confidence"] == 0.3 and command["threshold"] == 0.85, command
+    assert "below" in command["reason"] and "Not executed" in command["note"]
+    # The dictation itself is still saved and reported, and the cloud redo is queued.
+    assert stopped["result"]["text"] == "status"
+    assert any(j["kind"] == "cloud_transcription" for j in daemon.cloud_queue.list_jobs(limit=50))
 
     kinds = [j["kind"] for j in daemon.cloud_queue.list_jobs(limit=50)]
     assert {"chat", "plan_tiers", "cloud_transcription"}.issubset(kinds)
@@ -522,6 +566,214 @@ def test_doctor_reports_phase8_surfaces(config):
     report = run_doctor(config)
     checks = {c["check"]: c for c in report["checks"]}
     assert "connectivity mode" in checks
-    assert "one local voice" in checks
+    assert "voice routing" in checks  # stable label: the mode moves, the check name does not
     assert "offline ASR" in checks
-    assert "Gemini native audio is disabled" in checks["one local voice"]["detail"]
+    # The doctor no longer asserts a rule that has been deferred: it reports which
+    # voice is speaking and why, plus the one key that switches the posture back.
+    detail = checks["voice routing"]["detail"]
+    # The doctor runs without the daemon's mode manager, so it must admit the
+    # posture is unknown rather than guess a mode it cannot see.
+    assert "text only posture unknown" in detail   # no daemon here => no posture to claim
+    assert "dormant by amendment 2026-10-20" in detail  # the *reason* ships with the mode
+    assert "reported silence" in detail or "text only" in detail
+    assert "dormant" in detail                 # the local voice does not cover failures
+    assert 'online_voice = "local"' in detail  # the endgame switch is printed, not hidden
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INTERIM online voice (owner decision 2026-10-20): Gemini native audio (Flare)
+# speaks online, the local voice is offline backup, and the one-voice rule is
+# deferred - not cancelled - so the local path must keep working untouched.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class FakeVoiceClient:
+    """Stands in for GeminiClient's native-audio path. PCM is a real shape,
+    so the WAV writer, cache keys and routing are all genuinely exercised."""
+
+    def __init__(self, *, can=True, fail=None, rate=24000, mode="live"):
+        self.mode = mode
+        self._can = can
+        self._fail = fail
+        self.rate = rate
+        self.pcm = struct.pack("<640h", *[4000 if i % 2 else -4000 for i in range(640)])
+        self.calls: list[str] = []
+
+    def can_speak(self):
+        return self._can
+
+    def voice_request(self, text, *, voice=None):
+        return {"model": "gemini-2.5-flash-preview-tts", "voice_name": voice or "Flare",
+                "response_modalities": ["AUDIO"], "text": text}
+
+    def generate_voice(self, text, *, voice=None, correlation_id="-"):
+        self.calls.append(text)
+        if self._fail:
+            raise RuntimeError(self._fail)
+        return {"pcm": self.pcm, "sample_rate": self.rate, "voice_name": "Flare",
+                "usage": {"tokens_in": 9, "tokens_out": 40}}
+
+
+def _voice_config(tmp_path):
+    from assistant.config import load_config
+
+    config = load_config()
+    config.raw["tts"] = {
+        **config.raw["tts"], "backend": "mock", "voice_id": "elaria-test",
+        "player": "none", "cache_dir": str(tmp_path / "cache"),
+        "audition_dir": str(tmp_path / "auditions"),
+    }
+    return config
+
+
+def test_interim_defaults_name_flare_as_the_online_voice():
+    """The exact setting the owner asked for, pinned so a refactor can't drift it."""
+    from assistant.config import DEFAULTS
+
+    assert DEFAULTS["tts"]["online_voice"] == "gemini"
+    assert DEFAULTS["tts"]["offline_voice"] == "none"     # offline speaks no at all
+    assert DEFAULTS["gemini"]["voice"] == "Flare"
+    assert DEFAULTS["tts"]["backend"] == "piper"          # dormant path intact, not deleted
+
+
+def test_gemini_native_audio_owns_online_speech(tmp_path):
+    config = _voice_config(tmp_path)
+    client = FakeVoiceClient()
+    speech = SpeechService(config, make_store(tmp_path), client=client,
+                           is_online=lambda: True)
+
+    result = speech.speak("On it. Sorting 148 files into Finance.", play=False)
+
+    assert result.backend == "gemini-native-audio" and result.voice_id == "Flare"
+    assert client.calls == ["On it. Sorting 148 files into Finance."]
+    with wave.open(result.audio_path) as wav:
+        assert (wav.getframerate(), wav.getnchannels()) == (24000, 1)
+        assert wav.readframes(wav.getnframes()) == client.pcm  # no re-encode, no resample
+
+
+def test_status_reports_the_interim_posture_and_the_way_back(tmp_path):
+    config = _voice_config(tmp_path)
+    speech = SpeechService(config, make_store(tmp_path), client=FakeVoiceClient(),
+                           is_online=lambda: True)
+
+    status = speech.status()
+
+    assert status["voice_mode"] == "gemini-interim"
+    assert status["cloud_voice"] is True and status["gemini_native_audio"] is True
+    assert status["gemini_voice"] == "Flare" and status["voice_id"] == "Flare"
+    assert status["local"] is False and status["muted"] is False
+    assert "deferred" in status["one_voice_rule"]
+    assert status["switch_back"] == '[tts] online_voice = "local"'
+    assert "text only" in status["offline_output"]
+    dormant = status["dormant_local_voice"]
+    assert dormant["voice_id"] == "elaria-test"          # wired, but not speaking
+    assert 'offline_voice = "local"' in dormant["enable_with"]
+
+
+def test_offline_mode_makes_no_sound_at_all(tmp_path):
+    """The amendment: offline is text-only. No cloud call, no local audio, no file."""
+    config = _voice_config(tmp_path)
+    client = FakeVoiceClient()
+    speech = SpeechService(config, make_store(tmp_path), client=client,
+                            is_online=lambda: False)
+
+    result = speech.speak("Twelve need review.", play=False)
+
+    assert result.muted is True and result.audio_path is None
+    assert result.backend == "none" and result.voice_id == "none"
+    assert "text-only" in (result.error or "")
+    assert client.calls == []                      # offline never touches Gemini
+    assert speech.warm_ack_cache() == {}           # nothing to pre-render
+    ack = speech.play_ack("done")
+    assert ack["muted"] is True and ack["audio_path"] is None
+    assert ack["cache_miss"] is not True           # intentional silence, not a miss
+    cache = Path(config.raw["tts"]["cache_dir"])
+    assert not (cache.exists() and list(cache.glob("*.wav"))), "no audio written offline"
+
+
+def test_no_cloud_voice_produces_reported_silence_never_local_audio(tmp_path):
+    """A missing/failing cloud voice is explained silence. The dormant local voice
+    does not step in - that is the difference between this and the old rule."""
+    config = _voice_config(tmp_path)
+    store = make_store(tmp_path)
+
+    quiet = SpeechService(config, store, client=FakeVoiceClient(can=False, mode="mock"),
+                          is_online=lambda: True)
+    result = quiet.speak("Is that everything?", play=False)
+    assert result.muted is True and result.backend == "none"
+    assert "GEMINI_MODE=mock" in (result.error or "")
+    assert "dormant" in (result.error or "")
+    assert "GEMINI_MODE=mock" in quiet.status()["reason"]
+
+    broken = FakeVoiceClient(fail="429 quota exhausted")
+    speech = SpeechService(config, store, client=broken, is_online=lambda: True)
+    failed = speech.speak("No. Not at this hour.", play=False)
+    assert failed.muted is True and failed.audio_path is None
+    assert "429 quota exhausted" in failed.error
+    assert "429 quota exhausted" in speech.last_voice_error
+    assert speech.voice_route()[0] == "gemini"      # the route is still Flare's
+    cache = Path(config.raw["tts"]["cache_dir"])
+    assert not (cache.exists() and list(cache.glob("*.wav")))
+
+
+def test_acks_online_are_flare_and_the_cache_shape_is_unchanged(tmp_path):
+    """§18 budget holds: an ack is still one file lookup. Online, that file is
+    Flare's audio, warmed off the hot path."""
+    config = _voice_config(tmp_path)
+    store = make_store(tmp_path)
+    client = FakeVoiceClient()
+    speech = SpeechService(config, store, client=client, is_online=lambda: True)
+
+    warmed = speech.warm_ack_cache()
+
+    assert set(warmed) == set(STANDARD_ACKS)
+    assert client.calls == list(STANDARD_ACKS.values())
+    for item in warmed.values():
+        with wave.open(item["audio_path"]) as wav:
+            assert (wav.getframerate(), wav.getnchannels()) == (24000, 1)
+            assert wav.readframes(wav.getnframes()) == client.pcm
+
+    played = speech.play_ack("done")
+    assert played["cached"] is True and played["cache_miss"] is not True
+    assert played["voice_id"] == "Flare"
+    assert client.calls == list(STANDARD_ACKS.values())   # a hit costs no new call
+
+
+def test_a_cloud_render_is_never_reported_as_local(tmp_path):
+    """`local` / `cloud_voice` follow the route, warm cache or not.
+
+    The dataclass default is local=True, which used to leak into every Flare
+    render: `assist voice say` would report a cloud voice as locally produced,
+    including from the ack cache. Silence and fallbacks are both reported
+    truthfully or the owner cannot trust `voice status` at all.
+    """
+    config = _voice_config(tmp_path)
+    speech = SpeechService(config, make_store(tmp_path), client=FakeVoiceClient(),
+                           is_online=lambda: True)
+
+    first = speech.speak("Twelve need review.", play=False)
+    second = speech.speak("Twelve need review.", play=False)
+
+    assert (first.local, first.cloud_voice) == (False, True)
+    assert second.cached is True  # same route, from the file cache
+    assert (second.local, second.cloud_voice) == (False, True)
+    assert speech.route("Twelve need review.")["cloud_voice"] is True
+
+
+def test_silence_always_names_its_own_cause(tmp_path):
+    """Offline silence, unavailable-cloud silence and unknown posture are 3 facts."""
+    config = _voice_config(tmp_path)
+    offline = SpeechService(config, make_store(tmp_path / "a"), client=FakeVoiceClient(),
+                            is_online=lambda: False)
+    unavailable = SpeechService(config, make_store(tmp_path / "b"),
+                                client=FakeVoiceClient(can=False, mode="mock"),
+                                is_online=lambda: True)
+
+    assert offline.status()["voice_mode"] == "offline-text-only"
+    assert offline.status()["posture"] == "offline"
+    assert unavailable.status()["voice_mode"] == "text-only-cloud-voice-unavailable"
+    assert unavailable.status()["posture"] == "online"
+    assert "GEMINI_MODE=mock" in unavailable.status()["reason"]
+    # Never a bare absence and never local audio pretending to be the posture.
+    assert offline.status()["local"] is False and unavailable.status()["local"] is False
+    assert offline.status()["muted"] is True and unavailable.status()["muted"] is True

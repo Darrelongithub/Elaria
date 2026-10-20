@@ -50,6 +50,34 @@ def runtime_dir() -> Path:
     return Path(f"/tmp/assistant-{os.getuid()}")
 
 
+def canonical_voices(config) -> tuple[str, ...]:
+    """`[gemini] allowed_voices`, defaulting to `("Flare",)`.
+
+    The one-voice rule as data: the list is the whole policy, so approving a
+    different voice is a config edit the owner makes on purpose (VB-4) and never
+    something a stray `voice = "..."` achieves by itself.
+    """
+    gemini = config.section("gemini") if config else {}
+    allowed = gemini.get("allowed_voices")
+    if allowed is None:
+        # Absent means the shipped answer, not "whatever `voice` says": a typo in
+        # `voice` must never widen the rule by itself. An explicit empty list is
+        # respected as written, which refuses every voice - a loud config error.
+        allowed = ["Flare"]
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    return tuple(str(item) for item in allowed if str(item).strip())
+
+
+def resolve_voice(config, requested: str | None = None) -> tuple[str, bool]:
+    """(effective voice, allowed). An unapproved voice resolves to "" — refused."""
+    gemini = config.section("gemini") if config else {}
+    configured = str(requested or gemini.get("voice") or "Flare")
+    canonical = canonical_voices(config)
+    allowed = configured.lower() in {name.lower() for name in canonical}
+    return (configured if allowed else ""), allowed
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     out = dict(base)
     for key, value in override.items():
@@ -72,6 +100,17 @@ DEFAULTS: dict = {
         "model_chat": "gemini-flash-latest",
         "model_transcribe_live": "gemini-3.5-transcribe-live",
         "model_transcribe_batch": "gemini-flash-lite-latest",
+        # INTERIM speaking voice (owner choice 2026-10-20). Flare is the only
+        # voice Elaria ever speaks with; offline is text-only and the local Piper
+        # voice is dormant (see [tts]). `model_voice` must be a native-audio/TTS
+        # capable model.
+        "model_voice": "gemini-2.5-flash-preview-tts",
+        "voice": "Flare",
+        # The one-voice rule, expressed in config (VB-4): `[gemini] voice` must be
+        # one of these or she refuses to speak and `assist doctor` fails. Widening
+        # this list is the ONLY way to change her voice — no code edit, and no
+        # silent adoption of whatever string is in `voice`.
+        "allowed_voices": ["Flare"],
         "escalation_ladder": ["gemini-flash-lite-latest", "gemini-flash-latest"],
         "escalate_after_failures": 2,
         "max_scaffold_calls": 6,
@@ -112,8 +151,20 @@ DEFAULTS: dict = {
         "drain_on_reconnect": True,
     },
     "tts": {
-        # ONE-VOICE RULE: exactly one locally owned voice speaks for Elaria
-        # in every mode. Gemini may return text; it never supplies her voice.
+        # ONE-VOICE RULE — DEFERRED, NOT CANCELLED (owner decision 2026-10-20).
+        # Endgame is still exactly one locally owned voice in every mode, adopted
+        # in a single switch. Until then this is INTERIM: `online_voice = "gemini"`
+        # makes Gemini native audio (Flare) her speaking voice for online
+        # conversation. Offline nothing is spoken at all (see `offline_voice`), so
+        # the Piper voice below stays dormant - not an offline voice, not a
+        # fallback. Set `online_voice = "local"` to restore the strict one-voice
+        # posture; that one key is the whole switch back.
+        "online_voice": "gemini",  # gemini (interim) | local (the endgame posture)
+        # OFFLINE HAS NO VOICE (owner amendment 2026-10-20): offline replies are
+        # text only - Waybar, overlay, notification, log. Nothing is spoken from a
+        # local model in normal operation. `local` keeps the Piper path wired but
+        # dormant, for the future owned-voice endgame; `none` is the shipped truth.
+        "offline_voice": "none",   # none (text only) | local (dormant endgame path)
         "enabled": True,
         "backend": "piper",  # piper | mock (tests/dev only)
         # Owner-selected 2026-10-19 after two audition rounds. The first
@@ -185,6 +236,15 @@ DEFAULTS: dict = {
         # Adaptive endpointing (§13.8 soft check-in): per-mode silence
         # before the single "Is that all?" — narration waits far longer.
         "checkin_after_s": {"command": 4, "conversation": 6, "narration": 20},
+        # VB-5/VB-6: speech must last this long to count as a resumption (so a
+        # breath between silences cannot re-arm the check-in), and silence this
+        # long AFTER the check-in closes the session instead of holding the mic.
+        "speech_resume_s": 0.4,
+        "checkin_grace_s": 8.0,
+        # VB-8: a command transcript below this ASR confidence (or flagged by
+        # cleanup) is never executed. Unknown confidence still allows read-only
+        # intents, never a mutating one.
+        "command_min_confidence": 0.85,
         "vad_rms_threshold": 0.01,        # never stream silence (§8)
     },
     "cleanup": {
@@ -242,6 +302,11 @@ DEFAULTS: dict = {
     "tools": {"shell": "confirm"},
     "voice_test": {
         "keyword": "Elaria",
+        # The biometric template: where it lives and what produced it. `doctor`
+        # validates size, JSON, schema, dimension, model AND file mode against
+        # these (VB-9) — it no longer asks only whether the file exists.
+        "voiceprint_path": "~/voiceprint.json",
+        "embedding_dim": 192,
         "speaker_threshold": 0.75,
         "keyword_threshold": 0.5,
         "save_near_miss_clips": False,

@@ -64,7 +64,13 @@ class Daemon:
         self.mode = "idle"
         # Phase 8 resident hot paths: connectivity, ONE local voice, queue.
         self.mode_manager = ModeManager(config, self.store)
-        self.speech = SpeechService(config, self.store)
+        self.speech = SpeechService(
+            config, self.store, client=self.client,
+            # INTERIM online voice: Flare speaks only while actually online. Offline
+            # turns are text-only (amendment 2026-10-20) - no cloud call, and the
+            # dormant local voice does not take them over either.
+            is_online=lambda: self.mode_manager.status(refresh=False).effective_mode
+            == "ONLINE")
         self.cloud_queue = CloudQueue(config, self.store, self.client, self.mode_manager)
         self.dictation = DictationService(
             config, self.store, self.client,
@@ -81,6 +87,16 @@ class Daemon:
         self._meeting: dict | None = None  # {task, dual, mic_frames, sys_frames}
         self._meeting_processing = False
         self._plan_tasks: dict[int, asyncio.Task] = {}
+        # VB-13: early acks wait for the boot warm instead of being silent. The
+        # event is set as soon as a warm cycle ends (success, failure, or a
+        # posture that never speaks), so it can only ever delay a handler briefly.
+        self._ack_cache_ready = asyncio.Event()
+        self._warm_running = False
+        # True from the moment run() schedules the boot warm until that cycle
+        # ends: it covers the instant before the task first runs, so an ack
+        # landing there queues behind the warm instead of answering from a cold
+        # cache. A daemon driven without run() never sets it and never waits.
+        self._warm_pending = False
         self._subscribers: set = set()          # event-stream writers (§3.1)
         self._dictation_task: asyncio.Task | None = None
         self._dictation_session_mode = "narration"
@@ -306,15 +322,81 @@ class Daemon:
         kind = str(params.get("kind") or "on_it")
         route = self.speech.route(STANDARD_ACKS.get(kind, "On it."))
         cached = self.speech.cached_ack(kind)
-        ack["speech"] = {**route, "ack_kind": kind, "audio_path": cached,
-                         "cached": cached is not None, "played": False}
         should_speak = params.get("speak", self.config.section("tts").get("speak_acks", True))
+        if should_speak and cached is None and not route["muted"]:
+            await self._await_ack_cache()          # VB-13: boot warming, once
+            cached = self.speech.cached_ack(kind)
+        ack["speech"] = {**route, "ack_kind": kind, "audio_path": cached,
+                         "cached": cached is not None, "played": False,
+                         # A miss while she is supposed to speak is a reported
+                         # condition (VB-2), not a verdict: the re-warm below is
+                         # what makes the next press audible.
+                         "cache_miss": cached is None and not route["muted"]}
+        if cached is None:
+            self._schedule_rewarm_if_requested()   # VB-2: miss -> one warm cycle
         if should_speak and cached:
             self._track_task(asyncio.create_task(
                 asyncio.to_thread(self.speech.play_ack, kind)))
             ack["speech"]["queued"] = True
         self.store.log_persona_event(iso_now(), "ack", json.dumps(ack))
         return ack
+
+    # Intents that change the user's files. Reached from a dictation transcript,
+    # they get the strict gate; read-only intents keep their normal behaviour.
+    MUTATING_INTENTS = ("undo",)
+
+    def _command_gate(self, result: dict) -> dict | None:
+        """VB-8: no intent executes from a transcript she is not sure about.
+
+        Command mode and dictation share one microphone, so background speech (a
+        TV saying "undo.") lands in the same buffer as a deliberate command and the
+        same buffer used to feed the intent ladder directly. Two facts decide it,
+        both already computed: cleanup's `flagged` (the transcript is unreliable and
+        kept for review) and ASR's `confidence`. A veto is silent about actions and
+        loud about state: the text, the numbers, and the fact that nothing ran.
+        """
+        from .intents import route as route_intent
+
+        text = str(result.get("text") or "").strip()
+        confidence = result.get("confidence")
+        flagged = bool(result.get("flagged"))
+        threshold = float(self.config.section("transcribe").get("command_min_confidence",
+                                                                 0.85))
+        try:
+            intent = route_intent(text)
+        except Exception:            # a router that cannot parse cannot act either
+            intent = None
+        mutating = bool(intent is not None and str(getattr(intent, "kind", ""))
+                        in self.MUTATING_INTENTS)
+        low = confidence is not None and float(confidence) < threshold
+        unknown = confidence is None
+        # Flagged or below-threshold: nothing is routed, because the words
+        # themselves are in doubt. Known-confident, or unknown-but-harmless
+        # (a read-only intent): the ladder runs, as it did before. `mutating`
+        # is the line a mumble can never cross on an unverifiable transcript.
+        if not (flagged or low or (unknown and mutating)):
+            return None
+        reasons = []
+        if flagged:
+            reasons.append("cleanup flagged this transcript as unreliable")
+        if low:
+            reasons.append(f"ASR confidence {float(confidence):.2f} is below "
+                           f"{threshold:.2f}")
+        if unknown and mutating:
+            reasons.append("confidence is unknown and the intent would change files")
+        return {
+            "via": "refused",
+            "executed": False,
+            "intent": (getattr(intent, "kind", None) if intent is not None else None),
+            "text": text,
+            "confidence": confidence,
+            "flagged": flagged,
+            "threshold": threshold,
+            "reason": "; ".join(reasons) or "gated",
+            "note": ("Not executed — " + "; ".join(reasons)
+                      + ". Repeat it clearly, or run the command deliberately "
+                        "(`assist undo`, `assist remember ...`)."),
+        }
 
     async def _halt(self, params: dict) -> dict:
         set_halt(self.config.socket_path.parent)
@@ -368,7 +450,14 @@ class Daemon:
         return {"speech": result.as_dict()}
 
     async def _speech_warm(self, params: dict) -> dict:
+        """`speech.warm`: an explicit warm cycle (also `assist voice warm`).
+
+        Opening the ack gate here is what makes `assist voice warm` the documented
+        cure for a cold cache: from now on the hot path is allowed to answer.
+        """
         warmed = await asyncio.to_thread(self.speech.warm_ack_cache)
+        if self.speech.ack_cache_state()["complete"]:
+            self._ack_cache_ready.set()
         return {"warmed": warmed, "voice": self.speech.status()}
 
     async def _speech_audition(self, params: dict) -> dict:
@@ -404,7 +493,15 @@ class Daemon:
         # background task behind it. The user is already talking while the
         # socket opens — parse-while-you-speak starts here (§18 rule 3).
         if self._dictation_task and not self._dictation_task.done():
-            return {"listening": True, **await self._ack({"kind": "on_it"}),
+            # VB-11: the loser of the race is refused, and a refusal is not a
+            # request to be acknowledged. She is already listening; saying "On it."
+            # again is a second voice event for one press (and double audio when the
+            # user mashes the hotkey). No ack is played and none is queued.
+            route = self.speech.route(STANDARD_ACKS["on_it"])
+            return {"listening": True, "already_listening": True, "ack": None,
+                    "speech": {**route, "ack_kind": "on_it", "audio_path": None,
+                               "cached": False, "played": False,
+                               "suppressed": "already listening — no second ack"},
                     "note": "already listening"}
         ack = await self._ack({"kind": "on_it"})
         capture_cfg = self.config.section("capture")
@@ -481,12 +578,20 @@ class Daemon:
                          "seconds": session.duration_s}),
                 }
                 if self._dictation_session_mode == "command" and result["text"].strip():
-                    # Known grammar climbs the local ladder first; open text
-                    # follows the same offline queue policy as `ask`.
-                    result["command"] = await self._ask({
-                        "text": result["text"],
-                        "speak": params.get("speak", True),
-                    })
+                    veto = self._command_gate(result)
+                    if veto is not None:
+                        # Nothing was routed, so nothing was executed. The words are
+                        # still reported (they are the user's dictation, kept in the
+                        # transcript row) and the reason is stated as a fact.
+                        result["command"] = veto
+                        result["narration"] = veto["note"]
+                    else:
+                        # Known grammar climbs the local ladder first; open text
+                        # follows the same offline queue policy as `ask`.
+                        result["command"] = await self._ask({
+                            "text": result["text"],
+                            "speak": params.get("speak", True),
+                        })
                     result["narration"] = result["command"].get("reply", result["narration"])
             except Exception as exc:
                 result = {"error": f"dictation did not finish cleanly: {exc}"}
@@ -876,14 +981,53 @@ class Daemon:
             await self._note_connectivity_transition(status)
 
     async def _warm_speech_cache(self) -> None:
-        if not self.config.section("tts").get("enabled", True):
+        """One warm cycle for the active voice, off the hot path (§18).
+
+        Single-flight and repeatable: boot calls it before the socket serves, and
+        a cold-cache ack (VB-2) schedules it again so the next press is audible.
+        The ack gate opens when the cycle ends, however it ends - a cloud that
+        cannot render must not park every future ack behind a timeout.
+        """
+        if self._warm_running:
+            return
+        self._warm_running = True
+        self._warm_pending = True
+        try:
+            if not self.config.section("tts").get("enabled", True):
+                return
+            try:
+                await asyncio.to_thread(self.speech.warm_due)
+            except Exception as exc:
+                # Text/UI ack still works; status/doctor carry the reason.
+                self._ack_cache_ready.clear()   # a failed warm is not a ready cache
+                await self.broadcast({"event": "speech.error", "error": str(exc),
+                                      **self.speech.route("On it.")})
+                return
+            if self.speech.ack_cache_state()["complete"]:
+                self._ack_cache_ready.set()
+        finally:
+            self._warm_running = False
+            self._warm_pending = False
+
+    async def _await_ack_cache(self, timeout: float = 2.0) -> None:
+        """Queue the first acks after boot behind the warm (VB-13).
+
+        Bounded on purpose: the hot path keeps its 300 ms promise even when the
+        warm is still rendering, and a silent ack with a reason in `status` beats
+        a hung handler.
+        """
+        if self._ack_cache_ready.is_set() or not (self._warm_pending or self._warm_running):
             return
         try:
-            await asyncio.to_thread(self.speech.warm_ack_cache)
-        except Exception as exc:
-            # Text/UI ack still works; status/doctor carry the reason.
-            await self.broadcast({"event": "speech.error", "error": str(exc),
-                                  **self.speech.route("On it.")})
+            await asyncio.wait_for(asyncio.shield(self._ack_cache_ready.wait()), timeout)
+        except TimeoutError:      # asyncio.TimeoutError is this alias since 3.11
+            pass
+
+    def _schedule_rewarm_if_requested(self) -> None:
+        """VB-2: a `cache_miss` on the speaking route is the trigger, not a verdict."""
+        if self.speech.take_rewarm_request():
+            self._ack_cache_ready.clear()
+            self._track_task(asyncio.create_task(self._warm_speech_cache()))
 
     # -- lifecycle ---------------------------------------------------------------
     async def run(self) -> None:
@@ -894,9 +1038,28 @@ class Daemon:
             print(f"[assistd] WARNING: {len(outstanding)} uncommitted journal "
                   f"intent(s) from a previous run — inspect before enabling "
                   f"the executor.", flush=True)
+        # VB-13: the ack cache starts warming BEFORE anything can ask for an ack,
+        # and `_ack` queues behind it, so the first hotkey press after boot finds
+        # audio instead of silence. Everything else on the socket is unaffected.
+        # VB-10: if a previous run was SIGKILLed mid-playback (or mid-recording),
+        # its audio children are still holding the sink and the microphone, and a
+        # fresh daemon must not inherit that. pdeathsig covers the normal case;
+        # this covers the kernel/thread arrangements where it does not fire.
+        try:
+            from .proc import audio_child_names, reap_orphans
+
+            reaped = await asyncio.to_thread(
+                lambda: reap_orphans(names=audio_child_names(self.config)))
+            if reaped["killed"]:
+                print(f"[assistd] released {len(reaped['killed'])} orphaned audio "
+                      f"process(es) from a previous run: "
+                      f"{', '.join(reaped['detail'])}", flush=True)
+        except Exception as exc:            # never a reason to refuse to start
+            print(f"[assistd] audio-orphan sweep failed: {exc}", flush=True)
+        self._warm_pending = True
+        warm_task = asyncio.create_task(self._warm_speech_cache())
         server = await serve(self.config.socket_path, self.handle)
         connectivity_task = asyncio.create_task(self._connectivity_loop())
-        warm_task = asyncio.create_task(self._warm_speech_cache())
         _sd_notify("READY=1")
         print(f"[assistd] Elaria up · mode={self.config.gemini_mode} "
               f"· socket={self.config.socket_path}", flush=True)

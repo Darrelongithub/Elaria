@@ -197,3 +197,148 @@ deleted and no strict-xfail marker was dropped without a real fix.
   `PytestUnraisableExceptionWarning` asyncio-cleanup noise in
   `test_unknown_method_is_an_error_not_a_crash` and
   `test_500_files_round_trip`. Warnings, not failures.
+
+## 2026-10-20 — voice hunt fixes: Gates A–D
+
+Trigger: the voice-pipeline hunt (`VOICE-BUGTEST.md`) reported 13 defects (plus
+two unpinned observations). The owner ordered the fixes in mandatory gate order —
+voice identity first, then "speaks when she should", then session behaviour, then
+integrity and surfaces — with each strict-xfail pin converted into a passing
+regression and no gate starting before the previous one was green.
+
+### Gate A — voice identity (`3d2b9e5`)
+
+- `tts.py`: `_cache_path(text, descriptor, backend, *, identity=None)` plus
+  `_route_cache_path()` and `cloud_cache_identity()`. The cloud route keys on
+  `[gemini] voice` + `model_voice` + `voice_sample_rate`; the dormant local route
+  keeps voice/model/speaker/length_scale. Neither route can poison or invalidate
+  the other (VB-1, and the key half of VB-2).
+- `tts.py`: deleted `_ack_path`'s local-backend fallback and its
+  "a warmed local copy beats silence" comment (VB-3). A miss now returns
+  `cache_miss` + `warning` + `rewarm_needed`, and `ack_cache_state()` (new,
+  surfaced as `status["ack_cache"]`) is the single source for "which of the four
+  acks exist *for the identity that is live*" — so `cached_acks` can no longer
+  call a Piper file healthy on a Gemini route.
+- `config.py`: `canonical_voices()` / `resolve_voice()` and the new
+  `[gemini] allowed_voices` default `["Flare"]` — the one-voice rule as data.
+  Absent means the shipped answer (a typo in `voice` cannot widen the rule); an
+  explicit empty list is honoured as "refuse everything".
+- `tts.py`: `voice_identity()` + the gate at the top of `voice_route()`;
+  `gemini_client.voice_request()` reports `voice_allowed` / `voice_requested` /
+  `canonical_voices` and `generate_voice()` raises on a non-canonical voice, so
+  no caller can bypass the pin (VB-4).
+- `cli.py`: `voice routing` is now a **FAIL** (not a warning) with
+  `VOICE IDENTITY REFUSED — … SILENT until that is fixed`, names the ack-cache
+  state, and prints the legacy-`tts.selected_voice` precedence line; the summary
+  counts failures.
+- Docs: README gains "Her voice: one name, pinned, with documented precedence"
+  and the stale phase-8 claims ("both online/offline spoken replies use the same
+  configured local voice", "identical TTS backend+voice in both modes") are
+  replaced with the amended contract; `config.toml.example` documents
+  `allowed_voices`, `voice_sample_rate`, and the precedence order.
+
+### Gate B — speaks when she should (`d63f0de`)
+
+- `tts.py`: `request_rewarm()` / `take_rewarm_request()` / `warm_due()`; a miss
+  from `cached_ack()` *is* the trigger. `play_ack()`'s miss branch keeps its
+  budget (never synthesises) but reports the condition.
+- `daemon.py`: `run()` creates the warm task **before** `serve(...)`; `_ack`
+  queues a would-be miss behind the in-flight warm through `_await_ack_cache()`
+  (bounded 2 s, pending-aware so a daemon driven without `run()` never waits);
+  `_schedule_rewarm_if_requested()` turns a reported miss into one background
+  cycle; `speech.warm` opens the gate so `assist voice warm` stays the cure
+  (VB-13, and the healing half of VB-2).
+
+### Gate C — session behaviour (`c1469cc`)
+
+- `transcribe.py`: `SilenceLadder` gains `resume_s` (sustained speech before a
+  re-arm) and `grace_s` + `close_due()`; `dictate()` closes on the grace, emits
+  `session.grace_close` and notes why (VB-5, VB-6).
+- `transcribe.py`: rotation consumes only the `go_away` markers and `_final_texts()`
+  folds the replayed tail's immediately-repeated segment, so the head of a long
+  dictation survives (VB-7, data-loss).
+- `daemon.py`: the refused `_ptt_start` loser returns
+  `suppressed: "already listening — no second ack"` with no ack queued (VB-11);
+  `MUTATING_INTENTS` + `_command_gate()` sit between a command-mode transcript and
+  `intents.route()` (VB-8).
+- `config.py` / `config.toml.example`: `[transcribe] speech_resume_s`,
+  `checkin_grace_s`, `command_min_confidence` (0.85), each commented with the
+  finding it exists for.
+
+### Gate D — integrity and surfaces (`b058ea2`)
+
+- New `src/assistant/proc.py`: `child_kwargs()` (PR_SET_PDEATHSIG + own session),
+  `audio_child_names(config)` (stock names **plus** the configured
+  `[tts] player`), `orphaned_audio_children()`, `reap_orphans()`, `pid_alive()`.
+- `tts.play_audio` and `capture.PipeWireCapture.frames` spawn through it; the
+  daemon sweeps leaked audio children before it serves; `assist doctor` gained an
+  `orphaned audio` **FAIL** check naming pids and the cure; `assist voice cleanup`
+  is a local-only command (it must work with the daemon dead) and exits non-zero
+  if anything survives. `systemd/assistant.service` states both mechanisms
+  explicitly and warns against `KillMode=process`.
+- `voicetest.py`: `voiceprint_health()` + `voiceprint_path(config)` +
+  `BIOMETRIC_FILE_MODE`, and `enroll()` chmods 0600 as it writes; `[voice_test]`
+  gains `voiceprint_path`, `embedding_dim` (192) and the optional
+  `embedding_model` the doctor validates against (VB-9).
+- `waybar.py`: `format_voice_line()` replaces the hardcoded `voice: local …`
+  label (VB-14).
+
+### Test-side changes (all deliberate, none deleted)
+
+- 13 strict-xfail pins converted into passing regressions: `test_a3_…`,
+  `test_b7_…`, `test_b7c_…`, `test_b5b_…`, `test_b5c_…` (VB-4, VB-1, VB-3, VB-2,
+  VB-13) plus `test_c9_…`, `test_c9b_…`, `test_d11b_…`, `test_d13b_…`,
+  `test_g19_…`, `test_e14_…`, `test_g18_…` (VB-5, VB-6, VB-7, VB-8, VB-11, VB-9,
+  VB-10) and `test_a4c` (VB-14).
+- New guards: `test_a3b` (transport-level refusal), `test_b5d`/`test_b5e`
+  (self-heal within one warm cycle, service and daemon level), `test_b5cb`
+  (real `Daemon._ack` with an injected slow warm: cached, waited, bounded),
+  `test_g18b` (reaper names a planted parentless child under a private name so the
+  suite never signals the owner's real audio processes), `test_e14c` (healthy
+  template passes / absent warns / dimension+model mismatch fails / enroll lands
+  0600), `test_b5f` (skipped needs-live placeholder for the online boot window).
+- `test_g19_double_hotkey_acks_once` had carried the clock-jump/rotation body
+  under the wrong name with the VB-11 marker attached — the mislabel hid a
+  fixture too short to cross the age cap. It is now
+  `test_g20_clock_jump_does_not_fire_and_the_rotation_cap_holds` with a cap it
+  really crosses, and the real VB-11 double-press test exists.
+- The file's `Session` fake now emits the `turn_complete` the real transport sends
+  (`live_client.py:108-114`) and closes its event stream on it: every session test
+  had been burning the full 15 s final-transcript timeout. Whole-suite wall time
+  73 s → 32 s.
+- Two existing contract tests updated, each commented at the assertion:
+  `test_phase1_dictation.py::test_silence_ladder_asks_once_per_segment` (a single
+  frame above the gate no longer re-arms — VB-5's rule) and
+  `test_phase8_offline_voice.py::test_forced_offline_daemon_paths_make_zero_gemini_calls`
+  (an offline command transcript at 0.30 confidence is now **refused**: transcript
+  kept, cloud redo queued, nothing routed — VB-8's gate replaces "any local
+  confidence climbs the ladder").
+- `VoiceConfig`-adjacent helpers in `tests/test_voice_bughunt.py` gained
+  `allowed_voices` handling; `EchoClient` now mirrors the real client's
+  canonical-voice resolution, so an identity bypass at any call site surfaces.
+
+### Verification
+
+- Full suite, complete run: **1069 passed, 6 skipped, 46 xfailed, 0 failed**
+  (`PYTHONPATH=src pytest -q tests/ --tb=line -p no:randomly`, 32 s). Baseline
+  before this work: 1044 passed, 5 skipped, 59 xfailed. The known
+  pytest-9.1.1/3.11 traceback-render crash did not recur once the strict-xfails
+  were gone; `-p no:randomly` is still used because the crash was only ever
+  triggered by xfail traceback rendering.
+- `tests/test_voice_bughunt.py`: **59 passed, 1 skipped, 0 xfailed** — zero
+  `xfail` markers left in the file.
+- Every converted guard re-proved against pre-fix source: Gates A/B via a
+  `git worktree` at `9b0e4dd` (10 failed / 1 passed), Gates C/D via `git stash`
+  (5 failed / 0 passed and 10 failed / 1 passed respectively).
+- `ruff check src tests`: all checks passed.
+- Latency re-measured after the changes (`/home/user/measure_voice.py`, mock
+  backend, real fork+exec player): warm ack median 1.394 ms (p95 1.642), after
+  restart 1.387 ms, **after a dormant-only change 1.388 ms with a cache hit** —
+  the number that used to be 0.063 ms of silence — cold miss 0.046 ms, re-warm of
+  four acks 0.5 ms, end-to-end `ack` over a real Unix socket median 2.65 ms
+  (p95 3.21 ms) against the 300 ms budget.
+- Still needs-live, never faked: the ear-level confirmation that a widened
+  `allowed_voices` really changes her sound, the online size of the boot-warm
+  window, real PipeWire orphan behaviour after `kill -9`, and the comfort of
+  `speech_resume_s` / `checkin_grace_s` on real narration. See the needs-live
+  list in `VOICE-BUGTEST.md`.
