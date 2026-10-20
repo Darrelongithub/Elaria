@@ -70,10 +70,6 @@ class SilenceLadder:
         self._asked = False
         self._asked_at_s: float | None = None
 
-    @property
-    def asked(self) -> bool:
-        return self._asked
-
     def observe(self, frame: bytes, frame_s: float) -> bool:
         """True exactly once per segment: time for the soft check-in."""
         if frame_rms(frame) >= self.speech_rms:
@@ -329,6 +325,7 @@ class DictationService:
                                 "session_id": session_id})
                     if collector:
                         collector.cancel()
+                        await asyncio.gather(collector, return_exceptions=True)
                     try:
                         await transport.close()
                         if rotations >= 1:
@@ -363,6 +360,9 @@ class DictationService:
         finally:
             if wav_sink:
                 duration_s = wav_sink.close() or duration_s
+            if collector is not None and not collector.done():
+                collector.cancel()
+                await asyncio.gather(collector, return_exceptions=True)
             if transport is not None:
                 await transport.close()
             await source.aclose()

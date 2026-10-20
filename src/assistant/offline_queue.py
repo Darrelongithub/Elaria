@@ -24,14 +24,6 @@ APPROVAL_KINDS = {"external_action", "download", "web", "install_tool"}
 ACTIVE_STATUSES = {"pending", "running", "awaiting_approval", "approved"}
 
 
-def capability_for(kind: str) -> dict:
-    if kind in APPROVAL_KINDS:
-        return {"execution": "approval-required", "local": False}
-    if kind in ("cloud_transcription", "transcript_cleanup", "plan_tiers", "chat"):
-        return {"execution": "auto-on-reconnect", "local": False}
-    return {"execution": "local", "local": True}
-
-
 class CloudQueue:
     def __init__(self, config, store, client, mode_manager=None):
         self.config = config

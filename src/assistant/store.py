@@ -826,15 +826,6 @@ class Store:
             rows = self._conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
-    def update_holding(self, holding_id: int, *, status: str,
-                       updated_ts: str | None = None) -> bool:
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE holdings SET status = ?, updated_ts = ? WHERE id = ?",
-                (status, updated_ts, holding_id))
-            self._conn.commit()
-            return cur.rowcount == 1
-
     # -- knocks (Stage C, schema now so B can render the shelf) --------------
     def create_knock(self, *, ts: str, topic: str, reason: str, kind: str,
                      urgency: str = "normal", referent: str | None = None,

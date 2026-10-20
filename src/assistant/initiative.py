@@ -238,15 +238,6 @@ class InitiativeService:
                 return fact
         return None
 
-    def find_commitment(self, topic: str) -> dict | None:
-        needle = str(topic or "").lower().strip()
-        if not needle:
-            return None
-        for fact in self.store.list_facts(kind="commitment"):
-            if needle in str(fact["text"]).lower():
-                return fact
-        return None
-
     # -- reason gate --------------------------------------------------------
     def _validate_reason(self, *, topic: str, reason: str, kind: str,
                          referent: str | None, commitment_id: int | None) -> str:

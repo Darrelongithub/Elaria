@@ -218,10 +218,6 @@ class RingBuffer:
 # --------------------------------------------------------------------------
 # Sources (frame iterators) and scorers (pluggable models)
 # --------------------------------------------------------------------------
-class FrameSource(Protocol):
-    def frames(self) -> Iterator[bytes]: ...
-
-
 @dataclass
 class ScoredEvent:
     """One detection moment — exactly what the log may contain, no audio."""

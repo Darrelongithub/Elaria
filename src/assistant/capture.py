@@ -69,20 +69,6 @@ def list_nodes(runner=subprocess.run) -> dict:
         return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
-def pw_record_command(target: str, output_path: str, *, sample_rate: int = 16000) -> list[str]:
-    """Build the mic-capture command. `target` MUST be node.name or
-    object.serial — see module docstring. 16kHz mono PCM is what the
-    Live API wants natively (§3.4)."""
-    if target.isdigit() and len(target) < 4:
-        raise ValueError(
-            f"'{target}' looks like an object.id. pw-record --target wants "
-            "object.serial or node.name — an ID silently records the default "
-            "device instead of erroring (GETTING-STARTED Step 3)."
-        )
-    return ["pw-record", f"--target={target}", "--rate", str(sample_rate),
-            "--channels", "1", output_path]
-
-
 # --------------------------------------------------------------------------
 # PCM utilities (Phase 1): energy, rolling buffer, WAV sink, VAD gate
 # --------------------------------------------------------------------------
@@ -233,29 +219,6 @@ class PipeWireCapture:
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
             await self._proc.wait()
-
-
-class FileCapture:
-    """Replay a WAV as capture frames (tests, `assist transcribe` live-path
-    debugging). `realtime=True` paces at wall-clock; tests use burst mode."""
-
-    def __init__(self, path: Path, *, frame_ms: int = 30, realtime: bool = False):
-        self.path = Path(path)
-        self.frame_ms = frame_ms
-        self.realtime = realtime
-
-    async def frames(self) -> AsyncIterator[bytes]:
-        with wave.open(str(self.path), "rb") as wav:
-            if wav.getframerate() != SAMPLE_RATE or wav.getnchannels() != 1:
-                raise ValueError(f"{self.path}: need 16kHz mono WAV")
-            per_frame = SAMPLE_RATE * self.frame_ms // 1000
-            while chunk := wav.readframes(per_frame):
-                yield chunk
-                if self.realtime:
-                    await asyncio.sleep(self.frame_ms / 1000)
-
-    async def aclose(self) -> None:
-        return None
 
 
 class SimulatedCapture:

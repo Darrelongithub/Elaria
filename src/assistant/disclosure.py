@@ -95,26 +95,6 @@ COMPANY_OFF = (
     "its just us", "it is just us", "we are alone now",
 )
 
-# Questions about the owner — a guest asking these gets a deflection.
-_PROBE_PATTERNS: tuple[str, ...] = (
-    r"\bwhat\s+(?:does|did)\s+(?:he|she|the\s+owner|the\s+boss)\b",
-    r"\bwhere\s+(?:does|did)\s+(?:he|she|the\s+owner|the\s+boss)\b",
-    r"\bwho\s+is\s+(?:he|she|the\s+owner|the\s+boss)\b",
-    r"\bwhat(?:s|\s+is)\s+(?:his|her|the\s+owners?|the\s+bosses?)\b",
-    r"\btell\s+me\s+about\s+(?:him|her|the\s+owner|the\s+boss)\b",
-    r"\bwhat\s+do\s+you\s+know\s+about\b",
-    (r"\bhis\s+(?:wife|husband|girlfriend|boyfriend|family|kids?|children|"
-     r"habits?|routine|day|history|past|health|money|salary|password|plans?)\b"),
-    r"\bher\s+(?:husband|wife|family|kids?|children|habits?|routine|plans?)\b",
-    r"\bwhat\s+did\s+(?:he|she)\s+(?:say|do|ask)\b",
-    r"\bhow\s+does\s+(?:he|she)\s+(?:usually|normally)\b",
-    r"\bhis\s+real\s+name\b",
-    r"\bthe\s+owners?\s+(?:plans?|secrets?|password|schedule|files?)\b",
-    r"\b(?:tell|share)\b.{0,40}\b(?:about\s+(?:me|him|her|the\s+owner|the\s+boss))\b",
-    r"\bwhat\s+are\s+(?:his|her|the\s+owners?)\s+secrets?\b",
-    r"\bwhat\s+is\s+(?:he|she|the\s+owner)\s+working\s+on\b",
-)
-
 _CREDENTIAL_IN_REPLY = re.compile(
     r"\b(password|passphrase|passcode|pin|api[\s_-]?key|access[\s_-]?token|"
     r"secret[\s_-]?key|private[\s_-]?key|seed\s+phrase|recovery\s+phrase|"
@@ -174,11 +154,6 @@ def sensitive_values(text: str) -> list[str]:
             values.append(value)
     values.extend(match.group(0) for match in _DIGIT_RUN.finditer(str(text or "")))
     return list(dict.fromkeys(values))
-
-
-def is_owner_probe(text: str) -> bool:
-    normalised = _normalise(text)
-    return any(re.search(pattern, normalised) for pattern in _PROBE_PATTERNS)
 
 
 _INSTRUCTION = re.compile(
@@ -270,14 +245,6 @@ class DisclosureService:
 
     def prompt_note(self, *, guest: bool = False) -> str:
         return GUEST_NOTE if guest else COMPANY_NOTE
-
-    def guest_prompt(self, text: str) -> str:
-        return (
-            f"{GUEST_NOTE}\n\n"
-            "You have no memory context for this turn. Answer only what can be "
-            "answered without owner facts.\n\n"
-            f"Guest: {text}"
-        )
 
     # -- context filtering --------------------------------------------------
     def sensitive_fact_ids(self) -> set[int]:

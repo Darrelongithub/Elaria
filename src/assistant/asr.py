@@ -37,13 +37,6 @@ from .live_client import (
 )
 
 
-class PhasePending(NotImplementedError):
-    """Honest stub: designed, seamed, scheduled — not secretly fake."""
-    def __init__(self, backend: str, phase: str):
-        super().__init__(f"ASR backend '{backend}' is {phase} (blueprint §9). "
-                         "The seam exists now so filling it never touches callers.")
-
-
 @dataclass
 class Transcript:
     text: str

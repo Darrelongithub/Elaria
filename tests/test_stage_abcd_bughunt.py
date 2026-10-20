@@ -1274,3 +1274,163 @@ def test_readme_and_docs_cli_commands_exist_in_parser():
         ns = parser.parse_args(argv)
         assert ns.command == argv[0]
 
+
+def test_cross_cutting_clock_jumps_forward_and_backward(tmp_path: Path):
+    """Cross-cutting: backward (-2h NTP correction) and forward (+36h) clock
+    jumps across PresenceService, InitiativeService, and ShowoffService must
+    never crash, never prematurely trigger snoozed knocks on a backward jump,
+    and cleanly close show-off on a forward jump.
+    """
+    cfg = _sandbox_config(
+        tmp_path,
+        presence={
+            "class_mode": False,
+            "class_schedule_suggest": True,
+            "class_schedule": [
+                {"days": ["tue"], "start": "09:00", "end": "11:00", "label": "Morning"}
+            ],
+        },
+        showoff={"timeout_s": 1800},
+    )
+    store = Store(cfg.db_path)
+    try:
+        owner_emb = _write_voiceprint(
+            Path(cfg.section("voice_test")["voiceprint_path"])
+        )
+        t0 = datetime(2026, 10, 20, 10, 0, tzinfo=UTC)
+        now_box = [t0]
+        presence = PresenceService(cfg, store)
+        init = InitiativeService(cfg, store, presence=presence, now=lambda: now_box[0])
+        showoff = ShowoffService(cfg, store, now=lambda: now_box[0])
+
+        c = init.create_commitment("Check server logs", origin="user-request")
+        k = init.raise_knock(
+            topic="server logs",
+            reason="You asked me to check server logs.",
+            kind="follow-up",
+            commitment_id=c["commitment_id"],
+        )
+        init.later(k["id"], hours=4.0)
+        showoff.enter(
+            command="Elaria, show off",
+            embedding=owner_emb,
+            owner_present=True,
+            source="mic",
+            live_mic=True,
+        )
+
+        # Backward jump (-2 hours): snooze must NOT fire, showoff stays active
+        now_box[0] = t0 - timedelta(hours=2)
+        assert init.check_due() == []
+        assert showoff.active() is True
+        assert presence.status(now=now_box[0]).enabled is False
+
+        # Forward jump (+36 hours): snooze fires once, showoff auto-closes on timeout
+        now_box[0] = t0 + timedelta(hours=36)
+        due = init.check_due()
+        assert len(due) == 1
+        assert showoff.active() is False
+    finally:
+        store.close()
+
+
+def test_cross_cutting_sqlite_corrupt_state_and_concurrent_writes(tmp_path: Path):
+    """Cross-cutting: malformed JSON in `state` rows (`persona`, `tts.selected_voice`,
+    `voice.catalogue.*`) degrades cleanly without crashing Daemon or SpeechService,
+    and concurrent multi-threaded writes to Store preserve all rows without
+    database lock errors.
+    """
+    import threading
+
+    cfg = _sandbox_config(tmp_path)
+    store = Store(cfg.db_path)
+    try:
+        store.set_state("persona", "{not-valid-json")
+        store.set_state("tts.selected_voice", "{corrupt-descriptor")
+        store.set_state(f"voice.catalogue.{DEFAULT_VOICE_MODEL}", "{corrupt-catalogue")
+
+        assert load_cached(store, DEFAULT_VOICE_MODEL) is None
+        speech = SpeechService(cfg, store)
+        assert speech.descriptor().voice_id == cfg.section("tts")["voice_id"]
+
+        daemon = Daemon(cfg)
+        try:
+            assert isinstance(daemon.governor.familiarity, float)
+        finally:
+            daemon.store.close()
+
+        # Concurrent multi-threaded writes into the same WAL SQLite store
+        errors: list[Exception] = []
+
+        def _writer(tid: int) -> None:
+            try:
+                for i in range(15):
+                    store.add_fact(
+                        ts="2026-10-20T12:00:00Z",
+                        kind="note",
+                        text=f"thread-{tid}-fact-{i}",
+                        source="stated",
+                    )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_writer, args=(t,)) for t in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert errors == []
+        assert len(store.list_facts(kind="note")) == 60
+    finally:
+        store.close()
+
+
+def test_cross_cutting_disk_full_enospc_leaves_clean_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Cross-cutting: an `ENOSPC` failure mid-write in `SpeechService.write_wav`
+    leaves neither a truncated target WAV nor a leftover `.tmp-*` file.
+    """
+    import errno
+    import wave
+
+    dest = tmp_path / "cache" / "ack.wav"
+    orig_open = wave.open
+
+    def _enospc_wave_open(f, mode="rb"):
+        w = orig_open(f, mode)
+        if mode == "wb":
+            def _boom(_frames):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            w.writeframes = _boom
+        return w
+
+    monkeypatch.setattr("assistant.tts.wave.open", _enospc_wave_open)
+    with pytest.raises(OSError, match="No space left on device"):
+        SpeechService.write_wav(dest, _pcm_bytes(50), 24000)
+
+    assert not dest.exists()
+    assert list(dest.parent.glob("*")) == []
+
+
+def test_daemon_shutdown_cancels_in_flight_dictation_and_collector_cleanly(
+    tmp_path: Path,
+):
+    """Cross-cutting: `Daemon.aclose()` cancels an active `ptt.start` dictation
+    session and its nested `collect_events` task without leaking pending tasks.
+    """
+    cfg = _sandbox_config(tmp_path)
+
+    async def _run() -> None:
+        daemon = Daemon(cfg)
+        out = await daemon._ptt_start({"source": "simulated"})
+        assert out["listening"] is True
+        assert daemon._dictation_task is not None
+        await asyncio.sleep(0.05)
+        await daemon.aclose()
+        assert daemon._dictation_task.done()
+
+    asyncio.run(_run())
+
+

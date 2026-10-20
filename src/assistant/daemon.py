@@ -801,10 +801,10 @@ class Daemon:
                     asyncio.to_thread(self.speech.play_ack, "checkin")))
             await self.broadcast(event)
 
-        self._dictation_task = asyncio.create_task(
+        self._dictation_task = self._track_task(asyncio.create_task(
             self.dictation.dictate(
                 self._capture_source, mode=self._dictation_session_mode,
-                sink=dictation_sink, stop_event=self._stop_event))
+                sink=dictation_sink, stop_event=self._stop_event)))
         return {"listening": True, **ack, "simulated_capture": simulated,
                 "session_mode": self._dictation_session_mode,
                 "connectivity": connectivity.as_dict()}
@@ -1573,10 +1573,20 @@ class Daemon:
             async with server:
                 await stop.wait()
         finally:
-            for task in (connectivity_task, warm_task, knock_task,
-                         *self._background_tasks):
-                task.cancel()
-            self.store.close()
+            await self.aclose(extra_tasks=(connectivity_task, warm_task, knock_task))
+
+    async def aclose(self, *, extra_tasks=()) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
+        tasks = [
+            t for t in (*extra_tasks, self._dictation_task, *self._background_tasks)
+            if t is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.store.close()
 
 
 def main() -> None:

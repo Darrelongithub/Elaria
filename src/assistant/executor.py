@@ -147,11 +147,6 @@ class Executor:
             self.store.set_plan_status(plan_id, "applied")
         return report
 
-    @staticmethod
-    def assert_demo_path(path: str | Path, sandbox_root: str | Path) -> Path:
-        """Public face of the demo guard, for callers before they plan."""
-        return assert_within_sandbox(path, sandbox_root)
-
     # -- one op, fully journaled --------------------------------------------------
     @staticmethod
     def _copy_file_no_overwrite(src: Path, dst: Path) -> None:

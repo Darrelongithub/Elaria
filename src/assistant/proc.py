@@ -30,10 +30,6 @@ PR_SET_PDEATHSIG = 1
 _SUPPORTED = sys.platform.startswith("linux")
 
 
-def supported() -> bool:
-    return _SUPPORTED
-
-
 def pdeathsig_preexec():
     """`preexec_fn` that arms PR_SET_PDEATHSIG in the child (runs after fork).
 
