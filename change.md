@@ -452,6 +452,96 @@ and `vulture src/ --min-confidence 80` clean):
 - `vulture src/ --min-confidence 80`: **0 unused definitions.**
 
 
+## 2026-10-20 — BUG 6: live dictation stop hang + in-session echo loop
+
+Trigger: owner repro after the Bug 1–5 pass. `assist dictate` → "Listening…" →
+Enter blocked in the `ptt.stop` IPC recv for the 90 s client timeout (Ctrl-C
+needed), leaving `dictation_active=false`, `last_transcript=null` and no dictate
+turn. During the session she looped her generic line at herself: the BUG5 guard
+mutes capture around *local* playback, but the Live session's own output audio
+plays while the mic uplink into that same session stays open.
+
+### Release path
+
+- `daemon.py`: `_ptt_stop` no longer awaits dictation. It sets the stop event,
+  clears `_dictation_task`, and returns immediately with `processing`, the
+  `session_id`, and `result: null`. The slow half (final transcript, cleanup,
+  command routing) moved to `_finish_dictation`, a tracked background task that
+  broadcasts `ptt.result` and status when done. `wait_s` is an explicit,
+  bounded opt-in for scripts/tests; the hotkey path never sets it.
+- `daemon.py`: release emits **no spoken ack** (`speak=False`). It is a stop,
+  not a request to be talked to, and it must not wait on the boot ack warm.
+- `daemon.py`: new `ptt.result` IPC method (by session id, optional `wait_s`),
+  `status.dictation_processing` / `status.ptt_session_id`; `_session_active()`
+  includes the processing window so parked mode switches still wait. Session
+  results are keyed by id (last 8), and a finisher from an older session cannot
+  set the mode idle, clear the new session's processing flag, or release a
+  parked mode switch under a newer dictation.
+- `cli.py`: `assist dictate` acks the release, then asks `ptt.result` for the
+  transcript, so the turn is printed without the stop call blocking. `assist
+  ptt stop` stays immediate; `--wait` opts into the transcript.
+
+### Live half-duplex (in the session, not around `play_audio`)
+
+- `live_client.py`: `LiveDuplexGate` — output audio closes the uplink for its
+  duration (chunks extend sequentially, so a burst still reserves the full
+  audio) plus a 400 ms guard. Duration is injected-clock friendly; unknown
+  length stays closed until `playback_ended`.
+- `live_client.py`: `DuplexLiveTransport` wraps any transport. `send_audio`
+  refuses frames while the gate is closed or while an external probe (the
+  daemon's local-TTS `is_speaking`) reports playback. Output audio drives the
+  gate; output transcription is surfaced as `output_interim`/`output_final`
+  and recorded for echo matching; input `interim`/`final` during playback or
+  matching her own words become `echo_suppressed`, never user turns.
+- `live_client.py`: `GenaiLiveTransport` parses `model_turn` inline audio and
+  `output_transcription` into `output_*` events. `RecordingTransport` records
+  output audio as bytes/hash/duration only; fixtures replay the duration.
+- `live_client.py`: `SelfHearingLiveTransport` — the owner repro as a fake
+  session: plays output audio for its real duration and transcribes every frame
+  it still receives during that window back as user speech.
+- `transcribe.py`: dictation wraps its factory in `DuplexLiveTransport`,
+  forwards the daemon's playback probe, and checks the same gate before adding
+  a frame to the rolling replay buffer, the silence ladder or the uplink.
+  Gated frames are discarded (not held: holding would upload the echo when
+  playback ends) and are not written to the saved WAV — that file is the
+  batch fallback's source, so recording her own line there would re-enter it
+  as user text whenever Live failed. Only input events enter the transcript
+  record, so output audio/text can never become a final. Emits
+  `live.uplink_gated`, `live.output_audio`, `live.output_transcript`,
+  `live.duplex`, and notes the dropped frames in the session result.
+
+### Cost / failure attribution
+
+- `transcribe.py`: Live connect and rotation failures now write their own
+  ledger row (`housekeeping:transcribe_live`, `live <stage>: <error>`), and
+  successful live sessions carry the collected failure text. Previously a
+  failed Live connect that fell back to batch left no trace, which is exactly
+  the "silent Live failure" the month's 5-failure count could not exclude.
+- `store.py`: `log_llm_call` defaults a missing purpose to the role (never
+  NULL); new `failure_summary_since` groups failed rows by purpose, role,
+  model, mode and error.
+- `cost.py`: `classify_failure` (key / voice / quota / network /
+  live_transport / parse / unknown) and `summarise_failures`;
+  `format_cost_report` prints "Failures this month: N (key …, voice …)" with
+  one row per purpose+error and a loud `LIVE failures: N` line when any Live
+  path failed. Untagged legacy rows are reported as a ledger bug.
+- `daemon.py` / `cli.py`: `cost` includes `month.failures_detail`, daemon up or
+  not, so the 5 failures can be confirmed as key/voice housekeeping by reading
+  `assist cost` instead of trusting a count.
+
+### Tests
+
+- `tests/test_bug6_live_duplex_and_stop.py` (10 tests): `ptt.stop` < 2 s while
+  a Live turn is in flight with async delivery; gate timing (playback + 400 ms,
+  unknown-length playback); transport refuses frames during playback and local
+  playback; output transcription never a user final; the simulated
+  self-hearing session yields zero user turns / zero transcript segments and
+  the same double does echo without the gate (control); a finished previous
+  session cannot clobber the next dictation; the real `assist dictate`
+  subprocess prints a turn; cost rows/purpose tags/report.
+- Existing PTT round-trip tests use the explicit `wait_s` opt-in.
+- `pytest -q`: **1,290 passed, 6 skipped**.
+
 ## 2026-10-20 — Hardening pass 2 (BH-I1…BH-I13, `arena/8952fe51-elaria`)
 
 Baseline measured before any edit (`25179c8`): **1,280 passed, 6 skipped,
@@ -615,7 +705,9 @@ second-daemon exit, and the two CLI message helpers).
 ### Verification
 
 - `pytest -q --tb=line`: **1,315 passed, 6 skipped, 0 failed, 0 xfailed**
-  (pass-2 baseline in this checkout: 1,280 passed / 6 skipped).
+  before the merge with `main` (pass-2 baseline in this checkout: 1,280
+  passed / 6 skipped); **1,325 passed, 6 skipped** after merging PR #7's
+  BUG 6 suite. No test or assertion changed in the merge.
 - `ruff check .`: **All checks passed!**
 - `vulture src/ --min-confidence 80`: **0 findings.**
 - Documented commands re-run against a throwaway `HOME`/`XDG_*` sandbox:

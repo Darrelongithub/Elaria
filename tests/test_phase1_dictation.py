@@ -339,7 +339,9 @@ def test_daemon_ptt_round_trip_and_events(config):
         assert started["listening"] and started["network"] is False  # ack stayed local
         assert started["simulated_capture"] is True
         time.sleep(0.4)  # ~13 frames of 'speech'
-        stopped = call(config.socket_path, "ptt.stop", timeout=30.0)
+        # BUG6: the release acks immediately; `wait_s` is the explicit
+        # scripted opt-in that still returns the transcript in one call.
+        stopped = call(config.socket_path, "ptt.stop", {"wait_s": 30.0}, timeout=30.0)
         result = stopped["result"]
         assert result["inbox_path"] and Path(result["inbox_path"]).exists()
         assert "Transcript saved" in result["narration"]  # factual, governor-made

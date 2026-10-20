@@ -3,9 +3,10 @@ are dumb and disposable. Single asyncio process, systemd --user.
 
 Phase 0 handlers: ping, status, cost, doctor (via CLI-local checks),
 halt/resume, ack (the §18 <300ms local acknowledgement — pure in-process
-code, zero network), ptt.start/stop (acknowledged immediately and
-locally; capture+Live streaming is Phase 1), ask (governor + cheapest-
-first harness; fully functional in mock mode).
+code, zero network), ptt.start/stop/result (the release is acknowledged
+immediately; the transcript finishes in the background and is fetched with
+ptt.result — BUG 6), ask (governor + cheapest-first harness; fully
+functional in mock mode).
 
 Startup recovery (§4.2): outstanding journal intents are reported, never
 silently dropped. Cold starts are a Phase-0 bug (§18.6): config, store,
@@ -21,6 +22,7 @@ import signal
 import socket as socket_mod
 import sys
 import time
+import uuid
 
 from . import __version__
 from .asr import local_asr_status
@@ -146,6 +148,15 @@ class Daemon:
         self._dictation_session_mode = "narration"
         self._capture_source = None
         self._stop_event: asyncio.Event | None = None
+        # BUG6: ptt.stop answers on the release and the session finishes in the
+        # background. Processing state is observable through ptt.result/status.
+        self._ptt_session_id: str | None = None
+        self._ptt_processing = False
+        self._ptt_last_session_id: str | None = None
+        self._ptt_last_result: dict | None = None
+        self._ptt_results: dict[str, dict | None] = {}
+        self._ptt_result_event = asyncio.Event()
+        self._ptt_result_event.set()
         self._last_connectivity_mode = self.mode_manager.status(refresh=False).effective_mode
         self._background_tasks: set[asyncio.Task] = set()
         # One bound for every chat call (owner turns and guest turns): a
@@ -257,6 +268,7 @@ class Daemon:
 
     def _session_active(self) -> bool:
         return bool((self._dictation_task and not self._dictation_task.done())
+                    or self._ptt_processing
                     or self._meeting is not None or self._meeting_processing)
 
     async def _note_connectivity_transition(self, status) -> None:
@@ -378,6 +390,7 @@ class Daemon:
             "resume": self._resume,
             "ptt.start": self._ptt_start,
             "ptt.stop": self._ptt_stop,
+            "ptt.result": self._ptt_result,
             "transcribe.file": self._transcribe_file,
             "index.run": self._index_run,
             "plan.build": self._plan_build,
@@ -438,6 +451,10 @@ class Daemon:
                     "events": ["session.started", "transcript.interim",
                                "session.checkin", "session.offline",
                                "transcript.final", "session.ended",
+                               "transcript.echo_suppressed",
+                               "live.uplink_gated", "live.output_audio",
+                               "live.output_transcript", "live.duplex",
+                               "ptt.result",
                                "mode.changed", "offline.drained",
                                "speech.error", "conversation.message",
                                "class.changed", "knock.raised",
@@ -474,6 +491,8 @@ class Daemon:
             "uptime_s": round(time.monotonic() - self.started_monotonic, 1),
             "outstanding_intents": len(self.store.outstanding_intents()),
             "dictation_active": bool(self._dictation_task and not self._dictation_task.done()),
+            "dictation_processing": self._ptt_processing,
+            "ptt_session_id": self._ptt_session_id,
             "capture": capture,
             "last_transcript": last,
             "quota_today_live_calls": self.store.user_turn_calls_since(day_start_iso()),
@@ -507,6 +526,10 @@ class Daemon:
         # Keep live_calls as user_turn_calls for quota semantics (the bug was 10 counted as 10 quota)
         today["quota_calls"] = today["user_turn_calls"]
         month["by_purpose"] = month.get("by_purpose", [])
+        # BUG6 cost audit: the count alone cannot distinguish the known
+        # key/voice errors from a silent Live failure. Every failed row is
+        # listed with its purpose and error.
+        month["failures_detail"] = self.store.failure_summary_since(month_start_iso())
         return {"month": month, "today": today,
                 "quota": self.config.section("quota"),
                 "tier": self.config.section("privacy").get("tier", "free")}
@@ -927,83 +950,212 @@ class Daemon:
                     asyncio.to_thread(self.speech.play_ack, "checkin")))
             await self.broadcast(event)
 
-        # BUG5: wrap source to mute while speaking
+        # BUG5: wrap source to mute while speaking. BUG6: the Live transport
+        # gets the same playback probe so its own uplink gate agrees with the
+        # daemon's half-duplex state, instead of relying on the wrapper alone.
         muted_source = self._wrap_muted(self._capture_source)
+        session_id = uuid.uuid4().hex[:12]
+        self._ptt_session_id = session_id
+        self._ptt_last_session_id = session_id
+        self._ptt_last_result = None
+        self._ptt_results.pop(session_id, None)
+        self._ptt_processing = False
         self._dictation_task = self._track_task(asyncio.create_task(
             self.dictation.dictate(
                 muted_source, mode=self._dictation_session_mode,
-                sink=dictation_sink, stop_event=self._stop_event)))
+                sink=dictation_sink, stop_event=self._stop_event,
+                is_playback_active=self.is_speaking,
+                session_id=session_id)))
         return {"listening": True, **ack, "simulated_capture": simulated,
                 "session_mode": self._dictation_session_mode,
+                "session_id": session_id,
                 "connectivity": connectivity.as_dict()}
 
     async def _ptt_stop(self, params: dict) -> dict:
-        ack = await self._ack({"kind": "on_it"})  # release acked locally, instantly
+        """Release: acknowledge in-process, finish the session in the background.
+
+        BUG 6 (owner repro 2026-10-20): this used to await the dictation task
+        here, so the IPC reply (and therefore `assist dictate`) blocked behind
+        the Live activity_end, the final transcript, cleanup and any command
+        routing — up to the client's 90 s timeout, with Ctrl-C the only way
+        out. A stop that queues behind transcription is not a stop. The reply
+        now carries the session id; `ptt.result` (or the `ptt.result` event)
+        delivers the transcript when it exists.
+
+        No spoken ack is emitted on release: the caller asked to stop, and a
+        fresh "On it." from the speakers is both noise and, if the mic is still
+        open for a moment, more of her own audio to transcribe. `speak=False`
+        also means the reply cannot wait on the boot-time ack cache warm.
+        """
+        ack = await self._ack({"kind": "on_it", "speak": False})
+        task = self._dictation_task
+        session_id = self._ptt_session_id
         if self.mode == "listening":
             self.mode = "transcribing"  # waiting on final + cleanup (§3.9 states)
             await self.broadcast({"event": "status.changed", "mode": self.mode})
         if self._stop_event:
             self._stop_event.set()
-        result = None
-        if self._dictation_task:
-            try:
-                session = await asyncio.wait_for(self._dictation_task, timeout=60)
-                result = {
-                    "text": (session.cleaned_text
-                             if (session.cleaned_text and not session.flagged)
-                             else session.raw_text),
-                    "raw_text": session.raw_text,
-                    "backend": session.backend,
-                    "inbox_path": session.inbox_path,
-                    "audio_path": session.audio_path,
-                    "clipboard": session.clipboard,
-                    "flagged": session.flagged,
-                    "confidence": session.confidence,
-                    "cloud_status": session.cloud_status,
-                    "queued_job_ids": session.queued_job_ids,
-                    "connectivity_mode": session.connectivity_mode,
-                    "notes": session.notes,
-                    # Factual narration from real state (§13.1) — no model call.
-                    "narration": self.governor.narrate_fact(
-                        "transcribe.done",
-                        {"words": len(session.raw_text.split()),
-                         "seconds": session.duration_s}),
-                }
-                if self._dictation_session_mode == "command" and result["text"].strip():
-                    veto = self._command_gate(result)
-                    if veto is not None:
-                        # Nothing was routed, so nothing was executed. The words are
-                        # still reported (they are the user's dictation, kept in the
-                        # transcript row) and the reason is stated as a fact.
-                        result["command"] = veto
-                        result["narration"] = veto["note"]
+        self._dictation_task = None
+
+        if task is not None:
+            self._ptt_processing = True
+            self._ptt_result_event.clear()
+            self._track_task(asyncio.create_task(
+                self._finish_dictation(task, params, session_id,
+                                       self._dictation_session_mode)))
+        elif not self._ptt_processing:
+            # No release in flight: a second release is a no-op, and must not
+            # clear the mode or release a parked switch while the first
+            # session is still being transcribed.
+            self.mode = "idle"
+            await self.broadcast({"event": "status.changed", "mode": self.mode})
+            await self._apply_pending_mode_switch()
+
+        response = {"listening": False, **ack, "result": None,
+                    "processing": task is not None or self._ptt_processing,
+                    "session_id": session_id,
+                    "connectivity": self.mode_manager.status(refresh=False).as_dict()}
+        # Explicit opt-in for scripts/tests that want the old one-shot shape.
+        # The hotkey path never sets it; nothing here waits by default.
+        wait_s = float(params.get("wait_s") or 0)
+        if wait_s > 0:
+            # Wait on the session id, not the processing flag: a very fast
+            # finish could clear the flag between task creation and this line.
+            if session_id not in self._ptt_results:
+                try:
+                    await asyncio.wait_for(self._ptt_result_event.wait(),
+                                           timeout=wait_s)
+                except TimeoutError:
+                    pass
+            response["result"] = self._ptt_results.get(session_id)
+            response["processing"] = self._ptt_processing
+            response["connectivity"] = self.mode_manager.status(refresh=False).as_dict()
+        return response
+
+    async def _finish_dictation(self, task: asyncio.Task, params: dict,
+                                session_id: str | None,
+                                session_mode: str = "narration") -> None:
+        """The part of a release that is slow: final, cleanup, routing.
+
+        Runs as its own tracked task. Broadcasts `ptt.result` and always clears
+        the processing flag, so a failure here is reported rather than leaving
+        ptt.result waiting forever.
+        """
+        result: dict | None = None
+        try:
+            session = await asyncio.wait_for(task, timeout=60)
+            result = {
+                "text": (session.cleaned_text
+                         if (session.cleaned_text and not session.flagged)
+                         else session.raw_text),
+                "raw_text": session.raw_text,
+                "backend": session.backend,
+                "inbox_path": session.inbox_path,
+                "audio_path": session.audio_path,
+                "clipboard": session.clipboard,
+                "flagged": session.flagged,
+                "confidence": session.confidence,
+                "cloud_status": session.cloud_status,
+                "queued_job_ids": session.queued_job_ids,
+                "connectivity_mode": session.connectivity_mode,
+                "notes": session.notes,
+                "session_id": session.session_id,
+                # Factual narration from real state (§13.1) — no model call.
+                "narration": self.governor.narrate_fact(
+                    "transcribe.done",
+                    {"words": len(session.raw_text.split()),
+                     "seconds": session.duration_s}),
+            }
+            # The mode is captured at release time: a new dictation started
+            # while this one is finishing must not reroute these words.
+            if session_mode == "command" and result["text"].strip():
+                veto = self._command_gate(result)
+                if veto is not None:
+                    # Nothing was routed, so nothing was executed. The words are
+                    # still reported (they are the user's dictation, kept in the
+                    # transcript row) and the reason is stated as a fact.
+                    result["command"] = veto
+                    result["narration"] = veto["note"]
+                else:
+                    # Known grammar climbs the local ladder first; open text
+                    # follows the same offline queue policy as `ask`.
+                    # BUG5: drop echo of own TTS before routing to ask
+                    if self._is_echo(result["text"]):
+                        result["command"] = None
+                        result["narration"] = "echo suppressed — own TTS captured as input"
                     else:
-                        # Known grammar climbs the local ladder first; open text
-                        # follows the same offline queue policy as `ask`.
-                        # BUG5: drop echo of own TTS before routing to ask
-                        if self._is_echo(result["text"]):
-                            result["command"] = None
-                            result["narration"] = "echo suppressed — own TTS captured as input"
-                        else:
-                            result["command"] = await self._ask({
-                                "text": result["text"],
-                                "speak": params.get("speak", True),
-                            })
-                    result["narration"] = result["command"].get("reply", result["narration"])
-                # BUG5: general echo suppression for any ptt result
-                if result and result.get("text") and self._is_echo(result["text"]):
-                    result["text"] = ""
-                    result["raw_text"] = ""
-                    result["flagged"] = False
-                    result["narration"] = "echo suppressed — own TTS captured as input"
-                    result["echo_suppressed"] = True
-            except Exception as exc:
-                result = {"error": f"dictation did not finish cleanly: {exc}"}
-            self._dictation_task = None
-        self.mode = "idle"
-        await self.broadcast({"event": "status.changed", "mode": self.mode})
-        await self._apply_pending_mode_switch()
-        return {"listening": False, **ack, "result": result,
+                        result["command"] = await self._ask({
+                            "text": result["text"],
+                            "speak": params.get("speak", True),
+                        })
+                result["narration"] = result["command"].get("reply", result["narration"])
+            # BUG5: general echo suppression for any ptt result
+            if result.get("text") and self._is_echo(result["text"]):
+                result["text"] = ""
+                result["raw_text"] = ""
+                result["flagged"] = False
+                result["narration"] = "echo suppressed — own TTS captured as input"
+                result["echo_suppressed"] = True
+        except Exception as exc:
+            result = {"error": f"dictation did not finish cleanly: {exc}",
+                      "session_id": session_id}
+        finally:
+            self._ptt_last_result = result
+            self._ptt_last_session_id = session_id
+            self._ptt_results[session_id] = result
+            while len(self._ptt_results) > 8:
+                self._ptt_results.pop(next(iter(self._ptt_results)), None)
+            # A result may finish after the owner has already started the next
+            # dictation. It is still retrievable by session id, but it must not
+            # set the mode to idle, clear the new session's processing flag, or
+            # release a parked mode switch under the new session's feet.
+            if self._ptt_session_id == session_id:
+                self.mode = "idle"
+                # Ordering matters: the session is over (so a parked mode
+                # switch may apply), and only then is ptt.result released. A
+                # waiter that woke before the switch would report the
+                # pre-switch connectivity and look like the parked switch was
+                # lost.
+                self._ptt_processing = False
+                try:
+                    await self._apply_pending_mode_switch()
+                except Exception:  # noqa: S110 - a switch never blocks a result
+                    pass
+                self._ptt_result_event.set()
+            try:
+                await self.broadcast({"event": "ptt.result",
+                                      "session_id": session_id,
+                                      "result": result})
+                if self._ptt_session_id == session_id:
+                    await self.broadcast({"event": "status.changed",
+                                          "mode": self.mode})
+            except Exception:  # noqa: S110 - delivery is best-effort
+                pass
+
+    async def _ptt_result(self, params: dict) -> dict:
+        """Fetch the transcript of a released session, optionally waiting.
+
+        `wait_s` is bounded polling for the CLI; the hotkey path never needs it.
+        """
+        wait_s = float(params.get("wait_s") or 0)
+        if wait_s > 0 and self._ptt_processing:
+            try:
+                await asyncio.wait_for(self._ptt_result_event.wait(), timeout=wait_s)
+            except TimeoutError:
+                pass
+        requested = params.get("session_id")
+        if requested is not None and requested in self._ptt_results:
+            return {"session_id": requested, "processing": False,
+                    "result": self._ptt_results[requested], "found": True,
+                    "connectivity": self.mode_manager.status(refresh=False).as_dict()}
+        result = None
+        found = requested is None or requested == self._ptt_last_session_id
+        if found:
+            result = self._ptt_last_result
+        return {"session_id": self._ptt_last_session_id,
+                "processing": self._ptt_processing,
+                "result": result,
+                "found": found,
                 "connectivity": self.mode_manager.status(refresh=False).as_dict()}
 
     async def _transcribe_file(self, params: dict) -> dict:

@@ -328,6 +328,11 @@ class Store:
 
     # -- cost ledger (§3.2: a ledger write on every call) -------------------
     def log_llm_call(self, **fields) -> int:
+        # BUG6 cost audit: every row carries a purpose, failures included. A
+        # NULL purpose makes "which calls failed?" unanswerable without reading
+        # error strings, which is how silent Live failures hide.
+        purpose = fields.get("purpose") or fields.get("role") or "unknown"
+        fields["purpose"] = purpose
         columns = [
             "ts", "correlation_id", "role", "model", "mode", "tokens_in",
             "tokens_out", "tokens_estimated", "audio_seconds", "cost_usd",
@@ -396,6 +401,28 @@ class Store:
             params.append(purpose)
         with self._lock:
             return int(self._conn.execute(query, tuple(params)).fetchone()["n"])
+
+    def failure_summary_since(self, since_iso: str) -> list[dict]:
+        """Failed calls, grouped by purpose/model/error — the evidence behind
+        `assist cost`'s failure count (BUG6 cost note).
+
+        Grouping by purpose as well as error is deliberate: five failures from
+        key/voice housekeeping and five from silent Live transport failures
+        look identical in a bare count.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT COALESCE(NULLIF(purpose, ''), '(untagged)') AS purpose,
+                          role, model, mode,
+                          COALESCE(error, '(no error recorded)') AS error,
+                          COUNT(*) AS n
+                   FROM llm_calls
+                   WHERE ts >= ? AND ok = 0
+                   GROUP BY purpose, role, model, mode, error
+                   ORDER BY n DESC, purpose""",
+                (since_iso,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def calls_by_purpose_since(self, since_iso: str) -> dict:
         with self._lock:

@@ -1238,6 +1238,9 @@ def build_parser() -> argparse.ArgumentParser:
     ptt_p.add_argument("--source", help="capture source override")
     ptt_p.add_argument("--speak", action="store_true",
                        help="for command stop: speak the reply locally")
+    ptt_p.add_argument("--wait", action="store_true",
+                       help="for stop: also wait for the transcript (default: "
+                            "acknowledge the release immediately)")
     tr_p = sub.add_parser("transcribe", help="batch-transcribe a WAV (post tier, §3.6)")
     tr_p.add_argument("file")
     sub.add_parser("index", help="index configured roots (local only, shadow-safe)")
@@ -1379,6 +1382,8 @@ def main(argv: list[str] | None = None) -> int:
                 data["today"]["housekeeping_calls"] = store.housekeeping_calls_since(day_start_iso())
                 data["today"]["by_purpose"] = store.calls_by_purpose_since(day_start_iso())
                 data["today"]["quota_calls"] = data["today"]["user_turn_calls"]
+                data["month"]["failures_detail"] = store.failure_summary_since(
+                    month_start_iso())
                 store.close()
             from .cost import format_cost_report
             print(format_cost_report(data["month"], data["today"], data["quota"], data["tier"]))
@@ -1590,9 +1595,22 @@ def main(argv: list[str] | None = None) -> int:
                            timeout=5.0)
             note = " (SIMULATED capture — no PipeWire here)" if started.get("simulated_capture") else ""
             input(f"Listening{note}… press Enter to stop. ")
+            # BUG6: the release must be acknowledged at once. The transcript
+            # arrives from the daemon afterwards — `ptt.result` waits for it
+            # here so the terminal still prints a dictate turn, without ever
+            # making the stop call itself block on Live/cleanup.
             stopped = call(config.socket_path, "ptt.stop",
-                           {"speak": args.speak}, timeout=90.0)
-            result = stopped.get("result") or {}
+                           {"speak": args.speak}, timeout=5.0)
+            result = stopped.get("result")
+            if result is None and stopped.get("processing"):
+                try:
+                    final = call(config.socket_path, "ptt.result",
+                                 {"session_id": stopped.get("session_id"),
+                                  "wait_s": 60.0}, timeout=75.0)
+                    result = final.get("result")
+                except (DaemonUnavailable, RuntimeError, OSError) as exc:
+                    print(f"assist: transcript not delivered: {exc}", file=sys.stderr)
+            result = result or {}
             print(result.get("narration", ""))
             print(result.get("text", result.get("error", "(no transcript)")))
             print(f"[inbox: {result.get('inbox_path')} · clipboard: "
@@ -1625,8 +1643,10 @@ def main(argv: list[str] | None = None) -> int:
                     params["source"] = args.source
             elif args.speak:
                 params["speak"] = True
+            if action == "stop" and args.wait:
+                params["wait_s"] = 90.0
             result = call(config.socket_path, f"ptt.{action}", params,
-                          timeout=90.0 if action == "stop" else 3.0)
+                          timeout=95.0 if (action == "stop" and args.wait) else 3.0)
             print(json.dumps(result))
             return 0
     except (DaemonUnavailable, RuntimeError, OSError) as exc:

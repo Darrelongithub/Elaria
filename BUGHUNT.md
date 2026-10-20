@@ -271,8 +271,9 @@ Five more cases in `tests/test_hardening_pass2b.py` closed the second batch:
 - **BH-J6** — README's `assist status && assist cost` became `;` (status exits
   1 when the daemon is down, which skipped the command you want most).
 
-Final numbers for the branch: **1,315 passed / 6 skipped / 0 failed / 0 xfailed**
-(1,321 collected); Ruff **0**; Vulture **0**.
+Final numbers for the branch after merging `main` (BUG 6, PR #7):
+**1,325 passed / 6 skipped / 0 failed / 0 xfailed** (1,331 collected; the 10
+BUG 6 tests are included); Ruff **0**; Vulture **0**.
 
 Guard tests: `tests/test_hardening_pass2.py` (29 cases) and
 `tests/test_hardening_pass2b.py` (5 cases). Pre-fix: 24 failed /
