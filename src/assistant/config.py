@@ -644,11 +644,14 @@ def _file_sections(config_path: Path) -> set[str]:
 def load_humour_profile(config: Config) -> dict:
     """Parse humour.toml (the calibrated taste profile, §13.7).
 
-    Returns {} when absent — the governor must degrade to safe restraint,
-    never crash, and never invent a personality the owner didn't approve.
+    Returns {} when absent or malformed — the governor must degrade to safe
+    restraint, never crash, and never invent a personality the owner didn't approve.
     """
     path = config.humour_profile_path()
     if path is None:
         return {}
-    with path.open("rb") as handle:
-        return tomllib.load(handle)
+    try:
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+    except (tomllib.TOMLDecodeError, OSError):
+        return {}

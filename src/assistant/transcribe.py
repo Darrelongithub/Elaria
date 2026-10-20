@@ -240,6 +240,7 @@ class DictationService:
         collected: list[LiveEvent] = []
         live_failed = False
         started = time.monotonic()
+        rotations = 0
         resumption_handle: str | None = None
 
         async def collect_events(current: LiveTransport) -> None:
@@ -305,7 +306,7 @@ class DictationService:
                     continue
                 try:
                     # Rotation: never ride a session into its lifetime cap.
-                    if time.monotonic() - started > self.session_max_s:
+                    if rotations == 0 and time.monotonic() - started > self.session_max_s:
                         raise LiveUnavailable("proactive rotation at session age cap")
                     if any(e.type == "go_away" for e in collected):
                         # VB-7: finals are TRANSCRIBED TEXT and are not recoverable
@@ -330,7 +331,11 @@ class DictationService:
                         collector.cancel()
                     try:
                         await transport.close()
+                        if rotations >= 1:
+                            raise LiveUnavailable("rotation limit reached for this session")
                         transport = await open_session(resumption_handle)
+                        rotations += 1
+                        started = time.monotonic()
                         tail = buffer.tail()
                         for i in range(0, len(tail), 960):  # 30ms frames
                             await transport.send_audio(tail[i:i + 960])
@@ -441,7 +446,11 @@ class DictationService:
         # never attempted against Gemini.
         cleanup = None
         if raw and not skip_cleanup:
-            cleanup = await asyncio.to_thread(self.cleanup.run, raw)
+            try:
+                cleanup = await asyncio.to_thread(self.cleanup.run, raw)
+            except Exception as exc:
+                cleanup = None
+                notes.append(f"cleanup failed ({exc}); raw transcript preserved")
         elif raw and skip_cleanup:
             notes.append("cleanup skipped offline; raw transcript is the record")
         cleaned = cleanup.cleaned if cleanup else None

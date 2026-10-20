@@ -355,7 +355,6 @@ def test_bare_undo_refuses_without_scope(config, tmp_path):
     assert (root / "Finance" / "invoice-new.txt").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-B4: broken symlink crashes index_root")
 def test_broken_symlink_is_skipped_not_fatal(config, tmp_path):
     root = tmp_path / "docs"
     aged(root / "invoice.txt", "good")
@@ -370,7 +369,6 @@ def _index_fifo(config, spec, db_path: str) -> None:  # child process target
     Indexer(config, Store(Path(db_path))).index_root(spec)
 
 
-@pytest.mark.xfail(strict=True, reason="BH-B5: FIFO/special file can hang the indexer")
 def test_fifo_is_skipped_instead_of_blocking_indexer(config, tmp_path):
     root = tmp_path / "docs"
     aged(root / "invoice.txt", "good")
@@ -387,7 +385,6 @@ def test_fifo_is_skipped_instead_of_blocking_indexer(config, tmp_path):
     assert not alive, "indexer blocked forever reading a FIFO"
 
 
-@pytest.mark.xfail(strict=True, reason="BH-B6: never_send flag goes stale on unchanged files")
 def test_never_send_added_later_reflags_unchanged_documents(config, tmp_path):
     root = tmp_path / "docs"
     secret = aged(root / "invoice.txt", FIXTURES["secrets"]["never_send_marker"])
@@ -522,7 +519,6 @@ def test_apply_report_names_the_journal_operations_it_committed(config, tmp_path
     assert report.op_ids == [op["id"] for op in committed]
 
 
-@pytest.mark.xfail(strict=True, reason="BH-B8: unreadable directory is treated as empty")
 def test_unreadable_directory_does_not_mark_known_files_missing(config, tmp_path):
     root = tmp_path / "docs"
     subdir = root / "sub"
@@ -539,7 +535,6 @@ def test_unreadable_directory_does_not_mark_known_files_missing(config, tmp_path
     assert store.document_by_path(str(src))["status"] == "indexed"
 
 
-@pytest.mark.xfail(strict=True, reason="BH-B9: build_plan ignores indexer root-missing error")
 def test_build_plan_for_missing_root_does_not_finish_ready(config, tmp_path):
     root = tmp_path / "docs"
     aged(root / "invoice.txt", "was here")

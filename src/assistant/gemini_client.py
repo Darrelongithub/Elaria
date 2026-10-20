@@ -183,6 +183,7 @@ class _SdkTransport:
                 if not sent:
                     # Older SDK shape: realtime text input ends the turn itself.
                     await session.send_realtime_input(text=text)
+                completed = False
                 async for message in session.receive():
                     usage = getattr(message, "usage_metadata", None)
                     if usage is not None:
@@ -204,9 +205,11 @@ class _SdkTransport:
                             if match:
                                 rate = int(match.group(1))
                     if getattr(content, "turn_complete", False):
+                        completed = True
                         break
             return {"pcm": bytes(pcm), "sample_rate": rate,
                     "voice_name": voice_name,
+                    "completed": completed,
                     "usage": {"tokens_in": tokens_in, "tokens_out": tokens_out}}
 
         result = _run_coroutine_sync(render)
@@ -214,6 +217,10 @@ class _SdkTransport:
             raise RuntimeError(
                 f"the Live model {model} returned no audio for voice {voice_name!r}; "
                 "nothing is spoken rather than substituting another voice")
+        if not result.get("completed"):
+            raise RuntimeError(
+                f"the Live session for {model} closed before turn_complete "
+                "(truncated audio discarded rather than caching a partial clip)")
         return result
 
     def list_models(self) -> list[str]:
@@ -602,6 +609,12 @@ class GeminiClient:
                 return HarnessResult(last_text, model, attempts, tier > 0, None,
                                      correlation_id, response.get("fixture"))
             last_verified = bool(verify(last_text))
+            with self.store._lock:
+                self.store._conn.execute(
+                    "UPDATE llm_calls SET verified = ? WHERE correlation_id = ? AND attempt = ?",
+                    (1 if last_verified else 0, correlation_id, attempts),
+                )
+                self.store._conn.commit()
             if last_verified:
                 return HarnessResult(last_text, model, attempts, tier > 0, True,
                                      correlation_id, response.get("fixture"))

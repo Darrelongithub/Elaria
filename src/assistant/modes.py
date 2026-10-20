@@ -18,6 +18,7 @@ applied underneath the session. The daemon calls
 
 from __future__ import annotations
 
+import errno
 import socket
 import time
 from collections.abc import Callable
@@ -36,13 +37,27 @@ _NETWORK_MARKERS = (
     "connection refused", "connection reset", "connection aborted",
     "timed out", "timeout", "offline", "unavailable", "503",
 )
+_NETWORK_ERRNOS = {
+    errno.ENETUNREACH, errno.ENETDOWN, errno.ENETRESET,
+    errno.EHOSTUNREACH, errno.EHOSTDOWN,
+    errno.ECONNREFUSED, errno.ECONNRESET, errno.ECONNABORTED,
+    errno.ETIMEDOUT,
+}
 
 
 def looks_like_network_failure(error: object) -> bool:
-    """Conservative classifier: quota/429 is not a dead router, and a
-    transient Live disconnect that can rotate is not automatically one."""
-    if isinstance(error, (TimeoutError, ConnectionError, OSError)):
+    """Conservative classifier: quota/429 is not a dead router, and local
+    filesystem OSErrors (missing file, permission denied, disk full) are not
+    network failures (BH-E3)."""
+    if isinstance(error, (TimeoutError, ConnectionError, socket.gaierror, socket.herror)):
         return True
+    if isinstance(error, (FileNotFoundError, PermissionError, IsADirectoryError,
+                          NotADirectoryError, FileExistsError)):
+        return False
+    if isinstance(error, OSError):
+        err_no = getattr(error, "errno", None)
+        if err_no is not None:
+            return err_no in _NETWORK_ERRNOS
     text = str(error).lower()
     if "quota" in text or "429" in text or "rate" in text:
         return False
@@ -115,25 +130,29 @@ class ModeManager:
         self._healthy: bool | None = None
         self._checked_at: float | None = None
         self._reason = "health not checked yet"
+        self._mem_preference: str | None = None
+        self._mem_pending: str | None = None
 
     # -- persistence ---------------------------------------------------------
     @property
     def preference(self) -> str:
-        stored = self.store.get_state(_PREFERENCE_KEY) if self.store else None
+        stored = self.store.get_state(_PREFERENCE_KEY) if self.store else self._mem_preference
         value = stored or self.config.section("connectivity").get("mode", "auto")
         value = str(value).lower()
         return value if value in PREFERENCES else "auto"
 
     @property
     def pending_preference(self) -> str | None:
-        stored = self.store.get_state(_PENDING_KEY) if self.store else None
+        stored = self.store.get_state(_PENDING_KEY) if self.store else self._mem_pending
         return stored if stored in PREFERENCES else None
 
     def _set_stored_preference(self, value: str) -> None:
+        self._mem_preference = value
         if self.store:
             self.store.set_state(_PREFERENCE_KEY, value)
 
     def _set_pending_preference(self, value: str | None) -> None:
+        self._mem_pending = value or None
         if self.store:
             # The tiny state table has no delete API; empty means no pending.
             self.store.set_state(_PENDING_KEY, value or "")

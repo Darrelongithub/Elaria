@@ -172,6 +172,7 @@ class InitiativeService:
     store: object
     presence: object = None
     disclosure: object = None
+    sessions: object = None
     now: object = None
 
     def __post_init__(self):
@@ -378,10 +379,14 @@ class InitiativeService:
         knock = self.get(knock_id)
         if knock["status"] != "pending":
             raise InitiativeError(f"knock #{knock_id} is {knock['status']}")
+        ts = iso_now()
         self.store.update_knock(knock_id, status="accepted",
-                                resolved_ts=iso_now())
+                                resolved_ts=ts)
         class_now = self.class_mode() if class_mode is None else bool(class_mode)
         mode = ("console" if class_now or not voice_available else "voice")
+        if self.sessions is not None:
+            self.sessions.append("assistant", knock["reason"],
+                                 channel=mode, via="knock", ts=ts)
         return {
             "knock": {**knock, "status": "accepted"},
             "open": mode,

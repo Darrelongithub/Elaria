@@ -108,7 +108,7 @@ class Daemon:
         # reason gate — not a budget — decides whether she may speak at all.
         self.initiative = InitiativeService(
             config, self.store, presence=self.presence,
-            disclosure=self.disclosure)
+            disclosure=self.disclosure, sessions=self.sessions)
         self.knock_signal = KnockSignal(config)
         self.console = ConsoleService(
             config, self.store, presence=self.presence, sessions=self.sessions,
@@ -204,7 +204,11 @@ class Daemon:
 
         async def _run():
             try:
-                return await asyncio.to_thread(self.speech.speak, text)
+                res = await asyncio.to_thread(self.speech.speak, text)
+                if res.error and not route.get("muted"):
+                    await self.broadcast({"event": "speech.error", "error": res.error,
+                                          **route})
+                return res
             except Exception as exc:
                 await self.broadcast({"event": "speech.error", "error": str(exc),
                                       **route})
@@ -219,8 +223,13 @@ class Daemon:
         if requested is True:
             try:
                 result = await asyncio.to_thread(self.speech.speak, text)
+                if result.error and not route.get("muted"):
+                    await self.broadcast({"event": "speech.error", "error": result.error,
+                                          **route})
                 return result.as_dict()
             except Exception as exc:
+                await self.broadcast({"event": "speech.error", "error": str(exc),
+                                      **route})
                 return {**route, "played": False, "error": str(exc)}
         if requested is None and self.config.section("tts").get("speak_replies", False):
             return await self._speak_in_background(text)
@@ -562,17 +571,38 @@ class Daemon:
     async def _knock_accept(self, params: dict) -> dict:
         knock_id = int(params.get("id"))
         class_now = self.presence.status().enabled
-        voice_muted = bool((self.speech.status().get("voice") or {}).get("muted"))
+        speech_status = self.speech.status()
+        voice_muted = bool(
+            speech_status.get("muted")
+            if "muted" in speech_status
+            else (speech_status.get("voice") or {}).get("muted")
+        )
         try:
             result = self.initiative.accept(
                 knock_id, class_mode=class_now,
                 voice_available=not voice_muted)
         except InitiativeError as exc:
-            raise ValueError(str(exc)) from exc
+            existing = self.store.get_knock(knock_id)
+            existing_msgs = self.sessions.history(limit=40).get("messages") or []
+            already_appended = any(
+                m.get("via") == "knock" and m.get("text") == (existing or {}).get("reason")
+                for m in existing_msgs
+            )
+            if existing and existing.get("status") == "accepted" and not already_appended:
+                mode = "console" if class_now or voice_muted else "voice"
+                result = {
+                    "knock": existing,
+                    "open": mode,
+                    "first_line": existing["reason"],
+                    "class_mode": class_now,
+                }
+            else:
+                raise ValueError(str(exc)) from exc
         opened = result["open"]
         # Her REASON is the first line of the turn, whichever surface opened.
-        self.sessions.append("assistant", result["first_line"],
-                             channel=opened, via="knock", ts=iso_now())
+        if self.initiative.sessions is None:
+            self.sessions.append("assistant", result["first_line"],
+                                 channel=opened, via="knock", ts=iso_now())
         conversation_id = self.sessions.history()["id"]
         payload = {**result, "conversation_id": conversation_id,
                    "conversation": self.sessions.history(
@@ -960,8 +990,10 @@ class Daemon:
         verdict = params.get("verdict")
         if verdict not in ("approve", "reject"):
             raise ValueError("verdict must be approve|reject")
-        self.store.set_item_decision(item_id, "auto" if verdict == "approve" else "rejected")
-        return {"item_id": item_id, "decision": "auto" if verdict == "approve" else "rejected"}
+        decision = "auto" if verdict == "approve" else "rejected"
+        if not self.store.set_item_decision(item_id, decision):
+            raise ValueError(f"no review item {item_id}")
+        return {"item_id": item_id, "decision": decision}
 
     async def _undo(self, params: dict) -> dict:
         from .executor import parse_since
@@ -1250,6 +1282,7 @@ class Daemon:
                         "pushback": decision.pushback, "reason": decision.reason}))
         channel = str(params.get("channel") or "voice")
         conversation_id = self.sessions.active_id(iso_now())
+        prior_turns = self.sessions.history(limit=8).get("messages") or []
         self.sessions.append("user", text, channel=channel, ts=iso_now())
 
         reply, via, model, fixture = None, None, None, None
@@ -1273,10 +1306,33 @@ class Daemon:
             restricted = self.disclosure.company() or speaker != "owner"
             kept = self.disclosure.filter_hits(hits, guest=speaker != "owner")
             context = "\n".join(f"- [{h.source} {h.ref}] {h.text}" for h in kept)
+            history_lines = ""
+            if prior_turns:
+                safe_turns = [
+                    m for m in prior_turns[-6:]
+                    if m.get("text") and (
+                        not restricted
+                        or self.disclosure.leak_in(
+                            str(m["text"]), guest=speaker != "owner",
+                            company=self.disclosure.company()) is None
+                    )
+                ]
+                if safe_turns:
+                    history_lines = "\n".join(
+                        f"- {m['role']}: {m['text']}" for m in safe_turns
+                    )
             prompt = text
-            if context:
+            if history_lines and context:
+                prompt = (f"Context from the user's local memory/index "
+                          f"(cite paths plainly):\n{context}\n\n"
+                          f"Recent conversation in this session:\n{history_lines}\n\n"
+                          f"User: {text}")
+            elif context:
                 prompt = (f"Context from the user's local memory/index "
                           f"(cite paths plainly):\n{context}\n\nUser: {text}")
+            elif history_lines:
+                prompt = (f"Recent conversation in this session:\n{history_lines}\n\n"
+                          f"User: {text}")
             if restricted:
                 prompt += "\n\n" + self.disclosure.prompt_note(
                     guest=speaker != "owner")

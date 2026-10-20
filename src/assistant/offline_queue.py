@@ -10,6 +10,7 @@ awaiting explicit owner approval. Nothing cloud-bound fails silently.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from . import asr
@@ -37,10 +38,12 @@ class CloudQueue:
         self.store = store
         self.client = client
         self.mode_manager = mode_manager
+        self._in_flight: set[int] = set()
+        self._flight_lock = threading.Lock()
 
     # -- enqueue ---------------------------------------------------------------
     def _find_active(self, kind: str, key: str, value) -> dict | None:
-        for job in self.store.list_cloud_jobs(limit=500):
+        for job in self.store.list_cloud_jobs(status=tuple(ACTIVE_STATUSES), limit=500):
             if job["kind"] != kind or job["status"] not in ACTIVE_STATUSES:
                 continue
             try:
@@ -127,14 +130,33 @@ class CloudQueue:
                 return result
 
         result = self._empty_result(mode=mode)
-        existing = self.store.list_cloud_jobs(limit=500)
+        existing = self.store.list_cloud_jobs(
+            status=("pending", "approved", "awaiting_approval", "running"),
+            limit=max(500, limit * 2),
+        )
         # Jobs enqueued as external work start life awaiting approval; a
         # reconnect summary must still name them rather than pretend the
         # queue fully drained.
         result["awaiting_approval"] = sum(
             1 for j in existing if j["status"] == "awaiting_approval")
-        candidates = [j for j in existing
-                      if j["status"] in ("pending", "approved")][:limit]
+        candidates: list[dict] = []
+        for j in existing:
+            jid = int(j["id"])
+            if j["status"] in ("pending", "approved"):
+                candidates.append(j)
+            elif j["status"] == "running":
+                with self._flight_lock:
+                    in_flight = jid in self._in_flight
+                if not in_flight:
+                    recovered_status = "approved" if j["requires_approval"] else "pending"
+                    self.store.claim_cloud_job(
+                        jid, to_status=recovered_status,
+                        from_statuses=("running",), increment_attempts=False,
+                    )
+                    j = {**j, "status": recovered_status}
+                    candidates.append(j)
+            if len(candidates) >= limit:
+                break
         for job in candidates:
             job_id = int(job["id"])
             if job["requires_approval"] and job["status"] != "approved":
@@ -153,6 +175,8 @@ class CloudQueue:
             # of running the job twice (BH-C3).
             if not self.store.claim_cloud_job(job_id):
                 continue
+            with self._flight_lock:
+                self._in_flight.add(job_id)
             try:
                 payload = json.loads(job["payload_json"])
                 outcome = self._handle(job["kind"], payload, approved=job["status"] == "approved")
@@ -171,6 +195,9 @@ class CloudQueue:
                 result["jobs"].append({"id": job_id, "kind": job["kind"],
                                         "status": "failed", "error": str(exc)})
                 continue
+            finally:
+                with self._flight_lock:
+                    self._in_flight.discard(job_id)
             self.store.update_cloud_job(job_id, status="done",
                                         result_json=json.dumps(outcome),
                                         completed_ts=iso_now())

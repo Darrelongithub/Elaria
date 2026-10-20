@@ -239,12 +239,19 @@ def transcribe_file(config, client, audio_path: str, *, offline: bool = False,
     quota exhaustion degrades instead of failing)."""
     language = primary_language(config)
     errors: list[str] = []
+    last_empty: Transcript | None = None
     for backend in batch_chain(config, client, offline=offline,
                                local_backend=local_backend):
         try:
-            return backend.transcribe(audio_path, language)
+            result = backend.transcribe(audio_path, language)
+            if result.text and result.text.strip():
+                return result
+            last_empty = result
+            errors.append(f"{backend.name}: empty transcript")
         except Exception as exc:
             errors.append(f"{backend.name}: {exc}")
+    if last_empty is not None:
+        return last_empty
     raise RuntimeError("all ASR backends failed — " + " | ".join(errors))
 
 

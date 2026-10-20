@@ -458,13 +458,17 @@ class Store:
             self._conn.commit()
             return int(cur.lastrowid)
 
-    def list_cloud_jobs(self, status: str | None = None,
+    def list_cloud_jobs(self, status: str | Sequence[str] | None = None,
                         limit: int = 100) -> list[dict]:
         query = "SELECT * FROM cloud_jobs"
         params: list = []
-        if status:
+        if isinstance(status, str):
             query += " WHERE status = ?"
             params.append(status)
+        elif status:
+            placeholders = ", ".join("?" * len(status))
+            query += f" WHERE status IN ({placeholders})"
+            params.extend(status)
         query += " ORDER BY id LIMIT ?"
         params.append(limit)
         with self._lock:
@@ -677,12 +681,13 @@ class Store:
             rows = self._conn.execute(query + " ORDER BY src", params).fetchall()
         return [dict(r) for r in rows]
 
-    def set_item_decision(self, item_id: int, decision: str) -> None:
+    def set_item_decision(self, item_id: int, decision: str) -> bool:
         """Review queue mutations (§4.4): approve → auto, reject → rejected."""
         with self._lock:
-            self._conn.execute("UPDATE plan_items SET decision = ? WHERE id = ?",
-                               (decision, item_id))
+            cur = self._conn.execute("UPDATE plan_items SET decision = ? WHERE id = ?",
+                                     (decision, item_id))
             self._conn.commit()
+            return cur.rowcount == 1
 
     def set_plan_status(self, plan_id: int, status: str) -> None:
         with self._lock:

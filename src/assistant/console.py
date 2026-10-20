@@ -187,6 +187,7 @@ def stream_console(socket_path, *, interval_s: float = 5.0):
                         yield _safe_snapshot(socket_path)
                         continue
                     if not chunk:
+                        yield _safe_snapshot(socket_path)
                         break
                     buffer += chunk
                     while b"\n" in buffer:
@@ -197,7 +198,7 @@ def stream_console(socket_path, *, interval_s: float = 5.0):
                             message = json.loads(line)
                         except ValueError:
                             continue
-                        if "event" in message:
+                        if isinstance(message, dict) and "event" in message:
                             yield _safe_snapshot(socket_path)
         except (OSError, DaemonUnavailable):
             yield _safe_snapshot(socket_path)

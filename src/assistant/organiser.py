@@ -60,7 +60,11 @@ class OrganiserService:
         # the same readable proposal log first.
         plan_id = plan_id or self.store.create_plan(iso_now(), root, mode)
         try:
+            if not Path(root).exists():
+                raise FileNotFoundError(f"root does not exist: {root}")
             index_stats = self.indexer.index_root(root_spec) if reindex else {}
+            if isinstance(index_stats, dict) and str(index_stats.get("error", "")).startswith("root does not exist"):
+                raise FileNotFoundError(index_stats["error"])
             if progress:
                 progress({"event": "plan.progress", "plan_id": plan_id,
                           "stage": "indexed", "stats": index_stats})

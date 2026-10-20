@@ -138,11 +138,12 @@ class WavSink:
 
     def __init__(self, path: Path, sample_rate: int = SAMPLE_RATE):
         self.path = Path(path)
+        self.sample_rate = int(sample_rate)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._wav = wave.open(str(self.path), "wb")  # noqa: SIM115 — sink owns lifecycle; close() is the API
         self._wav.setnchannels(1)
         self._wav.setsampwidth(BYTES_PER_SAMPLE)
-        self._wav.setframerate(sample_rate)
+        self._wav.setframerate(self.sample_rate)
         self._frames = 0
 
     def write(self, frame: bytes) -> None:
@@ -151,7 +152,7 @@ class WavSink:
 
     def close(self) -> float:
         self._wav.close()
-        return self._frames / SAMPLE_RATE
+        return self._frames / self.sample_rate
 
 
 def write_wav(path: Path, frames: list[bytes], sample_rate: int = SAMPLE_RATE) -> Path:
@@ -345,6 +346,12 @@ async def _next_or_silence(iterator, _silence):
 
 def pw_record_pcm_stream_command(target: str | None, *, sample_rate: int = 16000) -> list[str]:
     """Raw s16le PCM to stdout — what assist-voice-test consumes live."""
+    if target and str(target).isdigit() and len(str(target)) < 4:
+        raise ValueError(
+            f"'{target}' looks like an object.id. pw-record --target wants "
+            "object.serial or node.name — an ID silently records the default "
+            "device instead of erroring (GETTING-STARTED Step 3)."
+        )
     command = ["pw-record", "--rate", str(sample_rate), "--channels", "1",
                "--format", "s16", "-"]
     if target:
