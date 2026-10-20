@@ -88,6 +88,18 @@ class_schedule_suggest = true
 history_limit = 200      # one conversation shared by voice + console
 snapshot_limit = 20
 
+[initiative]
+# §19.2 as amended: NO BUDGET. There is deliberately no per-day count, spacing
+# rule or rate key here — the reason gate is the only control. A knock requires
+# a stored, citable reason or it is refused.
+snooze_hours = 24             # "later" -> commitment memory
+retire_after_ignores = 3      # same topic ignored 3x is retired
+urgent_in_class_mode = true   # class mode = urgent-only, and silent
+notify_identity = "Elaria · knock"   # its own identity; nothing else uses it
+sound = "~/.local/share/assistant/sounds/knock.wav"
+notify = true
+play_sound = true
+
 [asr]
 primary  = "gemini_live"            # chain: live -> batch -> local (§12.7)
 fallback = ["gemini_batch", "local"]

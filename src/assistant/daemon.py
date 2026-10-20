@@ -28,6 +28,7 @@ from .config import Config, load_config, load_humour_profile
 from .console import ConsoleService, SessionService
 from .cost import day_start_iso, iso_now, month_start_iso
 from .gemini_client import GeminiClient
+from .initiative import InitiativeError, InitiativeService, KnockSignal
 from .ipc import serve
 from .modes import ModeManager
 from .offline_queue import CloudQueue
@@ -90,8 +91,14 @@ class Daemon:
         from .meeting import MeetingService
         self.meetings = MeetingService(
             config, self.store, self.client, mode_manager=self.mode_manager)
+        # Stage C: the knock. Class mode restricts it to urgent-only; the
+        # reason gate — not a budget — decides whether she may speak at all.
+        self.initiative = InitiativeService(
+            config, self.store, presence=self.presence)
+        self.knock_signal = KnockSignal(config)
         self.console = ConsoleService(
-            config, self.store, presence=self.presence, sessions=self.sessions)
+            config, self.store, presence=self.presence, sessions=self.sessions,
+            initiative=self.initiative)
         self._meeting: dict | None = None  # {task, dual, mic_frames, sys_frames}
         self._meeting_processing = False
         self._plan_tasks: dict[int, asyncio.Task] = {}
@@ -262,6 +269,14 @@ class Daemon:
             "queue.approve": self._queue_approve,
             "queue.enqueue_external": self._queue_enqueue_external,
             "console.state": self._console_state,
+            "knock.list": self._knock_list,
+            "knock.raise": self._knock_raise,
+            "knock.accept": self._knock_accept,
+            "knock.decline": self._knock_decline,
+            "knock.later": self._knock_later,
+            "knock.ignore": self._knock_ignore,
+            "knock.due": self._knock_due,
+            "initiative.status": self._initiative_status,
             "console.say": self._console_say,
             "class.status": self._class_status,
             "class.set": self._class_set,
@@ -276,7 +291,9 @@ class Daemon:
                                "session.checkin", "session.offline",
                                "transcript.final", "session.ended",
                                "mode.changed", "offline.drained",
-                               "speech.error", "error"]}
+                               "speech.error", "conversation.message",
+                               "class.changed", "knock.raised",
+                               "knock.accepted", "knock.changed", "error"]}
         handler = handlers.get(method)
         if handler is None:
             raise ValueError(f"unknown method '{method}' — supported: "
@@ -317,6 +334,7 @@ class Daemon:
             "connectivity_mode": connectivity.effective_mode,
             "voice": self.speech.status(),
             "class_mode": self.presence.status().as_dict(),
+            "knock": self.initiative.status(),
             "console": {
                 "conversation_id": (self.sessions.history()["id"]),
                 "messages": len(self.sessions.history()["messages"]),
@@ -480,6 +498,125 @@ class Daemon:
         return {**result, "channel": "console",
                 "conversation": self.sessions.history(limit=int(
                     params.get("history_limit", 40)))}
+
+    # -- the knock (§19.2 as amended) ----------------------------------------
+    def _knock_dict(self, knock: dict) -> dict:
+        return {**knock, "silent": self.presence.status().enabled,
+                "first_line": knock.get("reason")}
+
+    async def _knock_list(self, params: dict) -> dict:
+        status = params.get("status", "pending")
+        limit = int(params.get("limit", 50))
+        knocks = ([self._knock_dict(k)
+                   for k in self.store.list_knocks(status, limit=limit)]
+                  if status else
+                  [self._knock_dict(k)
+                   for k in self.store.list_knocks(None, limit=limit)])
+        return {"knocks": knocks, "status": self.initiative.status(),
+                "class_mode": self.presence.status().as_dict()}
+
+    async def _knock_raise(self, params: dict) -> dict:
+        try:
+            knock = self.initiative.raise_knock(
+                topic=str(params.get("topic") or ""),
+                reason=str(params.get("reason") or ""),
+                kind=str(params.get("kind") or "follow-up"),
+                urgency=str(params.get("urgency") or "normal"),
+                referent=params.get("referent"),
+                commitment_id=(int(params["commitment_id"])
+                               if params.get("commitment_id") is not None
+                               else None))
+        except InitiativeError as exc:
+            raise ValueError(str(exc)) from exc
+        signal = self.knock_signal.emit(
+            knock, class_mode=self.presence.status().enabled)
+        knock = self._knock_dict(knock)
+        await self.broadcast({"event": "knock.raised", "knock": knock,
+                              "signal": signal})
+        return {"knock": knock, "signal": signal}
+
+    async def _knock_accept(self, params: dict) -> dict:
+        knock_id = int(params.get("id"))
+        class_now = self.presence.status().enabled
+        voice_muted = bool((self.speech.status().get("voice") or {}).get("muted"))
+        try:
+            result = self.initiative.accept(
+                knock_id, class_mode=class_now,
+                voice_available=not voice_muted)
+        except InitiativeError as exc:
+            raise ValueError(str(exc)) from exc
+        opened = result["open"]
+        # Her REASON is the first line of the turn, whichever surface opened.
+        self.sessions.append("assistant", result["first_line"],
+                             channel=opened, via="knock", ts=iso_now())
+        conversation_id = self.sessions.history()["id"]
+        payload = {**result, "conversation_id": conversation_id,
+                   "conversation": self.sessions.history(
+                       limit=int(params.get("history_limit", 40)))}
+        await self.broadcast({"event": "knock.accepted",
+                              "knock": result["knock"],
+                              "open": opened, "first_line": result["first_line"],
+                              "conversation_id": conversation_id})
+        await self.broadcast({"event": "conversation.message",
+                              "conversation_id": conversation_id,
+                              "channel": opened, "role": "assistant"})
+        return payload
+
+    async def _knock_decline(self, params: dict) -> dict:
+        try:
+            result = self.initiative.decline(int(params.get("id")))
+        except InitiativeError as exc:
+            raise ValueError(str(exc)) from exc
+        await self.broadcast({"event": "knock.changed", "knock": result["knock"],
+                              "action": "declined"})
+        return result
+
+    async def _knock_later(self, params: dict) -> dict:
+        try:
+            result = self.initiative.later(
+                int(params.get("id")), hours=params.get("hours"))
+        except InitiativeError as exc:
+            raise ValueError(str(exc)) from exc
+        await self.broadcast({"event": "knock.changed", "knock": result["knock"],
+                              "action": "snoozed"})
+        return result
+
+    async def _knock_ignore(self, params: dict) -> dict:
+        try:
+            result = self.initiative.ignore(int(params.get("id")))
+        except InitiativeError as exc:
+            raise ValueError(str(exc)) from exc
+        await self.broadcast({"event": "knock.changed", "knock": result["knock"],
+                              "action": "retired" if result["retired"] else "ignored"})
+        return result
+
+    async def _knock_due_loop(self) -> None:
+        """Wake the user's own commitments when they come due (§19.2).
+
+        This is NOT time-based initiative: the loop only re-reads snoozes the
+        user created via "later". A topic she invented has no row to wake.
+        """
+        while True:
+            try:
+                await self._knock_due({})
+            except Exception as exc:      # a bad row must not kill the loop
+                print(f"[assistd] knock due-check failed: {exc}", flush=True)
+            await asyncio.sleep(60)
+
+    async def _knock_due(self, params: dict) -> dict:
+        raised = []
+        for knock in self.initiative.check_due():
+            signal = self.knock_signal.emit(
+                knock, class_mode=self.presence.status().enabled)
+            knock = self._knock_dict(knock)
+            raised.append(knock)
+            await self.broadcast({"event": "knock.raised", "knock": knock,
+                                  "signal": signal})
+        return {"raised": raised, "count": len(raised)}
+
+    async def _initiative_status(self, params: dict) -> dict:
+        return {"initiative": self.initiative.status(),
+                "class_mode": self.presence.status().as_dict()}
 
     async def _class_status(self, params: dict) -> dict:
         return {"class_mode": self.presence.status().as_dict()}
@@ -1136,6 +1273,7 @@ class Daemon:
         warm_task = asyncio.create_task(self._warm_speech_cache())
         server = await serve(self.config.socket_path, self.handle)
         connectivity_task = asyncio.create_task(self._connectivity_loop())
+        knock_task = asyncio.create_task(self._knock_due_loop())
         _sd_notify("READY=1")
         print(f"[assistd] Elaria up · mode={self.config.gemini_mode} "
               f"· socket={self.config.socket_path}", flush=True)
@@ -1150,7 +1288,8 @@ class Daemon:
             async with server:
                 await stop.wait()
         finally:
-            for task in (connectivity_task, warm_task, *self._background_tasks):
+            for task in (connectivity_task, warm_task, knock_task,
+                         *self._background_tasks):
                 task.cancel()
             self.store.close()
 

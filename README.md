@@ -228,6 +228,48 @@ in Waybar (`·class`) and in `assist status` (`class_mode`). A schedule can
 owner's. Spoken acks are suppressed in the daemon and the speech route reports
 silence with the reason, so nothing can accidentally speak around the toggle.
 
+### Initiative — the knock (Stage C, §19.2 as amended)
+
+```bash
+assist knock list                 # pending knocks, reason first
+assist knock raise --topic tax --reason "..." --kind finding --referent "the tax folder"
+assist knock accept 3             # opens console/voice with her REASON as line one
+assist knock decline 3            # no follow-up on that topic, ever
+assist knock later 3 --hours 24   # snooze into commitment memory
+assist knock ignore 3             # same topic 3× → retired
+assist knock status               # posture: budget = "none"
+assist commitment add "chase the tax office"   # the user's own follow-up
+```
+
+A knock is the **only** signal that means "Elaria wants to talk". It has its own
+Waybar state (`✦` / `·wants to talk`), its own notification identity
+(`Elaria · knock`) and its own short sound (`ui/sounds/knock.wav`). Errors,
+completions and system events never borrow it, and an AST test enforces that
+`knock_signal.emit` is reachable only from the two knock handlers.
+
+**There is no knock budget.** No daily counter, spacing rule, cooldown or rate
+rationing exists anywhere — `assist knock status` says so, and the tests raise a
+dozen knocks in a row without refusal. The control is the **reason gate**: a
+knock requires a stored, citable reason, enforced by a `NOT NULL CHECK` in SQLite
+and again in `InitiativeService.raise_knock()`. No reason → no knock.
+
+A follow-up can only cite a commitment created by an explicit user request or an
+accepted proposal (`assist commitment add …`, or "later" on a knock). She cannot
+invent an obligation and then use her own invention as a reason.
+
+**Anti-psychosis is runtime, not policy prose.** Needy framing (loneliness,
+missing-you, neglect, "you haven't talked to me", simulated feelings) and
+temporal initiation ("it's been three days…") are refused in the reason text and
+in every rendered opener; the generation prompts carry the same prohibition and
+tests lint both. A check-in needs a concrete referent; an urgency needs a real
+one. Class mode restricts knocks to urgent-only and renders them as silent
+visual pulses — no popup, no sound.
+
+Decline stops that topic. "Later" writes a commitment and snoozes; when it comes
+due, `assist knock due` raises a fresh knock whose reason is the user's own
+request ("You asked me to chase this, and it is due…"). Ignoring the same topic
+three times retires it.
+
 ## §10 open decisions — defaults taken, awaiting your word
 
 None block Phase 0 (§14). Each defaults to the blueprint's recommendation

@@ -12,5 +12,8 @@ corpus/
 near-miss/
 *.opus
 *.wav
+# Exception: the knock's own short UI sound is a product asset, not a
+# recording — synthesized, 13 KB, and the only sound the knock signal uses.
+!ui/sounds/knock.wav
 # NOTE: fixtures/ IS committed on purpose — it is the shared debugging
 # artifact that lets mentors reproduce behaviour in mock mode (§12.9).

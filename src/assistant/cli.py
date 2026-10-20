@@ -447,6 +447,119 @@ def _class_command(args, config) -> int:
     return 0
 
 
+def _initiative(config, store=None):
+    from .initiative import InitiativeService
+    from .presence import PresenceService
+    from .store import Store
+
+    owned = store is None
+    store = store or Store(config.db_path)
+    presence = PresenceService(config, store)
+    service = InitiativeService(config, store, presence=presence)
+    return service, store, owned
+
+
+def _knock_command(args, config) -> int:
+    """`assist knock …` — the only signal that means "she wants to talk"."""
+    action = getattr(args, "knock_action", None) or "list"
+    if action in ("list", "status") and not getattr(args, "local", False):
+        try:
+            out = call(config.socket_path,
+                       "knock.list" if action == "list" else "initiative.status",
+                       {"status": None if getattr(args, "all", False) else "pending"},
+                       timeout=5.0)
+            if getattr(args, "json", False):
+                print(json.dumps(out, indent=2))
+                return 0
+            if action == "status":
+                print(json.dumps(out, indent=2))
+                return 0
+            knocks = out.get("knocks") or []
+            if not knocks:
+                print("no knocks — she has nothing with a citable reason")
+            for knock in knocks:
+                print(f"#{knock['id']} [{knock['kind']}/{knock['urgency']}] "
+                      f"{knock['topic']}\n    reason: {knock['reason']}")
+            return 0
+        except (DaemonUnavailable, RuntimeError, OSError):
+            pass  # the store is local and authoritative; fall through
+
+    service, store, owned = _initiative(config)
+    try:
+        if action == "list":
+            status = None if getattr(args, "all", False) else "pending"
+            knocks = [service.get(k["id"]) if status == "pending" else k
+                      for k in store.list_knocks(status, limit=100)]
+            out = {"knocks": knocks, "status": service.status()}
+        elif action == "status":
+            out = {"initiative": service.status(),
+                   "class_mode": service.presence.status().as_dict()
+                   if service.presence else {}}
+        elif action == "due":
+            out = {"raised": service.check_due()}
+        elif action == "raise":
+            out = {"knock": service.raise_knock(
+                topic=args.topic, reason=args.reason, kind=args.kind,
+                urgency=args.urgency, referent=args.referent,
+                commitment_id=args.commitment)}
+        elif action == "accept":
+            out = service.accept(args.id)
+        elif action == "decline":
+            out = service.decline(args.id)
+        elif action == "later":
+            out = service.later(args.id, hours=args.hours)
+        elif action == "ignore":
+            out = service.ignore(args.id)
+        else:
+            raise ValueError(f"unknown knock action {action!r}")
+    except Exception as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if owned:
+            store.close()
+
+    if getattr(args, "json", False):
+        print(json.dumps(out, indent=2))
+        return 0
+    if action == "raise":
+        print(f"knock #{out['knock']['id']} — {out['knock']['reason']}")
+    elif action == "accept":
+        print(f"{out['open']} · first line: {out['first_line']}")
+    elif action == "decline":
+        print(f"declined — no follow-up on {out['knock']['topic']!r}")
+    elif action == "later":
+        print(f"snoozed until {out['snoozed_until']} and written to "
+              f"commitment memory (#{out['commitment']['commitment_id']})")
+    elif action == "ignore":
+        print(f"ignored {out['ignore_count']}×"
+              + (" — topic retired" if out["retired"] else
+                 f" (retires at {out['threshold']})"))
+    elif action == "due":
+        print(f"{out['raised'].__len__()} due follow-up(s) raised")
+    else:
+        print(json.dumps(out, indent=2))
+    return 0
+
+
+def _commitment_command(args, config) -> int:
+    """Commitment memory: only the user (or an accepted proposal) creates one."""
+    service, store, owned = _initiative(config)
+    try:
+        if args.commitment_action == "add":
+            out = service.create_commitment(args.text, origin=args.origin)
+        else:
+            out = {"commitments": store.list_facts(kind="commitment")}
+    except Exception as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if owned:
+            store.close()
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def _print_snapshot(snapshot: dict, *, messages: int = 12) -> None:
     """Human rendering of the same snapshot the QML panel binds to."""
     conversation = snapshot.get("conversation") or {}
@@ -934,6 +1047,46 @@ def build_parser() -> argparse.ArgumentParser:
         "class", help="class mode: voice out OFF, spoken acks OFF, console usable")
     class_p.add_argument("action", nargs="?", default="status",
                          choices=["on", "off", "toggle", "status"])
+    knock_p = sub.add_parser(
+        "knock", help="initiative: a knock always carries its stored reason")
+    knock_sub = knock_p.add_subparsers(dest="knock_action")
+    knock_list = knock_sub.add_parser("list", help="pending knocks (reason first)")
+    knock_list.add_argument("--all", action="store_true", help="include resolved")
+    knock_list.add_argument("--json", action="store_true")
+    knock_list.add_argument("--local", action="store_true",
+                            help="read the store directly instead of the daemon")
+    knock_sub.add_parser("status", help="initiative posture (no budget, ever)")
+    knock_sub.add_parser("due", help="raise follow-ups the user set in motion")
+    knock_raise = knock_sub.add_parser("raise", help="raise a knock (reason required)")
+    knock_raise.add_argument("--topic", required=True)
+    knock_raise.add_argument("--reason", required=True)
+    knock_raise.add_argument("--kind", default="follow-up",
+                             choices=["follow-up", "finding", "checkin", "urgency"])
+    knock_raise.add_argument("--urgency", default="normal", choices=["normal", "urgent"])
+    knock_raise.add_argument("--referent", default=None)
+    knock_raise.add_argument("--commitment", type=int, default=None)
+    knock_raise.add_argument("--json", action="store_true")
+    knock_accept = knock_sub.add_parser("accept", help="open with her reason first")
+    knock_accept.add_argument("id", type=int)
+    knock_accept.add_argument("--json", action="store_true")
+    knock_decline = knock_sub.add_parser("decline", help="no follow-up on this topic")
+    knock_decline.add_argument("id", type=int)
+    knock_later = knock_sub.add_parser("later", help="snooze into commitment memory")
+    knock_later.add_argument("id", type=int)
+    knock_later.add_argument("--hours", type=float, default=None)
+    knock_later.add_argument("--json", action="store_true")
+    knock_ignore = knock_sub.add_parser("ignore", help="retire a topic after 3 ignores")
+    knock_ignore.add_argument("id", type=int)
+    knock_ignore.add_argument("--json", action="store_true")
+    commitment_p = sub.add_parser(
+        "commitment", help="commitment memory: follow-ups the USER set in motion")
+    commitment_sub = commitment_p.add_subparsers(dest="commitment_action")
+    commitment_add = commitment_sub.add_parser("add")
+    commitment_add.add_argument("text")
+    commitment_add.add_argument("--origin", default="user-request",
+                                choices=["user-request", "accepted-proposal",
+                                         "user-later"])
+    commitment_sub.add_parser("list")
     mode_p = sub.add_parser("mode", help="connectivity: show or set auto|online|offline")
     mode_p.add_argument("mode_value", nargs="?", choices=["auto", "online", "offline"])
     ask_p = sub.add_parser("ask", help="one conversational turn (governor + harness)")
@@ -1087,6 +1240,10 @@ def main(argv: list[str] | None = None) -> int:
                           "connectivity": connectivity.as_dict(),
                           "connectivity_mode": connectivity.effective_mode,
                           "class_mode": PresenceService(config, store).status().as_dict(),
+                          "knock": {"pending": len(store.list_knocks("pending")),
+                                    "budget": "none — the reason gate is the only control",
+                                    "class_mode_urgent_only":
+                                        PresenceService(config, store).status().enabled},
                           "cloud_queue": store.cloud_job_counts()}
                 store.close()
             if args.waybar:
@@ -1116,6 +1273,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "class":
             return _class_command(args, config)
+
+        if args.command == "knock":
+            return _knock_command(args, config)
+
+        if args.command == "commitment":
+            return _commitment_command(args, config)
 
         if args.command == "talk":
             return _talk_command(args, config)

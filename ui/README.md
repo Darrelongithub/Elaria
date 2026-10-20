@@ -76,8 +76,15 @@ panel never steals a keystroke you didn't give it.
 
 1. `quickshell -p ui/quickshell/console` starts with no QML errors.
 2. `assist talk "hello"` → the line appears in the panel within one event.
-3. `assist class on` → header badge appears, input still works, no audio.
+3. `assist class on` → header badge appears, input still works, no audio,
+   and a knock arrives as a silent Waybar pulse (no popup, no sound).
 4. Kill/restart the daemon → panel shows a daemon-down snapshot, then recovers.
+5. `assist knock raise --topic test --reason "While testing, I found the knock path." --kind finding --referent "the knock test"`
+   → Waybar `✦ ·wants to talk`, one notification under `Elaria · knock`, one short
+   sound. `assist knock decline <id>` → the notification state clears.
+6. If the sound is silent, install the asset somewhere permanent:
+   `mkdir -p ~/.local/share/assistant/sounds && cp ui/sounds/knock.wav ~/.local/share/assistant/sounds/`
+   (the config default points there; the code also falls back to `ui/sounds/`).
 
 ## Hyprland binds
 

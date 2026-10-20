@@ -388,6 +388,20 @@ DEFAULTS: dict = {
         "history_limit": 200,      # one conversation; no per-channel fork
         "snapshot_limit": 20,
     },
+    "initiative": {
+        # §19.2 as amended: NO BUDGET. There is deliberately no per-day count,
+        # spacing rule or rate key in this section — the reason gate controls
+        # knocks (a stored, citable reason or no knock at all).
+        "snooze_hours": 24,             # "later" -> commitment memory
+        "retire_after_ignores": 3,      # same topic ignored 3x retires it
+        "urgent_in_class_mode": True,   # class mode = urgent-only, silently
+        # A knock has its OWN notification identity and its OWN short sound.
+        # Nothing else ever uses these (§19.2: not errors, not completions).
+        "notify_identity": "Elaria · knock",
+        "sound": "~/.local/share/assistant/sounds/knock.oga",
+        "notify": True,
+        "play_sound": True,
+    },
     "persona": {
         "name": "Elaria",
         "candour": 0.7,
