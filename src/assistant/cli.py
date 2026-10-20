@@ -208,6 +208,38 @@ def run_doctor(config) -> dict:
         f"runtime core limit={crash.get('limit_core_runtime')} "
         "(both must hold on the always-on path: no core dumps, RAM buffers "
         "dump-exempt)"))
+
+    # BUG 6 follow-up: stale user unit (LimitCORE) drift — repo vs installed.
+    # The owner fixed by copying the repo unit; doctor must flag drift.
+    try:
+        from pathlib import Path as _P
+        repo_unit = _P(__file__).resolve().parents[2] / "systemd" / "assistant.service"
+        # Installed user units live in XDG config; system units are secondary.
+        candidates = []
+        xdg = __import__("os").environ.get("XDG_CONFIG_HOME") or str(_P.home() / ".config")
+        candidates.append(_P(xdg) / "systemd" / "user" / "assistant.service")
+        candidates.append(_P.home() / ".config" / "systemd" / "user" / "assistant.service")
+        candidates.append(_P("/etc/systemd/user/assistant.service"))
+        installed = next((c for c in candidates if c.exists()), None)
+        if repo_unit.exists() and installed is not None:
+            repo_text = repo_unit.read_text()
+            installed_text = installed.read_text()
+            if repo_text != installed_text:
+                # Highlight LimitCORE drift specifically
+                repo_core = "LimitCORE=0" in repo_text
+                inst_core = "LimitCORE=0" in installed_text
+                detail = f"installed unit {installed} differs from repo {repo_unit}"
+                if repo_core != inst_core:
+                    detail += f" — LimitCORE drift (repo={'0' if repo_core else 'missing'} vs installed={'0' if inst_core else 'missing'}); copy repo unit: cp {repo_unit} {installed} && systemctl --user daemon-reload"
+                checks.append(_check("systemd unit", False, detail))
+            else:
+                checks.append(_check("systemd unit", True, f"installed {installed} matches repo {repo_unit}"))
+        elif repo_unit.exists() and installed is None:
+            checks.append(_check("systemd unit", True, f"no installed unit at {candidates[0]} — repo {repo_unit} is source of truth (copy on deploy)" , warn_only=True))
+        else:
+            checks.append(_check("systemd unit", True, f"repo unit {repo_unit} not found — skip drift check", warn_only=True))
+    except Exception as exc:
+        checks.append(_check("systemd unit", True, f"drift check skipped: {exc}", warn_only=True))
     from .wake_guard import KeywordModelUnavailable, OnnxKeywordModel
 
     keyword_model = config.section("hotword").get("keyword_model") or ""

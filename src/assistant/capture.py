@@ -50,7 +50,7 @@ def parse_wpctl_status(text: str) -> dict[str, list[dict]]:
         header = re.search(r"\b(Sinks|Sources|Sink endpoints|Source endpoints):\s*$", line)
         if header:
             current = header.group(1)
-            sections[current] = []
+            sections.setdefault(current, [])
             continue
         entry = re.search(r"([*]?)\s*(\d+)\.\s+(.+)", line)
         if entry and current:

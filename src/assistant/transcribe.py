@@ -250,6 +250,12 @@ class DictationService:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
 
+    def _log(self, step: str, **fields) -> None:
+        try:
+            self.store.log_persona_event(iso_now(), "dictate.lifecycle", __import__("json").dumps({"step": step, **fields}))
+        except Exception:
+            pass
+
     async def dictate(self, source, *, transport_factory=None,
                       mode: str = "narration",
                       sink: EventSink | None = None,
@@ -259,9 +265,11 @@ class DictationService:
                       clock: Callable[[], float] | None = None) -> SessionResult:
         session_id = session_id or uuid.uuid4().hex[:12]
         emit = sink or _noop_sink
+        self._log("dictate.enter", session_id=session_id, mode=mode, source_target=str(getattr(source, "target", None) or "default"))
         language = asr.primary_language(self.config)
         factory = transport_factory or (lambda: asr.make_live_transport(self.config))
         await emit({"event": "session.started", "session_id": session_id, "mode": mode})
+        self._log("dictate.session_started", session_id=session_id)
 
         when = datetime.now().astimezone()
         wav_sink = None
@@ -269,6 +277,7 @@ class DictationService:
         if self.save_audio:
             audio_path = self.audio_dir / f"{when:%Y%m%d-%H%M%S}-{session_id[:6]}.wav"
             wav_sink = WavSink(audio_path)
+            self._log("dictate.wav_sink", session_id=session_id, audio_path=str(audio_path))
 
         buffer = RollingAudioBuffer(seconds=self.replay_s)
         gate = FrameGate(rms_threshold=self.vad_threshold)
@@ -366,14 +375,17 @@ class DictationService:
             collector = asyncio.create_task(collect_events(current))
             return current
 
+        self._log("dictate.transport_open_attempt", session_id=session_id, offline_at_start=str(offline_at_start))
         if offline_at_start:
             notes.append("offline mode: local ASR only; raw audio saved for any redo")
             await emit({"event": "session.offline", "backend": "local",
                         "connectivity": connectivity.effective_mode if connectivity else None,
                         "session_id": session_id})
+            self._log("dictate.offline", session_id=session_id)
         else:
             try:
                 transport = await open_session(None)
+                self._log("dictate.transport_opened", session_id=session_id)
             except Exception as exc:
                 from .modes import looks_like_network_failure
 
@@ -529,17 +541,32 @@ class DictationService:
                             "playbacks": int(duplex.get("playbacks", 0)),
                             "output_audio_bytes": int(duplex.get("output_audio_bytes", 0))})
         finally:
+            self._log("dictate.cleanup_start", session_id=session_id)
             if wav_sink:
-                duration_s = wav_sink.close() or duration_s
+                try:
+                    duration_s = wav_sink.close() or duration_s
+                    self._log("dictate.wav_closed", session_id=session_id, duration_s=round(duration_s,3))
+                except Exception as exc:
+                    self._log("dictate.wav_close_failed", session_id=session_id, error=str(exc)[:120])
             if collector is not None and not collector.done():
                 collector.cancel()
                 await asyncio.gather(collector, return_exceptions=True)
+                self._log("dictate.collector_cancelled", session_id=session_id)
             if transport is not None:
-                await transport.close()
-            await source.aclose()
+                try:
+                    await transport.close()
+                    self._log("dictate.transport_closed", session_id=session_id)
+                except Exception as exc:
+                    self._log("dictate.transport_close_failed", session_id=session_id, error=str(exc)[:120])
+            try:
+                await source.aclose()
+                self._log("dictate.source_closed", session_id=session_id, target=str(getattr(source, "target", None) or "default"))
+            except Exception as exc:
+                self._log("dictate.source_close_failed", session_id=session_id, error=str(exc)[:120])
 
         # BUG 6 capture diagnostics — every session logs the node, bytes and
         # peak level, so "it captured nothing" is a fact, not a guess.
+        self._log("dictate.capture_diagnostics", session_id=session_id, frames_seen=frames_seen, bytes=captured_bytes)
         stalled = bool(getattr(source, "stalled", False))
         # ~zero audio = a dead session: no bytes at all (wedged/dead capture)
         # or nothing above the digital-noise floor (a silent node). A real
@@ -568,6 +595,7 @@ class DictationService:
                     **capture_stats})
         self.store.log_persona_event(
             iso_now(), "capture.stats", json.dumps(capture_stats))
+        self._log("dictate.capture_stats_logged", session_id=session_id, **capture_stats)
 
         use_offline_chain = offline_at_start or network_drop
         if (live_failed or not final_text) and not no_speech:

@@ -347,3 +347,49 @@ def test_hotword_layer_has_no_acoustic_or_energy_trigger():
 
     source = inspect.getsource(hotword)
     assert "EnergyScorer" not in source
+
+# ---------------------------------------------------------------------------
+# BUG 8b: blocking transport that completes after first-token deadline but
+# within total bound must be DELIVERED (first-token applies only to streaming)
+# ---------------------------------------------------------------------------
+class BlockingChatTransport:
+    """Hardware SDK shape: never fires on_first_token mid-generation (blocking)."""
+    def __init__(self, text: str, delay: float = 0.8):
+        self.text = text
+        self.delay = delay
+        self.calls = 0
+
+    def generate(self, model, contents, config, on_first_token=None):
+        # Do NOT call on_first_token — blocking transport
+        time.sleep(self.delay)
+        self.calls += 1
+        return {"text": self.text, "usage": {"tokens_in": 4, "tokens_out": 2}}
+
+
+def test_blocking_transport_late_but_within_total_is_delivered(config, running_daemon):
+    """BUG 8b regression: blocking fake transport whose on_first_token never
+    fires but completes at ~0.8s must be delivered, not substituted. Real
+    hardware showed \"Four\" at 8s after 5s first-token deadline was logged
+    instead of delivered because first-token was treated as hard deadline.
+    """
+    daemon, _server = running_daemon
+    daemon._chat_first_token_s = 0.3
+    daemon._chat_timeout_s = 2.0
+    _attach(daemon, BlockingChatTransport("Four", delay=0.8))
+
+    t0 = time.monotonic()
+    result = call(config.socket_path, "ask",
+                  {"text": "What is 2 plus 2? Answer with one word only."},
+                  timeout=10.0)
+    elapsed = time.monotonic() - t0
+    assert result["reply"] == "Four", f"blocking late generation must be delivered, got {result!r}"
+    assert result["via"] == "gemini"
+    assert elapsed >= 0.7, "should have awaited the blocking generation"
+    assert elapsed < 2.5, "should have delivered within total bound"
+    # Must NOT be counted as a substitution (not delivered)
+    status = call(config.socket_path, "status", timeout=3.0)
+    assert status.get("reply_substitutions") == [], f"late delivered should not be a substitution, got {status.get('reply_substitutions')}"
+    # But it should be marked late in the log (reply_late)
+    late = daemon.store.list_persona_events(kind="reply_late", limit=5)
+    assert late, "late delivery must be marked in log"
+    assert any("first_token" in (r.get("detail") or "") for r in late)

@@ -192,6 +192,8 @@ class Daemon:
         self._ptt_results: dict[str, dict | None] = {}
         self._ptt_result_event = asyncio.Event()
         self._ptt_result_event.set()
+        self._ptt_started_at: float | None = None
+        self._ptt_capture_target: str | None = None
         self._last_connectivity_mode = self.mode_manager.status(refresh=False).effective_mode
         self._background_tasks: set[asyncio.Task] = set()
         # One bound for every chat call (owner turns and guest turns): a
@@ -1106,22 +1108,38 @@ class Daemon:
             dict(params.get("payload") or {}))
         return {"job_id": job_id, "status": "awaiting_approval"}
 
+    def _ptt_log(self, step: str, **fields) -> None:
+        """BUG 6c instrumentation: ptt.start -> session create -> capture spawn.
+
+        Each step is a persona event so the next hardware run shows exactly
+        where it stops — "capture_target" in status alone is not enough when
+        last_capture stays null and the journal has no capture/dictate lines.
+        """
+        try:
+            self.store.log_persona_event(
+                iso_now(), "ptt.lifecycle", json.dumps({"step": step, **fields}))
+        except Exception:
+            pass
+
     async def _ptt_start(self, params: dict) -> dict:
         # §18: ack RETURNS immediately; capture + Live session spin up in a
         # background task behind it. The user is already talking while the
         # socket opens — parse-while-you-speak starts here (§18 rule 3).
+        self._ptt_log("ptt.start.received", params={k: str(v)[:80] for k, v in params.items()})
         if self._dictation_task and not self._dictation_task.done():
             # VB-11: the loser of the race is refused, and a refusal is not a
             # request to be acknowledged. She is already listening; saying "On it."
             # again is a second voice event for one press (and double audio when the
             # user mashes the hotkey). No ack is played and none is queued.
             route = self.speech.route(STANDARD_ACKS["on_it"])
+            self._ptt_log("ptt.start.refused_already_listening")
             return {"listening": True, "already_listening": True, "ack": None,
                     "speech": {**route, "ack_kind": "on_it", "audio_path": None,
                                "cached": False, "played": False,
                                "suppressed": "already listening — no second ack"},
                     "note": "already listening"}
         ack = await self._ack({"kind": "on_it"})
+        self._ptt_log("ptt.start.ack_done")
         capture_cfg = self.config.section("capture")
         frame_ms = int(capture_cfg.get("chunk_ms", 30))
         source_kind = params.get("source") or capture_cfg.get("source", "mic")
@@ -1135,24 +1153,29 @@ class Daemon:
                   or self.config.section("meeting").get("mic_target")
                   or None)
         stall_timeout_s = float(capture_cfg.get("stall_timeout_s", 8.0))
+        self._ptt_log("ptt.start.target_resolved", target=str(target or "default"), source_kind=str(source_kind))
         simulated = False
         if source_kind == "simulated":
             self._capture_source = SimulatedCapture(speech_frames=100_000,
                                                     frame_ms=frame_ms, realtime=True)
             simulated = True
+            self._ptt_log("ptt.start.capture_spawn", target="simulated", simulated=True, kind="SimulatedCapture")
         else:
             try:
                 self._capture_source = PipeWireCapture(
                     target, frame_ms=frame_ms, stall_timeout_s=stall_timeout_s)
-            except RuntimeError:
+                self._ptt_log("ptt.start.capture_spawn", target=str(target or "default"), simulated=False, kind="PipeWireCapture", stall_timeout_s=stall_timeout_s)
+            except RuntimeError as exc:
                 # No PipeWire (headless/containers): simulated frames keep
                 # the full pipeline exercisable; status reports it honestly.
                 self._capture_source = SimulatedCapture(speech_frames=100_000,
                                                         frame_ms=frame_ms, realtime=True)
                 simulated = True
+                self._ptt_log("ptt.start.capture_spawn_fallback", target=str(target or "default"), reason=str(exc)[:120], kind="SimulatedCapture")
         self._stop_event = asyncio.Event()
         self._dictation_session_mode = str(params.get("mode") or "narration")
         self.mode = "listening"
+        self._ptt_log("ptt.start.mode_listening", mode=self.mode)
         # Hotkey path: use the monitor's latest snapshot, never probe here.
         connectivity = await self._connectivity_snapshot(refresh=False)
         await self.broadcast({"event": "status.changed", "mode": self.mode,
@@ -1175,12 +1198,20 @@ class Daemon:
         self._ptt_last_result = None
         self._ptt_results.pop(session_id, None)
         self._ptt_processing = False
-        self._dictation_task = self._track_task(asyncio.create_task(
-            self.dictation.dictate(
-                muted_source, mode=self._dictation_session_mode,
-                sink=dictation_sink, stop_event=self._stop_event,
-                is_playback_active=self.is_speaking,
-                session_id=session_id)))
+        self._ptt_started_at = time.monotonic()
+        self._ptt_capture_target = str(getattr(self._capture_source, "target", None) or "default")
+        self._ptt_log("ptt.start.session_create", session_id=session_id, capture_target=self._ptt_capture_target, mode=self._dictation_session_mode)
+        try:
+            self._dictation_task = self._track_task(asyncio.create_task(
+                self.dictation.dictate(
+                    muted_source, mode=self._dictation_session_mode,
+                    sink=dictation_sink, stop_event=self._stop_event,
+                    is_playback_active=self.is_speaking,
+                    session_id=session_id)))
+            self._ptt_log("ptt.start.dictate_spawned", session_id=session_id)
+        except Exception as exc:
+            self._ptt_log("ptt.start.dictate_spawn_failed", session_id=session_id, error=f"{type(exc).__name__}: {exc}"[:200])
+            raise
         return {"listening": True, **ack, "simulated_capture": simulated,
                 "session_mode": self._dictation_session_mode,
                 "session_id": session_id,
@@ -1205,19 +1236,23 @@ class Daemon:
         open for a moment, more of her own audio to transcribe. `speak=False`
         also means the reply cannot wait on the boot-time ack cache warm.
         """
+        self._ptt_log("ptt.stop.received", session_id=str(self._ptt_session_id or ""))
         ack = await self._ack({"kind": "on_it", "speak": False})
         task = self._dictation_task
         session_id = self._ptt_session_id
         if self.mode == "listening":
             self.mode = "transcribing"  # waiting on final + cleanup (§3.9 states)
             await self.broadcast({"event": "status.changed", "mode": self.mode})
+            self._ptt_log("ptt.stop.mode_transcribing", session_id=str(session_id or ""))
         if self._stop_event:
             self._stop_event.set()
+            self._ptt_log("ptt.stop.stop_event_set", session_id=str(session_id or ""))
         self._dictation_task = None
 
         if task is not None:
             self._ptt_processing = True
             self._ptt_result_event.clear()
+            self._ptt_log("ptt.stop.finish_spawn", session_id=str(session_id or ""))
             self._track_task(asyncio.create_task(
                 self._finish_dictation(task, params, session_id,
                                        self._dictation_session_mode)))
@@ -1228,6 +1263,7 @@ class Daemon:
             self.mode = "idle"
             await self.broadcast({"event": "status.changed", "mode": self.mode})
             await self._apply_pending_mode_switch()
+            self._ptt_log("ptt.stop.no_task_idle", session_id=str(session_id or ""))
 
         response = {"listening": False, **ack, "result": None,
                     "processing": task is not None or self._ptt_processing,
@@ -1237,6 +1273,20 @@ class Daemon:
         # The hotkey path never sets it; nothing here waits by default.
         wait_s = float(params.get("wait_s") or 0)
         if wait_s > 0:
+            # BUG 6c: fail fast when session is dead — don't wait full budget
+            # when we know the capture never produced stats. Check before wait.
+            dead = self._ptt_is_dead_state(session_id)
+            if dead.get("dead"):
+                self._ptt_log("ptt.stop.dead_fast", session_id=str(session_id or ""), reason=dead.get("reason"))
+                # Create a fast no-speech result instead of waiting 60s
+                fast = {"error": dead["reason"], "session_id": session_id, "no_speech": True, "capture": {"node": self._ptt_capture_target or "unknown", "bytes": 0, "peak_rms": 0.0, "no_speech": True, "stalled": True}, "narration": "no speech captured", "text": "", "raw_text": ""}
+                self._ptt_last_result = fast
+                self._ptt_results[session_id] = fast
+                self._ptt_processing = False
+                self._ptt_result_event.set()
+                response["result"] = fast
+                response["processing"] = False
+                return response
             # Wait on the session id, not the processing flag: a very fast
             # finish could clear the flag between task creation and this line.
             if session_id not in self._ptt_results:
@@ -1244,11 +1294,55 @@ class Daemon:
                     await asyncio.wait_for(self._ptt_result_event.wait(),
                                            timeout=wait_s)
                 except TimeoutError:
+                    # BUG 6c: if still processing after wait, check dead again and fail fast for caller
+                    dead2 = self._ptt_is_dead_state(session_id)
+                    if dead2.get("dead") and session_id not in self._ptt_results:
+                        fast2 = {"error": dead2["reason"], "session_id": session_id, "no_speech": True, "capture": {"node": self._ptt_capture_target or "unknown", "bytes": 0, "peak_rms": 0.0, "no_speech": True, "stalled": True}, "narration": "no speech captured", "text": "", "raw_text": ""}
+                        self._ptt_results[session_id] = fast2
+                        self._ptt_last_result = fast2
+                        self._ptt_last_session_id = session_id
+                        self.mode = "idle"
+                        self._ptt_processing = False
+                        self._ptt_result_event.set()
                     pass
             response["result"] = self._ptt_results.get(session_id)
             response["processing"] = self._ptt_processing
             response["connectivity"] = self.mode_manager.status(refresh=False).as_dict()
         return response
+
+    def _ptt_is_dead_state(self, session_id: str | None) -> dict:
+        """BUG 6c: detect a dead capture session that will never produce stats.
+
+        Hardware: ptt.result blocked 60s, status showed capture_target=Mic1
+        but last_capture=null and journal had NO capture/dictate lines — the
+        session never reached the capture-stats point. The caller needs a
+        fail-fast "no speech captured" instead of the full wait.
+        """
+        if not self._ptt_processing:
+            return {"dead": False}
+        # If the dictate task is already done but no result yet, dead if last_capture still null after a grace
+        if self._ptt_started_at is not None and (time.monotonic() - self._ptt_started_at) > 4.0:
+            # No dictate result and no capture stats logged for this session
+            try:
+                # Check if any capture.stats arrived since start; if none, consider dead
+                recent = self.store.list_persona_events(kind="capture.stats", limit=5)
+                # If last_capture in status is still None, dead
+                has_stats = any("capture.stats" in (e.get("kind") or "") for e in recent) if recent else False
+                # Also check ptt.lifecycle to see if dictate_spawned but never reached capture
+                # Simplest: if we have waited > stall_timeout+2 and task still processing with no result, dead
+                stall = float(self.config.section("capture").get("stall_timeout_s", 8.0))
+                if (time.monotonic() - self._ptt_started_at) > (stall + 3.0):
+                    # Capture should have either produced or stalled by now
+                    # If no result and beyond stall window, dead
+                    if session_id and session_id not in self._ptt_results:
+                        return {"dead": True, "reason": f"capture dead — no stats {stall+3:.0f}s after start (target={self._ptt_capture_target})"}
+            except Exception:
+                pass
+        # Explicit stalled flag on capture source
+        src = getattr(self, "_capture_source", None)
+        if src is not None and getattr(src, "stalled", False):
+            return {"dead": True, "reason": "capture stalled — no bytes within stall timeout"}
+        return {"dead": False}
 
     async def _finish_dictation(self, task: asyncio.Task, params: dict,
                                 session_id: str | None,
@@ -1259,9 +1353,12 @@ class Daemon:
         the processing flag, so a failure here is reported rather than leaving
         ptt.result waiting forever.
         """
+        self._ptt_log("ptt.finish.enter", session_id=str(session_id or ""), mode=session_mode)
         result: dict | None = None
         try:
+            self._ptt_log("ptt.finish.await_task", session_id=str(session_id or ""), timeout=60)
             session = await asyncio.wait_for(task, timeout=60)
+            self._ptt_log("ptt.finish.task_done", session_id=str(session_id or ""), no_speech=str(getattr(session, "no_speech", False)))
             no_speech = bool(getattr(session, "no_speech", False))
             result = {
                 "text": (session.cleaned_text
@@ -1325,15 +1422,17 @@ class Daemon:
             timed_out = isinstance(exc, TimeoutError)
             error = ("session never finished — treating as no speech captured"
                      if timed_out else f"dictation did not finish cleanly: {exc}")
+            self._ptt_log("ptt.finish.exception", session_id=str(session_id or ""), error=error[:200], timed_out=str(timed_out))
             result = {"error": error,
                       "session_id": session_id,
                       # BUG 6: a session that cannot even finish is a dead
                       # session. ptt.result must say so NOW, not after the
                       # caller's wait budget expires.
                       "no_speech": True,
-                      "capture": None,
+                      "capture": {"node": self._ptt_capture_target or "unknown", "bytes": 0, "peak_rms": 0.0, "no_speech": True, "stalled": True} if timed_out else None,
                       "narration": "no speech captured"}
         finally:
+            self._ptt_log("ptt.finish.finally", session_id=str(session_id or ""), has_result=str(result is not None))
             self._ptt_last_result = result
             self._ptt_last_session_id = session_id
             self._ptt_results[session_id] = result
@@ -1370,12 +1469,28 @@ class Daemon:
         """Fetch the transcript of a released session, optionally waiting.
 
         `wait_s` is bounded polling for the CLI; the hotkey path never needs it.
+        BUG 6c: if the session is in a dead state (no capture stats after stall
+        window), fail fast instead of waiting the full budget.
         """
         wait_s = float(params.get("wait_s") or 0)
         if wait_s > 0 and self._ptt_processing:
+            dead = self._ptt_is_dead_state(self._ptt_session_id)
+            if dead.get("dead"):
+                self._ptt_log("ptt.result.dead_fast", session_id=str(self._ptt_session_id or ""), reason=dead["reason"])
+                # Synthesize a fast no-speech result so caller doesn't wait
+                fast = {"error": dead["reason"], "session_id": self._ptt_session_id, "no_speech": True, "capture": {"node": self._ptt_capture_target or "unknown", "bytes": 0, "peak_rms": 0.0, "no_speech": True, "stalled": True}, "narration": "no speech captured", "text": "", "raw_text": ""}
+                return {"session_id": self._ptt_session_id, "processing": False, "result": fast, "found": True, "connectivity": self.mode_manager.status(refresh=False).as_dict(), "dead_fast": True}
             try:
                 await asyncio.wait_for(self._ptt_result_event.wait(), timeout=wait_s)
             except TimeoutError:
+                # Second chance after wait: check dead state and synthesize if needed
+                dead2 = self._ptt_is_dead_state(self._ptt_session_id)
+                if dead2.get("dead") and self._ptt_session_id not in self._ptt_results:
+                    fast2 = {"error": dead2["reason"], "session_id": self._ptt_session_id, "no_speech": True, "capture": {"node": self._ptt_capture_target or "unknown", "bytes": 0, "peak_rms": 0.0, "no_speech": True, "stalled": True}, "narration": "no speech captured", "text": "", "raw_text": ""}
+                    self._ptt_results[self._ptt_session_id] = fast2
+                    self._ptt_last_result = fast2
+                    self._ptt_last_session_id = self._ptt_session_id
+                    return {"session_id": self._ptt_session_id, "processing": False, "result": fast2, "found": True, "connectivity": self.mode_manager.status(refresh=False).as_dict(), "dead_fast": True}
                 pass
         requested = params.get("session_id")
         if requested is not None and requested in self._ptt_results:
@@ -1810,6 +1925,26 @@ class Daemon:
             pass
         return record
 
+    def _log_reply_late(self, *, original_len: int, turn: str | None = None) -> None:
+        """Generation delivered after first-token deadline but within total.
+
+        BUG 8b (2026-10-20 hardware): a blocking transport that completes at
+        ~8s was logged as NOT delivered because the first-token callback never
+        fired mid-generation. The reply WAS delivered; this record marks it
+        late in the log without counting as a substitution (cost shows only
+        NOT delivered)."""
+        record = {
+            "ts": iso_now(),
+            "reason": "deadline:first_token:late_delivered",
+            "original_len": original_len,
+            "turn": (turn or "")[:60],
+        }
+        try:
+            self.store.log_persona_event(
+                record["ts"], "reply_late", json.dumps(record))
+        except Exception:
+            pass
+
     def _reply_substitution_records(self, limit: int = 20) -> list[dict]:
         try:
             rows = self.store.list_persona_events(kind="reply_substituted",
@@ -1840,6 +1975,13 @@ class Daemon:
           non-streaming double counts only its completion as progress);
         * generous total bound — a generation that started is awaited to
           completion and delivered verbatim.
+
+        BUG 8b (2026-10-20 hardware): the real SDK transport never fires
+        mid-generation, so the first-token deadline acted as a hard 5s total
+        deadline for blocking transports. Fix: first-token deadline applies
+        ONLY to streaming transports; blocking transports use the total bound
+        alone, and a generation completing after the first-token deadline
+        but within the total bound is DELIVERED (marked late, not substituted).
 
         A deadline raise is an actual failure (ChatTimeout with `.reason`),
         and any generation that completes after we gave up is logged as a
@@ -1903,19 +2045,45 @@ class Daemon:
             if task in done:
                 return task.result()      # success: delivered verbatim
             if progress in done:
-                # The generation started — it gets the generous total bound.
+                # Streaming: first token arrived within deadline — generous total.
                 remaining = max(0.0, total_s - first_token_s)
-                return await asyncio.wait_for(asyncio.shield(task),
-                                              timeout=remaining)
-            abandoned["flag"] = True
-            abandoned["reason"] = "first_token"
-            raise ChatTimeout("first_token", first_token_s)
-        except TimeoutError as exc:
-            abandoned["flag"] = True
-            if not isinstance(exc, ChatTimeout):
+                try:
+                    return await asyncio.wait_for(asyncio.shield(task),
+                                                  timeout=remaining)
+                except TimeoutError as exc:
+                    abandoned["flag"] = True
+                    abandoned["reason"] = "total"
+                    raise ChatTimeout("total", total_s) from exc
+            # Neither completed nor signaled within first-token deadline.
+            # For blocking transports (real SDK on hardware) this is NOT failure:
+            # the generation may still complete within the total bound and must
+            # be DELIVERED (marked late, not substituted) — BUG 8b.
+            remaining = max(0.0, total_s - first_token_s)
+            if remaining <= 0:
+                abandoned["flag"] = True
+                abandoned["reason"] = "first_token"
+                raise ChatTimeout("first_token", first_token_s)
+            try:
+                result = await asyncio.wait_for(asyncio.shield(task),
+                                                timeout=remaining)
+                # Delivered late but within total — mark late, don't substitute.
+                try:
+                    text = getattr(result, "text", "") or ""
+                    self._log_reply_late(original_len=len(text), turn=prompt[-60:])
+                except Exception:
+                    pass
+                return result
+            except TimeoutError as exc:
+                abandoned["flag"] = True
                 abandoned["reason"] = "total"
                 raise ChatTimeout("total", total_s) from exc
-            raise
+        except TimeoutError as exc:
+            # Already a ChatTimeout (first_token case with no remaining) — re-raise.
+            if isinstance(exc, ChatTimeout):
+                raise
+            abandoned["flag"] = True
+            abandoned["reason"] = "total"
+            raise ChatTimeout("total", total_s) from exc
         finally:
             if not progress.done():
                 progress.cancel()
