@@ -21,6 +21,10 @@ TimeoutStopSec=5
 # access to $HOME is the product (§3.7), so no ProtectHome here.
 NoNewPrivileges=true
 PrivateTmp=true
+# Crash leaves nothing (wake-knock package §4): no core dumps from the
+# daemon or its children — wake audio in RAM must not leak through a crash.
+# `assist doctor` / `assist hotword status` report this as checkable.
+LimitCORE=0
 
 [Install]
 WantedBy=default.target

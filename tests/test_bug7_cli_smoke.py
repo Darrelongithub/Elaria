@@ -104,6 +104,11 @@ def _smoke_table(tmp_path: Path) -> list[list[str]]:
         ["meeting", "stop"],
         ["meeting", "transcribe", str(mic), str(system)],
         ["meeting", "setup"],
+        ["hotword", "status"],
+        ["hotword", "start"],
+        ["hotword", "start", "--unsafe-energy-test"],
+        ["hotword", "stop"],
+        ["hotword", "purge"],
         ["dictate"],
         ["events"],
     ]

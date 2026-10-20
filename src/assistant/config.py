@@ -392,6 +392,49 @@ DEFAULTS: dict = {
         "stall_timeout_s": 8.0,
         "retention_days": 30,
     },
+    # Wake-knock package (2026-10-20). Always-on acoustic path: a real
+    # keyword model arms it, the dual-use pending buffer feeds the voiceprint
+    # verdict, and RAM-only buffers + MADV_DONTDUMP keep the audio out of
+    # crashes and logs. No energy fallback is a wake path.
+    "hotword": {
+        "phrase": "Elaria",
+        # Pre-wake ring: capped at 2.0 s in code regardless of this value.
+        "ring_window_s": 2.0,
+        # Post-trigger pending window: clamped to the 2-3 s band in code.
+        "pending_window_s": 2.5,
+        # Below this much detected speech in the pending window, Stage B
+        # falls back to wake-clip-only scoring (insufficient-speech branch).
+        "pending_speech_threshold_s": 0.5,
+        "speech_rms": 0.01,
+        # Real keyword spotter (.onnx). Empty/missing => `hotword start`
+        # refuses cleanly. There is no energy/loudness fallback.
+        "keyword_model": "",
+        "keyword_threshold": 0.5,
+        # ECAPA backend (hardware-side): a command `cmd <clip.wav>` printing
+        # {"embedding": [...]} (cosine vs ecapa_reference) or {"score": 0..1}.
+        "ecapa_cmd": "",
+        "ecapa_reference": "",
+        "ecapa_high": 0.75,
+        "ecapa_uncertain": 0.5,
+        # Fail-closed policy when no embedding can be computed: raise the
+        # wake-knock (default) or ignore. Never listen, either way.
+        "missing_embedding_action": "wake_knock",
+        # Watchdog: no frames for this long while armed -> disarm + "stalled".
+        "stall_timeout_s": 2.0,
+        # Wake clips OFF by default. Opt-in: <= 5 s per clip, 0700 dir,
+        # 24 h purge; failed-verify audio is never saved without
+        # debug_save_failed.
+        "save_wake_clips": False,
+        "clip_dir": "",
+        "clip_max_s": 5.0,
+        "clip_retention_h": 24.0,
+        "debug_save_failed": False,
+        # Endpointing for the wake path — parameters of the SHARED
+        # SilenceLadder (transcribe.py), not a second implementation.
+        "checkin_after_s": 30.0,
+        "resume_s": 0.4,
+        "grace_s": 8.0,
+    },
     "transcribe": {
         # §3.5: rolling local buffer replayed into a resumed session so a
         # mid-sentence reset doesn't lose the utterance.
@@ -899,6 +942,29 @@ def validate_config(config: Config) -> dict:
                   transcribe.get("speech_resume_s"), minimum=0.0)
     _number_error(errors, "[transcribe] checkin_grace_s",
                   transcribe.get("checkin_grace_s"), minimum=0.0)
+
+    # -- hotword (wake-knock package) ---------------------------------------
+    hotword = raw.get("hotword") if isinstance(raw.get("hotword"), dict) else {}
+    _number_error(errors, "[hotword] ring_window_s", hotword.get("ring_window_s"),
+                  minimum=0.1, maximum=2.0)
+    _number_error(errors, "[hotword] pending_window_s",
+                  hotword.get("pending_window_s"), minimum=2.0, maximum=3.0)
+    _number_error(errors, "[hotword] pending_speech_threshold_s",
+                  hotword.get("pending_speech_threshold_s"), minimum=0.0)
+    _number_error(errors, "[hotword] ecapa_high", hotword.get("ecapa_high"),
+                  minimum=0.0, maximum=1.0)
+    _number_error(errors, "[hotword] ecapa_uncertain", hotword.get("ecapa_uncertain"),
+                  minimum=0.0, maximum=1.0)
+    _number_error(errors, "[hotword] stall_timeout_s",
+                  hotword.get("stall_timeout_s"), minimum=0.1)
+    if str(hotword.get("missing_embedding_action", "wake_knock")) not in (
+            "wake_knock", "ignore"):
+        errors.append("[hotword] missing_embedding_action must be "
+                      "'wake_knock' or 'ignore'")
+    _bool_error(errors, "[hotword] save_wake_clips",
+                hotword.get("save_wake_clips"))
+    _bool_error(errors, "[hotword] debug_save_failed",
+                hotword.get("debug_save_failed"))
 
     # -- connectivity ---------------------------------------------------------
     connectivity = (raw.get("connectivity")

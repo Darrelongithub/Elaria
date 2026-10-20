@@ -196,6 +196,33 @@ def run_doctor(config) -> dict:
         bool(level.get("available") and level.get("bytes", 0) > 0),
         level_detail))
 
+    # Wake-knock package §4: "crash leaves nothing" must be CHECKABLE.
+    from .wake_guard import crash_safety_report
+
+    crash = crash_safety_report()
+    checks.append(_check(
+        "hotword crash safety",
+        bool(crash.get("limit_core") and crash.get("madv_dontdump")),
+        f"LimitCORE={'0' if crash.get('limit_core') else 'not set in unit'} · "
+        f"MADV_DONTDUMP={'yes' if crash.get('madv_dontdump') else 'no'} · "
+        f"runtime core limit={crash.get('limit_core_runtime')} "
+        "(both must hold on the always-on path: no core dumps, RAM buffers "
+        "dump-exempt)"))
+    from .wake_guard import KeywordModelUnavailable, OnnxKeywordModel
+
+    keyword_model = config.section("hotword").get("keyword_model") or ""
+    try:
+        OnnxKeywordModel.load(keyword_model)
+        checks.append(_check(
+            "hotword keyword model", True,
+            f"armed-ready: {keyword_model} — acoustic path needs this real "
+            ".onnx model; there is no energy fallback"))
+    except KeywordModelUnavailable as exc:
+        checks.append(_check(
+            "hotword keyword model", False,
+            f"{exc} — wake path stays unarmed until a real .onnx exists "
+            "(training plan: docs/hotword-training-plan.md)"))
+
     # Phase 7: language pinning + code-switch guard state (§12.4/§12.5).
     from .asr import code_switching_enabled, configured_languages
     from .cleanup import SW_MARKERS, load_extra_markers
@@ -395,6 +422,47 @@ def _memory_command(args, config) -> int:
         store.close()
     print(f"Embedded {out['embedded']} chunk(s) with {out['embedder']} (local, no quota).")
     return 0
+
+
+def _hotword_command(args, config) -> int:
+    """Wake-knock package: status / arm / disarm / clip purge."""
+    action = args.hotword_action
+    params: dict = {}
+    if action == "start" and getattr(args, "unsafe_energy_test", False):
+        params["unsafe_energy_test"] = True
+    method = {"status": "hotword.status", "start": "hotword.start",
+              "stop": "hotword.stop", "purge": "hotword.purge"}[action]
+    try:
+        out = call(config.socket_path, method, params, timeout=30.0)
+        print(json.dumps(out, indent=2))
+        return 0
+    except (DaemonUnavailable, RuntimeError, OSError) as exc:
+        text = str(exc)
+        if text.startswith("refused"):
+            # A refusal is an answer (fail closed, cleanly) — exit 2.
+            print(_refusal_text(exc), file=sys.stderr)
+            return 2
+        if action == "status":
+            from .wake_guard import crash_safety_report
+
+            out = {"hotword": {"armed": False, "state": "daemon_down",
+                               "crash_safety": crash_safety_report()}}
+            print(json.dumps(out, indent=2))
+            return 0
+        if action == "purge":
+            from .wake_guard import WakeClipStore
+
+            clip_cfg = config.section("hotword")
+            clips = WakeClipStore(
+                clip_cfg.get("clip_dir") or None,
+                enabled=bool(clip_cfg.get("save_wake_clips", False)),
+                retention_h=float(clip_cfg.get("clip_retention_h", 24.0)),
+                max_s=float(clip_cfg.get("clip_max_s", 5.0)))
+            print(json.dumps({"purged": clips.purge()}, indent=2))
+            return 0
+        print(f"assist hotword {action}: daemon unavailable: {text}",
+              file=sys.stderr)
+        return 1
 
 
 def _meeting_command(args, config) -> int:
@@ -1265,6 +1333,23 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("halt", help="panic switch (§4.4)")
     sub.add_parser("resume", help="clear the halt flag")
     ptt_p = sub.add_parser("ptt", help="push-to-talk (bind press/release in Hyprland)")
+    hotword_p = sub.add_parser(
+        "hotword", help="wake-knock model (armed state, buffers, clips, watchdog)")
+    hotword_sub = hotword_p.add_subparsers(dest="hotword_action", required=True)
+    hotword_sub.add_parser(
+        "status",
+        help="armed state, ring capacity/residence/path(null), scorer, "
+             "last trigger, pending disposition, watchdog")
+    hotword_start = hotword_sub.add_parser(
+        "start",
+        help="arm the always-on wake path (refuses without a real .onnx "
+             "keyword model)")
+    hotword_start.add_argument(
+        "--unsafe-energy-test", action="store_true",
+        help="plumbing tests ONLY: energy scorer; can never open command "
+             "listening")
+    hotword_sub.add_parser("stop", help="disarm and zero the RAM buffers")
+    hotword_sub.add_parser("purge", help="delete saved wake clips now")
     ptt_p.add_argument("action", choices=["start", "stop", "toggle"])
     ptt_p.add_argument("--mode", choices=["narration", "conversation", "command"],
                        help="session mode for start; command routes via the local ladder")
@@ -1632,6 +1717,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "meeting":
             return _meeting_command(args, config)
+
+        if args.command == "hotword":
+            return _hotword_command(args, config)
 
         if args.command == "dictate":
             started = call(config.socket_path, "ptt.start",

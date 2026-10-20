@@ -37,7 +37,7 @@ from pathlib import Path
 
 from .cost import iso_now
 
-ALLOWED_KINDS = ("follow-up", "finding", "checkin", "urgency")
+ALLOWED_KINDS = ("follow-up", "finding", "checkin", "urgency", "wake")
 URGENCY_LEVELS = ("normal", "urgent")
 COMMITMENT_ORIGINS = ("user-request", "accepted-proposal", "user-later")
 
@@ -119,6 +119,9 @@ KNOCK_OPENERS: dict[str, str] = {
     "finding": "While working on {referent}, I found {detail}.",
     "checkin": "About {referent}: {detail}.",
     "urgency": "{referent} needs a decision now.",
+    # A wake-knock is an authentication EVENT REPORT, not initiative and
+    # never simulated emotion (anti-psychosis clause applies in full).
+    "wake": "Wake phrase detected: {detail}.",
 }
 
 # Prompt text for any model-assisted prose around initiative. The lint test
@@ -283,6 +286,13 @@ class InitiativeService:
                 raise InitiativeError(
                     f"refused: commitment #{commitment_id} does not exist — she "
                     "cannot invent obligations for the user.")
+        elif kind == "wake":
+            # A wake-knock is an authentication event report raised by the
+            # wake gate (wake_guard.py): its citable reason is the detection
+            # fact itself ("phrase 'Elaria' detected, voice confidence 0.61").
+            # No commitment, no referent — the reason gate above still runs
+            # (non-empty, citable, never needy, never temporal).
+            pass
         elif kind in ("checkin", "finding", "urgency") and not str(referent or "").strip():
             raise InitiativeError(
                 f"refused: a {kind} knock needs a concrete referent "
@@ -367,7 +377,10 @@ class InitiativeService:
             topic=topic, reason=reason, kind=kind, referent=referent,
             commitment_id=commitment_id)
         retired = self._topic_retired(topic)
-        if retired is not None:
+        # Wake-knocks are per-trigger authentication event reports, not
+        # follow-up topics: decline/ignore of one trigger must not retire the
+        # phrase, or three dismissals would silence the wake path forever.
+        if kind != "wake" and retired is not None:
             raise InitiativeError(
                 f"refused: topic {topic!r} is {retired['status']} "
                 f"(ignored {retired['ignore_count']}× / declined) — no follow-up "
@@ -376,12 +389,16 @@ class InitiativeService:
         # CLASS MODE: initiative is urgent-only (or completely suppressed when
         # `urgent_in_class_mode` / `class_mode_urgent_only` is false). A suppressed
         # knock is not created at all; its holding stays on the shelf for later.
+        # Wake-knocks are exempt: they are authentication prompts TO the user
+        # (she did not initiate anything), and accepting one in class mode
+        # opens the console, not speech.
         settings = self._settings()
         urgent_only = bool(
             settings.get("urgent_in_class_mode", True)
             and settings.get("class_mode_urgent_only", True)
         )
-        if self.class_mode() and (not urgent_only or urgency != "urgent"):
+        if (kind != "wake" and self.class_mode()
+                and (not urgent_only or urgency != "urgent")):
             raise InitiativeError(
                 "refused: class mode restricts initiative to urgent-only. The "
                 "holding remains on the shelf; nothing is announced.")
@@ -390,13 +407,15 @@ class InitiativeService:
             ts=iso_now(), topic=topic, reason=reason, kind=kind,
             urgency=urgency, referent=referent, commitment_id=commitment_id)
         # A new knock on a topic that already has a pending one counts as the
-        # previous one being ignored. Three and the topic retires.
-        topic_k = _topic_key(topic)
-        for older in self.store.list_knocks("pending", limit=200):
-            if older["id"] == knock_id:
-                continue
-            if _topic_key(older["topic"]) == topic_k:
-                self.ignore(older["id"])
+        # previous one being ignored. Three and the topic retires. (Wake-knocks
+        # keep every trigger: they are independent event reports.)
+        if kind != "wake":
+            topic_k = _topic_key(topic)
+            for older in self.store.list_knocks("pending", limit=200):
+                if older["id"] == knock_id:
+                    continue
+                if _topic_key(older["topic"]) == topic_k:
+                    self.ignore(older["id"])
         return self.get(knock_id)
 
     def get(self, knock_id: int) -> dict:

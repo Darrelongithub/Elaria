@@ -16,6 +16,7 @@ governor and client are resident from boot.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -143,6 +144,23 @@ class Daemon:
             config, self.store, presence=self.presence,
             disclosure=self.disclosure, sessions=self.sessions)
         self.knock_signal = KnockSignal(config)
+        # Wake-knock package: the always-on gate. A phrase hit NEVER grants
+        # command authority; the guard holds that line (wake_guard.py). The
+        # scorer is the hardware-side ECAPA seam; missing = fail closed.
+        from .voiceprint import EcapaCommandScorer, load_reference
+        from .wake_guard import WakeGuard
+        self.wake_guard = WakeGuard(
+            settings=config.section("hotword"),
+            store=self.store,
+            initiative=self.initiative,
+            class_mode=lambda: self.presence.status().enabled,
+            showoff=self.showoff,
+            scorer=EcapaCommandScorer(
+                config.section("hotword").get("ecapa_cmd"),
+                load_reference(config.section("hotword").get("ecapa_reference")),
+                sample_rate=int(config.section("hotword").get("sample_rate", 16000))),
+            phrase=str(config.section("hotword").get("phrase", "Elaria")))
+        self._hotword_task: asyncio.Task | None = None
         self.console = ConsoleService(
             config, self.store, presence=self.presence, sessions=self.sessions,
             initiative=self.initiative, showoff=self.showoff,
@@ -472,6 +490,10 @@ class Daemon:
             "knock.ignore": self._knock_ignore,
             "knock.due": self._knock_due,
             "initiative.status": self._initiative_status,
+            "hotword.status": self._hotword_status,
+            "hotword.start": self._hotword_start,
+            "hotword.stop": self._hotword_stop,
+            "hotword.purge": self._hotword_purge,
             "privacy.status": self._privacy_status,
             "privacy.set": self._privacy_set,
             "privacy.toggle": self._privacy_toggle,
@@ -554,6 +576,9 @@ class Daemon:
             "capture_target": capture_target,
             "last_capture": last_capture,
             "reply_substitutions": self._reply_substitution_records(limit=5),
+            "hotword": {"armed": self.wake_guard.armed,
+                        "state": self.wake_guard.state,
+                        "watchdog": self.wake_guard.watchdog.state},
             "last_transcript": last,
             "quota_today_live_calls": self.store.user_turn_calls_since(day_start_iso()),
             "quota_today_housekeeping": self.store.housekeeping_calls_since(day_start_iso()),
@@ -782,6 +807,9 @@ class Daemon:
 
     async def _knock_accept(self, params: dict) -> dict:
         knock_id = int(params.get("id"))
+        knock_row = self.store.get_knock(knock_id)
+        if knock_row is not None and knock_row.get("kind") == "wake":
+            return await self._wake_knock_accept(knock_id, params)
         class_now = self.presence.status().enabled
         speech_status = self.speech.status()
         voice_muted = bool(
@@ -828,14 +856,51 @@ class Daemon:
                               "channel": opened, "role": "assistant"})
         return payload
 
-    async def _knock_decline(self, params: dict) -> dict:
+    async def _wake_knock_accept(self, knock_id: int, params: dict) -> dict:
+        """Wake-knock accept: owner authentication, then listening (or the
+        console in class mode). voice-accept must itself be voiceprint
+        verified; hotkey/console carry the same trust as PTT. The guest door
+        stays show-off's alone."""
+        from .wake_guard import WakeGuardError
+
+        channel = str(params.get("channel") or "console")
+        voiceprint_score = params.get("voiceprint_score")
+        if voiceprint_score is not None:
+            voiceprint_score = float(voiceprint_score)
         try:
-            result = self.initiative.decline(int(params.get("id")))
+            gate = self.wake_guard.wake_knock_accepted(
+                knock_id=knock_id, channel=channel,
+                voiceprint_score=voiceprint_score)
+        except WakeGuardError as exc:
+            raise ValueError(str(exc)) from exc
+        class_now = self.presence.status().enabled
+        result = self.initiative.accept(
+            knock_id, class_mode=class_now,
+            voice_available=(gate.get("open") == "listening"))
+        opened = gate.get("open", result.get("open"))
+        payload = {**result, "open": opened, "wake": gate}
+        await self.broadcast({"event": "knock.accepted",
+                              "knock": result["knock"],
+                              "open": opened, "first_line": result["first_line"]})
+        return payload
+
+    async def _knock_decline(self, params: dict) -> dict:
+        knock_id = int(params.get("id"))
+        try:
+            result = self.initiative.decline(knock_id)
         except InitiativeError as exc:
             raise ValueError(str(exc)) from exc
+        self._wake_knock_denied(knock_id, "declined")
         await self.broadcast({"event": "knock.changed", "knock": result["knock"],
                               "action": "declined"})
         return result
+
+    def _wake_knock_denied(self, knock_id: int, action: str) -> None:
+        """Decline/ignore of a wake-knock returns the gate to sleep."""
+        row = self.store.get_knock(knock_id)
+        if (row is not None and row.get("kind") == "wake"
+                and self.wake_guard.state == "wake_knock"):
+            self.wake_guard.wake_knock_denied(knock_id=knock_id, action=action)
 
     async def _knock_later(self, params: dict) -> dict:
         try:
@@ -848,10 +913,12 @@ class Daemon:
         return result
 
     async def _knock_ignore(self, params: dict) -> dict:
+        knock_id = int(params.get("id"))
         try:
-            result = self.initiative.ignore(int(params.get("id")))
+            result = self.initiative.ignore(knock_id)
         except InitiativeError as exc:
             raise ValueError(str(exc)) from exc
+        self._wake_knock_denied(knock_id, "ignored")
         await self.broadcast({"event": "knock.changed", "knock": result["knock"],
                               "action": "retired" if result["retired"] else "ignored"})
         return result
@@ -883,6 +950,81 @@ class Daemon:
     async def _initiative_status(self, params: dict) -> dict:
         return {"initiative": self.initiative.status(),
                 "class_mode": self.presence.status().as_dict()}
+
+    # -- hotword: wake-knock model (never straight hit->listening) ----------
+    def _hotword_capture_factory(self):
+        """Always-on capture for the wake path (production mic path)."""
+        from .capture import PipeWireCapture
+
+        capture_cfg = self.config.section("capture")
+        target = (capture_cfg.get("mic_target")
+                  or self.config.section("meeting").get("mic_target") or None)
+        return PipeWireCapture(
+            target=target or None,
+            sample_rate=int(capture_cfg.get("sample_rate", 16000)),
+            chunk_ms=int(capture_cfg.get("chunk_ms", 30)))
+
+    async def _hotword_loop(self) -> None:
+        """Feed always-on frames through the guard + watchdog.
+
+        Stall semantics: no frames for `stall_timeout_s` disarms, zeroes both
+        RAM buffers and leaves a visible "stalled" state. Never a silent
+        forever-recording.
+        """
+        guard = self.wake_guard
+        source = None
+        try:
+            source = self._hotword_capture_factory()
+            async for frame in source.frames():
+                if not guard.armed:
+                    break
+                guard.feed(frame)
+                if guard.watchdog.check():
+                    guard.disarm(reason="stalled")
+                    await self.broadcast({"event": "hotword.stalled",
+                                          "state": "stalled"})
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            guard.disarm(reason="error")
+            await self.broadcast({"event": "hotword.stalled",
+                                  "state": "stalled", "error": str(exc)[:200]})
+        finally:
+            close = getattr(source, "close", None)
+            if callable(close):
+                close()
+
+    async def _hotword_start(self, params: dict) -> dict:
+        from .wake_guard import KeywordModelUnavailable
+
+        unsafe = bool(params.get("unsafe_energy_test"))
+        try:
+            status = self.wake_guard.arm(unsafe_energy_test=unsafe)
+        except KeywordModelUnavailable as exc:
+            raise ValueError(str(exc)) from exc
+        if self._hotword_task is None or self._hotword_task.done():
+            self._hotword_task = asyncio.create_task(self._hotword_loop())
+        return {"hotword": status,
+                "note": ("UNSAFE ENERGY TEST — plumbing only; this trigger "
+                         "can never open command listening"
+                         if unsafe else "armed with the real keyword model")}
+
+    async def _hotword_stop(self, params: dict) -> dict:
+        task = self._hotword_task
+        self._hotword_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        return {"hotword": self.wake_guard.disarm(reason="manual")}
+
+    async def _hotword_status(self, params: dict) -> dict:
+        return {"hotword": self.wake_guard.status()}
+
+    async def _hotword_purge(self, params: dict) -> dict:
+        removed = self.wake_guard.clips.purge()
+        return {"purged": removed}
 
     async def _class_status(self, params: dict) -> dict:
         return {"class_mode": self.presence.status().as_dict()}
