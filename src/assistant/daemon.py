@@ -1137,7 +1137,65 @@ class Daemon:
             self.store.log_persona_event(
                 iso_now(), "ptt.lifecycle", json.dumps({"step": step, **fields}))
         except Exception:
-            pass
+            return
+
+    def _dictate_log(self, step: str, **fields) -> None:
+        """Lifecycle markers for work after the dictation task returns."""
+        try:
+            self.store.log_persona_event(
+                iso_now(), "dictate.lifecycle", json.dumps({"step": step, **fields}))
+        except Exception:
+            return
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Future) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            return
+
+    async def _await_dictate_step(self, step: str, awaitable, *,
+                                  session_id: str | None,
+                                  timeout_s: float):
+        """Bound and journal post-dictation daemon work."""
+        timeout_s = max(0.0, float(timeout_s))
+        started = time.monotonic()
+        self._dictate_log(f"{step}_start", session_id=str(session_id or ""),
+                          timeout_s=timeout_s)
+        task = asyncio.ensure_future(awaitable)
+        try:
+            done, _pending = await asyncio.wait(
+                {task}, timeout=timeout_s,
+                return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(self._consume_task_result)
+            self._dictate_log(f"{step}_cancelled",
+                              session_id=str(session_id or ""),
+                              elapsed_s=round(time.monotonic() - started, 3))
+            raise
+        if not done:
+            task.cancel()
+            task.add_done_callback(self._consume_task_result)
+            self._dictate_log(
+                f"{step}_timeout", session_id=str(session_id or ""),
+                timeout_s=timeout_s,
+                elapsed_s=round(time.monotonic() - started, 3))
+            raise TimeoutError(f"{step} timed out after {timeout_s:.1f}s")
+        try:
+            result = task.result()
+        except Exception as exc:
+            self._dictate_log(
+                f"{step}_failed", session_id=str(session_id or ""),
+                elapsed_s=round(time.monotonic() - started, 3),
+                error=f"{type(exc).__name__}: {exc}"[:200])
+            raise
+        self._dictate_log(f"{step}_done", session_id=str(session_id or ""),
+                          elapsed_s=round(time.monotonic() - started, 3))
+        return result
 
     async def _ptt_start(self, params: dict) -> dict:
         # §18: ack RETURNS immediately; capture + Live session spin up in a
@@ -1504,6 +1562,7 @@ class Daemon:
             session = await asyncio.wait_for(task, timeout=60)
             self._ptt_log("ptt.finish.task_done", session_id=str(session_id or ""), no_speech=str(getattr(session, "no_speech", False)))
             no_speech = bool(getattr(session, "no_speech", False))
+            no_final = bool(getattr(session, "no_final", False))
             result = {
                 "text": (session.cleaned_text
                          if (session.cleaned_text and not session.flagged)
@@ -1525,8 +1584,11 @@ class Daemon:
                 # session is empty instead of waiting out their full budget.
                 "capture": getattr(session, "capture", None),
                 "no_speech": no_speech,
+                "no_final": no_final,
                 # Factual narration from real state (§13.1) — no model call.
                 "narration": ("no speech captured" if no_speech else
+                              "No final transcript received; captured audio is "
+                              "retained for retry." if no_final else
                               self.governor.narrate_fact(
                                   "transcribe.done",
                                   {"words": len(session.raw_text.split()),
@@ -1550,11 +1612,61 @@ class Daemon:
                         result["command"] = None
                         result["narration"] = "echo suppressed — own TTS captured as input"
                     else:
-                        result["command"] = await self._ask({
+                        reply_timeout_s = max(
+                            0.1, min(10.0, float(self._chat_timeout_s)))
+                        self._dictate_log(
+                            "dictate.reply_generation_start",
+                            session_id=str(session_id or ""),
+                            timeout_s=reply_timeout_s)
+                        reply_started = time.monotonic()
+                        reply_task = asyncio.create_task(self._ask({
                             "text": result["text"],
                             "speak": params.get("speak", True),
-                        })
-                result["narration"] = result["command"].get("reply", result["narration"])
+                        }))
+                        try:
+                            done, _pending = await asyncio.wait(
+                                {reply_task}, timeout=reply_timeout_s,
+                                return_when=asyncio.FIRST_COMPLETED)
+                            if not done:
+                                reply_task.cancel()
+                                reply_task.add_done_callback(self._consume_task_result)
+                                self._dictate_log(
+                                    "dictate.reply_generation_timeout",
+                                    session_id=str(session_id or ""),
+                                    timeout_s=reply_timeout_s,
+                                    elapsed_s=round(time.monotonic() - reply_started, 3))
+                                result["command"] = {
+                                    "reply": ("Dictation saved, but reply generation "
+                                              "timed out."),
+                                    "error": "reply generation timed out",
+                                }
+                            else:
+                                result["command"] = reply_task.result()
+                                self._dictate_log(
+                                    "dictate.reply_generation_done",
+                                    session_id=str(session_id or ""),
+                                    elapsed_s=round(time.monotonic() - reply_started, 3))
+                        except asyncio.CancelledError:
+                            if not reply_task.done():
+                                reply_task.cancel()
+                                reply_task.add_done_callback(self._consume_task_result)
+                            self._dictate_log(
+                                "dictate.reply_generation_cancelled",
+                                session_id=str(session_id or ""))
+                            raise
+                        except Exception as exc:
+                            self._dictate_log(
+                                "dictate.reply_generation_failed",
+                                session_id=str(session_id or ""),
+                                error=f"{type(exc).__name__}: {exc}"[:200])
+                            result["command"] = {
+                                "reply": ("Dictation saved, but reply generation "
+                                          "failed."),
+                                "error": str(exc)[:200],
+                            }
+                if isinstance(result.get("command"), dict):
+                    result["narration"] = result["command"].get(
+                        "reply", result["narration"])
             # BUG5: general echo suppression for any ptt result
             if result.get("text") and self._is_echo(result["text"]):
                 result["text"] = ""
@@ -1602,9 +1714,16 @@ class Daemon:
                 # pre-switch connectivity and look like the parked switch was
                 # lost.
                 try:
-                    await self._apply_pending_mode_switch()
-                except Exception:  # noqa: S110 - a switch never blocks a result
-                    pass
+                    await self._await_dictate_step(
+                        "dictate.pending_mode_switch",
+                        self._apply_pending_mode_switch(),
+                        session_id=session_id, timeout_s=1.0)
+                except Exception as exc:
+                    # A switch never blocks the already-stored dictation result.
+                    self._dictate_log(
+                        "dictate.pending_mode_switch_ignored",
+                        session_id=str(session_id or ""),
+                        error=f"{type(exc).__name__}: {exc}"[:200])
             if session_id is not None:
                 # BUG 6d: unconditional. The old code set the (single, global)
                 # result event only while this session was still the daemon's
@@ -1613,15 +1732,23 @@ class Daemon:
                 # orphaned event. Every session's waiters wake on its own
                 # terminal transition, superseded or not.
                 self._ptt_event_for(session_id).set()
-            try:
+            async def _broadcast_result_events():
                 await self.broadcast({"event": "ptt.result",
                                       "session_id": session_id,
                                       "result": result})
                 if self._ptt_session_id == session_id:
                     await self.broadcast({"event": "status.changed",
                                           "mode": self.mode})
-            except Exception:  # noqa: S110 - delivery is best-effort
-                pass
+
+            try:
+                await self._await_dictate_step(
+                    "dictate.result_broadcast", _broadcast_result_events(),
+                    session_id=session_id, timeout_s=1.0)
+            except Exception as exc:
+                self._dictate_log(
+                    "dictate.result_broadcast_ignored",
+                    session_id=str(session_id or ""),
+                    error=f"{type(exc).__name__}: {exc}"[:200])
 
     async def _ptt_result(self, params: dict) -> dict:
         """Fetch the terminal answer for ONE session, optionally waiting.
@@ -2096,7 +2223,7 @@ class Daemon:
             self.store.log_persona_event(
                 record["ts"], "reply_late", json.dumps(record))
         except Exception:
-            pass
+            return
 
     def _reply_substitution_records(self, limit: int = 20) -> list[dict]:
         try:
@@ -2224,7 +2351,7 @@ class Daemon:
                     text = getattr(result, "text", "") or ""
                     self._log_reply_late(original_len=len(text), turn=prompt[-60:])
                 except Exception:
-                    pass
+                    return result
                 return result
             except TimeoutError as exc:
                 abandoned["flag"] = True
