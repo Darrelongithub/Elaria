@@ -99,3 +99,8 @@
 #custom-elaria.showoff.knock {
   color: #ffb86c;
 }
+
+/* Disclosure awareness — company present: memory allowed, secrets not. */
+#custom-elaria.company {
+  color: #7fe3d4;
+}

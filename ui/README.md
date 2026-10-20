@@ -87,7 +87,10 @@ panel never steals a keystroke you didn't give it.
    announcement, and `assist showoff status` shows `permissions: []` and the
    demo sandbox path. Say a guest command ("delete his files") → refusal, mode
    off, `assist showoff status` reports `never_list`.
-7. If the sound is silent, install the asset somewhere permanent:
+7. Say "I'm not alone" → console header shows `COMPANY`; ask her for a stored
+   password → deflection, not the value. Say "I'm alone now" → badge clears and
+   the answer returns.
+8. If the sound is silent, install the asset somewhere permanent:
    `mkdir -p ~/.local/share/assistant/sounds && cp ui/sounds/knock.wav ~/.local/share/assistant/sounds/`
    (the config default points there; the code also falls back to `ui/sounds/`).
 

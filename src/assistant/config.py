@@ -388,6 +388,13 @@ DEFAULTS: dict = {
         "history_limit": 200,      # one conversation; no per-channel fork
         "snapshot_limit": 20,
     },
+    "disclosure": {
+        # Owner rule 2026-10-20: memory is allowed, leaking is not. Behaviour is
+        # speakable; secrets and private plans are not — not even to the owner
+        # while they have company. Awareness comes from the owner saying they are
+        # not alone, and from show-off mode. A guest voice gets no memory at all.
+        "owner_name": "",            # how she refers to you in a deflection
+    },
     "showoff": {
         # §19.3. Entry happens through a voiceprint-verified command only; this
         # section carries no grant of authority, only the demo's own bounds.

@@ -171,6 +171,7 @@ class InitiativeService:
     config: object
     store: object
     presence: object = None
+    disclosure: object = None
     now: object = None
 
     def __post_init__(self):
@@ -242,6 +243,15 @@ class InitiativeService:
             raise InitiativeError("refused: a reason must be citable, not a gesture")
         ensure_not_needy(reason, where="knock reason")
         ensure_not_temporal(reason, where="knock reason")
+        # Company present: a knock is aloud in the room, so a secret or private
+        # plan cannot be its reason — hold it until the owner is alone.
+        if (self.disclosure is not None and self.disclosure.company()
+                and (self.disclosure.is_sensitive(reason)
+                     or self.disclosure.is_sensitive(topic))):
+            raise InitiativeError(
+                "refused: the reason names a secret or private plan, and "
+                "company is present. A knock is spoken aloud — hold it until "
+                "you're alone.")
 
         if kind == "follow-up":
             if commitment_id is None:

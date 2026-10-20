@@ -88,6 +88,13 @@ class_schedule_suggest = true
 history_limit = 200      # one conversation shared by voice + console
 snapshot_limit = 20
 
+[disclosure]
+# Owner rule 2026-10-20: memory is allowed, leaking is not. While company is
+# present (say "I'm not alone", or `assist privacy company`) or show-off is on,
+# she may speak about habits and ordinary activity but never secrets,
+# credentials or private plans. A guest voice gets no owner memory at all.
+owner_name = ""               # how she refers to you in a deflection
+
 [showoff]
 # §19.3. Entry is a voiceprint-verified owner command; nothing here grants
 # authority. Guests never see owner facts beyond this allowlist.

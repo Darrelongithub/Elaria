@@ -312,6 +312,42 @@ hotkey, or any never-list attempt. On exit `assist status` reports show-off off,
 how many guest turns were heard, how many requests were declined, why it ended —
 with `audio_retained = 0`. No guest audio is kept.
 
+### Disclosure awareness — memory is allowed, leaking is not
+
+```bash
+assist privacy status        # company present? what is withheld?
+assist privacy company       # "I'm not alone" (also: `assist privacy alone`)
+assist privacy toggle
+```
+
+Or just say it: **"I'm not alone"** / **"we have company"** turns awareness on;
+**"I'm alone now"** / **"they've left"** turns it off. The same flips happen in
+`assist talk` with `/company on|off`.
+
+`disclosure.py` classifies what she remembers:
+
+| Class | Example | Owner alone | Company present / show-off |
+|---|---|---|---|
+| `behaviour` | "files invoices on Fridays", "prefers the window seat" | speakable | **speakable** |
+| `plan` | "we're going to surprise Sam Friday" | speakable | withheld |
+| `secret` | passwords, PINs, API keys, card/bank, passport/ID, "keep this between us" | speakable | **withheld** |
+
+Awareness is not a mode: voice, class mode and surfacing are unaffected. While it
+is on, stored secrets and private plans are filtered out of the model's context,
+and an outgoing guard checks the reply before it is spoken — so a model that
+ignores the prompt still cannot read a password back to the room. A blocked
+reply is replaced with a deflection and logged by category and fact id, never by
+the secret's text.
+
+A voice that is not the owner's gets **no owner memory at all** — not even in
+normal mode. Probes get the deflection in character ("Oh, the boss would kill me
+if I told you that."), instructions get "I only take that kind of instruction
+from the boss." Speaker verification results supplied by the capture path
+(`owner_verified: false`) are honoured at the same boundary.
+
+A knock cannot carry a secret or private plan as its reason while company is
+present — a knock is spoken aloud. Class mode still controls how loud it is.
+
 ## §10 open decisions — defaults taken, awaiting your word
 
 None block Phase 0 (§14). Each defaults to the blueprint's recommendation

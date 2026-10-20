@@ -58,6 +58,9 @@ def format_waybar(status: dict) -> dict:
         suffix += " ·class"
     elif class_mode.get("suggested"):
         classes.append("class-suggested")
+    company = status.get("company") or {}
+    if company.get("company"):
+        classes.append("company")
     showoff = status.get("showoff") or {}
     if showoff.get("active"):
         classes.append("showoff")
@@ -88,6 +91,9 @@ def format_waybar(status: dict) -> dict:
                              "knocks silent · initiative urgent-only")
     elif class_mode.get("suggested"):
         tooltip_lines.append("class suggestion: " + str(class_mode.get("suggestion")))
+    if company.get("company"):
+        tooltip_lines.append("company present · secrets and private plans "
+                             "withheld · behaviour memory allowed")
     if showoff.get("active"):
         tooltip_lines.append("show-off mode · demo sandbox only · zero standing "
                              "permissions · private memory closed")

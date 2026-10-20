@@ -71,6 +71,7 @@ class ConsoleService:
     presence: object = None
     initiative: object = None
     showoff: object = None
+    disclosure: object = None
     sessions: SessionService | None = None
 
     def __post_init__(self):
@@ -123,6 +124,8 @@ class ConsoleService:
                       if self.presence is not None else {"enabled": False})
         showoff = (self.showoff.status(now) if self.showoff is not None
                    else {"active": False})
+        company = (self.disclosure.status() if self.disclosure is not None
+                   else {"company": False})
         return {
             "ts": iso_now(),
             "conversation": self.sessions.history(),
@@ -134,6 +137,7 @@ class ConsoleService:
             "knocks": knocks,
             "class_mode": class_mode,
             "showoff": showoff,
+            "company": company,
             "counts": {
                 "pending_plans": len(pending_plans),
                 "parked": len(parked),
@@ -154,6 +158,7 @@ def _safe_snapshot(socket_path) -> dict:
                 "offline_queue": {"counts": {}, "jobs": []}, "holding": [],
                 "knocks": [], "class_mode": {"enabled": False},
                 "showoff": {"active": False},
+                "company": {"company": False, "note": "daemon down"},
                 "counts": {"pending_plans": 0, "parked": 0, "queue": 0,
                            "holding": 0, "knocks": 0}}
 

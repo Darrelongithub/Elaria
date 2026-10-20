@@ -27,6 +27,11 @@ from .capture import PipeWireCapture, SimulatedCapture
 from .config import Config, load_config, load_humour_profile
 from .console import ConsoleService, SessionService
 from .cost import day_start_iso, iso_now, month_start_iso
+from .disclosure import (
+    DisclosureService,
+    detect_company_command,
+    is_instruction,
+)
 from .gemini_client import GeminiClient
 from .initiative import InitiativeError, InitiativeService, KnockSignal
 from .ipc import serve
@@ -92,6 +97,9 @@ class Daemon:
         from .meeting import MeetingService
         self.meetings = MeetingService(
             config, self.store, self.client, mode_manager=self.mode_manager)
+        # Disclosure awareness: memory may be used, secrets/plans never spoken
+        # while company is present, and no owner memory to a guest voice.
+        self.disclosure = DisclosureService(config, self.store)
         # Stage D: show-off is the owner's, voiceprint-verified, and grants
         # nothing that survives it. Demo actions are sandboxed at the executor.
         self.showoff = ShowoffService(
@@ -99,11 +107,13 @@ class Daemon:
         # Stage C: the knock. Class mode restricts it to urgent-only; the
         # reason gate — not a budget — decides whether she may speak at all.
         self.initiative = InitiativeService(
-            config, self.store, presence=self.presence)
+            config, self.store, presence=self.presence,
+            disclosure=self.disclosure)
         self.knock_signal = KnockSignal(config)
         self.console = ConsoleService(
             config, self.store, presence=self.presence, sessions=self.sessions,
-            initiative=self.initiative, showoff=self.showoff)
+            initiative=self.initiative, showoff=self.showoff,
+            disclosure=self.disclosure)
         self._meeting: dict | None = None  # {task, dual, mic_frames, sys_frames}
         self._meeting_processing = False
         self._plan_tasks: dict[int, asyncio.Task] = {}
@@ -282,6 +292,9 @@ class Daemon:
             "knock.ignore": self._knock_ignore,
             "knock.due": self._knock_due,
             "initiative.status": self._initiative_status,
+            "privacy.status": self._privacy_status,
+            "privacy.set": self._privacy_set,
+            "privacy.toggle": self._privacy_toggle,
             "showoff.status": self._showoff_status,
             "showoff.enter": self._showoff_enter,
             "showoff.exit": self._showoff_exit,
@@ -345,6 +358,7 @@ class Daemon:
             "class_mode": self.presence.status().as_dict(),
             "knock": self.initiative.status(),
             "showoff": self.showoff.status(),
+            "company": self.disclosure.status(),
             "console": {
                 "conversation_id": (self.sessions.history()["id"]),
                 "messages": len(self.sessions.history()["messages"]),
@@ -1054,6 +1068,48 @@ class Daemon:
                 "transcript_preview": result.transcript[:400],
                 "connectivity": self.mode_manager.status(refresh=False).as_dict()}
 
+    # -- disclosure awareness (owner rule 2026-10-20) ------------------------
+    async def _privacy_status(self, params: dict) -> dict:
+        return {"company": self.disclosure.status()}
+
+    async def _privacy_set(self, params: dict) -> dict:
+        if "company" not in params:
+            raise ValueError("privacy.set needs params.company (bool)")
+        status = self.disclosure.set_company(bool(params["company"]),
+                                             source="owner command")
+        await self.broadcast({"event": "privacy.changed", "company": status})
+        return {"company": status}
+
+    async def _privacy_toggle(self, params: dict) -> dict:
+        status = self.disclosure.toggle(source="owner command")
+        await self.broadcast({"event": "privacy.changed", "company": status})
+        return {"company": status}
+
+    async def _guest_turn_normal(self, text: str, params: dict) -> dict:
+        """A non-owner voice outside show-off: no memory, deflection in character."""
+        channel = str(params.get("channel") or "voice")
+        conversation_id = self.sessions.active_id(iso_now())
+        self.sessions.append("user", text, channel=channel, ts=iso_now())
+        reply = self.disclosure.deflection(guest=True,
+                                           action=is_instruction(text))
+        decision = self.governor.decide(TurnContext(user_text=text))
+        self.disclosure.log_guest("guest_turn", category="non-owner voice",
+                                  chars=len(text))
+        speech = await self._maybe_speak_reply(reply, params)
+        self.sessions.append("assistant", reply, channel=channel,
+                             via="guest-deflection", ts=iso_now())
+        await self.broadcast({"event": "conversation.message",
+                              "conversation_id": conversation_id,
+                              "channel": channel, "role": "assistant"})
+        return {
+            "reply": reply, "speaker": "guest", "via": "guest-deflection",
+            "channel": channel, "conversation_id": conversation_id,
+            "model": None, "register": decision.register, "serious_gate": None,
+            "mode": self.config.gemini_mode, "fixture": None,
+            "speech": speech, "memory_closed": True, "withheld": None,
+            "company": self.disclosure.status(),
+        }
+
     # -- show-off (§19.3) ----------------------------------------------------
     async def _showoff_status(self, params: dict) -> dict:
         return {"showoff": self.showoff.status()}
@@ -1122,6 +1178,13 @@ class Daemon:
                 via = "showoff"
         else:
             reply, via = verdict["reply"], "showoff-refusal"
+        leak = self.disclosure.leak_in(reply, guest=True) if verdict.get("allowed") else None
+        if leak is not None:
+            self.disclosure.log("leak_blocked", {
+                "kind": leak["kind"], "why": leak["why"],
+                "fact_id": leak.get("fact_id"), "channel": channel,
+                "speaker": "guest", "context": "showoff"})
+            reply, via = self.disclosure.deflection(guest=True), "withheld"
         speech = await self._maybe_speak_reply(reply, params)
         self.sessions.append("assistant", reply, channel=channel, via=via,
                              ts=iso_now())
@@ -1153,8 +1216,21 @@ class Daemon:
             raise ValueError("ask needs params.text")
         speaker = str(params.get("speaker") or "owner").lower()
         showoff_now = self.showoff.status()
-        if showoff_now.get("active") and speaker != "owner":
-            return await self._guest_turn(text, params, showoff_now)
+        # Speaker verification, when the caller supplies a verdict, is authority
+        # here too: a voice that is not the owner never sees owner memory.
+        verified = params.get("owner_verified")
+        if verified is False:
+            speaker = "guest"
+        if speaker != "owner":
+            if showoff_now.get("active"):
+                return await self._guest_turn(text, params, showoff_now)
+            return await self._guest_turn_normal(text, params)
+
+        # The owner can tell her the room has company. That is awareness, not a
+        # mode: nothing about voice, class mode or surfacing changes.
+        company_command = detect_company_command(text)
+        if company_command is not None:
+            self.disclosure.set_company(company_command, source="owner speech")
 
         decision = self.governor.decide(TurnContext(user_text=text))
         self.store.log_persona_event(
@@ -1169,18 +1245,31 @@ class Daemon:
         reply, via, model, fixture = None, None, None, None
         queued_job_id = None
         connectivity = await self._connectivity_snapshot()
-        intent = route(text)
+        if company_command is not None:
+            # An awareness command answers locally and never reaches a model.
+            reply = ("Noted — company present. Secrets and private plans stay "
+                     "unsaid; habits and ordinary memory are still fine."
+                     if company_command else
+                     "Noted — alone again. Secrets and private plans are back "
+                     "on the table.")
+            via = "local-awareness"
+        intent = None if company_command is not None else route(text)
         if intent is not None:
             reply, via = await self._run_intent(intent)
 
         if reply is None:
             # Rung 5/6: assemble the exact context the cheap model needs.
             hits = await asyncio.to_thread(self.memory.recall, text)
-            context = "\n".join(f"- [{h.source} {h.ref}] {h.text}" for h in hits)
+            restricted = self.disclosure.company() or speaker != "owner"
+            kept = self.disclosure.filter_hits(hits, guest=speaker != "owner")
+            context = "\n".join(f"- [{h.source} {h.ref}] {h.text}" for h in kept)
             prompt = text
             if context:
                 prompt = (f"Context from the user's local memory/index "
                           f"(cite paths plainly):\n{context}\n\nUser: {text}")
+            if restricted:
+                prompt += "\n\n" + self.disclosure.prompt_note(
+                    guest=speaker != "owner")
             if decision.register == "expressive-allowed":
                 prompt += ("\n\nRegister note: the user is bantering; matching "
                            "their playful-teasing register concisely is welcome "
@@ -1197,6 +1286,26 @@ class Daemon:
                 reply, via, model, fixture = result.text, "gemini", result.model, result.fixture
                 if reply:
                     self.mode_manager.observe_success("gemini")
+
+        # The outgoing guard: a model that ignores the prompt still cannot read a
+        # stored secret, plan or owner fact back to the room.
+        leak = self.disclosure.leak_in(
+            reply, guest=speaker != "owner",
+            company=self.disclosure.company())
+        withheld = None
+        if leak is not None:
+            self.disclosure.log("leak_blocked", {
+                "kind": leak["kind"], "why": leak["why"],
+                "fact_id": leak.get("fact_id"), "channel": channel,
+                "speaker": speaker})
+            withheld = {"kind": leak["kind"], "why": leak["why"],
+                        "note": "the reply named something she may not say aloud"}
+            if speaker != "owner":
+                reply = self.disclosure.deflection(guest=True)
+            else:
+                reply = (f"{self.disclosure.deflection(guest=False)} "
+                         "Ask me again when we're alone and I'll tell you plainly.")
+            via = "withheld"
 
         speech = await self._maybe_speak_reply(reply, params)
         self.sessions.append("assistant", reply, channel=channel, via=via,
@@ -1222,6 +1331,9 @@ class Daemon:
             "connectivity": connectivity.as_dict(),
             "queued_job_id": queued_job_id,
             "speech": speech,
+            "speaker": speaker,
+            "company": self.disclosure.status(),
+            "withheld": withheld,
         }
 
     async def _run_intent(self, intent) -> tuple[str | None, str]:

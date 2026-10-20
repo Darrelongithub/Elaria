@@ -18,7 +18,7 @@ ShellRoot {
             pending_plans: [], parked_items: [], job_progress: [],
             offline_queue: {counts: {}, jobs: []}, holding: [],
             knocks: [], class_mode: {enabled: false},
-            showoff: {active: false},
+            showoff: {active: false}, company: {company: false},
             counts: {pending_plans: 0, parked: 0, queue: 0,
                      holding: 0, knocks: 0}
         })
@@ -91,6 +91,15 @@ ShellRoot {
                         width: classBadge.width + 10; height: 20
                         Text { id: classBadge; anchors.centerIn: parent
                                text: "CLASS MODE"; color: "#ffcb6b"
+                               font.pixelSize: 10; font.bold: true }
+                    }
+                    Rectangle {
+                        visible: panel.snap.company && panel.snap.company.company
+                        radius: 5
+                        color: "#153a3a"
+                        width: companyBadge.width + 10; height: 20
+                        Text { id: companyBadge; anchors.centerIn: parent
+                               text: "COMPANY"; color: "#7fe3d4"
                                font.pixelSize: 10; font.bold: true }
                     }
                     Rectangle {

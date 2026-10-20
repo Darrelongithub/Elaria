@@ -542,6 +542,39 @@ def _knock_command(args, config) -> int:
     return 0
 
 
+def _privacy_command(args, config) -> int:
+    """`assist privacy …` — awareness, not a mode.
+
+    `status` shows whether company is present; `company`/`alone` say it directly;
+    `toggle` flips it. The same words spoken to her work too ("I'm not alone").
+    """
+    action = getattr(args, "privacy_action", None) or "status"
+    wanted = {"company": True, "alone": False}.get(action)
+    try:
+        if action in ("company", "alone", "toggle"):
+            method = "privacy.toggle" if action == "toggle" else "privacy.set"
+            params = {} if action == "toggle" else {"company": wanted}
+            out = call(config.socket_path, method, params, timeout=5.0)
+        else:
+            out = call(config.socket_path, "privacy.status", timeout=5.0)
+    except (DaemonUnavailable, RuntimeError, OSError):
+        from .disclosure import DisclosureService
+
+        store = _local_store(config)
+        disclosure = DisclosureService(config, store)
+        if action in ("company", "alone", "toggle"):
+            status = (disclosure.toggle(source="owner command")
+                      if action == "toggle" else
+                      disclosure.set_company(wanted, source="owner command"))
+        else:
+            status = disclosure.status()
+        out = {"company": status,
+               "note": "stored locally; the daemon will observe it"}
+        store.close()
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def _showoff_command(args, config) -> int:
     """`assist showoff …` — owner surfaces only. Entry is voice-only by design."""
     action = getattr(args, "showoff_action", None) or "status"
@@ -591,6 +624,10 @@ def _print_snapshot(snapshot: dict, *, messages: int = 12) -> None:
     counts = snapshot.get("counts") or {}
     mode = snapshot.get("class_mode") or {}
     print("── Elaria · console ─────────────────────────────────────────")
+    company = snapshot.get("company") or {}
+    if company.get("company"):
+        print("company present — secrets and private plans withheld; "
+              "behaviour and ordinary memory still allowed")
     print(f"class mode: {'ON' if mode.get('enabled') else 'off'}"
           + (f" · suggestion: {mode['suggestion']}" if mode.get("suggestion") else "")
           + f" · conversation #{conversation.get('id')}"
@@ -658,8 +695,8 @@ def _talk_command(args, config) -> int:
         print(f"assist talk: {exc}", file=sys.stderr)
         return 1
     _print_snapshot(snapshot)
-    print("Continue here, or /state /class on|off /knock /accept N /decline N "
-          "/later N /showoff /quit")
+    print("Continue here, or /state /class on|off /company on|off /knock "
+          "/accept N /decline N /later N /showoff /quit")
     while True:
         try:
             line = input("you> ").strip()
@@ -671,8 +708,8 @@ def _talk_command(args, config) -> int:
         if line in ("/quit", "/exit"):
             return 0
         if line == "/help":
-            print("/state · /class on|off|toggle · /knock · /accept N · "
-                  "/decline N · /later N · /showoff status|exit · /quit")
+            print("/state · /class on|off|toggle · /company on|off · /knock · "
+                  "/accept N · /decline N · /later N · /showoff status|exit · /quit")
             continue
         if line == "/state":
             try:
@@ -696,6 +733,19 @@ def _talk_command(args, config) -> int:
                     print("class mode " + ("ON" if out["class_mode"]["enabled"] else "OFF"))
             except (DaemonUnavailable, RuntimeError, OSError) as exc:
                 print(f"class command failed: {exc}", file=sys.stderr)
+            continue
+        if line.startswith("/company"):
+            parts = line.split()
+            action = parts[1] if len(parts) > 1 else "status"
+            try:
+                if action in ("on", "off"):
+                    out = call(config.socket_path, "privacy.set",
+                               {"company": action == "on"}, timeout=5.0)
+                else:
+                    out = call(config.socket_path, "privacy.status", timeout=5.0)
+                print(json.dumps(out["company"], indent=2))
+            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+                print(f"privacy command failed: {exc}", file=sys.stderr)
             continue
         if line.startswith("/knock"):
             try:
@@ -1103,6 +1153,10 @@ def build_parser() -> argparse.ArgumentParser:
     knock_ignore = knock_sub.add_parser("ignore", help="retire a topic after 3 ignores")
     knock_ignore.add_argument("id", type=int)
     knock_ignore.add_argument("--json", action="store_true")
+    privacy_p = sub.add_parser(
+        "privacy", help="disclosure awareness: is the room listening?")
+    privacy_p.add_argument("privacy_action", nargs="?", default="status",
+                           choices=["status", "company", "alone", "toggle"])
     showoff_p = sub.add_parser(
         "showoff", help="demo mode: owner-entered, zero standing permissions")
     showoff_sub = showoff_p.add_subparsers(dest="showoff_action")
@@ -1276,6 +1330,7 @@ def main(argv: list[str] | None = None) -> int:
                           "connectivity_mode": connectivity.effective_mode,
                           "class_mode": PresenceService(config, store).status().as_dict(),
                           "showoff": {"active": False, "permissions": []},
+                          "company": {"company": False},
                           "knock": {"pending": len(store.list_knocks("pending")),
                                     "budget": "none — the reason gate is the only control",
                                     "class_mode_urgent_only":
@@ -1318,6 +1373,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "showoff":
             return _showoff_command(args, config)
+
+        if args.command == "privacy":
+            return _privacy_command(args, config)
 
         if args.command == "talk":
             return _talk_command(args, config)

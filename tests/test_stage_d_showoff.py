@@ -352,7 +352,7 @@ def test_daemon_guest_turn_is_conversation_only(config, running_daemon,
     monkeypatch.setattr(daemon, "_run_intent", real_intent)
     monkeypatch.setattr(daemon.memory, "recall", real_recall)
     owner = call(config.socket_path, "ask", {"text": "hello"})
-    assert owner.get("speaker") is None
+    assert owner.get("speaker") == "owner"
     assert call(config.socket_path, "status")["showoff"]["active"] is True
 
 
