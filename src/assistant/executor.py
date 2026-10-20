@@ -37,7 +37,9 @@ from .safety import (
     assert_within_sandbox,
     check_blast_radius,
     check_operation,
+    expand,
     is_halted,
+    is_protected,
     is_safe_filename,
     sha256_file,
 )
@@ -87,18 +89,24 @@ class Executor:
         plan = self.store.get_plan(plan_id)
         if plan is None or plan["status"] != "ready":
             raise ValueError(f"plan {plan_id} is not ready to apply")
-        root = Path(root_spec["path"])
+        root = expand(root_spec["path"]).resolve()
+        plan_root = expand(plan["root"]).resolve()
+        if plan_root != root:
+            raise ValueError(
+                f"plan {plan_id} was built for root {plan['root']!r}, not {root_spec['path']!r}"
+            )
         if sandbox_root is not None:
             # Show-off mode: the demo may only ever act inside its own folder,
             # checked here (before any read of plan items) and again per op.
             assert_within_sandbox(root, sandbox_root)
+        allowed_taxonomy = set(root_spec.get("taxonomy") or []) | {"_Unsorted", "_Conflicts"}
         items = [i for i in self.store.plan_items(plan_id)
                  if i["decision"] == "auto"
                  or (include_review and i["decision"] == "review")]
         items = [i for i in items if i["dest"]]
         report = ApplyReport(plan_id=plan_id)
 
-        total_indexed = len(self.store.documents_in_root(str(root)))
+        total_indexed = len(self.store.documents_in_root(str(root_spec["path"])))
         blast = check_blast_radius(len(items), total_indexed,
                                    max_ops_per_run=self.max_per_run,
                                    tripwire_pct=self.tripwire_pct)
@@ -117,8 +125,14 @@ class Executor:
             if report.applied + report.conflicts >= self.max_per_run or hourly_budget <= 0:
                 report.capped = True
                 break
-            outcome = self._apply_item(item, root, plan_id,
-                                       sandbox_root=sandbox_root)
+            outcome = self._apply_item(
+                item,
+                Path(root_spec["path"]),
+                plan_id,
+                sandbox_root=sandbox_root,
+                allowed_taxonomy=allowed_taxonomy,
+                report=report,
+            )
             if outcome == "applied":
                 report.applied += 1
                 hourly_budget -= 1
@@ -143,11 +157,17 @@ class Executor:
     def _copy_file_no_overwrite(src: Path, dst: Path) -> None:
         """Exclusive-create copy for the cross-device path. `xb` makes a
         destination that raced us a hard failure, never an overwrite."""
-        with src.open("rb") as source, dst.open("xb") as target:
-            shutil.copyfileobj(source, target, length=1024 * 1024)
-            target.flush()
-            os.fsync(target.fileno())
-        shutil.copystat(src, dst)
+        try:
+            with src.open("rb") as source, dst.open("xb") as target:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+            shutil.copystat(src, dst)
+        except BaseException:
+            # BH-B2: if disk fills mid-copy, clean up the partial destination
+            # so no truncated file is left behind.
+            dst.unlink(missing_ok=True)
+            raise
 
     @classmethod
     def _create_destination_no_overwrite(cls, src: Path, dst: Path) -> str:
@@ -178,7 +198,9 @@ class Executor:
         return "copy"
 
     def _apply_item(self, item: dict, root: Path, plan_id: int,
-                    *, sandbox_root: Path | None = None):
+                    *, sandbox_root: Path | None = None,
+                    allowed_taxonomy: set[str] | None = None,
+                    report: ApplyReport | None = None):
         src = Path(item["src"])
         new_name = item["new_name"] or src.name
         # Defence in depth: the executor is the last line before a syscall,
@@ -195,19 +217,29 @@ class Executor:
                 or any(part in ("", ".", "..") or "\\" in part for part in dest_parts)):
             return {"src": str(src),
                     "reason": f"unsafe destination folder {dest_value!r}"}
+        if allowed_taxonomy is not None and dest_value not in allowed_taxonomy:
+            return {"src": str(src),
+                    "reason": f"destination {dest_value!r} is outside configured taxonomy"}
         dest_dir = root / dest_value
         dst = dest_dir / new_name
         if sandbox_root is not None:
             assert_within_sandbox(src, sandbox_root)
             assert_within_sandbox(dst, sandbox_root)
         root_resolved = root.resolve()
+        src_resolved = src.resolve()
+        if root_resolved != src_resolved and root_resolved not in src_resolved.parents:
+            return {"src": str(src),
+                    "reason": f"source is outside the root: {src_resolved}"}
         dst_resolved = dst.resolve()
         if root_resolved != dst_resolved and root_resolved not in dst_resolved.parents:
             return {"src": str(src),
                     "reason": f"destination escapes the root: {dst_resolved}"}
 
-        # Already in place (verify-only proposal): nothing to do, honestly.
-        if src.resolve() == dst_resolved:
+        # Already in place (verify-only proposal or already nested inside dest_dir):
+        # nothing to do, honestly (BH-A8).
+        if (src_resolved == dst_resolved
+                or item.get("rule") == "already-filed"
+                or (dest_dir.resolve() in src_resolved.parents and new_name == src.name)):
             return "skipped"
         if not src.exists():
             return {"src": str(src), "reason": "source vanished since planning — re-index"}
@@ -223,15 +255,22 @@ class Executor:
 
         decision = check_operation("move", src, dst, protected=self.protected,
                                    recent_guard_minutes=self.recent_guard)
+        if is_halted(self.runtime):
+            if report is not None:
+                report.halted = True
+            return {"src": str(src), "reason": "halted before move"}
         if decision.action == "conflict":
-            return self._to_conflicts(item, src, root, plan_id, current_hash)
+            return self._to_conflicts(item, src, root, plan_id, current_hash, report=report)
         if not decision.allowed:
             return {"src": str(src), "reason": decision.reason}
 
-        return self._journaled_move(src, dst, plan_id, current_hash)
+        return self._journaled_move(src, dst, plan_id, current_hash, report=report)
 
     def _journaled_move(self, src: Path, dst: Path, plan_id: int | None,
-                        sha_before: str, *, op: str = "move") -> str:
+                        sha_before: str, *, op: str = "move",
+                        report: ApplyReport | None = None) -> str | dict:
+        if is_halted(self.runtime):
+            return {"src": str(src), "reason": "halted before syscall"}
         dst.parent.mkdir(parents=True, exist_ok=True)
         # lstat (not stat) so a symlink journals its own size, not its target's.
         op_id = self.journal.begin(op, str(src), str(dst), plan_id=plan_id,
@@ -254,12 +293,15 @@ class Executor:
                 self.journal.mark_copied(op_id, sha_after)
             src.unlink()
             self.journal.commit(op_id, sha_after=sha_after)
+            if report is not None:
+                report.op_ids.append(op_id)
             return "applied"
         except Exception as exc:
             self.journal.fail(op_id, f"{type(exc).__name__}: {exc}")
             return {"src": str(src), "reason": str(exc)}
 
-    def _to_conflicts(self, item, src: Path, root: Path, plan_id: int, sha: str) -> str:
+    def _to_conflicts(self, item, src: Path, root: Path, plan_id: int, sha: str,
+                      *, report: ApplyReport | None = None) -> str | dict:
         conflicts = root / "_Conflicts"
         candidate = conflicts / src.name
         counter = 2
@@ -280,13 +322,20 @@ class Executor:
         if not decision.allowed:
             return {"src": str(src),
                     "reason": f"_Conflicts route refused: {decision.reason}"}
-        result = self._journaled_move(src, candidate, plan_id, sha)
+        result = self._journaled_move(src, candidate, plan_id, sha, report=report)
         return "conflict" if result == "applied" else result
 
     # -- trash (the only 'delete' shape allowed) ----------------------------------
     def trash(self, path: Path, *, plan_id: int | None = None) -> dict:
         """Move to assistant trash with a manifest. Nothing is ever rm'd."""
         path = Path(path)
+        if is_halted(self.runtime):
+            return {"trashed_as": None, "result": {"src": str(path), "reason": "halted"},
+                    "manifest": None}
+        if is_protected(path, self.protected):
+            return {"trashed_as": None,
+                    "result": {"src": str(path), "reason": f"protected path: {path}"},
+                    "manifest": None}
         self.trash_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         dest = self.trash_dir / f"{stamp}-{path.name}"
@@ -302,11 +351,15 @@ class Executor:
     # -- undo: journaled reversal, itself undoable (§4.2) ----------------------------
     def undo(self, *, op_id: int | None = None, plan_id: int | None = None,
              since_iso: str | None = None) -> dict:
+        if op_id is None and plan_id is None and since_iso is None:
+            raise ValueError(
+                "undo requires an explicit scope (op_id, plan_id, or since_iso)"
+            )
         if op_id is not None:
             op = self.store.get_operation(op_id)
-            operations = [op] if op and op["status"] == "committed" else []
+            operations = [op] if op and op["status"] in ("committed", "copied", "intent") else []
         else:
-            operations = self.store.committed_operations(
+            operations = self.store.undoable_operations(
                 plan_id=plan_id, since_iso=since_iso)
         undone, problems = 0, []
         for op in reversed(operations):  # reverse order, like unwinding a stack
@@ -314,15 +367,16 @@ class Executor:
                 problems.append({"reason": "halted mid-undo — remaining ops untouched"})
                 break
             src, dst = Path(op["dst"]), Path(op["src"])  # swap: dst is current home
+            expected_sha = op["sha256_after"] or op["sha256_before"]
             if not src.exists():
                 problems.append({"op": op["id"], "reason": f"{src} no longer exists"})
                 continue
-            if op["sha256_after"] and sha256_file(src) != op["sha256_after"]:
+            if expected_sha and sha256_file(src) != expected_sha:
                 problems.append({"op": op["id"],
                                  "reason": "content changed since the op — undo "
                                            "refused rather than clobber your edits"})
                 continue
-            if dst.exists() and sha256_file(dst) != (op["sha256_after"] or ""):
+            if dst.exists() and sha256_file(dst) != (expected_sha or ""):
                 problems.append({"op": op["id"],
                                  "reason": f"original location {dst} now occupied "
                                            "by different content — refused"})
@@ -330,11 +384,17 @@ class Executor:
             # Reuse the one journaled move path: create + verify destination
             # first, only then unlink the current home (cross-device safe).
             result = self._journaled_move(
-                src, dst, op["plan_id"], op["sha256_after"] or sha256_file(src),
+                src, dst, op["plan_id"], expected_sha or sha256_file(src),
                 op=op["op"])
             if result == "applied":
                 self.store.mark_rolled_back(op["id"])
                 undone += 1
+                if src.parent.name in ("_Conflicts", "_Unsorted"):
+                    try:
+                        if src.parent.is_dir() and not any(src.parent.iterdir()):
+                            src.parent.rmdir()
+                    except OSError:
+                        pass
             else:
                 problems.append({
                     "op": op["id"],

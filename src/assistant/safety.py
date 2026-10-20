@@ -29,7 +29,28 @@ class PolicyDecision:
 
 
 def expand(path: str | Path) -> Path:
-    return Path(path).expanduser()
+    return Path(os.path.expandvars(str(path))).expanduser()
+
+
+def _has_symlink_component(path: Path, stop_at: Path | None = None) -> bool:
+    """True if `path` or any ancestor down to `stop_at` is a symbolic link."""
+    cur = path
+    stop_resolved = stop_at.resolve() if stop_at is not None else None
+    visited: set[Path] = set()
+    while cur not in visited:
+        visited.add(cur)
+        if cur.is_symlink():
+            return True
+        if stop_resolved is not None:
+            try:
+                if cur.resolve() == stop_resolved:
+                    break
+            except OSError:
+                return True
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return False
 
 
 def assert_within_sandbox(path: str | Path, sandbox_root: str | Path) -> Path:
@@ -39,8 +60,18 @@ def assert_within_sandbox(path: str | Path, sandbox_root: str | Path) -> Path:
     executor calls this before any syscall in sandbox mode, so a real user path
     is refused at the last line of defence — not by prompt or convention.
     """
-    resolved = Path(path).expanduser().resolve()
-    root = Path(sandbox_root).expanduser().resolve()
+    raw_root = expand(sandbox_root)
+    raw_path = expand(path)
+    if _has_symlink_component(raw_root):
+        raise PermissionError(
+            f"demo sandbox refused: sandbox root {raw_root} involves a symlink (§19.3)."
+        )
+    root = raw_root.resolve()
+    if _has_symlink_component(raw_path, stop_at=raw_root):
+        raise PermissionError(
+            f"demo sandbox refused: {raw_path} traverses a symlink inside {root} (§19.3)."
+        )
+    resolved = raw_path.resolve()
     if resolved != root and root not in resolved.parents:
         raise PermissionError(
             f"demo sandbox refused: {resolved} is outside {root}. Show-off "
@@ -101,6 +132,8 @@ def check_operation(
     if dst is not None and is_protected(dst, protected):
         return PolicyDecision(False, f"protected destination: {expand(dst)}", "deny")
     if source.exists():
+        if source.is_dir():
+            return PolicyDecision(False, f"source is a directory: {source}", "deny")
         age_s = (now or time.time()) - source.stat().st_mtime
         if age_s < recent_guard_minutes * 60:
             return PolicyDecision(
@@ -112,6 +145,12 @@ def check_operation(
     if dst is not None:
         dest = expand(dst)
         if dest.exists():
+            if dest.is_dir():
+                return PolicyDecision(
+                    False,
+                    f"destination is an existing directory: {dest} — refused (§4.1)",
+                    "deny",
+                )
             # Never overwrite. Identical content is a no-op duplicate;
             # different content sends both to _Conflicts/ (§4.1).
             if source.exists() and sha256_file(source) == sha256_file(dest):

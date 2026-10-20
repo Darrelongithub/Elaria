@@ -1119,7 +1119,11 @@ class Daemon:
             result = self.showoff.enter(
                 command=str(params.get("command") or ""),
                 embedding=params.get("embedding"),
-                owner_present=bool(params.get("owner_present", False)))
+                owner_present=bool(params.get("owner_present", False)),
+                source=str(params.get("source") or "mic"),
+                replayed=bool(params.get("replayed", False)),
+                live_mic=bool(params.get("live_mic", True)),
+                audio_sha256=params.get("audio_sha256"))
         except ShowoffError as exc:
             raise ValueError(str(exc)) from exc
         speech = await self._maybe_speak_reply(
@@ -1215,10 +1219,16 @@ class Daemon:
         if not text:
             raise ValueError("ask needs params.text")
         speaker = str(params.get("speaker") or "owner").lower()
+        channel = str(params.get("channel") or "voice")
         showoff_now = self.showoff.status()
         # Speaker verification, when the caller supplies a verdict, is authority
         # here too: a voice that is not the owner never sees owner memory.
+        # During show-off mode, the room has guests by definition — any voice
+        # turn claiming to be the owner must pass voiceprint verification.
         verified = params.get("owner_verified")
+        if verified is None and showoff_now.get("active") and speaker == "owner" and channel == "voice":
+            verdict = self.showoff.verify_owner(params.get("embedding"))
+            verified = bool(verdict.get("verified"))
         if verified is False:
             speaker = "guest"
         if speaker != "owner":

@@ -43,19 +43,26 @@ def _parse_batch(text: str, allowed: set[str], expected_paths: set[str]) -> list
         return None
     if not isinstance(data, list):
         return None
+    seen_paths: set[str] = set()
     for entry in data:
         if not isinstance(entry, dict):
             return None
-        if entry.get("path") not in expected_paths:
-            return None  # hallucinated or dropped file
+        path = entry.get("path")
+        if path not in expected_paths or path in seen_paths:
+            return None  # hallucinated, dropped, or duplicate file (BH-D1)
+        seen_paths.add(path)
         if entry.get("dest") not in allowed:
             return None  # invented folder — the one unforgivable sin
         new_name = entry.get("new_name")
         if new_name not in (None, "") and not is_safe_filename(new_name):
             return None  # path escape via new_name (../../, absolute, a/b)
         confidence = entry.get("confidence")
-        if not isinstance(confidence, (int, float)) or not (0.0 <= confidence <= 1.0):
+        if (isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not (0.0 <= confidence <= 1.0)):
             return None
+    if seen_paths != expected_paths:
+        return None
     return data
 
 

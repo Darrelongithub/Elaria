@@ -56,10 +56,13 @@ SECRET_PATTERNS: tuple[str, ...] = (
     r"\b2fa\b",
     r"\botp\b",
     r"\bsecret\b",
+    r"\bsecrets\b",
     r"\bconfidential\b",
     r"\bdon'?t\s+tell\b",
     r"\bbetween\s+us\b",
     r"\bkeep\s+(?:this|it)\s+(?:quiet|between|secret)\b",
+    r"\b(?:medical|diagnosis|prescription|medication|lithium)\b",
+    r"\bvault\s+code\b",
 )
 
 # Plans and surprises: not credentials, still not for the room.
@@ -107,6 +110,9 @@ _PROBE_PATTERNS: tuple[str, ...] = (
     r"\bhow\s+does\s+(?:he|she)\s+(?:usually|normally)\b",
     r"\bhis\s+real\s+name\b",
     r"\bthe\s+owners?\s+(?:plans?|secrets?|password|schedule|files?)\b",
+    r"\b(?:tell|share)\b.{0,40}\b(?:about\s+(?:me|him|her|the\s+owner|the\s+boss))\b",
+    r"\bwhat\s+are\s+(?:his|her|the\s+owners?)\s+secrets?\b",
+    r"\bwhat\s+is\s+(?:he|she|the\s+owner)\s+working\s+on\b",
 )
 
 _CREDENTIAL_IN_REPLY = re.compile(

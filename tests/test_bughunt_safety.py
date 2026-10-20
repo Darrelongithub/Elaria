@@ -287,7 +287,6 @@ def test_taxonomy_symlink_cannot_smuggle_file_outside_root(config, tmp_path):
     assert not (outside / "invoice.txt").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-A4: protected paths ignore $VAR expansion")
 def test_protected_path_env_var_spelling_is_honoured(tmp_path, monkeypatch):
     fake_home = tmp_path / "home"
     secret = aged(fake_home / "secret" / "id.txt", "secret")
@@ -297,7 +296,6 @@ def test_protected_path_env_var_spelling_is_honoured(tmp_path, monkeypatch):
 
 # -- B: crash boundaries / hostile filesystem -------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="BH-B1: intent-phase ops are not undoable/recoverable")
 def test_kill_after_move_before_commit_can_be_undone(config, tmp_path):
     root = tmp_path / "docs"
     src = aged(root / "invoice.txt", "moved then process died")
@@ -320,7 +318,6 @@ def test_kill_after_move_before_commit_can_be_undone(config, tmp_path):
     assert undo["undone"] == 1 and src.exists() and not moved.exists()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-B2: partial cross-device copy is left behind")
 def test_disk_full_mid_move_leaves_no_partial_destination(config, tmp_path, monkeypatch):
     root = tmp_path / "docs"
     src = aged(root / "invoice.txt", "complete source")
@@ -341,7 +338,6 @@ def test_disk_full_mid_move_leaves_no_partial_destination(config, tmp_path, monk
     assert not (root / "Finance" / "invoice.txt").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-B3: unscoped undo unwinds all history")
 def test_bare_undo_refuses_without_scope(config, tmp_path):
     root = tmp_path / "docs"
     old = aged(root / "invoice-old.txt", "old plan")
@@ -408,7 +404,6 @@ def test_never_send_added_later_reflags_unchanged_documents(config, tmp_path):
 
 # -- C: halt / trash ---------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="BH-C1: halt is not re-checked before the syscall")
 def test_halt_landing_after_policy_check_prevents_the_move(
         config, tmp_path, monkeypatch):
     root = tmp_path / "docs"
@@ -432,7 +427,6 @@ def test_halt_landing_after_policy_check_prevents_the_move(
     assert src.exists() and not (root / "Finance" / "invoice.txt").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-C2: trash bypasses protected/halt policy")
 def test_trash_refuses_protected_paths_and_halt(config, tmp_path):
     protected_root = tmp_path / "protected"
     doomed = aged(protected_root / "keep.txt", "protected")
@@ -448,7 +442,6 @@ def test_trash_refuses_protected_paths_and_halt(config, tmp_path):
 
 # -- A continued: executor must distrust its plan/spec pairing -----------------
 
-@pytest.mark.xfail(strict=True, reason="BH-A5: executor does not verify plan root == spec root")
 def test_plan_for_one_root_cannot_be_applied_with_another_root_spec(config, tmp_path):
     root_a = tmp_path / "a"
     root_b = tmp_path / "b"
@@ -464,7 +457,6 @@ def test_plan_for_one_root_cannot_be_applied_with_another_root_spec(config, tmp_
     assert not (root_a / "Finance" / "invoice.txt").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-A6: executor does not require src inside the root")
 def test_plan_item_source_outside_root_is_refused(config, tmp_path):
     root = tmp_path / "docs"
     outside = aged(tmp_path / "outside" / "invoice.txt", "outside")
@@ -479,7 +471,6 @@ def test_plan_item_source_outside_root_is_refused(config, tmp_path):
     assert not (root / "Finance" / "invoice.txt").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-A7: executor accepts destinations outside taxonomy")
 def test_plan_item_invented_destination_is_refused(config, tmp_path):
     root = tmp_path / "docs"
     src = aged(root / "invoice.txt", "stay")
@@ -492,7 +483,6 @@ def test_plan_item_invented_destination_is_refused(config, tmp_path):
     assert not (root / "Invented" / "invoice.txt").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-A8: nested already-filed files are flattened")
 def test_nested_already_filed_file_is_not_flattened(config, tmp_path):
     root = tmp_path / "docs"
     src = aged(root / "Finance" / "2024" / "invoice.txt", "already nested")
@@ -506,7 +496,6 @@ def test_nested_already_filed_file_is_not_flattened(config, tmp_path):
     assert not (root / "Finance" / "invoice.txt").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-A9: destination directory crashes policy hashing")
 def test_destination_occupied_by_directory_is_refused_not_raised(config, tmp_path):
     root = tmp_path / "docs"
     src = aged(root / "invoice.txt", "incoming")
@@ -521,7 +510,6 @@ def test_destination_occupied_by_directory_is_refused_not_raised(config, tmp_pat
     assert src.exists() and blocker.is_dir()
 
 
-@pytest.mark.xfail(strict=True, reason="BH-A10: ApplyReport.op_ids is never populated")
 def test_apply_report_names_the_journal_operations_it_committed(config, tmp_path):
     root = tmp_path / "docs"
     src = aged(root / "invoice.txt", "journal me")

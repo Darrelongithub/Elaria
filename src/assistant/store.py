@@ -901,6 +901,16 @@ class Store:
                 (ts, exit_reason, guests_heard, declined_requests, session_id))
             self._conn.commit()
 
+    def update_showoff_counts(self, session_id: int, *, guests_heard: int,
+                              declined_requests: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                """UPDATE showoff_sessions
+                   SET guests_heard = ?, declined_requests = ?, audio_retained = 0
+                   WHERE id = ?""",
+                (guests_heard, declined_requests, session_id))
+            self._conn.commit()
+
     def list_showoff_sessions(self, limit: int = 20) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
@@ -918,6 +928,20 @@ class Store:
     def committed_operations(self, *, plan_id: int | None = None,
                              since_iso: str | None = None) -> list[dict]:
         query = "SELECT * FROM operations WHERE status = 'committed'"
+        params: list = []
+        if plan_id is not None:
+            query += " AND plan_id = ?"
+            params.append(plan_id)
+        if since_iso:
+            query += " AND ts >= ?"
+            params.append(since_iso)
+        with self._lock:
+            rows = self._conn.execute(query + " ORDER BY id", params).fetchall()
+        return [dict(r) for r in rows]
+
+    def undoable_operations(self, *, plan_id: int | None = None,
+                            since_iso: str | None = None) -> list[dict]:
+        query = "SELECT * FROM operations WHERE status IN ('committed', 'copied', 'intent')"
         params: list = []
         if plan_id is not None:
             query += " AND plan_id = ?"

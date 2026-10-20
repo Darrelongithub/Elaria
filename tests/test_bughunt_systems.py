@@ -50,7 +50,6 @@ def test_must_not_act_phrases_do_not_route_to_local_actions(phrase):
     assert route(phrase) is None
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D1: planner verifier accepts duplicate/dropped paths")
 def test_llm_batch_with_duplicate_path_and_missing_file_is_invalid():
     payload = json.dumps([
         {"path": "/r/a.txt", "dest": "Finance", "confidence": 0.99},
@@ -59,7 +58,6 @@ def test_llm_batch_with_duplicate_path_and_missing_file_is_invalid():
     assert _parse_batch(payload, {"Finance"}, {"/r/a.txt", "/r/b.txt"}) is None
 
 
-@pytest.mark.xfail(strict=True, reason="BH-D1: boolean is accepted as model confidence")
 def test_llm_batch_boolean_confidence_is_invalid():
     payload = json.dumps([
         {"path": "/r/a.txt", "dest": "Finance", "confidence": True},
