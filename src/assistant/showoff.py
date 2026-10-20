@@ -58,6 +58,10 @@ STOP_PHRASES = (
     "that's enough",
 )
 
+# Audio extensions the demo could ever write into its sandbox. Recovery
+# sweeps ONLY these, and ONLY inside the sandbox (BH-I6).
+DEMO_AUDIO_SUFFIXES = (".wav", ".pcm", ".ogg", ".flac", ".mp3", ".raw")
+
 ANNOUNCEMENT = (
     "Demo mode on. I'll answer questions and show you what I do. His files, "
     "messages, settings and private life stay closed — and the demo only "
@@ -283,14 +287,42 @@ class ShowoffService:
                     int(row["id"]), ts=iso_now(), exit_reason="daemon_restart",
                     guests_heard=int(row.get("guests_heard") or 0),
                     declined_requests=int(row.get("declined_requests") or 0))
-        if recovered and self.config is not None:
-            audio_dir = Path(self.config.data_dir) / "audio"
-            if audio_dir.is_dir():
-                for wav in audio_dir.glob("*.wav"):
-                    try:
-                        wav.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+        if recovered:
+            self._purge_sandbox_audio()
+
+    def _purge_sandbox_audio(self) -> None:
+        """Remove audio residue from the DEMO SANDBOX only (BH-I6).
+
+        The previous sweep globbed `data_dir/audio` — the shared recordings
+        folder where dictation (`transcribe.py`) and meeting captures live and
+        which §12.5 calls "the record". A crash during a demo therefore deleted
+        the owner's dictation and meeting WAVs on the next start. The demo never
+        writes outside its own sandbox, so the sandbox is the only place residue
+        can exist.
+        """
+        sandbox = self.sandbox_path()
+        if not sandbox.is_dir() or sandbox.is_symlink():
+            return
+        removed = 0
+        for path in sandbox.rglob("*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            if path.suffix.lower() not in DEMO_AUDIO_SUFFIXES:
+                continue
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                # A residue file we cannot delete is a privacy fact worth a row.
+                self.store.log_persona_event(
+                    iso_now(), "showoff",
+                    json.dumps({"event": "residue_purge_failed",
+                                "path": str(path), "error": str(exc)}))
+        if removed:
+            self.store.log_persona_event(
+                iso_now(), "showoff",
+                json.dumps({"event": "residue_purged", "files": removed,
+                            "scope": "demo-sandbox"}))
 
     def active(self) -> bool:
         self._expire_if_needed()

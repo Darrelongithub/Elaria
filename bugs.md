@@ -1019,3 +1019,260 @@ their own CRITICAL class.
   (so TOML parsed them inside `transcribe-batch`), 10 keys drifted between
   `DEFAULTS` and `config.toml.example`, and `run_doctor()` had no schema check.
 
+
+---
+
+## Area I — Second hardening pass (2026-10-20, `arena/8952fe51-elaria`)
+
+All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
+(written first; 24 of its 28 cases failed before any fix).
+
+### BH-I1 — Deprecated `gemini.model_voice` still beat an explicit `gemini_voice_model`
+
+- **Severity:** wrong-behaviour (voice identity)
+- **Status:** fixed in this pass
+- **Repro:** `test_voice_model_explicit_new_key_wins_over_legacy_alias`
+  (and `test_voice_model_legacy_alias_is_still_read_when_alone`)
+- **Expected:** a key the owner's TOML actually names wins; the legacy alias is
+  read only when the new key is absent, and never when it holds the removed
+  TTS-preview id.
+- **Actual (before):** `voice_model()` preferred any non-removed `model_voice`
+  over `gemini_voice_model`. `BH-H4` had only filtered the specific removed id
+  `gemini-2.5-flash-preview-tts`, so a file carrying both keys still spoke the
+  legacy model while doctor reported the new key as authoritative.
+
+### BH-I2 — Config poisoning passed validation and crashed the readers
+
+- **Severity:** crash-with-safe-state / wrong-action
+- **Status:** fixed in this pass
+- **Repro:** `test_validate_config_names_poisoned_keys`,
+  `test_doctor_survives_poisoned_config`,
+  `test_speech_status_survives_poisoned_tts_values`,
+  `test_organise_roots_rejects_bad_entries`
+- **Expected:** `validate_config()` names the key, the expected shape and the
+  bad value; `Config.section()` returns `{}` for a non-table; `organise_roots()`
+  raises a named `ValueError`; doctor completes and reports.
+- **Actual (before):** `gemini.mode="bogus"`, `tts.speaker="loud"`,
+  `gemini.allowed_voices=5` and `organise.roots=[{"mode":"shadow"}]` all passed
+  with zero errors/warnings. Downstream: `SpeechService.status()` raised
+  `TypeError: 'int' object is not iterable`, `organise_roots()` raised
+  `KeyError: 'path'`, and unknown keys were silently accepted (the
+  accept-and-ignore bug class the task forbids).
+
+### BH-I3 — `[console] history_limit` was documented but ignored
+
+- **Severity:** wrong-behaviour
+- **Status:** fixed in this pass
+- **Repro:** `test_daemon_uses_console_history_limit`
+- **Expected:** the daemon's one `SessionService` is constructed with the
+  configured limit; `history_limit = 1` retains one message.
+- **Actual (before):** daemon used the `SessionService` default (200) while
+  `console.history` honoured the config, so follow-mode and print-mode
+  disagreed about the same conversation.
+
+### BH-I4 — A timed-out reply was synthesised and played twice
+
+- **Severity:** wrong-behaviour (double audio, owner-visible)
+- **Status:** fixed in this pass
+- **Repro:** `test_timed_out_reply_is_spoken_once`
+- **Expected:** one synthesis per utterance; a slow render keeps running in the
+  background and the handler returns `queued=True`.
+- **Actual (before):** `_maybe_speak_reply` waited 1.5 s, timed out, and queued
+  `_speak_reply_async`; the original `to_thread` call was never cancelled, so a
+  1.9 s utterance was spoken twice, overlapping.
+
+### BH-I5 — Post-guard echo check suppressed legitimate short replies
+
+- **Severity:** wrong-behaviour
+- **Status:** fixed in this pass
+- **Repro:** `test_short_user_reply_is_not_echo_after_guard`
+- **Expected:** with the speaking guard expired, `"No."` is a user turn even if
+  her last sentence contained the word.
+- **Actual (before):** `_is_echo` used two-way substring containment, so any
+  short reply (`"No."`, `"Yes."`, `"Ok."`) that appeared anywhere in her previous
+  utterance was discarded as echo. Reproduced with
+  `_speaking_until = 0` and `"No. Not at this hour."`.
+
+### BH-I6 — Show-off crash recovery deleted EVERY dictation and meeting recording
+
+- **Severity:** data-loss
+- **Status:** fixed in this pass
+- **Repro:** `test_showoff_crash_recovery_never_deletes_dictation_or_meeting_audio`
+  (and the corrected `test_bh_h20_showoff_crash_exit_residue_cleaned_on_restart`)
+- **Expected:** recovery purges only the demo sandbox, where the demo ever wrote.
+- **Actual (before):** `_reconcile()` globbed `data_dir/audio/*.wav` and
+  unlinked every match on the first start after `kill -9` — including
+  dictation WAVs and `meeting-<stamp>-{mic,system}.wav`, i.e. the §12.5 record.
+  The `BH-H20` test had encoded that deletion as the contract; it was corrected,
+  not deleted (see `change.md`).
+
+### BH-I7 — `initiative.status()["latest"]` reported the OLDEST pending knock
+
+- **Severity:** wrong-behaviour
+- **Status:** fixed in this pass
+- **Repro:** `test_initiative_latest_is_newest_pending`
+- **Expected:** `latest` is the newest pending knock (`list_knocks()` is id DESC).
+- **Actual (before):** `pending[-1]` returned the oldest, so Waybar and the
+  console announced a stale knock while a newer one was waiting.
+
+### BH-I7b — A due knock refused every cycle was silent
+
+- **Severity:** wrong-behaviour (observability)
+- **Status:** fixed in this pass
+- **Repro:** `test_due_loop_refusal_is_logged_not_swallowed`
+- **Expected:** an `InitiativeError` while raising a due knock leaves the row
+  snoozed but writes a `knock_due_refused` persona event (knock id, topic,
+  reason).
+- **Actual (before):** `except InitiativeError: continue` — a commitment that
+  could never be raised vanished from all evidence surfaces while `pending`
+  stayed non-zero.
+
+### BH-I8 — Two daemons could still race the check-unlink-bind window
+
+- **Severity:** crash-with-safe-state (socket loss)
+- **Status:** fixed in this pass
+- **Repro:** `test_ipc_serve_refuses_when_daemon_lock_is_held`,
+  `test_ipc_serve_reclaims_stale_lock`
+- **Expected:** `serve()` takes an exclusive `flock` on `<sock>.lock` before
+  probing/unlinking; a held lock raises `RuntimeError("already running")`; the
+  lock is released when the server closes.
+- **Actual (before):** two starts that both observed a stale socket could both
+  unlink and bind; one could delete the other's freshly bound socket (the
+  `BH-H21` probe only narrowed the window, it did not close it).
+
+### BH-I9 — Malformed IPC frames escaped as raw JSON errors; reply drain was unbounded
+
+- **Severity:** crash-with-safe-state / hang
+- **Status:** fixed in this pass
+- **Repro:** `test_ipc_call_malformed_reply_is_daemon_unavailable`,
+  `test_subscribe_events_skips_malformed_lines`,
+  `test_play_audio_timeout_is_reported`
+- **Expected:** `call()` raises `DaemonUnavailable` naming the malformed reply;
+  event consumers skip non-object frames; a client that stops reading cannot
+  park the handler (5 s drain bound); a player timeout is surfaced in
+  `last_voice_error`.
+- **Actual (before):** `json.loads` inside `call()` leaked `JSONDecodeError`
+  (not a CLI error class), `subscribe_events()` killed the iterator on a torn
+  line, `writer.drain()` had no bound, and `play_audio()` swallowed
+  `TimeoutExpired` into a bare `False`.
+
+### BH-I10 — A failed catalogue refresh downgraded a verified cache; timestamp-less cache was trusted
+
+- **Severity:** wrong-action (voice selection)
+- **Status:** fixed in this pass
+- **Repro:** `test_catalogue_refresh_falls_back_to_verified_cache`,
+  `test_catalogue_cache_without_timestamp_is_not_trusted`
+- **Expected:** a refresh that returns nothing falls back to the verified cached
+  catalogue and says why; a cache row with no `retrieved` stamp is unusable.
+- **Actual (before):** `refresh=True` skipped the cache and returned the
+  committed baseline (never checked against the API), and `load_cached()` with
+  `max_age_s=None` accepted a cache row with no timestamp.
+
+### BH-I11 — Needy framing survived paraphrases
+
+- **Severity:** wrong-behaviour (persona boundary)
+- **Status:** fixed in this pass
+- **Repro:** `test_needy_paraphrases_rejected` (7 parametrised openers, e.g.
+  "it's been quiet lately", "just checking you still want me",
+  "you've been away")
+- **Expected:** `NeedinessError` before any knock/speech.
+- **Actual (before):** the `NEEDY_PATTERNS` list missed all seven; two of the
+  seven were already caught by earlier patterns and stayed as regression pins.
+
+### BH-I12 — A guest turn had no network timeout at all
+
+- **Severity:** crash-unsafe (hung demo)
+- **Status:** fixed in this pass
+- **Repro:** `test_guest_turn_is_time_bounded`
+- **Expected:** guest generation is bounded by the same 4 s ceiling as owner
+  turns; a timeout yields a spoken fallback and the demo continues.
+- **Actual (before):** `_guest_turn` called `asyncio.to_thread(self.client.generate, ...)`
+  with no `wait_for`, so a stalled Live transport froze the show-off until the
+  process was killed. The `TypeError`-as-feature-detect retry around it could
+  also only fire after awaiting.
+
+### BH-I13 — Waybar/console streams died on one malformed event line
+
+- **Severity:** crash-with-safe-state (display only)
+- **Status:** fixed in this pass
+- **Repro:** `test_waybar_stream_survives_malformed_event_line`
+- **Expected:** a non-JSON or non-object line is skipped and the stream keeps
+  yielding.
+- **Actual (before):** `json.loads(line)` in `stream_waybar()` raised and ended
+  the generator; the bar froze until restart.
+
+---
+
+## Area J — Second-batch pins (2026-10-20, same branch)
+
+Reproduced with `tests/test_hardening_pass2b.py` (5 cases; J1, J2 and J3 were
+red before their fixes, J4/J5 were missing helpers, J6 was reproduced by
+running the documented command chain).
+
+### BH-J1 — Guest speech was written into the OWNER's conversation record
+
+- **Severity:** privacy boundary / record contamination
+- **Status:** fixed in this pass
+- **Repro:** `test_non_owner_voice_never_enters_owner_conversation`,
+  `test_showoff_guest_turn_never_enters_owner_conversation`
+- **Expected:** the §16 conversation contains only turns addressed to the owner;
+  a non-owner voice is audited through `disclosure.log_guest` and broadcast, but
+  not persisted as `user`/`assistant` history.
+- **Actual (before):** both guest paths (`_guest_turn_normal` for a TV/room
+  voice, `_guest_turn` for show-off) called `sessions.append` twice. A guest
+  utterance therefore appeared in `assist console`, was loaded as `prior_turns`
+  context for the owner's next model turn, and was stored in SQLite as the
+  owner's conversation. In show-off, guest turns also had no
+  `disclosure.log_guest` row at all.
+
+### BH-J2 — One connectivity probe error killed the posture loop
+
+- **Severity:** crash-unsafe (frozen state)
+- **Status:** fixed in this pass
+- **Repro:** `test_connectivity_loop_survives_a_failing_tick`
+- **Expected:** a failed probe is logged and the loop keeps its cadence.
+- **Actual (before):** `_connectivity_loop` was a bare `while True` around
+  `mode_manager.refresh(force=True)`. The first exception (DB locked, socket
+  race, transient parse error) ended the background task silently. The daemon
+  kept serving with a frozen connectivity posture — it could not transition to
+  or from `OFFLINE`/`FORCED_OFFLINE` again, so queue drain and voice routing
+  stayed stale until restart.
+
+### BH-J3 — A second `assistd` printed a traceback instead of one line
+
+- **Severity:** cosmetic (diagnosability)
+- **Status:** fixed in this pass
+- **Repro:** `test_second_daemon_exits_cleanly_with_one_line`
+- **Expected:** `assistd: another daemon is already running …`, exit 1.
+- **Actual (before):** the `RuntimeError` from `ipc.serve()` escaped `main()`
+  as a full traceback. The first fix attempt in this pass also proved the test
+  catches a missing `import sys` (NameError inside the handler), which is why
+  the assertion is on stderr text, not just the exit code.
+
+### BH-J4 — `assist forget <topic>` claimed "No argument, as designed."
+
+- **Severity:** cosmetic (misleading output)
+- **Status:** fixed in this pass
+- **Repro:** `test_forget_message_names_the_topic_it_searched`
+- **Expected:** name the topic searched and whether anything matched.
+- **Actual (before):** the message was written when the topic argument was
+  optional; with the now-required argument every miss printed the stale
+  no-argument sentence. The parser help also still said "no argument".
+
+### BH-J5 — Daemon refusals printed "refused: refused: …"
+
+- **Severity:** cosmetic
+- **Status:** fixed in this pass
+- **Repro:** `test_refusal_text_does_not_double_the_prefix`
+- **Expected:** exactly one prefix.
+- **Actual (before):** `raise_knock` already raises `InitiativeError("refused: …")`
+  and the CLI wrapped every exception in `refused: {exc}`.
+
+### BH-J6 — README's `assist status && assist cost` chain stops when the daemon is down
+
+- **Severity:** documentation (stale command)
+- **Status:** fixed in this pass (README changed to `assist status; assist cost`)
+- **Repro:** run both commands with no daemon: `assist status` correctly prints a
+  `running: false` snapshot but exits 1 (service-down signal), so `&&` skips
+  `cost` — the command you most want when the daemon is down.
+- **Expected:** the documented command always shows cost.

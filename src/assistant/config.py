@@ -56,6 +56,12 @@ def canonical_voices(config) -> tuple[str, ...]:
     The one-voice rule as data: the list is the whole policy, so approving a
     different voice is a config edit the owner makes on purpose (VB-4) and never
     something a stray `voice = "..."` achieves by itself.
+
+    A value that is not a string or a list is an invalid config and
+    `validate_config()`/`doctor` names the key; at runtime it falls back to the
+    shipped answer rather than crashing the speech path (BH-I2). Falling back
+    to Flare cannot widen the policy: no other voice can be selected by
+    accident.
     """
     gemini = config.section("gemini") if config else {}
     allowed = gemini.get("allowed_voices")
@@ -66,7 +72,10 @@ def canonical_voices(config) -> tuple[str, ...]:
         allowed = ["Flare"]
     if isinstance(allowed, str):
         allowed = [allowed]
-    return tuple(str(item) for item in allowed if str(item).strip())
+    if not isinstance(allowed, (list, tuple)):
+        allowed = ["Flare"]
+    return tuple(str(item) for item in allowed
+                 if isinstance(item, str) and item.strip())
 
 
 def resolve_voice(config, requested: str | None = None) -> tuple[str, bool]:
@@ -87,6 +96,10 @@ def resolve_voice(config, requested: str | None = None) -> tuple[str, bool]:
 # blindly.
 DEFAULT_VOICE_MODEL = "gemini-3.8-live"
 
+# The TTS-preview default that `model_voice` used to point at. It is the reason
+# Flare was unsupported; it must never shadow the explicit key (BH-H4).
+REMOVED_TTS_MODEL = "gemini-2.5-flash-preview-tts"
+
 
 def voice_model(config) -> str:
     """`[gemini] gemini_voice_model`, with the old `model_voice` as an alias.
@@ -94,14 +107,24 @@ def voice_model(config) -> str:
     `model_voice` used to point at a TTS-preview model, which is exactly the bug
     that made Flare unsupported. It is still read (so an owner's existing file
     does not silently revert to a default) but new configs use the explicit key,
-    and the removed old default (`gemini-2.5-flash-preview-tts`) never shadows
-    `gemini_voice_model` (BH-H4).
+    and the removed old default never shadows `gemini_voice_model` (BH-H4).
+
+    Precedence is decided by *intent*, not by value equality (BH-I1): if the
+    owner's file names `gemini_voice_model` (or sets it to anything other than
+    the shipped default), that key wins even when a stale `model_voice` row is
+    still present. Without this, a file carrying both keys kept speaking the
+    legacy model while `doctor` said the new key was in charge.
     """
     gemini = config.section("gemini") if config else {}
     explicit = gemini.get("gemini_voice_model")
     legacy = gemini.get("model_voice")
-    if legacy and legacy != "gemini-2.5-flash-preview-tts" and (
-            not explicit or str(explicit) == DEFAULT_VOICE_MODEL):
+    named_modern = (
+        config.explicit("gemini", "gemini_voice_model")
+        or (explicit is not None and str(explicit) != DEFAULT_VOICE_MODEL)
+    )
+    if named_modern and explicit:
+        return str(explicit)
+    if legacy and legacy != REMOVED_TTS_MODEL:
         return str(legacy)
     return str(explicit or legacy or DEFAULT_VOICE_MODEL)
 
@@ -492,16 +515,28 @@ class Config:
     gemini_mode: str
     gemini_mode_source: str  # "env" | "config" | "auto-no-key" | "auto-key"
     _api_key: str | None = field(default=None, repr=False)
+    # Keys the owner's file actually names (not merged defaults). Intent matters
+    # where two spellings of the same setting exist (BH-I1).
+    explicit_keys: dict[str, set[str]] = field(default_factory=dict, repr=False)
 
     # -- section accessors -------------------------------------------------
     def section(self, name: str) -> dict:
-        return dict(self.raw.get(name, {}))
+        value = self.raw.get(name, {})
+        # A section poisoned to a scalar is an invalid config that
+        # `validate_config()` reports by name; readers still get a mapping so a
+        # daemon/doctor run degrades instead of crashing on `dict("x")`.
+        return dict(value) if isinstance(value, dict) else {}
+
+    def explicit(self, section: str, key: str) -> bool:
+        """Did the owner's config file name this key (vs a merged default)?"""
+        return key in self.explicit_keys.get(section, set())
 
     def model_for_role(self, role: str) -> str:
-        gemini = self.raw["gemini"]
+        gemini = self.section("gemini")
         if role == "voice":
             return voice_model(self)
-        return gemini.get(f"model_{role}", gemini["model_default"])
+        return str(gemini.get(f"model_{role}")
+                   or gemini.get("model_default") or "")
 
     def voice_model(self) -> str:
         """The Live model that owns native audio (Stage A: `gemini_voice_model`)."""
@@ -515,20 +550,45 @@ class Config:
     def organise_roots(self) -> list[dict]:
         """Normalised [[organise.roots]] entries: expanded paths, per-root
         mode defaulting to shadow (§4.3 — new roots NEVER start live),
-        frozen taxonomy with the _Unsorted escape hatch guaranteed."""
+        frozen taxonomy with the _Unsorted escape hatch guaranteed.
+
+        Invalid entries are refused by name (BH-I2). A made-up mode used to be
+        stored verbatim in the plan row and a missing `path` raised a bare
+        `KeyError`; both are config errors the owner must see, not crashes.
+        """
         organise = self.section("organise")
+        entries = organise.get("roots") or []
+        if not isinstance(entries, list):
+            raise TypeError(
+                "[organise] roots must be a list of [[organise.roots]] tables")
         roots = []
-        for entry in organise.get("roots") or []:
+        for index, entry in enumerate(entries):
+            where = f"[organise.roots] entry {index}"
+            if not isinstance(entry, dict):
+                raise TypeError(f"{where} must be a table, not {type(entry).__name__}")
+            raw_path = entry.get("path")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise ValueError(
+                    f"{where} is missing a non-empty `path` "
+                    "(organise.roots.path is required)")
+            mode = str(entry.get("mode", "shadow")).strip().lower() or "shadow"
+            if mode not in ("shadow", "live"):
+                raise ValueError(
+                    f"{where} has mode={entry.get('mode')!r}; organise.roots.mode "
+                    "must be 'shadow' or 'live' (new roots start in shadow, §4.3)")
             raw_taxonomy = entry.get("taxonomy") or []
             if isinstance(raw_taxonomy, str):
                 raw_taxonomy = [raw_taxonomy]
+            if not isinstance(raw_taxonomy, (list, tuple)):
+                raise TypeError(
+                    f"{where} taxonomy must be a string or a list of strings")
             taxonomy = [str(t) for t in raw_taxonomy if str(t).strip()]
             for required in ("_Unsorted", "_Conflicts"):
                 if required not in taxonomy:
                     taxonomy.append(required)
             roots.append({
-                "path": str(Path(entry["path"]).expanduser()),
-                "mode": entry.get("mode", "shadow"),
+                "path": str(Path(raw_path).expanduser()),
+                "mode": mode,
                 "taxonomy": taxonomy,
             })
         return roots
@@ -563,9 +623,16 @@ class Config:
         return self.data_dir / "fixtures"
 
     def humour_profile_path(self) -> Path | None:
-        """Locate humour.toml: persona dir first, then repo root (dev)."""
-        configured = Path(self.raw["persona"]["humour_profile"]).expanduser()
-        if configured.exists():
+        """Locate humour.toml: persona dir first, then repo root (dev).
+
+        A poisoned `[persona] humour_profile` (wrong type, or a section that is
+        not a table) must leave the governor at its restraint default rather
+        than crash every `assist` invocation (BH-I2).
+        """
+        configured_value = self.section("persona").get("humour_profile")
+        configured = (Path(str(configured_value)).expanduser()
+                      if configured_value else None)
+        if configured is not None and configured.exists():
             return configured
         repo_root = Path(__file__).resolve().parents[2] / "humour.toml"
         if repo_root.exists():
@@ -597,9 +664,16 @@ def load_config() -> Config:
     ).expanduser()
     raw = _deep_merge(DEFAULTS, {})
     found = config_path.exists()
+    explicit_keys: dict[str, set[str]] = {}
     if found:
         with config_path.open("rb") as handle:
-            raw = _deep_merge(raw, tomllib.load(handle))
+            user_raw = tomllib.load(handle)
+        raw = _deep_merge(raw, user_raw)
+        explicit_keys = {
+            section: set(values)
+            for section, values in user_raw.items()
+            if isinstance(values, dict)
+        }
 
     env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     file_key, file_mode = _read_env_file(config_home() / "assistant" / "gemini.env")
@@ -611,10 +685,12 @@ def load_config() -> Config:
         api_key, source = None, "none"
 
     env_mode = os.environ.get("GEMINI_MODE", "").strip().lower()
+    file_gemini = raw.get("gemini") if isinstance(raw.get("gemini"), dict) else {}
     if env_mode in VALID_MODES:
         mode, mode_source = env_mode, "env"
-    elif raw["gemini"].get("mode") in VALID_MODES and "mode" in _file_sections(config_path):
-        mode, mode_source = raw["gemini"]["mode"], "config"
+    elif (file_gemini.get("mode") in VALID_MODES
+          and "mode" in explicit_keys.get("gemini", set())):
+        mode, mode_source = file_gemini["mode"], "config"
     elif api_key:
         mode, mode_source = "live", "auto-key"
     else:
@@ -631,19 +707,8 @@ def load_config() -> Config:
         gemini_mode=mode,
         gemini_mode_source=mode_source,
         _api_key=api_key,
+        explicit_keys=explicit_keys,
     )
-
-
-def _file_sections(config_path: Path) -> set[str]:
-    """Top-level keys actually present in the user's file (vs defaults)."""
-    if not config_path.exists():
-        return set()
-    try:
-        with config_path.open("rb") as handle:
-            parsed = tomllib.load(handle)
-        return {"mode"} if "mode" in parsed.get("gemini", {}) else set()
-    except Exception:
-        return set()
 
 
 def load_humour_profile(config: Config) -> dict:
@@ -669,70 +734,246 @@ _KNOWN_DEPRECATED_KEYS: dict[tuple[str, str], str] = {
 }
 
 
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _number_error(errors: list[str], path: str, value, *,
+                  minimum: float | None = None,
+                  maximum: float | None = None,
+                  integer: bool = False) -> None:
+    """One shape check that never raises on a poisoned value."""
+    if value is None:
+        return
+    if not _is_number(value) or (integer and int(value) != value):
+        errors.append(f"{path}={value!r} must be {'an integer' if integer else 'a number'}")
+        return
+    if minimum is not None and value < minimum:
+        errors.append(f"{path}={value!r} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        errors.append(f"{path}={value!r} must be <= {maximum}")
+
+
+def _bool_error(errors: list[str], path: str, value) -> None:
+    if value is not None and not isinstance(value, bool):
+        errors.append(f"{path}={value!r} must be true or false")
+
+
+def _string_list_error(errors: list[str], path: str, value) -> None:
+    if value is None:
+        return
+    if isinstance(value, str):
+        return
+    if (not isinstance(value, (list, tuple))
+            or any(not isinstance(item, str) or not item.strip() for item in value)):
+        errors.append(f"{path}={value!r} must be a string or a list of non-empty strings")
+
+
+def _valid_hhmm(value) -> bool:
+    try:
+        hour, minute = str(value).split(":")
+        return 0 <= int(hour) < 24 and 0 <= int(minute) < 60
+    except (TypeError, ValueError):
+        return False
+
+
 def validate_config(config: Config) -> dict:
     """Validate `config.raw` against `DEFAULTS` for unknown keys, deprecated
-    aliases, negative quotas, and invalid mode/posture values (BH-H22)."""
+    aliases, negative quotas, wrong types and invalid mode/posture values.
+
+    The rule is "doctor names the key, the daemon does not crash": every check
+    below reports `[section] key` and tolerates a value of any type (BH-H22,
+    BH-I2). Warnings are still configuration drift; errors are values no code
+    path can honour.
+    """
     warnings: list[str] = []
     errors: list[str] = []
     raw = config.raw if config else {}
+    if not isinstance(raw, dict):
+        return {"ok": False, "errors": ["config root must be a table"],
+                "warnings": [], "detail": "INVALID: config root must be a table"}
+
     for sec, sec_val in raw.items():
         if sec not in DEFAULTS:
             warnings.append(f"unknown section [{sec}]")
             continue
         default_sec = DEFAULTS[sec]
-        if not isinstance(sec_val, dict) or not isinstance(default_sec, dict):
+        if not isinstance(sec_val, dict):
+            errors.append(f"section [{sec}] must be a table, not "
+                          f"{type(sec_val).__name__}")
             continue
-        for key in sec_val:
+        if not isinstance(default_sec, dict):
+            continue
+        for key, value in sec_val.items():
             if key.startswith("_"):
                 continue
             if (sec, key) in _KNOWN_DEPRECATED_KEYS:
                 warnings.append(f"[{sec}] {key}: {_KNOWN_DEPRECATED_KEYS[(sec, key)]}")
             elif key not in default_sec:
                 warnings.append(f"unknown key [{sec}] {key}")
+            elif isinstance(default_sec[key], dict) and not isinstance(value, dict):
+                errors.append(f"[{sec}] {key} must be a table")
 
-    quota = raw.get("quota") or {}
-    if isinstance(quota, dict):
-        for qkey in ("max_requests_per_day", "max_requests_per_minute",
-                     "flash_rpm", "flash_tpm", "flash_rpd",
-                     "flash_lite_rpm", "flash_lite_tpm", "flash_lite_rpd"):
-            val = quota.get(qkey)
-            if val is not None and (
-                isinstance(val, bool) or not isinstance(val, (int, float)) or val < 0
-            ):
-                errors.append(f"[quota] {qkey}={val!r} must be a non-negative number")
-        models = quota.get("models")
-        if isinstance(models, dict):
-            for mname, mrow in models.items():
-                if not isinstance(mrow, dict):
+    # -- enums: the values code branches on ---------------------------------
+    enum_keys = {
+        ("gemini", "mode"): VALID_MODES,
+        ("connectivity", "mode"): ("auto", "online", "offline"),
+        ("tts", "online_voice"): ("gemini", "local", "none"),
+        ("tts", "offline_voice"): ("none", "local"),
+        ("tts", "backend"): ("piper", "mock"),
+        ("organise", "mode"): ("shadow", "live"),
+    }
+    for (sec, key), allowed in enum_keys.items():
+        section = raw.get(sec)
+        if not isinstance(section, dict) or key not in section:
+            continue
+        value = section.get(key)
+        if str(value).lower() not in allowed:
+            errors.append(
+                f"[{sec}] {key}={value!r} must be one of: {', '.join(allowed)}")
+
+    # -- gemini / voice identity --------------------------------------------
+    gemini = raw.get("gemini") if isinstance(raw.get("gemini"), dict) else {}
+    _string_list_error(errors, "[gemini] allowed_voices", gemini.get("allowed_voices"))
+    for key in ("voice", "gemini_voice_model", "model_voice"):
+        value = gemini.get(key)
+        if value is not None and not isinstance(value, str):
+            errors.append(f"[gemini] {key}={value!r} must be a string")
+    _number_error(errors, "[gemini] voice_sample_rate", gemini.get("voice_sample_rate"),
+                  minimum=1, integer=True)
+
+    # -- tts ----------------------------------------------------------------
+    tts = raw.get("tts") if isinstance(raw.get("tts"), dict) else {}
+    _number_error(errors, "[tts] speaker", tts.get("speaker"), minimum=0, integer=True)
+    _number_error(errors, "[tts] length_scale", tts.get("length_scale"), minimum=0.01)
+    _bool_error(errors, "[tts] speak_acks", tts.get("speak_acks"))
+    _bool_error(errors, "[tts] speak_replies", tts.get("speak_replies"))
+    _bool_error(errors, "[tts] enabled", tts.get("enabled"))
+    if tts.get("player") is not None and not isinstance(tts.get("player"), str):
+        errors.append(f"[tts] player={tts.get('player')!r} must be a string")
+    candidates = tts.get("audition_candidates")
+    if candidates is not None:
+        if not isinstance(candidates, list):
+            errors.append("[tts] audition_candidates must be a list of tables")
+        else:
+            for index, entry in enumerate(candidates):
+                if not isinstance(entry, dict) or not str(entry.get("id") or "").strip():
+                    errors.append(
+                        f"[tts] audition_candidates[{index}] needs a non-empty `id`")
+
+    # -- capture / transcribe ------------------------------------------------
+    capture = raw.get("capture") if isinstance(raw.get("capture"), dict) else {}
+    _number_error(errors, "[capture] sample_rate", capture.get("sample_rate"),
+                  minimum=1, integer=True)
+    _number_error(errors, "[capture] chunk_ms", capture.get("chunk_ms"),
+                  minimum=1, integer=True)
+    transcribe = raw.get("transcribe") if isinstance(raw.get("transcribe"), dict) else {}
+    _number_error(errors, "[transcribe] command_min_confidence",
+                  transcribe.get("command_min_confidence"), minimum=0.0, maximum=1.0)
+    _number_error(errors, "[transcribe] live_session_max_s",
+                  transcribe.get("live_session_max_s"), minimum=1)
+    _number_error(errors, "[transcribe] speech_resume_s",
+                  transcribe.get("speech_resume_s"), minimum=0.0)
+    _number_error(errors, "[transcribe] checkin_grace_s",
+                  transcribe.get("checkin_grace_s"), minimum=0.0)
+
+    # -- connectivity ---------------------------------------------------------
+    connectivity = (raw.get("connectivity")
+                    if isinstance(raw.get("connectivity"), dict) else {})
+    _number_error(errors, "[connectivity] health_port", connectivity.get("health_port"),
+                  minimum=1, maximum=65535, integer=True)
+    _number_error(errors, "[connectivity] health_timeout_s",
+                  connectivity.get("health_timeout_s"), minimum=0.01)
+    _number_error(errors, "[connectivity] health_check_interval_s",
+                  connectivity.get("health_check_interval_s"), minimum=1)
+
+    # -- console / presence / initiative / showoff ---------------------------
+    console = raw.get("console") if isinstance(raw.get("console"), dict) else {}
+    _number_error(errors, "[console] history_limit", console.get("history_limit"),
+                  minimum=1, integer=True)
+    _number_error(errors, "[console] snapshot_limit", console.get("snapshot_limit"),
+                  minimum=1, integer=True)
+
+    presence = raw.get("presence") if isinstance(raw.get("presence"), dict) else {}
+    _bool_error(errors, "[presence] class_mode", presence.get("class_mode"))
+    _bool_error(errors, "[presence] class_schedule_suggest",
+                presence.get("class_schedule_suggest"))
+    schedule = presence.get("class_schedule")
+    if schedule is not None:
+        if not isinstance(schedule, list):
+            errors.append("[presence] class_schedule must be a list of tables")
+        else:
+            for index, window in enumerate(schedule):
+                if not isinstance(window, dict):
+                    errors.append(f"[presence] class_schedule[{index}] must be a table")
                     continue
-                for rkey in ("rpm", "tpm", "rpd"):
-                    rval = mrow.get(rkey)
-                    if rval not in (None, "unlimited") and (
-                        isinstance(rval, bool)
-                        or not isinstance(rval, (int, float))
-                        or rval < 0
-                    ):
+                for key in ("start", "end"):
+                    if not _valid_hhmm(window.get(key)):
                         errors.append(
-                            f"[quota.models.{mname}] {rkey}={rval!r} must be >= 0"
-                        )
+                            f"[presence] class_schedule[{index}].{key}="
+                            f"{window.get(key)!r} must be HH:MM")
 
-    conn_mode = str((raw.get("connectivity") or {}).get("mode", "auto")).lower()
-    if conn_mode not in ("auto", "online", "offline"):
-        errors.append(
-            f"[connectivity] mode={conn_mode!r} must be auto, online, or offline"
-        )
-    tts = raw.get("tts") or {}
-    if str(tts.get("online_voice", "gemini")).lower() not in ("gemini", "local", "none"):
-        errors.append(
-            f"[tts] online_voice={tts.get('online_voice')!r} must be gemini, local, or none"
-        )
-    if str(tts.get("offline_voice", "none")).lower() not in ("none", "local"):
-        errors.append(
-            f"[tts] offline_voice={tts.get('offline_voice')!r} must be none or local"
-        )
-    org_mode = str((raw.get("organise") or {}).get("mode", "shadow")).lower()
-    if org_mode not in ("shadow", "live"):
-        errors.append(f"[organise] mode={org_mode!r} must be shadow or live")
+    initiative = raw.get("initiative") if isinstance(raw.get("initiative"), dict) else {}
+    _number_error(errors, "[initiative] snooze_hours", initiative.get("snooze_hours"),
+                  minimum=0)
+    _number_error(errors, "[initiative] retire_after_ignores",
+                  initiative.get("retire_after_ignores"), minimum=1, integer=True)
+    _bool_error(errors, "[initiative] urgent_in_class_mode",
+                initiative.get("urgent_in_class_mode"))
+
+    showoff = raw.get("showoff") if isinstance(raw.get("showoff"), dict) else {}
+    _number_error(errors, "[showoff] timeout_s", showoff.get("timeout_s"), minimum=1)
+    _string_list_error(errors, "[showoff] demo_safe_facts", showoff.get("demo_safe_facts"))
+
+    # -- organise roots (per-root posture) -----------------------------------
+    organise = raw.get("organise") if isinstance(raw.get("organise"), dict) else {}
+    roots = organise.get("roots")
+    if roots is not None:
+        if not isinstance(roots, list):
+            errors.append("[organise] roots must be a list of tables")
+        else:
+            for index, entry in enumerate(roots):
+                where = f"[organise.roots] entry {index}"
+                if not isinstance(entry, dict):
+                    errors.append(f"{where} must be a table")
+                    continue
+                path = entry.get("path")
+                if not isinstance(path, str) or not path.strip():
+                    errors.append(f"{where} is missing a non-empty `path`")
+                if "mode" in entry and str(entry.get("mode")).lower() not in ("shadow", "live"):
+                    errors.append(
+                        f"{where} mode={entry.get('mode')!r} must be shadow or live")
+                taxonomy = entry.get("taxonomy")
+                if taxonomy is not None:
+                    _string_list_error(errors, f"{where} taxonomy", taxonomy)
+
+    # -- quota numbers (the owner-measured limits) ---------------------------
+    quota = raw.get("quota") if isinstance(raw.get("quota"), dict) else {}
+    for qkey in ("max_requests_per_day", "max_requests_per_minute",
+                 "flash_rpm", "flash_tpm", "flash_rpd",
+                 "flash_lite_rpm", "flash_lite_tpm", "flash_lite_rpd",
+                 "transcribe_live_rpm", "transcribe_live_tpm", "transcribe_live_rpd",
+                 "transcribe_batch_rpd"):
+        _number_error(errors, f"[quota] {qkey}", quota.get(qkey), minimum=0)
+    models = quota.get("models")
+    if models is not None and not isinstance(models, dict):
+        errors.append("[quota] models must be a table of per-model rows")
+    elif isinstance(models, dict):
+        for mname, mrow in models.items():
+            if not isinstance(mrow, dict):
+                errors.append(f"[quota.models.{mname}] must be a table")
+                continue
+            for key in mrow:
+                if key not in ("rpm", "tpm", "rpd"):
+                    warnings.append(f"unknown key [quota.models.{mname}] {key}")
+            for rkey in ("rpm", "tpm", "rpd"):
+                rval = mrow.get(rkey)
+                if rval in (None, "unlimited"):
+                    continue
+                if not _is_number(rval) or rval < 0:
+                    errors.append(
+                        f"[quota.models.{mname}] {rkey}={rval!r} must be >= 0 "
+                        "or 'unlimited'")
 
     if errors:
         detail = "INVALID: " + "; ".join(errors + warnings)

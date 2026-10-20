@@ -359,7 +359,7 @@ def _memory_command(args, config) -> int:
             store, memory = local()
             out = {"forgotten": memory.forget(args.topic)}
             store.close()
-        print(f"Forgotten: {out['forgotten']} fact(s). No argument, as designed.")
+        print(_forget_message(args.topic, int(out["forgotten"])))
         return 0
     # embed
     try:
@@ -518,7 +518,7 @@ def _knock_command(args, config) -> int:
         else:
             raise ValueError(f"unknown knock action {action!r}")
     except Exception as exc:
-        print(f"refused: {exc}", file=sys.stderr)
+        print(_refusal_text(exc), file=sys.stderr)
         return 2
     finally:
         if owned:
@@ -545,6 +545,19 @@ def _knock_command(args, config) -> int:
     else:
         print(json.dumps(out, indent=2))
     return 0
+
+
+def _forget_message(topic: str, forgotten: int) -> str:
+    """Say what was actually searched, not a stale no-argument promise (BH-J5)."""
+    if forgotten:
+        return f"Forgotten: {forgotten} fact(s) matching {topic!r}."
+    return f"Forgotten: 0 fact(s) matching {topic!r}. No active fact matched."
+
+
+def _refusal_text(exc: Exception) -> str:
+    """One `refused:` prefix, whichever layer wrote the sentence (BH-J6)."""
+    text = str(exc)
+    return text if text.lower().startswith("refused") else f"refused: {text}"
 
 
 def _privacy_command(args, config) -> int:
@@ -1274,7 +1287,7 @@ def build_parser() -> argparse.ArgumentParser:
                        choices=["profile", "preference", "commitment", "relationship"])
     mem_p = sub.add_parser("memory", help="show everything believed about you (§16)")
     mem_p.add_argument("--kind")
-    forget_p = sub.add_parser("forget", help="delete facts by id or topic — no argument")
+    forget_p = sub.add_parser("forget", help="delete facts by id or topic")
     forget_p.add_argument("topic")
     sub.add_parser("embed", help="backfill local chunk embeddings (Phase 5)")
     meeting_p = sub.add_parser("meeting", help="dual-channel meeting capture (Phase 6)")

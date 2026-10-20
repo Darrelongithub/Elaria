@@ -132,14 +132,20 @@ def load_cached(store, model: str, *,
         return None
     if not cached.get("verified"):
         return None
-    if max_age_s is not None and cached.get("retrieved"):
+    if max_age_s is not None:
+        # No timestamp means unknown age: it cannot be called fresh (BH-I10).
+        # A row without `retrieved` is either hand-written or from an aborted
+        # write, and pretending it was fetched now would keep a dead voice
+        # catalogue alive forever.
+        if not cached.get("retrieved"):
+            return None
         try:
             retrieved_dt = datetime.fromisoformat(str(cached["retrieved"]))
             if retrieved_dt.tzinfo is None:
                 retrieved_dt = retrieved_dt.replace(tzinfo=UTC)
             if (datetime.now(UTC) - retrieved_dt).total_seconds() > max_age_s:
                 return None
-        except ValueError:
+        except (TypeError, ValueError):
             return None
     return cached
 
@@ -152,20 +158,40 @@ def save_cached(store, catalogue: dict) -> None:
 def resolve_catalogue(model: str, *, store=None, fetched: dict | None = None,
                       refresh: bool = False,
                       max_age_s: float | None = DEFAULT_CATALOGUE_TTL_S) -> dict:
-    """Cached-live > freshly fetched > baseline, in that order of authority.
+    """Freshly fetched > cached verified (fresh) > baseline, in that order.
 
     `fetched` is what a transport returned from a real API call; it is persisted
     so warm is one call, not four, and so the exact catalogue that validated a
     voice is auditable later.
+
+    `refresh` is advisory: it records that the caller *attempted* a live fetch.
+    A failed attempt arrives here as `fetched=None`, and must not downgrade a
+    verified cache to the committed baseline, which has never been checked
+    against the API (BH-I10). It only annotates the baseline when even the
+    cache is unusable.
     """
     if fetched and fetched.get("verified") and fetched.get("model") == model:
         save_cached(store, fetched)
         return fetched
-    if not refresh:
-        cached = load_cached(store, model, max_age_s=max_age_s)
-        if cached:
-            return cached
-    return baseline_catalogue(model)
+    cached = load_cached(store, model, max_age_s=max_age_s)
+    if cached:
+        return cached
+    if refresh:
+        # The refresh FAILED (no `fetched`). A verified-but-stale catalogue is
+        # still evidence; the committed baseline has never been checked against
+        # the API. Prefer the evidence and say that it is old (BH-I10).
+        stale = load_cached(store, model, max_age_s=None)
+        if stale:
+            stale = dict(stale)
+            stale["reason"] = (
+                f"{stale.get('reason')}; served from a verified cache older than "
+                "the TTL because the live refresh failed")
+            return stale
+    catalogue = baseline_catalogue(model)
+    if refresh:
+        catalogue["reason"] = (
+            f"{catalogue.get('reason')}; the live refresh produced no catalogue")
+    return catalogue
 
 
 def validate_voice(model: str, voice: str, catalogue: dict) -> dict:

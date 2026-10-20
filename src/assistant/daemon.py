@@ -20,6 +20,7 @@ import json
 import os
 import signal
 import socket as socket_mod
+import sys
 import time
 import uuid
 
@@ -44,7 +45,6 @@ from .persona import (
     PersonaGovernor,
     TurnContext,
     build_chat_prompt,
-    is_simple_turn,
     is_valid_chat_reply,
 )
 from .presence import PresenceService
@@ -52,7 +52,7 @@ from .safety import clear_halt, is_halted, set_halt
 from .showoff import ShowoffError, ShowoffService
 from .store import Store
 from .transcribe import DictationService
-from .tts import STANDARD_ACKS, SpeechService
+from .tts import STANDARD_ACKS, SpeechResult, SpeechService
 
 
 def _sd_notify(message: str) -> None:
@@ -83,7 +83,15 @@ class Daemon:
         self.mode_manager = ModeManager(config, self.store)
         # Stage B: class mode + the one shared conversation.
         self.presence = PresenceService(config, self.store)
-        self.sessions = SessionService(self.store)
+        # `[console] history_limit` is a real setting, not a doc string: the
+        # daemon owns the one conversation service and must honour it (BH-I3).
+        # A poisoned value falls back here; `validate_config()` names the key.
+        history_setting = config.section("console").get("history_limit", 200)
+        try:
+            history_limit = max(1, int(history_setting))
+        except (TypeError, ValueError):
+            history_limit = 200
+        self.sessions = SessionService(self.store, history_limit=history_limit)
         self.speech = SpeechService(
             config, self.store, client=self.client,
             # INTERIM online voice: Flare speaks only while actually online. Offline
@@ -151,9 +159,13 @@ class Daemon:
         self._ptt_result_event.set()
         self._last_connectivity_mode = self.mode_manager.status(refresh=False).effective_mode
         self._background_tasks: set[asyncio.Task] = set()
+        # One bound for every chat call (owner turns and guest turns): a
+        # stalled transport must return a spoken fact, never freeze the
+        # console (BH-I12).
         # BUG5 half-duplex: capture muted while she is speaking (+ guard)
         self._speaking_until: float = 0.0
         self._speaking_text: str | None = None
+        self._chat_timeout_s = 4.0
         self._load_relationship_state()
 
     async def broadcast(self, event: dict) -> None:
@@ -173,11 +185,15 @@ class Daemon:
                     await asyncio.wait_for(w.drain(), timeout=1.0)
                 except (ConnectionResetError, BrokenPipeError, RuntimeError, OSError):
                     self._subscribers.discard(w)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Timeout is NOT a disconnect — keep subscriber for think-time
                     pass
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # A drain that fails for any other reason is a real
+                    # subscriber failure: drop it and say why, never `pass`.
+                    self._subscribers.discard(w)
+                    print(f"[assistd] event subscriber dropped: "
+                          f"{type(exc).__name__}: {exc}", flush=True)
             self._track_task(asyncio.create_task(_drain()))
 
     # -- half-duplex: capture muted while speaking (BUG5) -----------------
@@ -233,7 +249,10 @@ class Daemon:
         norm_trans = " ".join(transcript_text.lower().split())
         if norm_spoken and norm_spoken in norm_trans:
             return True
-        if norm_trans and norm_trans in norm_spoken:
+        # Reverse containment needs substance: "No." is a legitimate answer
+        # even when her last sentence contained the word (BH-I5). Two words
+        # are still ambiguous, three words of her own sentence are not.
+        if len(norm_trans.split()) >= 3 and norm_trans in norm_spoken:
             return True
         # Filter the filler even without timing match
         from .persona import FILLER_PHRASES
@@ -292,83 +311,56 @@ class Daemon:
         return result
 
     async def _speak_in_background(self, text: str) -> dict:
+        """Fire-and-forget speech; returns at once with the route metadata."""
         route = self.speech.route(text)
         if not self.config.section("tts").get("enabled", True):
             return {**route, "played": False, "queued": False}
-
-        async def _run():
-            self._set_speaking(True, text=text)
-            try:
-                res = await asyncio.to_thread(self.speech.speak, text)
-                if res.error and not route.get("muted"):
-                    await self.broadcast({"event": "speech.error", "error": res.error,
-                                          **route})
-                return res
-            except Exception as exc:
-                await self.broadcast({"event": "speech.error", "error": str(exc),
-                                      **route})
-                return None
-            finally:
-                self._set_speaking(False, text=text)
-
-        self._track_task(asyncio.create_task(_run()))
+        self._set_speaking(True, text=text)
+        self._track_task(asyncio.create_task(self._speak_once(text, route)))
         return {**route, "queued": True}
 
-    async def _maybe_speak_reply(self, text: str, params: dict) -> dict:
-        # Hybrid: try blocking with short timeout for fast local TTS (tests expect audio_path),
-        # but don't hang forever on slow Live TTS (BUG1). Fast path returns real result;
-        # slow/hung path queues in background and returns promptly.
-        route = self.speech.route(text)
-        requested = params.get("speak")
-        if requested is True:
-            # Half-duplex: mark speaking before attempt
-            self._set_speaking(True, text=text)
-            try:
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(self.speech.speak, text), timeout=1.5)
-                if result.error and not route.get("muted"):
-                    await self.broadcast({"event": "speech.error", "error": result.error,
-                                          **route})
-                # Success: keep guard then return
-                self._set_speaking(False, text=text)
-                return result.as_dict()
-            except asyncio.TimeoutError:
-                # Live TTS hung — keep speaking flag (already set with estimate+guard), queue
-                self._track_task(asyncio.create_task(self._speak_reply_async(text, route)))
-                return {**route, "played": False, "queued": True, "note": "speech queued in background (timeout)"}
-            except Exception as exc:
-                self._set_speaking(False, text=text)
-                await self.broadcast({"event": "speech.error", "error": str(exc), **route})
-                return {**route, "played": False, "error": str(exc)}
-        if requested is None and self.config.section("tts").get("speak_replies", False):
-            # For speak_replies auto, also try bounded
-            self._set_speaking(True, text=text)
-            try:
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(self.speech.speak, text), timeout=1.5)
-                if result.error and not route.get("muted"):
-                    await self.broadcast({"event": "speech.error", "error": result.error, **route})
-                self._set_speaking(False, text=text)
-                return result.as_dict()
-            except asyncio.TimeoutError:
-                self._track_task(asyncio.create_task(self._speak_in_background(text)))
-                return {**route, "played": False, "queued": True}
-            except Exception as exc:
-                self._set_speaking(False, text=text)
-                return {**route, "played": False, "error": str(exc)}
-        return {**route, "played": False, "queued": False}
+    async def _speak_once(self, text: str, route: dict):
+        """Speak one utterance off-loop; failures become events, never raises.
 
-    async def _speak_reply_async(self, text: str, route: dict) -> None:
-        # Background speech: set half-duplex speaking flag, synthesize, guard interval
-        self._set_speaking(True, text=text)
+        ONE implementation for every fire-and-forget speech path. It owns the
+        half-duplex flag and clears it in `finally`, so a caller that times out
+        can keep waiting on the SAME task instead of starting a second
+        synthesis of the same text (BH-I4).
+        """
         try:
             result = await asyncio.to_thread(self.speech.speak, text)
             if result.error and not route.get("muted"):
-                await self.broadcast({"event": "speech.error", "error": result.error, **route})
+                await self.broadcast({"event": "speech.error", "error": result.error,
+                                      **route})
+            return result
         except Exception as exc:
             await self.broadcast({"event": "speech.error", "error": str(exc), **route})
+            return SpeechResult(text=text.strip(), backend="none", voice_id="none",
+                                muted=True, error=str(exc))
         finally:
             self._set_speaking(False, text=text)
+
+    async def _maybe_speak_reply(self, text: str, params: dict) -> dict:
+        # Hybrid: try blocking with a short timeout so a fast local render can
+        # return its real audio path, but never hang a handler on slow Live TTS
+        # (BUG1). On timeout the SAME task keeps running in the background - a
+        # second `speak()` would double the audio (BH-I4).
+        route = self.speech.route(text)
+        requested = params.get("speak")
+        auto = (requested is None
+                and self.config.section("tts").get("speak_replies", False))
+        if requested is not True and not auto:
+            return {**route, "played": False, "queued": False}
+        self._set_speaking(True, text=text)
+        task = self._track_task(asyncio.create_task(self._speak_once(text, route)))
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
+        except TimeoutError:
+            # Live TTS is slow; the task already owns the speaking flag and
+            # will clear it when the real playback finishes.
+            return {**route, "played": False, "queued": True,
+                    "note": "speech continues in the background (timeout)"}
+        return result.as_dict()
 
     # -- relationship state persists across restarts (§16) -------------------
     def _load_relationship_state(self) -> None:
@@ -377,8 +369,10 @@ class Daemon:
             try:
                 saved = json.loads(raw)
                 self.governor.familiarity = float(saved.get("familiarity", 0.0))
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as exc:
+                # A corrupt row is not fatal, but silence would hide it forever.
+                print(f"[assistd] relationship state unreadable: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
 
     def _save_relationship_state(self) -> None:
         self.store.set_state(
@@ -1422,24 +1416,26 @@ class Daemon:
         return {"company": status}
 
     async def _guest_turn_normal(self, text: str, params: dict) -> dict:
-        """A non-owner voice outside show-off: no memory, deflection in character."""
+        """A non-owner voice outside show-off: no memory, deflection in character.
+
+        A guest turn is NOT part of the owner's conversation (BH-J1). Writing it
+        there made the room's words her "user" history: visible in the console,
+        fed back as context on the owner's next turn, and durable in SQLite.
+        The guest audit trail belongs to `disclosure.log_guest`, not to §16.
+        """
         channel = str(params.get("channel") or "voice")
-        conversation_id = self.sessions.active_id(iso_now())
-        self.sessions.append("user", text, channel=channel, ts=iso_now())
         reply = self.disclosure.deflection(guest=True,
                                            action=is_instruction(text))
         decision = self.governor.decide(TurnContext(user_text=text))
         self.disclosure.log_guest("guest_turn", category="non-owner voice",
                                   chars=len(text))
         speech = await self._maybe_speak_reply(reply, params)
-        self.sessions.append("assistant", reply, channel=channel,
-                             via="guest-deflection", ts=iso_now())
         await self.broadcast({"event": "conversation.message",
-                              "conversation_id": conversation_id,
-                              "channel": channel, "role": "assistant"})
+                              "conversation_id": None,
+                              "channel": channel, "role": "guest"})
         return {
             "reply": reply, "speaker": "guest", "via": "guest-deflection",
-            "channel": channel, "conversation_id": conversation_id,
+            "channel": channel, "conversation_id": None,
             "model": None, "register": decision.register, "serious_gate": None,
             "mode": self.config.gemini_mode, "fixture": None,
             "speech": speech, "memory_closed": True, "withheld": None,
@@ -1500,9 +1496,11 @@ class Daemon:
                           status: dict) -> dict:
         """A guest turn in show-off mode: conversation only, authority none."""
         channel = str(params.get("channel") or "voice")
-        conversation_id = self.sessions.active_id(iso_now())
-        self.sessions.append("user", text, channel=channel, ts=iso_now())
         verdict = self.showoff.guest_turn(text)
+        # Same boundary in show-off: the demo is not the owner's history
+        # (BH-J1), and every guest turn leaves an audit row.
+        self.disclosure.log_guest("guest_turn", category="show-off",
+                                  chars=len(text))
         model = None
         if verdict.get("allowed"):
             prompt = self.showoff.build_guest_prompt(text)
@@ -1512,18 +1510,17 @@ class Daemon:
                          "the good answers are on hold.")
                 via = "local"
             else:
-                # Guest turn: support test doubles without purpose param
                 try:
-                    result = await asyncio.to_thread(
-                        self.client.generate, "chat", prompt,
-                        purpose="housekeeping:guest_turn", is_user_turn=0)
-                except TypeError as e:
-                    if "unexpected keyword" in str(e):
-                        result = await asyncio.to_thread(self.client.generate, "chat", prompt)
-                    else:
-                        raise
-                reply, model = result.text, result.model
-                via = "showoff"
+                    result = await self._generate(
+                        prompt, purpose="housekeeping:guest_turn", is_user_turn=0)
+                    reply, model = result.text, result.model
+                    via = "showoff"
+                except TimeoutError:
+                    # A stalled transport must not freeze the demo (BH-I12).
+                    reply = ("That one stalled on the network. Ask me again in a "
+                             "moment.")
+                    via = "local-timeout-fallback"
+                    model = None
         else:
             reply, via = verdict["reply"], "showoff-refusal"
         leak = self.disclosure.leak_in(reply, guest=True) if verdict.get("allowed") else None
@@ -1534,22 +1531,43 @@ class Daemon:
                 "speaker": "guest", "context": "showoff"})
             reply, via = self.disclosure.deflection(guest=True), "withheld"
         speech = await self._maybe_speak_reply(reply, params)
-        self.sessions.append("assistant", reply, channel=channel, via=via,
-                             ts=iso_now())
         await self.broadcast({"event": "conversation.message",
-                              "conversation_id": conversation_id,
-                              "channel": channel, "role": "assistant"})
+                              "conversation_id": None,
+                              "channel": channel, "role": "guest"})
         if verdict.get("exited"):
             await self.broadcast({"event": "showoff.exited",
                                   "summary": verdict.get("summary")})
         return {
             "reply": reply, "speaker": "guest", "via": via,
-            "channel": channel, "conversation_id": conversation_id,
+            "channel": channel, "conversation_id": None,
             "model": model, "register": "expressive-allowed",
             "showoff": verdict, "memory_closed": True,
             "speech": speech, "fixture": None,
             "serious_gate": None, "mode": self.config.gemini_mode,
         }
+
+    async def _generate(self, prompt: str, *, gen_config=None, verify=None,
+                        purpose: str = "user_turn", is_user_turn=True):
+        """One bounded chat call. The test-double fallback lives here only.
+
+        `asyncio.to_thread(...)` cannot raise `TypeError` while the coroutine is
+        being built, so the previous nested try/except could only observe the
+        error after awaiting - and then duplicated the whole timeout path for
+        the retry. One helper, one behaviour, one bound (BH-I12).
+        """
+        timeout = self._chat_timeout_s
+        kwargs = {"gen_config": gen_config, "verify": verify,
+                  "purpose": purpose, "is_user_turn": is_user_turn}
+        try:
+            coro = asyncio.to_thread(self.client.generate, "chat", prompt, **kwargs)
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except TypeError as exc:
+            # Only a test double with an older signature is retried; a genuine
+            # TypeError raised inside the client must surface.
+            if "unexpected keyword" not in str(exc):
+                raise
+        coro = asyncio.to_thread(self.client.generate, "chat", prompt)
+        return await asyncio.wait_for(coro, timeout=timeout)
 
     async def _ask(self, params: dict) -> dict:
         """Conversational turn on the §13.4 ladder: governor (local) →
@@ -1666,46 +1684,24 @@ class Daemon:
                 # a retry with feedback (and escalation if needed).
                 def _verify(reply_text: str) -> bool:
                     return is_valid_chat_reply(reply_text, original_user_text=text)
-                # Bounded Live work: console.say must return within N seconds even with slow transport (BUG1)
+                # Bounded Live work: console.say must return within N seconds
+                # even with a slow transport (BUG1).
                 try:
-                    # Try with full persona-aware kwargs; fall back for test doubles that don't accept them
-                    try:
-                        coro = asyncio.to_thread(
-                            self.client.generate, "chat", full_prompt,
-                            gen_config=gen_config, verify=_verify,
-                            purpose="user_turn", is_user_turn=True)
-                    except TypeError:
-                        coro = asyncio.to_thread(self.client.generate, "chat", full_prompt)
-                    result = await asyncio.wait_for(coro, timeout=4.0)
-                    reply, via, model, fixture = result.text, "gemini", result.model, result.fixture
+                    result = await self._generate(
+                        full_prompt, gen_config=gen_config, verify=_verify,
+                        purpose="user_turn", is_user_turn=True)
+                    reply, via, model, fixture = (result.text, "gemini",
+                                                  result.model, result.fixture)
                     if reply:
                         self.mode_manager.observe_success("gemini")
-                except TypeError as exc:
-                    # Test stub doesn't accept gen_config/purpose — retry minimal
-                    if "unexpected keyword" in str(exc):
-                        try:
-                            result = await asyncio.wait_for(
-                                asyncio.to_thread(self.client.generate, "chat", full_prompt),
-                                timeout=4.0)
-                            reply, via, model, fixture = result.text, "gemini", result.model, result.fixture
-                            if reply:
-                                self.mode_manager.observe_success("gemini")
-                        except asyncio.TimeoutError:
-                            reply = "I am now. What do you need?"
-                            via = "local-timeout-fallback"
-                            model = None
-                            fixture = None
-                            await self.broadcast({"event": "live.timeout", "text": text[:40]})
-                    else:
-                        raise
-                except asyncio.TimeoutError:
-                    # Live transport hung — return terse fallback promptly, never hang caller
-                    # The turn is still persisted as completed; speech (if any) is async
+                except TimeoutError:
+                    # Live transport hung — return a terse fallback promptly,
+                    # never hang the caller. The turn is still persisted as
+                    # completed; speech (if any) is async.
                     reply = "I am now. What do you need?"
                     via = "local-timeout-fallback"
                     model = None
                     fixture = None
-                    # Don't mark success; the transport is slow/broken
                     await self.broadcast({"event": "live.timeout", "text": text[:40]})
 
         # The outgoing guard: a model that ignores the prompt still cannot read a
@@ -1820,15 +1816,28 @@ class Daemon:
                     "your review + apply. Watch `assist events`."), "local-intent")
         return (None, "local-intent")
 
+    async def _connectivity_tick(self) -> None:
+        # refresh() itself returns immediately without probing when the owner
+        # forced offline; the socket probe runs off-loop in auto.
+        status = await asyncio.to_thread(self.mode_manager.refresh, force=True)
+        await self._note_connectivity_transition(status)
+
     async def _connectivity_loop(self) -> None:
+        """Background posture checks; one failure is logged, never fatal.
+
+        A bare `while True` around an unguarded probe meant any single exception
+        ended the loop silently: the daemon kept running with a frozen
+        connectivity state, never transitioning to/from offline again (BH-J2).
+        """
         interval = float(self.config.section("connectivity").get(
             "health_check_interval_s", 20))
         while True:
             await asyncio.sleep(max(1.0, interval))
-            # refresh() itself returns immediately without probing when the
-            # owner forced offline; the socket probe runs off-loop in auto.
-            status = await asyncio.to_thread(self.mode_manager.refresh, force=True)
-            await self._note_connectivity_transition(status)
+            try:
+                await self._connectivity_tick()
+            except Exception as exc:
+                print(f"[assistd] connectivity check failed: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
 
     async def _warm_speech_cache(self) -> None:
         """One warm cycle for the active voice, off the hot path (§18).
@@ -1943,7 +1952,12 @@ class Daemon:
 
 def main() -> None:
     config = load_config()
-    asyncio.run(Daemon(config).run())
+    try:
+        asyncio.run(Daemon(config).run())
+    except RuntimeError as exc:
+        # Two-daemon refusal is a normal startup outcome, not a crash (BH-J4).
+        print(f"assistd: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

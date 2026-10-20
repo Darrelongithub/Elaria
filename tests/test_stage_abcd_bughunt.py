@@ -991,8 +991,14 @@ def test_bh_h19_allowlist_fact_leaking_via_paraphrase_questions_blocked(tmp_path
 def test_bh_h20_showoff_crash_exit_residue_cleaned_on_restart(tmp_path: Path):
     """BH-H20: After a crash-exit (`kill -9` mid-demo), restarting `ShowoffService`
     must close all open `showoff_sessions` rows, persist any guest turns recorded
-    before the crash, purge demo audio files from `data_dir / "audio"`, and retain
-    zero standing permissions.
+    before the crash, purge demo audio from the DEMO SANDBOX, and retain zero
+    standing permissions.
+
+    Corrected in the 2026-10-20 hardening pass (BH-I6): this test originally
+    asserted that recovery deleted `data_dir / "audio" / *.wav`, which is the
+    shared folder holding dictation and meeting recordings (the §12.5 "record").
+    That was the data-loss bug, not the contract. The sweep now targets only the
+    sandbox, and an unrelated recording is created here to prove it survives.
     """
     cfg = _sandbox_config(tmp_path)
     store = Store(cfg.db_path)
@@ -1007,10 +1013,14 @@ def test_bh_h20_showoff_crash_exit_residue_cleaned_on_restart(tmp_path: Path):
             owner_present=True,
         )
         showoff1.guest_turn("What can you do?")
+        sandbox = showoff1.sandbox_path()
+        sandbox.mkdir(parents=True, exist_ok=True)
+        leaked_wav = sandbox / "guest_demo_leak.wav"
+        leaked_wav.write_bytes(_pcm_bytes(50))
         audio_dir = cfg.data_dir / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
-        leaked_wav = audio_dir / "guest_demo_leak.wav"
-        leaked_wav.write_bytes(_pcm_bytes(50))
+        meeting_wav = audio_dir / "meeting-2026-10-20-101010-mic.wav"
+        meeting_wav.write_bytes(_pcm_bytes(50))
 
         # Simulate kill -9: do NOT call exit_owner/exit_hotkey; construct a fresh ShowoffService
         showoff2 = ShowoffService(cfg, store)
@@ -1018,6 +1028,8 @@ def test_bh_h20_showoff_crash_exit_residue_cleaned_on_restart(tmp_path: Path):
         assert st["active"] is False
         assert st["permissions"] == []
         assert not leaked_wav.exists(), "Demo audio residue survived crash recovery"
+        assert meeting_wav.exists(), (
+            "crash recovery deleted a meeting recording from the shared audio dir")
 
         sessions = store.list_showoff_sessions(limit=5)
         assert sessions[0]["ended_ts"] is not None

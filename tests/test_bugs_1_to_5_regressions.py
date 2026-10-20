@@ -32,16 +32,10 @@ import asyncio
 import json
 import socket
 import time
-from pathlib import Path
-from unittest.mock import MagicMock
-
-import pytest
 
 from assistant.capture import SimulatedCapture
-from assistant.config import Config
 from assistant.cost import day_start_iso, format_cost_report
-from assistant.daemon import Daemon
-from assistant.gemini_client import GeminiClient, HarnessResult
+from assistant.gemini_client import GeminiClient
 from assistant.ipc import call
 from assistant.persona import (
     CHAT_SYSTEM_PROMPT,
@@ -52,8 +46,6 @@ from assistant.persona import (
     is_simple_turn,
     is_valid_chat_reply,
 )
-from assistant.store import Store
-
 
 # ==============================================================================
 # BUG 1 REGRESSION: console.say must return promptly, never hang 120s
@@ -235,7 +227,7 @@ def test_bug4_console_survives_idle_think_time_without_drop(config, running_daem
     due to timeout during user think-time. Pruning must only occur on real EOF/error.
     A turn sent after idle continues the same conversation session.
     """
-    daemon, _server = running_daemon
+    _daemon, _server = running_daemon
 
     # 1. Connect a subscriber socket (like assist events / console follow)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

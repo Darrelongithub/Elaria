@@ -10,8 +10,8 @@ One formatter, two delivery modes sharing it:
 
 Classes emitted here are styled in ui/waybar/style.css — keep them in sync:
 idle | listening | transcribing | halted | down | mock | offline |
-forced-offline | class-mode | class-suggested | knock | knock-loud |
-knock-silent (combinable).
+forced-offline | class-mode | class-suggested | company | showoff |
+knock | knock-loud | knock-silent (combinable).
 
 The offline marker follows §13.9 rule 1: one small suffix, while the
 tooltip carries the exact connectivity mode, queue and local voice.
@@ -19,10 +19,9 @@ tooltip carries the exact connectivity mode, queue and local voice.
 
 from __future__ import annotations
 
-import json
 import socket
 
-from .ipc import DaemonUnavailable, call
+from .ipc import DaemonUnavailable, call, parse_event_line
 
 
 def format_waybar(status: dict) -> dict:
@@ -166,8 +165,10 @@ def stream_waybar(socket_path, *, interval_s: float = 5.0):
                         line, buffer = buffer.split(b"\n", 1)
                         if not line.strip():
                             continue
-                        message = json.loads(line)
-                        if "event" in message:  # a broadcast, not our subscribe reply
+                        message = parse_event_line(line)
+                        if message is not None and "event" in message:
+                            # A broadcast, not our subscribe reply. A malformed
+                            # frame is skipped, never fatal (BH-I13).
                             yield format_waybar(_safe_status(socket_path))
         except (OSError, DaemonUnavailable):
             yield format_waybar({"running": False})

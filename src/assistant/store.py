@@ -828,6 +828,25 @@ class Store:
             self._conn.commit()
             return cur.rowcount
 
+    def deactivate_facts(self, fact_ids) -> int:
+        """Deactivate a set of facts in one transaction (declined commitments).
+
+        `InitiativeService.decline()` used to reach into `store._lock` and
+        `store._conn` directly, so the SQL lived in two modules and a future
+        connection change would break only the caller that forgot. The store
+        owns its schema; callers own the policy.
+        """
+        ids = sorted({int(fact_id) for fact_id in fact_ids})
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" * len(ids))
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE facts SET active = 0 WHERE id IN ({placeholders})",
+                tuple(ids))
+            self._conn.commit()
+            return cur.rowcount
+
     def get_or_create_conversation(self, ts: str) -> int:
         with self._lock:
             row = self._conn.execute(

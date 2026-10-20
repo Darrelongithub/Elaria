@@ -88,7 +88,7 @@ ln -sf "$PWD/.venv/bin/assistd" ~/.local/bin/assistd
 ln -sf "$PWD/.venv/bin/assist" ~/.local/bin/assist
 cp systemd/assistant.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now assistant
-assist status && assist cost
+assist status; assist cost
 ```
 
 No key yet? Everything still runs — `GEMINI_MODE` defaults to **mock**

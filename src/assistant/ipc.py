@@ -20,27 +20,130 @@ import socket
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+try:                                  # Linux/Fedora target; tests may run anywhere
+    import fcntl
+except ImportError:                   # pragma: no cover - non-Unix developer box
+    fcntl = None
+
 Handler = Callable[[str, dict], Awaitable[dict]]
+
+# A client that stops reading must not park a connection task forever. Five
+# seconds is orders of magnitude above a normal local drain, and the peer is
+# already gone by then.
+REPLY_DRAIN_TIMEOUT_S = 5.0
+
+
+def _lock_path(socket_path: Path) -> Path:
+    return socket_path.with_name(socket_path.name + ".lock")
+
+
+def _acquire_daemon_lock(socket_path: Path):
+    """Serialise the check-unlink-bind window with an advisory file lock.
+
+    Probing the socket and unlinking a stale one are two syscalls: two daemons
+    starting together could both see "stale", both unlink, and one could unlink
+    the socket the other had just bound. The lock closes that window (BH-I8).
+    The kernel releases it if the process dies, so a stale file is harmless.
+    """
+    if fcntl is None:                 # pragma: no cover
+        return None
+    # The handle must outlive this call and is closed by the server's close(),
+    # so a context manager would release the lock immediately.
+    handle = open(_lock_path(socket_path), "a+", encoding="utf-8")  # noqa: SIM115
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise RuntimeError(
+            f"another daemon is already running (lock held on "
+            f"{_lock_path(socket_path)})") from None
+    return handle
+
+
+def _release_daemon_lock(handle) -> None:
+    if handle is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        handle.close()
+
+
+def _attach_lock_release(server, handle) -> None:
+    """Release the daemon lock when the asyncio server is closed."""
+    if handle is None:
+        return
+    original_close = server.close
+    released = False
+
+    def close() -> None:
+        nonlocal released
+        try:
+            original_close()
+        finally:
+            if not released:
+                released = True
+                _release_daemon_lock(handle)
+
+    server.close = close          # asyncio.Server has no __slots__
+
+
+async def _write_reply(writer: asyncio.StreamWriter, reply: dict,
+                       *, drain_timeout: float = REPLY_DRAIN_TIMEOUT_S) -> None:
+    """Write one reply and bound the drain.
+
+    `await writer.drain()` waits for the peer to consume the kernel buffer; a
+    client that never reads can therefore hold the handler task forever
+    (BH-I9). A missed drain deadline is treated as a disconnect.
+    """
+    writer.write((json.dumps(reply) + "\n").encode())
+    try:
+        await asyncio.wait_for(writer.drain(), timeout=drain_timeout)
+    except TimeoutError:
+        raise ConnectionResetError(
+            "client stopped reading (reply drain timed out)") from None
+
+
+def parse_event_line(line: bytes) -> dict | None:
+    """One newline-delimited event frame, or None if it is not a JSON object.
+
+    The event stream is a convenience surface: a torn or malformed frame is
+    skipped by every consumer instead of killing the Waybar/console feed
+    (BH-I13). Malformed *request* frames are still answered with `ok: false`.
+    """
+    try:
+        parsed = json.loads(line)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 async def serve(socket_path: Path, handler: Handler,
                 event_sink: Callable[[asyncio.StreamWriter], None] | None = None):
     """Start the daemon's Unix server. Returns the asyncio Server."""
     socket_path.parent.mkdir(parents=True, exist_ok=True)
-    if socket_path.exists():
-        live_peer = False
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-                probe.settimeout(0.5)
-                probe.connect(str(socket_path))
-                live_peer = True
-        except OSError:
+    lock_handle = _acquire_daemon_lock(socket_path)
+    try:
+        if socket_path.exists():
             live_peer = False
-        if live_peer:
-            raise RuntimeError(
-                f"another daemon is already running and listening on {socket_path}"
-            )
-        socket_path.unlink(missing_ok=True)  # stale socket from a crashed daemon
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(0.5)
+                    probe.connect(str(socket_path))
+                    live_peer = True
+            except OSError:
+                live_peer = False
+            if live_peer:
+                raise RuntimeError(
+                    f"another daemon is already running and listening on "
+                    f"{socket_path}")
+            socket_path.unlink(missing_ok=True)  # stale socket from a crashed daemon
+    except BaseException:
+        _release_daemon_lock(lock_handle)
+        raise
 
     accepts_writer = len(inspect.signature(handler).parameters) >= 3
 
@@ -67,8 +170,7 @@ async def serve(socket_path: Path, handler: Handler,
                 except Exception as exc:
                     reply = {"id": req_id, "ok": False,
                              "error": f"{type(exc).__name__}: {exc}"}
-                writer.write((json.dumps(reply) + "\n").encode())
-                await writer.drain()
+                await _write_reply(writer, reply)
         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
             pass
         finally:
@@ -77,8 +179,13 @@ async def serve(socket_path: Path, handler: Handler,
             except RuntimeError:
                 pass
 
-    server = await asyncio.start_unix_server(_client, path=str(socket_path))
+    try:
+        server = await asyncio.start_unix_server(_client, path=str(socket_path))
+    except BaseException:
+        _release_daemon_lock(lock_handle)
+        raise
     os.chmod(socket_path, 0o600)  # owner-only: the socket *is* the auth boundary
+    _attach_lock_release(server, lock_handle)
     return server
 
 
@@ -105,7 +212,23 @@ def subscribe_events(socket_path: Path):
         while b"\n" in buffer:
             line, buffer = buffer.split(b"\n", 1)
             if line.strip():
-                yield json.loads(line)
+                message = parse_event_line(line)
+                if message is not None:
+                    yield message
+
+
+def _parse_reply_frame(raw_line: bytes) -> dict:
+    """A reply frame, or a clear `DaemonUnavailable` (never a raw JSON error)."""
+    try:
+        parsed = json.loads(raw_line)
+    except ValueError as exc:
+        raise DaemonUnavailable(
+            f"malformed reply from daemon at this socket: {raw_line[:80]!r}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise DaemonUnavailable(
+            f"malformed reply from daemon (not a JSON object): {raw_line[:80]!r}")
+    return parsed
 
 
 def call(socket_path: Path, method: str, params: dict | None = None, timeout: float = 10.0) -> dict:
@@ -128,8 +251,8 @@ def call(socket_path: Path, method: str, params: dict | None = None, timeout: fl
                     raw_line, buffer = buffer.split(b"\n", 1)
                     if not raw_line.strip():
                         continue
-                    parsed = json.loads(raw_line)
-                    if isinstance(parsed, dict) and "ok" in parsed:
+                    parsed = _parse_reply_frame(raw_line)
+                    if "ok" in parsed:
                         reply = parsed
                         break
                 if reply is not None:
@@ -137,8 +260,8 @@ def call(socket_path: Path, method: str, params: dict | None = None, timeout: fl
                 chunk = sock.recv(65536)
                 if not chunk:
                     if buffer.strip():
-                        parsed = json.loads(buffer.splitlines()[0])
-                        if isinstance(parsed, dict) and "ok" in parsed:
+                        parsed = _parse_reply_frame(buffer.splitlines()[0])
+                        if "ok" in parsed:
                             reply = parsed
                     break
                 buffer += chunk
