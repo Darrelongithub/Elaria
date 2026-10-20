@@ -256,7 +256,26 @@ skipped). Recorded rather than silently rewritten.
   turns; the timeout speaks a fallback instead of freezing the demo.
 - **BH-I13** — Waybar/console event streams survive malformed lines.
 
-Guard tests: `tests/test_hardening_pass2.py` (29 cases). Pre-fix: 24 failed /
+### Pass 2b (2026-10-20)
+
+Five more cases in `tests/test_hardening_pass2b.py` closed the second batch:
+
+- **BH-J1** — guest turns (room voice and show-off) no longer enter the owner's
+  conversation history or SQLite conversation tables; show-off guest turns now
+  write a disclosure audit row.
+- **BH-J2** — one connectivity-probe error no longer kills the posture loop.
+- **BH-J3** — a second `assistd` prints one line and exits 1 instead of a
+  traceback.
+- **BH-J4/J5** — `assist forget <topic>` names the topic it searched; daemon
+  refusals no longer print `refused: refused:`.
+- **BH-J6** — README's `assist status && assist cost` became `;` (status exits
+  1 when the daemon is down, which skipped the command you want most).
+
+Final numbers for the branch: **1,315 passed / 6 skipped / 0 failed / 0 xfailed**
+(1,321 collected); Ruff **0**; Vulture **0**.
+
+Guard tests: `tests/test_hardening_pass2.py` (29 cases) and
+`tests/test_hardening_pass2b.py` (5 cases). Pre-fix: 24 failed /
 4 passed (the 29th was added when the stale-cache fallback was tightened).
 Corrected test: `test_bh_h20_showoff_crash_exit_residue_cleaned_on_restart` had
 encoded BH-I6 (deleting `data_dir/audio`) as the contract; its remaining BH-H20

@@ -584,3 +584,42 @@ Baseline measured before any edit (`25179c8`): **1,280 passed, 6 skipped,
 - Suite after fixes: **1,308 passed, 6 skipped, 0 failed, 0 xfailed, 0 warnings**
   (`pytest -q --tb=line`, 45.2 s). `ruff check .`: **All checks passed!**
   `vulture src/ --min-confidence 80`: **0 findings**.
+
+## 2026-10-20 — Hardening pass 2b (BH-J1…BH-J6)
+
+Second batch after the pass-2 ledgers. Tests first:
+`tests/test_hardening_pass2b.py` (5 cases; guest paths, loop survival, clean
+second-daemon exit, and the two CLI message helpers).
+
+### Fixed
+
+- `src/assistant/daemon.py`
+  - Guest turns (`_guest_turn_normal`, `_guest_turn`) no longer append to
+    `SessionService`: no owner conversation row is created, guest speech is
+    broadcast with `role: "guest"` and `conversation_id: null`, and every
+    show-off guest turn now writes a `disclosure.log_guest` audit row (BH-J1).
+  - `_connectivity_loop` body extracted to `_connectivity_tick()` and wrapped
+    in try/except with a logged reason; one failed probe no longer ends posture
+    tracking for the process lifetime (BH-J2).
+  - `main()` catches the two-daemon `RuntimeError` and prints one line to
+    stderr before `SystemExit(1)` (BH-J3); `import sys` added (the first version
+    of the handler would itself have raised `NameError`).
+- `src/assistant/cli.py`
+  - `_forget_message(topic, count)` reports the searched topic and match count
+    (BH-J4); `forget` help no longer claims the argument is optional.
+  - `_refusal_text(exc)` avoids the `refused: refused:` duplication (BH-J5);
+    used by both the knock and commitment handlers.
+- `README.md`: `assist status && assist cost` → `assist status; assist cost`
+  (BH-J6: `status` exits 1 when the daemon is down).
+
+### Verification
+
+- `pytest -q --tb=line`: **1,315 passed, 6 skipped, 0 failed, 0 xfailed**
+  (pass-2 baseline in this checkout: 1,280 passed / 6 skipped).
+- `ruff check .`: **All checks passed!**
+- `vulture src/ --min-confidence 80`: **0 findings.**
+- Documented commands re-run against a throwaway `HOME`/`XDG_*` sandbox:
+  `doctor status cost voice status privacy status|company|alone class
+  on|off|status knock status|list|accept|raise showoff status|exit|demo
+  memory|forget console --json verify mode auto taxonomy suggest transcribe
+  ask ptt start`, plus the new `forget`/`knock raise` messages.

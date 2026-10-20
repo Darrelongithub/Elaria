@@ -1200,3 +1200,79 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   yielding.
 - **Actual (before):** `json.loads(line)` in `stream_waybar()` raised and ended
   the generator; the bar froze until restart.
+
+---
+
+## Area J — Second-batch pins (2026-10-20, same branch)
+
+Reproduced with `tests/test_hardening_pass2b.py` (5 cases; J1, J2 and J3 were
+red before their fixes, J4/J5 were missing helpers, J6 was reproduced by
+running the documented command chain).
+
+### BH-J1 — Guest speech was written into the OWNER's conversation record
+
+- **Severity:** privacy boundary / record contamination
+- **Status:** fixed in this pass
+- **Repro:** `test_non_owner_voice_never_enters_owner_conversation`,
+  `test_showoff_guest_turn_never_enters_owner_conversation`
+- **Expected:** the §16 conversation contains only turns addressed to the owner;
+  a non-owner voice is audited through `disclosure.log_guest` and broadcast, but
+  not persisted as `user`/`assistant` history.
+- **Actual (before):** both guest paths (`_guest_turn_normal` for a TV/room
+  voice, `_guest_turn` for show-off) called `sessions.append` twice. A guest
+  utterance therefore appeared in `assist console`, was loaded as `prior_turns`
+  context for the owner's next model turn, and was stored in SQLite as the
+  owner's conversation. In show-off, guest turns also had no
+  `disclosure.log_guest` row at all.
+
+### BH-J2 — One connectivity probe error killed the posture loop
+
+- **Severity:** crash-unsafe (frozen state)
+- **Status:** fixed in this pass
+- **Repro:** `test_connectivity_loop_survives_a_failing_tick`
+- **Expected:** a failed probe is logged and the loop keeps its cadence.
+- **Actual (before):** `_connectivity_loop` was a bare `while True` around
+  `mode_manager.refresh(force=True)`. The first exception (DB locked, socket
+  race, transient parse error) ended the background task silently. The daemon
+  kept serving with a frozen connectivity posture — it could not transition to
+  or from `OFFLINE`/`FORCED_OFFLINE` again, so queue drain and voice routing
+  stayed stale until restart.
+
+### BH-J3 — A second `assistd` printed a traceback instead of one line
+
+- **Severity:** cosmetic (diagnosability)
+- **Status:** fixed in this pass
+- **Repro:** `test_second_daemon_exits_cleanly_with_one_line`
+- **Expected:** `assistd: another daemon is already running …`, exit 1.
+- **Actual (before):** the `RuntimeError` from `ipc.serve()` escaped `main()`
+  as a full traceback. The first fix attempt in this pass also proved the test
+  catches a missing `import sys` (NameError inside the handler), which is why
+  the assertion is on stderr text, not just the exit code.
+
+### BH-J4 — `assist forget <topic>` claimed "No argument, as designed."
+
+- **Severity:** cosmetic (misleading output)
+- **Status:** fixed in this pass
+- **Repro:** `test_forget_message_names_the_topic_it_searched`
+- **Expected:** name the topic searched and whether anything matched.
+- **Actual (before):** the message was written when the topic argument was
+  optional; with the now-required argument every miss printed the stale
+  no-argument sentence. The parser help also still said "no argument".
+
+### BH-J5 — Daemon refusals printed "refused: refused: …"
+
+- **Severity:** cosmetic
+- **Status:** fixed in this pass
+- **Repro:** `test_refusal_text_does_not_double_the_prefix`
+- **Expected:** exactly one prefix.
+- **Actual (before):** `raise_knock` already raises `InitiativeError("refused: …")`
+  and the CLI wrapped every exception in `refused: {exc}`.
+
+### BH-J6 — README's `assist status && assist cost` chain stops when the daemon is down
+
+- **Severity:** documentation (stale command)
+- **Status:** fixed in this pass (README changed to `assist status; assist cost`)
+- **Repro:** run both commands with no daemon: `assist status` correctly prints a
+  `running: false` snapshot but exits 1 (service-down signal), so `&&` skips
+  `cost` — the command you most want when the daemon is down.
+- **Expected:** the documented command always shows cost.
