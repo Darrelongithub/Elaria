@@ -17,6 +17,7 @@ import inspect
 import json
 import os
 import socket
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -232,12 +233,20 @@ def _parse_reply_frame(raw_line: bytes) -> dict:
 
 
 def call(socket_path: Path, method: str, params: dict | None = None, timeout: float = 10.0) -> dict:
-    """Synchronous one-shot request from the thin CLI."""
+    """Synchronous one-shot request from the thin CLI.
+
+    `timeout` is a TOTAL deadline (BUG 6d, hardware report 2026-10-20). The
+    daemon streams event frames on the same connection as the reply, and a
+    per-recv timeout reset by every frame let `assist dictate` sit inside
+    `ptt.result` far past its wait_s budget while events trickled by. One
+    deadline covers connect, send and the entire reply wait.
+    """
     if not socket_path.exists():
         raise DaemonUnavailable(
             f"daemon socket not found at {socket_path} — is assistd running? "
             "(systemctl --user status assistant)"
         )
+    deadline = (time.monotonic() + timeout) if timeout is not None else None
     reply: dict | None = None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -257,6 +266,13 @@ def call(socket_path: Path, method: str, params: dict | None = None, timeout: fl
                         break
                 if reply is not None:
                     break
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise DaemonUnavailable(
+                            f"daemon at {socket_path} did not reply to "
+                            f"'{method}' within {timeout:g}s")
+                    sock.settimeout(remaining)
                 chunk = sock.recv(65536)
                 if not chunk:
                     if buffer.strip():
