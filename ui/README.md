@@ -82,7 +82,12 @@ panel never steals a keystroke you didn't give it.
 5. `assist knock raise --topic test --reason "While testing, I found the knock path." --kind finding --referent "the knock test"`
    → Waybar `✦ ·wants to talk`, one notification under `Elaria · knock`, one short
    sound. `assist knock decline <id>` → the notification state clears.
-6. If the sound is silent, install the asset somewhere permanent:
+6. Enrol the voiceprint (`assist-voice-test enroll`), then say "Elaria, show
+   off" with the owner present: the header shows `SHOW-OFF`, the room hears the
+   announcement, and `assist showoff status` shows `permissions: []` and the
+   demo sandbox path. Say a guest command ("delete his files") → refusal, mode
+   off, `assist showoff status` reports `never_list`.
+7. If the sound is silent, install the asset somewhere permanent:
    `mkdir -p ~/.local/share/assistant/sounds && cp ui/sounds/knock.wav ~/.local/share/assistant/sounds/`
    (the config default points there; the code also falls back to `ui/sounds/`).
 

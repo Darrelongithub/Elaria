@@ -388,6 +388,16 @@ DEFAULTS: dict = {
         "history_limit": 200,      # one conversation; no per-channel fork
         "snapshot_limit": 20,
     },
+    "showoff": {
+        # §19.3. Entry happens through a voiceprint-verified command only; this
+        # section carries no grant of authority, only the demo's own bounds.
+        "timeout_s": 600,            # ~10 minutes, then it ends itself
+        "sandbox": "",               # "" -> <data_dir>/demo-sandbox
+        # The ONLY owner facts visible to guests. Empty by default: private
+        # memory (§16) is closed in this mode, not merely discouraged.
+        "demo_safe_facts": [],
+        "announce": True,
+    },
     "initiative": {
         # §19.2 as amended: NO BUDGET. There is deliberately no per-day count,
         # spacing rule or rate key in this section — the reason gate controls

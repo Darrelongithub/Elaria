@@ -91,3 +91,11 @@
   60%  { opacity: 0.7; }
   100% { opacity: 1; }
 }
+
+/* Stage D — show-off mode: the room is invited; authority is not. */
+#custom-elaria.showoff {
+  color: #e08cff;
+}
+#custom-elaria.showoff.knock {
+  color: #ffb86c;
+}

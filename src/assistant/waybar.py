@@ -58,6 +58,10 @@ def format_waybar(status: dict) -> dict:
         suffix += " ·class"
     elif class_mode.get("suggested"):
         classes.append("class-suggested")
+    showoff = status.get("showoff") or {}
+    if showoff.get("active"):
+        classes.append("showoff")
+        suffix += " ·demo"
     knock = status.get("knock") or {}
     pending_knocks = int(knock.get("pending") or 0)
     if pending_knocks:
@@ -84,6 +88,9 @@ def format_waybar(status: dict) -> dict:
                              "knocks silent · initiative urgent-only")
     elif class_mode.get("suggested"):
         tooltip_lines.append("class suggestion: " + str(class_mode.get("suggestion")))
+    if showoff.get("active"):
+        tooltip_lines.append("show-off mode · demo sandbox only · zero standing "
+                             "permissions · private memory closed")
     if pending_knocks:
         tooltip_lines.append(
             f"{pending_knocks} knock(s) — she has a stated reason; click to open "

@@ -542,6 +542,31 @@ def _knock_command(args, config) -> int:
     return 0
 
 
+def _showoff_command(args, config) -> int:
+    """`assist showoff …` — owner surfaces only. Entry is voice-only by design."""
+    action = getattr(args, "showoff_action", None) or "status"
+    try:
+        if action == "status":
+            out = call(config.socket_path, "showoff.status", timeout=5.0)
+        elif action == "exit":
+            out = call(config.socket_path, "showoff.exit",
+                       {"reason": "owner_hotkey"}, timeout=10.0)
+        else:
+            out = call(config.socket_path, "showoff.demo",
+                       {"action": getattr(args, "demo_action", "list"),
+                        "name": getattr(args, "name", None),
+                        "content": getattr(args, "content", "")}, timeout=30.0)
+    except (DaemonUnavailable, RuntimeError, OSError) as exc:
+        if action == "status":
+            out = {"showoff": {"active": False, "permissions": [],
+                               "note": f"daemon unavailable: {exc}"}}
+        else:
+            print(f"showoff {action}: {exc}", file=sys.stderr)
+            return 1
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def _commitment_command(args, config) -> int:
     """Commitment memory: only the user (or an accepted proposal) creates one."""
     service, store, owned = _initiative(config)
@@ -1078,6 +1103,16 @@ def build_parser() -> argparse.ArgumentParser:
     knock_ignore = knock_sub.add_parser("ignore", help="retire a topic after 3 ignores")
     knock_ignore.add_argument("id", type=int)
     knock_ignore.add_argument("--json", action="store_true")
+    showoff_p = sub.add_parser(
+        "showoff", help="demo mode: owner-entered, zero standing permissions")
+    showoff_sub = showoff_p.add_subparsers(dest="showoff_action")
+    showoff_sub.add_parser("status", help="active? sandbox? permissions?")
+    showoff_sub.add_parser("exit", help="owner hotkey / local stop")
+    showoff_demo = showoff_sub.add_parser(
+        "demo", help="a demonstration confined to the demo sandbox")
+    showoff_demo.add_argument("--action", default="list", choices=["list", "write"])
+    showoff_demo.add_argument("--name", default="demo.txt")
+    showoff_demo.add_argument("--content", default="Elaria demo\n")
     commitment_p = sub.add_parser(
         "commitment", help="commitment memory: follow-ups the USER set in motion")
     commitment_sub = commitment_p.add_subparsers(dest="commitment_action")
@@ -1240,6 +1275,7 @@ def main(argv: list[str] | None = None) -> int:
                           "connectivity": connectivity.as_dict(),
                           "connectivity_mode": connectivity.effective_mode,
                           "class_mode": PresenceService(config, store).status().as_dict(),
+                          "showoff": {"active": False, "permissions": []},
                           "knock": {"pending": len(store.list_knocks("pending")),
                                     "budget": "none — the reason gate is the only control",
                                     "class_mode_urgent_only":
@@ -1279,6 +1315,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "commitment":
             return _commitment_command(args, config)
+
+        if args.command == "showoff":
+            return _showoff_command(args, config)
 
         if args.command == "talk":
             return _talk_command(args, config)

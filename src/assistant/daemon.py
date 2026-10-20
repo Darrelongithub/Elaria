@@ -36,6 +36,7 @@ from .organiser import OrganiserService
 from .persona import PersonaGovernor, TurnContext
 from .presence import PresenceService
 from .safety import clear_halt, is_halted, set_halt
+from .showoff import ShowoffError, ShowoffService
 from .store import Store
 from .transcribe import DictationService
 from .tts import STANDARD_ACKS, SpeechService
@@ -91,6 +92,10 @@ class Daemon:
         from .meeting import MeetingService
         self.meetings = MeetingService(
             config, self.store, self.client, mode_manager=self.mode_manager)
+        # Stage D: show-off is the owner's, voiceprint-verified, and grants
+        # nothing that survives it. Demo actions are sandboxed at the executor.
+        self.showoff = ShowoffService(
+            config, self.store, presence=self.presence, sessions=self.sessions)
         # Stage C: the knock. Class mode restricts it to urgent-only; the
         # reason gate — not a budget — decides whether she may speak at all.
         self.initiative = InitiativeService(
@@ -98,7 +103,7 @@ class Daemon:
         self.knock_signal = KnockSignal(config)
         self.console = ConsoleService(
             config, self.store, presence=self.presence, sessions=self.sessions,
-            initiative=self.initiative)
+            initiative=self.initiative, showoff=self.showoff)
         self._meeting: dict | None = None  # {task, dual, mic_frames, sys_frames}
         self._meeting_processing = False
         self._plan_tasks: dict[int, asyncio.Task] = {}
@@ -277,6 +282,10 @@ class Daemon:
             "knock.ignore": self._knock_ignore,
             "knock.due": self._knock_due,
             "initiative.status": self._initiative_status,
+            "showoff.status": self._showoff_status,
+            "showoff.enter": self._showoff_enter,
+            "showoff.exit": self._showoff_exit,
+            "showoff.demo": self._showoff_demo,
             "console.say": self._console_say,
             "class.status": self._class_status,
             "class.set": self._class_set,
@@ -335,6 +344,7 @@ class Daemon:
             "voice": self.speech.status(),
             "class_mode": self.presence.status().as_dict(),
             "knock": self.initiative.status(),
+            "showoff": self.showoff.status(),
             "console": {
                 "conversation_id": (self.sessions.history()["id"]),
                 "messages": len(self.sessions.history()["messages"]),
@@ -1044,6 +1054,92 @@ class Daemon:
                 "transcript_preview": result.transcript[:400],
                 "connectivity": self.mode_manager.status(refresh=False).as_dict()}
 
+    # -- show-off (§19.3) ----------------------------------------------------
+    async def _showoff_status(self, params: dict) -> dict:
+        return {"showoff": self.showoff.status()}
+
+    async def _showoff_enter(self, params: dict) -> dict:
+        try:
+            result = self.showoff.enter(
+                command=str(params.get("command") or ""),
+                embedding=params.get("embedding"),
+                owner_present=bool(params.get("owner_present", False)))
+        except ShowoffError as exc:
+            raise ValueError(str(exc)) from exc
+        speech = await self._maybe_speak_reply(
+            result["announcement"], {"speak": params.get("speak", True)})
+        await self.broadcast({"event": "showoff.entered",
+                              "session_id": result["session_id"],
+                              "announcement": result["announcement"]})
+        return {**result, "speech": speech}
+
+    async def _showoff_exit(self, params: dict) -> dict:
+        try:
+            if params.get("command") or params.get("reason") == "owner_stop":
+                summary = self.showoff.exit_owner(
+                    command=str(params.get("command") or ""),
+                    embedding=params.get("embedding"))
+            elif params.get("reason") == "owner_hotkey" or not params.get("reason"):
+                summary = self.showoff.exit_hotkey()
+            else:
+                raise ValueError(
+                    "show-off exits only by owner stop command, owner hotkey, "
+                    "timeout, or a never-list attempt")
+        except ShowoffError as exc:
+            raise ValueError(str(exc)) from exc
+        await self.broadcast({"event": "showoff.exited", "summary": summary})
+        return {"showoff": self.showoff.status(), "summary": summary}
+
+    async def _showoff_demo(self, params: dict) -> dict:
+        if not self.showoff.active():
+            raise ValueError("show-off mode is not on")
+        if str(params.get("action") or "list") == "write":
+            return self.showoff.demo_write(str(params.get("name") or "demo.txt"),
+                                           str(params.get("content") or ""))
+        return {"sandbox": str(self.showoff.sandbox_path()),
+                "target": str(self.showoff.demo_target(
+                    str(params.get("name") or "")))}
+
+    async def _guest_turn(self, text: str, params: dict,
+                          status: dict) -> dict:
+        """A guest turn in show-off mode: conversation only, authority none."""
+        channel = str(params.get("channel") or "voice")
+        conversation_id = self.sessions.active_id(iso_now())
+        self.sessions.append("user", text, channel=channel, ts=iso_now())
+        verdict = self.showoff.guest_turn(text)
+        model = None
+        if verdict.get("allowed"):
+            prompt = self.showoff.build_guest_prompt(text)
+            connectivity = await self._connectivity_snapshot()
+            if connectivity.is_offline:
+                reply = ("I'm offline, so the demo is text-only right now — "
+                         "the good answers are on hold.")
+                via = "local"
+            else:
+                result = await asyncio.to_thread(
+                    self.client.generate, "chat", prompt)
+                reply, model = result.text, result.model
+                via = "showoff"
+        else:
+            reply, via = verdict["reply"], "showoff-refusal"
+        speech = await self._maybe_speak_reply(reply, params)
+        self.sessions.append("assistant", reply, channel=channel, via=via,
+                             ts=iso_now())
+        await self.broadcast({"event": "conversation.message",
+                              "conversation_id": conversation_id,
+                              "channel": channel, "role": "assistant"})
+        if verdict.get("exited"):
+            await self.broadcast({"event": "showoff.exited",
+                                  "summary": verdict.get("summary")})
+        return {
+            "reply": reply, "speaker": "guest", "via": via,
+            "channel": channel, "conversation_id": conversation_id,
+            "model": model, "register": "expressive-allowed",
+            "showoff": verdict, "memory_closed": True,
+            "speech": speech, "fixture": None,
+            "serious_gate": None, "mode": self.config.gemini_mode,
+        }
+
     async def _ask(self, params: dict) -> dict:
         """Conversational turn on the §13.4 ladder: governor (local) →
         exact/grammar intents (local) → memory recall (local) → and only
@@ -1055,6 +1151,11 @@ class Daemon:
         text = str(params.get("text", "")).strip()
         if not text:
             raise ValueError("ask needs params.text")
+        speaker = str(params.get("speaker") or "owner").lower()
+        showoff_now = self.showoff.status()
+        if showoff_now.get("active") and speaker != "owner":
+            return await self._guest_turn(text, params, showoff_now)
+
         decision = self.governor.decide(TurnContext(user_text=text))
         self.store.log_persona_event(
             iso_now(), "decision",

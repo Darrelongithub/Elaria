@@ -1,22 +1,9 @@
-// Elaria — her console (§19.1).
+// Elaria · console — a dumb renderer over `assist console --follow`.
 //
-// A dedicated surface, not a second assistant. DUMB RENDERER by design:
-// every field below comes from `assistant/console.py::ConsoleService.snapshot()`.
-// The one conversation is shared with voice turns in the daemon's store; this
-// panel never keeps its own history, so starting by voice and continuing here
-// cannot fork context.
-//
-// Feed:  `assist console --follow`  (one JSON snapshot per line, on every
-//        daemon event plus a periodic refresh)
-// Send:  `assist talk "<text>"`     (same `_ask` handler the voice path uses)
-//
-// WAYLAND: layer-shell Top (not Overlay) because a console may take keyboard
-// focus — but only OnDemand, so it never steals a keystroke from your editor
-// until you click into the input.
-//
-// STATUS: UNVERIFIED on real Quickshell/Hyprland. If Process/SplitParser names
-// differ in your Quickshell version, only the feed block needs adjusting.
-
+// No logic lives here: every verdict (class mode, knocks, plans, holding,
+// show-off) comes from the daemon snapshot. Sending a line calls
+// `assist talk <text>`, which is the SAME handler the voice path uses, so
+// there is still exactly one conversation.
 import QtQuick
 import QtQuick.Controls
 import Quickshell
@@ -26,17 +13,43 @@ import Quickshell.Wayland
 ShellRoot {
     PanelWindow {
         id: panel
-
-        // --- state bound from the JSON feed ---------------------------------
         property var snap: ({
             conversation: {id: null, messages: []},
             pending_plans: [], parked_items: [], job_progress: [],
             offline_queue: {counts: {}, jobs: []}, holding: [],
-            knocks: [], class_mode: {enabled: false}, showoff: {active: false},
-            counts: {pending_plans: 0, parked: 0, queue: 0, holding: 0, knocks: 0}
+            knocks: [], class_mode: {enabled: false},
+            showoff: {active: false},
+            counts: {pending_plans: 0, parked: 0, queue: 0,
+                     holding: 0, knocks: 0}
         })
         property string draft: ""
         property string sendStatus: ""
+        property bool feedUp: false
+
+        function messages() {
+            return (panel.snap.conversation && panel.snap.conversation.messages) || []
+        }
+        function parseSnapshot(line) {
+            if (!line || line.trim().length === 0) return
+            try {
+                panel.snap = JSON.parse(line)
+                panel.feedUp = true
+                scrollTimer.restart()
+            } catch (e) {
+                panel.sendStatus = "feed parse error"
+            }
+        }
+        function send() {
+            var text = panel.draft.trim()
+            if (text.length === 0 || sendProcess.running) return
+            sendProcess.command = ["assist", "talk", text]
+            sendProcess.running = true
+            panel.sendStatus = "sent"
+        }
+        function knock(action, id) {
+            knockProcess.command = ["assist", "knock", action, String(id)]
+            knockProcess.running = true
+        }
 
         WlrLayershell.layer: WlrLayer.Top
         WlrLayershell.namespace: "elaria-console"
@@ -46,254 +59,231 @@ ShellRoot {
         margins.top: 12
         margins.right: 12
         implicitWidth: 460
-        implicitHeight: 640
+        implicitHeight: 680
         color: "transparent"
 
         Rectangle {
             anchors.fill: parent
             radius: 14
-            color: "#151824"
-            opacity: 0.97
+            color: "#161922"
+            border.color: "#2b3040"
             border.width: 1
-            border.color: panel.snap.class_mode.enabled ? "#8be9fd" : "#3b4261"
 
             Column {
                 anchors.fill: parent
                 anchors.margins: 14
-                spacing: 10
+                spacing: 8
 
-                // --- header: who/which mode, at a glance -------------------
+                // Header: mode is visible, never implied.
                 Row {
+                    width: parent.width
                     spacing: 8
                     Text {
-                        text: "Elaria — console"
+                        text: "Elaria · console"
                         color: "#e6e9f5"
                         font.pixelSize: 16
                         font.bold: true
                     }
                     Rectangle {
-                        visible: panel.snap.class_mode.enabled
-                        radius: 8
-                        color: "#1f3b45"
-                        width: classLabel.implicitWidth + 14
-                        height: 20
-                        Text {
-                            id: classLabel
-                            anchors.centerIn: parent
-                            text: "CLASS MODE"
-                            color: "#8be9fd"
-                            font.pixelSize: 11
-                            font.bold: true
-                        }
+                        visible: panel.snap.class_mode && panel.snap.class_mode.enabled
+                        radius: 5
+                        color: "#4a3a15"
+                        width: classBadge.width + 10; height: 20
+                        Text { id: classBadge; anchors.centerIn: parent
+                               text: "CLASS MODE"; color: "#ffcb6b"
+                               font.pixelSize: 10; font.bold: true }
                     }
                     Rectangle {
-                        visible: panel.snap.showoff.active === true
-                        radius: 8
-                        color: "#4a2e1f"
-                        width: showLabel.implicitWidth + 14
-                        height: 20
-                        Text {
-                            id: showLabel
-                            anchors.centerIn: parent
-                            text: "SHOW-OFF"
-                            color: "#ffb86c"
-                            font.pixelSize: 11
-                            font.bold: true
-                        }
+                        visible: panel.snap.showoff && panel.snap.showoff.active
+                        radius: 5
+                        color: "#3a1540"
+                        width: demoBadge.width + 10; height: 20
+                        Text { id: demoBadge; anchors.centerIn: parent
+                               text: "SHOW-OFF"; color: "#e08cff"
+                               font.pixelSize: 10; font.bold: true }
+                    }
+                    Text {
+                        text: panel.feedUp ? "" : "daemon down"
+                        color: "#ff6b6b"
+                        font.pixelSize: 11
                     }
                 }
 
                 Text {
-                    visible: panel.snap.class_mode.suggested === true
-                    text: panel.snap.class_mode.suggestion || ""
-                    color: "#6272a4"
-                    font.pixelSize: 11
-                    wrapMode: Text.WordWrap
                     width: parent.width
+                    text: "conversation #" + (panel.snap.conversation.id || "—")
+                        + " · holding " + (panel.snap.counts.holding || 0)
+                        + " · parked " + (panel.snap.counts.parked || 0)
+                        + " · queue " + (panel.snap.counts.queue || 0)
+                        + " · knocks " + (panel.snap.counts.knocks || 0)
+                    color: "#8f97ad"
+                    font.pixelSize: 11
+                    elide: Text.ElideRight
                 }
 
-                // --- one conversation, both channels ----------------------
-                Rectangle {
+                // The knock shelf, reason first.
+                Column {
                     width: parent.width
-                    height: 250
-                    radius: 8
-                    color: "#10121c"
-
-                    Flickable {
-                        anchors.fill: parent
-                        anchors.margins: 8
-                        clip: true
-                        contentHeight: thread.implicitHeight
-                        ScrollBar.vertical: ScrollBar {}
-
-                        Column {
-                            id: thread
+                    spacing: 3
+                    visible: (panel.snap.knocks || []).length > 0
+                    Text { text: "wants to talk"; color: "#ffb86c"
+                           font.pixelSize: 12; font.bold: true }
+                    Repeater {
+                        model: panel.snap.knocks || []
+                        delegate: Column {
                             width: parent.width
-                            spacing: 6
-                            Repeater {
-                                model: panel.snap.conversation.messages || []
-                                delegate: Text {
-                                    width: thread.width
-                                    wrapMode: Text.WordWrap
-                                    font.pixelSize: 12
-                                    color: modelData.role === "user" ? "#e6e9f5" : "#8be9fd"
-                                    text: (modelData.role === "user" ? "you " : "elaria ")
-                                        + "[" + (modelData.channel || "voice") + "]: "
-                                        + modelData.text
+                            spacing: 2
+                            Text {
+                                width: parent.width
+                                text: "#" + modelData.id + " [" + modelData.urgency
+                                    + "] " + modelData.reason
+                                color: "#e6e9f5"
+                                font.pixelSize: 12
+                                wrapMode: Text.WordWrap
+                            }
+                            Row {
+                                spacing: 6
+                                Button {
+                                    text: "accept"
+                                    onClicked: panel.knock("accept", modelData.id)
+                                }
+                                Button {
+                                    text: "later"
+                                    onClicked: panel.knock("later", modelData.id)
+                                }
+                                Button {
+                                    text: "decline"
+                                    onClicked: panel.knock("decline", modelData.id)
                                 }
                             }
                         }
                     }
                 }
 
-                // --- the knock shelf: reason is the first line ------------
-                Column {
+                // The one conversation. Voice and console turns interleave.
+                Flickable {
+                    id: feedFlick
                     width: parent.width
-                    spacing: 4
-                    visible: (panel.snap.knocks || []).length > 0
-                    Text { text: "wants to talk — the reason comes first"; color: "#ffb86c"; font.pixelSize: 12; font.bold: true }
-                    Repeater {
-                        model: panel.snap.knocks || []
-                        delegate: Text {
-                            width: parent.width
-                            wrapMode: Text.WordWrap
-                            font.pixelSize: 12
-                            color: "#e6e9f5"
-                            text: "#" + modelData.id + " [" + modelData.urgency + "] "
-                                + modelData.topic + ": " + modelData.reason
-                                + "   (accept/decline/later in `assist talk`)"
+                    height: parent.height - 210
+                    clip: true
+                    contentWidth: width
+                    contentHeight: feedColumn.implicitHeight
+                    boundsBehavior: Flickable.StopAtBounds
+                    Column {
+                        id: feedColumn
+                        width: feedFlick.width
+                        spacing: 6
+                        Repeater {
+                            model: panel.messages()
+                            delegate: Text {
+                                width: feedColumn.width
+                                text: (modelData.role === "user" ? "you" : "elaria")
+                                    + " [" + (modelData.channel || "voice") + "]  "
+                                    + modelData.text
+                                color: modelData.role === "user" ? "#9fd2ff" : "#e6e9f5"
+                                font.pixelSize: 12
+                                wrapMode: Text.WordWrap
+                            }
                         }
                     }
                 }
 
-                // --- plans, parked items, queue, holding ------------------
+                Timer {
+                    id: scrollTimer
+                    interval: 40
+                    repeat: false
+                    onTriggered: feedFlick.contentY = Math.max(
+                        0, feedFlick.contentHeight - feedFlick.height)
+                }
+
+                // Everything else the snapshot carries, compactly.
                 Text {
                     width: parent.width
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: 12
-                    color: "#c8cee8"
-                    text: {
-                        const parts = [];
-                        const plans = panel.snap.pending_plans || [];
-                        if (plans.length)
-                            parts.push("plans: " + plans.map(p =>
-                                "#" + p.id + " " + p.status + " " + p.placed + "/" + p.total).join(" · "));
-                        if ((panel.snap.parked_items || []).length)
-                            parts.push("parked for review: " + panel.snap.parked_items.length);
-                        const q = panel.snap.offline_queue || {};
-                        if (q.counts && Object.keys(q.counts).length)
-                            parts.push("queue: " + Object.keys(q.counts).map(k => k + "=" + q.counts[k]).join(", "));
-                        const jobs = panel.snap.job_progress || [];
-                        if (jobs.length)
-                            parts.push("running: " + jobs.map(j => j.label).join(" · "));
-                        return parts.join("\n");
-                    }
+                    visible: (panel.snap.pending_plans || []).length > 0
+                    text: "plans: " + (panel.snap.pending_plans || []).map(
+                        p => "#" + p.id + " " + p.placed + "/" + p.total).join(" · ")
+                    color: "#8f97ad"; font.pixelSize: 11; wrapMode: Text.WordWrap
                 }
-
-                Column {
+                Text {
                     width: parent.width
-                    spacing: 4
+                    visible: (panel.snap.job_progress || []).length > 0
+                    text: "jobs: " + (panel.snap.job_progress || []).map(
+                        j => j.label + " " + j.status).join(" · ")
+                    color: "#8f97ad"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                }
+                Text {
+                    width: parent.width
                     visible: (panel.snap.holding || []).length > 0
-                    Text { text: "holding for you"; color: "#6272a4"; font.pixelSize: 11; font.bold: true }
-                    Repeater {
-                        model: panel.snap.holding || []
-                        delegate: Text {
-                            width: parent.width
-                            wrapMode: Text.WordWrap
-                            font.pixelSize: 12
-                            color: "#c8cee8"
-                            text: "• [" + modelData.kind + "] " + modelData.title
-                                + (modelData.detail ? " — " + modelData.detail : "")
-                        }
-                    }
+                    text: "holding: " + (panel.snap.holding || []).map(
+                        h => h.title).join(" · ")
+                    color: "#8f97ad"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                }
+                Text {
+                    width: parent.width
+                    visible: (panel.snap.offline_queue
+                              && Object.keys(panel.snap.offline_queue.counts || {}).length > 0)
+                    text: "offline queue: " + JSON.stringify(
+                        panel.snap.offline_queue.counts || {})
+                    color: "#8f97ad"; font.pixelSize: 11; wrapMode: Text.WordWrap
                 }
 
-                // --- input: text works in class mode too ------------------
                 Row {
                     width: parent.width
-                    spacing: 8
+                    spacing: 6
                     TextField {
-                        id: input
+                        id: draftField
                         width: parent.width - sendButton.width - 8
-                        placeholderText: panel.snap.class_mode.enabled
-                            ? "class mode — voice off, text on"
-                            : "say something (voice or text, one conversation)"
+                        placeholderText: "talk to her — same conversation as voice"
                         color: "#e6e9f5"
-                        background: Rectangle { color: "#10121c"; radius: 6 }
-                        onAccepted: sendProcess.send()
+                        placeholderTextColor: "#6c7488"
+                        background: Rectangle { color: "#1e2230"; radius: 6 }
+                        text: panel.draft
+                        onTextChanged: panel.draft = text
+                        onAccepted: panel.send()
                     }
                     Button {
                         id: sendButton
-                        text: "Send"
-                        enabled: input.text.trim().length > 0
-                        onClicked: sendProcess.send()
+                        text: "send"
+                        enabled: panel.draft.trim().length > 0
+                        onClicked: panel.send()
                     }
                 }
-
                 Text {
-                    text: panel.sendStatus
-                    color: "#6272a4"
-                    font.pixelSize: 10
                     width: parent.width
-                    wrapMode: Text.WordWrap
+                    text: panel.sendStatus
+                    color: "#8f97ad"; font.pixelSize: 10
                 }
             }
         }
 
-        // --- feed: one snapshot per line ---------------------------------
+        // The feed: one snapshot per daemon event, plus reconnects.
         Process {
-            id: feed
-            running: true
+            id: feedProcess
             command: ["assist", "console", "--follow"]
-            stdout: SplitParser {
-                onRead: line => {
-                    try {
-                        panel.snap = JSON.parse(line);
-                    } catch (e) {
-                        // A partial/malformed line must never crash the panel.
-                    }
-                }
+            running: true
+            stdout: SplitParser { onRead: line => panel.parseSnapshot(line) }
+            onExited: {
+                panel.feedUp = false
+                feedRetry.start()
             }
-            onExited: restartTimer.start()
         }
-
         Timer {
-            id: restartTimer
+            id: feedRetry
             interval: 1500
-            onTriggered: { feed.running = true; }
+            repeat: false
+            onTriggered: feedProcess.running = true
         }
-
-        // --- send: same handler as the voice path ------------------------
         Process {
             id: sendProcess
-            property string pendingText: ""
-            running: false
-            function send() {
-                const text = input.text.trim();
-                if (!text) return;
-                pendingText = text;
-                panel.sendStatus = "sent";
-                command = ["assist", "talk", text];
-                running = true;
-                input.text = "";
-            }
             onExited: {
-                panel.sendStatus = "";
-                // The daemon broadcasts console.message; if the feed is between
-                // reconnects, this immediate nudge keeps the panel current.
-                refresh.running = true;
+                panel.draft = ""
+                draftField.text = ""
+                panel.sendStatus = ""
             }
         }
-
         Process {
-            id: refresh
-            running: false
-            command: ["assist", "console", "--json"]
-            stdout: SplitParser {
-                onRead: line => {
-                    try { panel.snap = JSON.parse(line); } catch (e) {}
-                }
-            }
+            id: knockProcess
+            onExited: panel.sendStatus = ""
         }
     }
 }

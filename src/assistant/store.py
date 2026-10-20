@@ -962,6 +962,19 @@ class Store:
             )
             self._conn.commit()
 
+    def list_persona_events(self, *, kind: str | None = None,
+                            limit: int = 50) -> list[dict]:
+        query = "SELECT * FROM persona_events"
+        params: list = []
+        if kind:
+            query += " WHERE kind = ?"
+            params.append(kind)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
     def get_state(self, key: str, default: str | None = None) -> str | None:
         with self._lock:
             row = self._conn.execute(

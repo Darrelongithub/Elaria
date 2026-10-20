@@ -270,6 +270,48 @@ due, `assist knock due` raises a fresh knock whose reason is the user's own
 request ("You asked me to chase this, and it is due…"). Ignoring the same topic
 three times retires it.
 
+### Show-off mode (Stage D, §19.3)
+
+```bash
+assist showoff status        # active? sandbox? permissions? (always [])
+assist showoff exit          # owner hotkey / local stop
+assist showoff demo --action write --name notes.txt
+```
+
+**Entry is voice-only, and it is the owner's.** "Elaria, show off" / "talk to
+them", spoken with the owner present and verified against the enrolled
+voiceprint. There is deliberately no CLI `enter`: the phrase is not the
+credential, so a guest who says the same words gets nothing. A voiceprint score
+below `voice_test.speaker_threshold` is refused with the reason.
+
+Once in, exactly one gate opens: **speaker verification is off for
+conversation**. Guests may talk, banter and ask what she can do; the persona
+governor takes the brag register one notch up — performative confidence and
+roasting *situations*, never a guest's body, accent, identity, history or real
+traits. Serious-gates still win, so a stressed room gets plain speech.
+
+Everything else stays shut:
+
+* **Authority never transfers.** A guest request to move files, send messages,
+  change settings, buy something or expose owner data is declined in character,
+  counted, logged (category only — never the guest's words) and ends the demo as
+  a never-list attempt. Guest turns never reach intents or tools.
+* **Private memory (§16) is closed.** The only owner facts visible in this mode
+  are the owner-editable `[showoff] demo_safe_facts` allowlist (empty by
+  default). A "what does he usually…" probe is deflected, not answered.
+* **Demonstrations are sandboxed.** They act only inside `[showoff] sandbox`
+  (default `<data dir>/demo-sandbox`). The executor enforces it at the syscall
+  boundary via `safety.assert_within_sandbox`; a real path is refused even if a
+  plan or prompt is fooled.
+* **Zero standing permissions.** Nothing is granted on entry, nothing survives
+  exit, and a daemon restart closes any open session as `daemon_restart`.
+
+Exit paths: owner stop command (voiceprint-verified), ~10-minute timeout, owner
+hotkey, or any never-list attempt. On exit `assist status` reports show-off off,
+`permissions: []`, and the session row keeps a summary — what the room was told,
+how many guest turns were heard, how many requests were declined, why it ended —
+with `audio_retained = 0`. No guest audio is kept.
+
 ## §10 open decisions — defaults taken, awaiting your word
 
 None block Phase 0 (§14). Each defaults to the blueprint's recommendation
@@ -298,7 +340,7 @@ assist doctor                         # paste this into the question, always
 ## Tests
 
 ```bash
-uv run pytest        # or: python -m pytest — passes offline, keyless, ~1s
+uv run pytest        # or: python -m pytest — passes offline, keyless, ~40s
 ```
 
 Tests deliberately strip `GEMINI_API_KEY` and forbid network on the ack path.

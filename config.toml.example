@@ -88,6 +88,14 @@ class_schedule_suggest = true
 history_limit = 200      # one conversation shared by voice + console
 snapshot_limit = 20
 
+[showoff]
+# §19.3. Entry is a voiceprint-verified owner command; nothing here grants
+# authority. Guests never see owner facts beyond this allowlist.
+timeout_s = 600
+sandbox = ""                  # "" -> <data dir>/demo-sandbox
+demo_safe_facts = []          # e.g. ["She can organise a folder by type."]
+announce = true
+
 [initiative]
 # §19.2 as amended: NO BUDGET. There is deliberately no per-day count, spacing
 # rule or rate key here — the reason gate is the only control. A knock requires
