@@ -53,6 +53,47 @@ If `Process`/`SplitParser` import names differ in your Quickshell version,
 only the feed block at the bottom of `shell.qml` needs adjusting — everything
 above it is property bindings.
 
+## Elaria console (Stage B, §19.1)
+
+```bash
+quickshell -p ui/quickshell/console        # dedicated panel, same repo
+cp systemd/elaria-console.service ~/.config/systemd/user/
+systemctl --user enable --now elaria-console
+```
+
+A dedicated panel, not a second assistant: it renders
+`assistant/console.py::ConsoleService.snapshot()` from
+`assist console --follow` and sends turns with `assist talk "<text>"`. The
+conversation is the daemon's single store, so voice→console continuity needs no
+extra plumbing. It shows pending plans, parked items, offline queue, job
+progress, the holding shelf and any pending knock (reason first). Class mode is
+in the header; text input keeps working while voice is off.
+
+`WlrKeyboardFocus.OnDemand` only: clicking into the input focuses it, but the
+panel never steals a keystroke you didn't give it.
+
+### Console first-run checklist
+
+1. `quickshell -p ui/quickshell/console` starts with no QML errors.
+2. `assist talk "hello"` → the line appears in the panel within one event.
+3. `assist class on` → header badge appears, input still works, no audio,
+   and a knock arrives as a silent Waybar pulse (no popup, no sound).
+4. Kill/restart the daemon → panel shows a daemon-down snapshot, then recovers.
+5. `assist knock raise --topic test --reason "While testing, I found the knock path." --kind finding --referent "the knock test"`
+   → Waybar `✦ ·wants to talk`, one notification under `Elaria · knock`, one short
+   sound. `assist knock decline <id>` → the notification state clears.
+6. Enrol the voiceprint (`assist-voice-test enroll`), then say "Elaria, show
+   off" with the owner present: the header shows `SHOW-OFF`, the room hears the
+   announcement, and `assist showoff status` shows `permissions: []` and the
+   demo sandbox path. Say a guest command ("delete his files") → refusal, mode
+   off, `assist showoff status` reports `never_list`.
+7. Say "I'm not alone" → console header shows `COMPANY`; ask her for a stored
+   password → deflection, not the value. Say "I'm alone now" → badge clears and
+   the answer returns.
+8. If the sound is silent, install the asset somewhere permanent:
+   `mkdir -p ~/.local/share/assistant/sounds && cp ui/sounds/knock.wav ~/.local/share/assistant/sounds/`
+   (the config default points there; the code also falls back to `ui/sounds/`).
+
 ## Hyprland binds
 
 `assist doctor` prints your syntax. Lua (0.55+): append `ui/hyprland/elaria-binds.lua`.

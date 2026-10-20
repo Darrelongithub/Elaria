@@ -41,7 +41,7 @@ class EchoClient:
 
     def voice_request(self, text, *, voice=None):
         g = self.config.section("gemini")
-        return {"model": g["model_voice"], "voice_name": str(voice or g["voice"] or "Flare"),
+        return {"model": g.get("gemini_voice_model") or g.get("model_voice") or "gemini-3.8-live", "voice_name": str(voice or g["voice"] or "Flare"),
                 "response_modalities": ["AUDIO"], "text": text}
 
     def generate_voice(self, text, *, voice=None, correlation_id="-"):

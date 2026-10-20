@@ -34,6 +34,7 @@ from pathlib import Path
 from .cost import iso_now
 from .safety import (
     Journal,
+    assert_within_sandbox,
     check_blast_radius,
     check_operation,
     is_halted,
@@ -72,7 +73,8 @@ class Executor:
     # -- public -----------------------------------------------------------------
     def apply_plan(self, plan_id: int, root_spec: dict, *,
                    include_review: bool = False,
-                   allow_tripwire: bool = False) -> ApplyReport:
+                   allow_tripwire: bool = False,
+                   sandbox_root: Path | None = None) -> ApplyReport:
         """Apply a ready plan's auto items (+ approved review items).
 
         `allow_tripwire` is the owner's explicit 'yes, move >25% of my
@@ -86,6 +88,10 @@ class Executor:
         if plan is None or plan["status"] != "ready":
             raise ValueError(f"plan {plan_id} is not ready to apply")
         root = Path(root_spec["path"])
+        if sandbox_root is not None:
+            # Show-off mode: the demo may only ever act inside its own folder,
+            # checked here (before any read of plan items) and again per op.
+            assert_within_sandbox(root, sandbox_root)
         items = [i for i in self.store.plan_items(plan_id)
                  if i["decision"] == "auto"
                  or (include_review and i["decision"] == "review")]
@@ -111,7 +117,8 @@ class Executor:
             if report.applied + report.conflicts >= self.max_per_run or hourly_budget <= 0:
                 report.capped = True
                 break
-            outcome = self._apply_item(item, root, plan_id)
+            outcome = self._apply_item(item, root, plan_id,
+                                       sandbox_root=sandbox_root)
             if outcome == "applied":
                 report.applied += 1
                 hourly_budget -= 1
@@ -125,6 +132,11 @@ class Executor:
         if report.applied or report.conflicts:
             self.store.set_plan_status(plan_id, "applied")
         return report
+
+    @staticmethod
+    def assert_demo_path(path: str | Path, sandbox_root: str | Path) -> Path:
+        """Public face of the demo guard, for callers before they plan."""
+        return assert_within_sandbox(path, sandbox_root)
 
     # -- one op, fully journaled --------------------------------------------------
     @staticmethod
@@ -165,7 +177,8 @@ class Executor:
         cls._copy_file_no_overwrite(src, dst)
         return "copy"
 
-    def _apply_item(self, item: dict, root: Path, plan_id: int):
+    def _apply_item(self, item: dict, root: Path, plan_id: int,
+                    *, sandbox_root: Path | None = None):
         src = Path(item["src"])
         new_name = item["new_name"] or src.name
         # Defence in depth: the executor is the last line before a syscall,
@@ -184,6 +197,9 @@ class Executor:
                     "reason": f"unsafe destination folder {dest_value!r}"}
         dest_dir = root / dest_value
         dst = dest_dir / new_name
+        if sandbox_root is not None:
+            assert_within_sandbox(src, sandbox_root)
+            assert_within_sandbox(dst, sandbox_root)
         root_resolved = root.resolve()
         dst_resolved = dst.resolve()
         if root_resolved != dst_resolved and root_resolved not in dst_resolved.parents:

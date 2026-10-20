@@ -114,7 +114,8 @@ class Decision:
     serious_gate: str | None          # humour.toml gate that fired, if any
     pushback: str                     # none | taste | pushback | hard-no (§13.3)
     reason: str                       # evidence, always — vibes-based nagging is banned
-    teasing_licence: str = "none"     # none | tease | roast (earned, §13.7)
+    teasing_licence: str = "none"     # none | tease | roast | brag (§19.3)
+    showoff: bool = False             # brag register only, guest-safe targets
 
 
 def _parse_quiet_hours(spec: str) -> tuple[dtime, dtime] | None:
@@ -172,7 +173,8 @@ class PersonaGovernor:
         return start <= current or current < end if start > end else start <= current < end
 
     # -- the decision ---------------------------------------------------------
-    def decide(self, ctx: TurnContext, *, now: datetime | None = None) -> Decision:
+    def decide(self, ctx: TurnContext, *, now: datetime | None = None,
+               showoff: bool = False) -> Decision:
         gate = self.active_gate(ctx)
         if ctx.safety_refusal:
             return Decision(True, "plain", gate, "hard-no",
@@ -191,6 +193,17 @@ class PersonaGovernor:
         if self.in_quiet_hours(now) and not ctx.user_text:
             return Decision(False, "plain", None, "none",
                             "quiet hours and nothing was asked — stay silent (§13.5)")
+
+        if showoff:
+            # §19.3: one notch up, not off the leash. The owner's own command
+            # opened this mode; confidence is performative and the target is
+            # always the SITUATION, never a guest's real traits.
+            return Decision(
+                True, "expressive-allowed", None, "none",
+                "show-off mode: brag register one notch up — performative "
+                "confidence and roasting situations; never a guest's body, "
+                "accent, identity, history or real traits",
+                teasing_licence="brag", showoff=True)
 
         tone = read_tone(ctx.user_text) if ctx.user_text else ToneSignals()
         # Teasing/roasting licence: earned by familiarity, aimed only at

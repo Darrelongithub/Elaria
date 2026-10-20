@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import canonical_voices, resolve_voice
+from .config import voice_model as config_voice_model
 from .proc import child_kwargs
 
 # The ack strings are load-bearing for audibility, not style. This voice cannot
@@ -216,11 +217,16 @@ class SpeechService:
     """The only speech-output service. Callers never pick a voice."""
 
     def __init__(self, config, store=None, *, backend: TtsBackend | None = None,
-                 runner=None, player_runner=None, client=None, is_online=None):
+                 runner=None, player_runner=None, client=None, is_online=None,
+                 presence=None):
         self.config = config
         self.store = store
         self._client = client
         self._is_online = is_online
+        # Stage B: class mode is posture, not a caller decision. Injecting the
+        # presence service here means every speech path (ack, say, reply, warm)
+        # obeys the toggle without each caller remembering to check it.
+        self._presence = presence
         self.last_voice_error: str | None = None
         self._backend_override = backend
         self._runner = runner
@@ -298,13 +304,21 @@ class SpeechService:
         """
         configured, canonical = self.configured_voice(), canonical_voices(self.config)
         effective, allowed = resolve_voice(self.config)
+        model = config_voice_model(self.config)
+        if allowed:
+            # Regression (Stage A): `allowed` used to be True while `reason` still
+            # read "refused ... not canonical". A pass must read as a pass.
+            reason = (f"voice identity verified: [gemini] voice = {configured!r} is "
+                      f"canonical (allowed: {', '.join(canonical)}) and routes through "
+                      f"the Live model {model!r}")
+        else:
+            reason = (f"voice identity refused: [gemini] voice = {configured!r} is not "
+                      f"canonical (allowed: {', '.join(canonical)}); she will not speak "
+                      f"in an unapproved voice — correct [gemini] voice, or widen "
+                      f"[gemini] allowed_voices deliberately")
         return {
             "configured": configured, "canonical": list(canonical), "allowed": allowed,
-            "effective": effective,
-            "reason": (f"voice identity refused: [gemini] voice = {configured!r} is not "
-                       f"canonical (allowed: {', '.join(canonical)}); she will not speak "
-                       f"in an unapproved voice — correct [gemini] voice, or widen "
-                       f"[gemini] allowed_voices deliberately"),
+            "effective": effective, "model": model, "reason": reason,
         }
 
     def cloud_cache_identity(self) -> dict:
@@ -317,7 +331,7 @@ class SpeechService:
         gemini = self.config.section("gemini") if self.config else {}
         return {
             "voice": self.voice_identity()["effective"] or self.configured_voice(),
-            "model": str(gemini.get("model_voice") or "gemini-2.5-flash-preview-tts"),
+            "model": config_voice_model(self.config),
             "sample_rate": int(gemini.get("voice_sample_rate", 24000)),
         }
 
@@ -349,7 +363,10 @@ class SpeechService:
             "offline_output": "text only: Waybar, overlay, notification, log - no speech",
             "gemini_native_audio": speaking_gemini,
             "gemini_voice": identity["effective"] or gemini.get("voice", "Flare"),
-            "gemini_voice_model": gemini.get("model_voice", "gemini-2.5-flash-preview-tts"),
+            "gemini_voice_model": config_voice_model(self.config),
+            "gemini_voice_api": "live",
+            "class_mode": (self._presence.status().as_dict()
+                           if self._presence is not None else None),
             "voice_identity": identity,
             "cache_identity": (self.cloud_cache_identity() if speaking_gemini else
                                {"voice": backend.voice_id,
@@ -481,7 +498,19 @@ class SpeechService:
         notification, log). The local Piper path stays in the tree but dormant - it
         speaks only when a config key explicitly asks for it, which is also the
         single switch for the future one-owned-voice endgame.
+
+        Stage B: class mode is checked FIRST and is absolute — voice out OFF,
+        spoken acks OFF — while the console stays fully usable.
         """
+        if self._presence is not None:
+            try:
+                presence = self._presence.status()
+            except Exception:            # a broken presence read must not speak
+                presence = None
+            if presence is not None and getattr(presence, "enabled", False):
+                return "silent", (
+                    "class mode: voice out OFF and spoken acks OFF; the console, "
+                    "text replies and local tools remain fully usable")
         settings = self.config.section("tts") if self.config else {}
         online = str(settings.get("online_voice", "gemini")).lower()
         offline = str(settings.get("offline_voice", "none")).lower()
@@ -704,6 +733,18 @@ class SpeechService:
     def warm_ack_cache(self) -> dict[str, dict]:
         if self.voice_route()[0] == "silent":
             return {}  # nothing speaks, so nothing to pre-render
+        if self.voice_route()[0] == "gemini":
+            client = self._gemini_client()
+            # Stage A: validate the model + voice against the real catalogue ONCE
+            # before rendering four acks. A mismatch fails here, with the allowed
+            # list, instead of four separate mid-sentence 400s.
+            validator = getattr(client, "validate_speech_config", None)
+            if callable(validator):
+                try:
+                    validator()
+                except Exception as exc:
+                    self.last_voice_error = f"voice validation failed: {exc}"
+                    raise TtsUnavailable(f"no speech: {exc}") from exc
         warmed = {}
         for kind, text in STANDARD_ACKS.items():
             warmed[kind] = self.synthesize(text, self._ack_path(kind)).as_dict()

@@ -211,7 +211,52 @@ CREATE TABLE IF NOT EXISTS messages (
   ts TEXT NOT NULL,
   role TEXT NOT NULL,          -- user | assistant
   text TEXT NOT NULL,
-  via TEXT                     -- local-intent | local-memory | gemini (honesty)
+  via TEXT,                    -- local-intent | local-memory | gemini (honesty)
+  channel TEXT NOT NULL DEFAULT 'voice'   -- voice | console (ONE conversation)
+);
+
+-- The holding shelf (§19.1): follow-ups and findings that are hers to keep,
+-- never a nag. A holding is what a knock may cite; it is not a knock itself.
+CREATE TABLE IF NOT EXISTS holdings (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  kind TEXT NOT NULL,          -- follow-up | finding
+  title TEXT NOT NULL,
+  detail TEXT,
+  source TEXT,                 -- user-request | accepted-proposal | her-work
+  ref TEXT,                    -- citable: commitment id, job id, path
+  status TEXT NOT NULL DEFAULT 'active',  -- active | resolved | retired
+  due_ts TEXT,
+  updated_ts TEXT
+);
+
+-- The knock ledger (§19.2). reason is NOT NULL and non-empty BY SCHEMA: a
+-- knock without a citable reason cannot exist, not even as a bug.
+CREATE TABLE IF NOT EXISTS knocks (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+  kind TEXT NOT NULL,          -- follow-up | finding | checkin | urgency
+  urgency TEXT NOT NULL DEFAULT 'normal',  -- normal | urgent
+  referent TEXT,               -- concrete thing the reason points at
+  commitment_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending|accepted|declined|snoozed|retired
+  ignore_count INTEGER NOT NULL DEFAULT 0,
+  snooze_until TEXT,
+  resolved_ts TEXT
+);
+
+-- Show-off sessions (§19.3): summary-level log only. No guest audio, ever.
+CREATE TABLE IF NOT EXISTS showoff_sessions (
+  id INTEGER PRIMARY KEY,
+  started_ts TEXT NOT NULL,
+  ended_ts TEXT,
+  exit_reason TEXT,
+  told_summary TEXT,
+  guests_heard INTEGER NOT NULL DEFAULT 0,
+  declined_requests INTEGER NOT NULL DEFAULT 0,
+  audio_retained INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS state (
@@ -246,6 +291,14 @@ class Store:
                     "NOT NULL DEFAULT 'complete'")
             if "offline_text" not in transcript_columns:
                 self._conn.execute("ALTER TABLE transcripts ADD COLUMN offline_text TEXT")
+            # Additive migration (Stage B): one conversation, two channels.
+            message_columns = {
+                r[1] for r in self._conn.execute("PRAGMA table_info(messages)")
+            }
+            if "channel" not in message_columns:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL "
+                    "DEFAULT 'voice'")
             self.fts5_available = self._init_fts5()
             self._conn.commit()
 
@@ -713,11 +766,12 @@ class Store:
             return int(cur.lastrowid)
 
     def add_message(self, conversation_id: int, ts: str, role: str, text: str,
-                    via: str | None = None) -> int:
+                    via: str | None = None, channel: str = "voice") -> int:
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO messages (conversation_id, ts, role, text, via) "
-                "VALUES (?, ?, ?, ?, ?)", (conversation_id, ts, role, text, via))
+                "INSERT INTO messages (conversation_id, ts, role, text, via, channel) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (conversation_id, ts, role, text, via, channel))
             self._conn.commit()
             return int(cur.lastrowid)
 
@@ -726,6 +780,133 @@ class Store:
             rows = self._conn.execute(
                 "SELECT * FROM messages ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in reversed(rows)]
+
+    def conversation_messages(self, conversation_id: int, limit: int = 200) -> list[dict]:
+        """Messages for ONE conversation, oldest first (console history)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM messages WHERE conversation_id = ? "
+                "ORDER BY id DESC LIMIT ?", (conversation_id, limit)).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    def latest_conversation(self) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM conversations ORDER BY id DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+    # -- holding shelf (Stage B, §19.1) --------------------------------------
+    def add_holding(self, *, ts: str, kind: str, title: str, detail: str | None = None,
+                    source: str | None = None, ref: str | None = None,
+                    due_ts: str | None = None) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO holdings
+                   (ts, kind, title, detail, source, ref, status, due_ts, updated_ts)
+                   VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+                (ts, kind, title, detail, source, ref, due_ts, ts))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def list_holdings(self, status: str | None = "active",
+                      limit: int = 50) -> list[dict]:
+        query = "SELECT * FROM holdings"
+        params: list = []
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_holding(self, holding_id: int, *, status: str,
+                       updated_ts: str | None = None) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE holdings SET status = ?, updated_ts = ? WHERE id = ?",
+                (status, updated_ts, holding_id))
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    # -- knocks (Stage C, schema now so B can render the shelf) --------------
+    def create_knock(self, *, ts: str, topic: str, reason: str, kind: str,
+                     urgency: str = "normal", referent: str | None = None,
+                     commitment_id: int | None = None) -> int:
+        if not str(reason or "").strip():
+            raise ValueError("a knock requires a stored, citable reason")
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO knocks
+                   (ts, topic, reason, kind, urgency, referent, commitment_id,
+                    status, ignore_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0)""",
+                (ts, topic, reason.strip(), kind, urgency, referent,
+                 commitment_id))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def get_knock(self, knock_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM knocks WHERE id = ?", (knock_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_knocks(self, status: str | None = "pending",
+                    limit: int = 50) -> list[dict]:
+        query = "SELECT * FROM knocks"
+        params: list = []
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_knock(self, knock_id: int, **fields) -> bool:
+        allowed = {"status", "ignore_count", "snooze_until", "resolved_ts",
+                   "commitment_id"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return False
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE knocks SET {assignments} WHERE id = ?",
+                (*updates.values(), knock_id))
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    # -- show-off sessions (Stage D, schema now) ------------------------------
+    def start_showoff_session(self, *, ts: str, told_summary: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO showoff_sessions
+                   (started_ts, told_summary, audio_retained)
+                   VALUES (?, ?, 0)""", (ts, told_summary))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def end_showoff_session(self, session_id: int, *, ts: str, exit_reason: str,
+                            guests_heard: int, declined_requests: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                """UPDATE showoff_sessions
+                   SET ended_ts = ?, exit_reason = ?, guests_heard = ?,
+                       declined_requests = ?, audio_retained = 0
+                   WHERE id = ?""",
+                (ts, exit_reason, guests_heard, declined_requests, session_id))
+            self._conn.commit()
+
+    def list_showoff_sessions(self, limit: int = 20) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM showoff_sessions ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
     # -- operations journal queries (executor/undo, §4.2/§4.4) -----------------
     def get_operation(self, op_id: int) -> dict | None:
@@ -780,6 +961,19 @@ class Store:
                 (ts, kind, detail_json),
             )
             self._conn.commit()
+
+    def list_persona_events(self, *, kind: str | None = None,
+                            limit: int = 50) -> list[dict]:
+        query = "SELECT * FROM persona_events"
+        params: list = []
+        if kind:
+            query += " WHERE kind = ?"
+            params.append(kind)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
 
     def get_state(self, key: str, default: str | None = None) -> str | None:
         with self._lock:

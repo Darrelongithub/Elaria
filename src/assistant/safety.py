@@ -32,6 +32,23 @@ def expand(path: str | Path) -> Path:
     return Path(path).expanduser()
 
 
+def assert_within_sandbox(path: str | Path, sandbox_root: str | Path) -> Path:
+    """The demo-sandbox choke point (§19.3).
+
+    Show-off demonstrations may act ONLY inside the designated demo folder. The
+    executor calls this before any syscall in sandbox mode, so a real user path
+    is refused at the last line of defence — not by prompt or convention.
+    """
+    resolved = Path(path).expanduser().resolve()
+    root = Path(sandbox_root).expanduser().resolve()
+    if resolved != root and root not in resolved.parents:
+        raise PermissionError(
+            f"demo sandbox refused: {resolved} is outside {root}. Show-off "
+            "demonstrations act only on the demo folder; real paths are never "
+            "touched (§19.3).")
+    return resolved
+
+
 def is_safe_filename(value: object) -> bool:
     """A model/plan-supplied name must be ONE filename, never a path.
 

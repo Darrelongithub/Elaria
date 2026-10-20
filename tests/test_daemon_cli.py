@@ -71,8 +71,13 @@ def _cli(args, env_extra=None):
 def test_cli_doctor_reports_honest_facts():
     out = _cli(["doctor"])
     assert out.returncode == 0, out.stdout + out.stderr
-    assert "UNVERIFIED" in out.stdout           # quota shape flagged (§11)
-    assert "aistudio.google.com/rate-limit" in out.stdout
+    # Stage A / Step 0: the owner has VERIFIED the quota shape, so the doctor
+    # reads the real numbers from [quota] and must not cry wolf any more.
+    assert "VERIFIED 2026-10-20" in out.stdout
+    assert "5 RPM" in out.stdout and "20 RPD" in out.stdout
+    assert "UNVERIFIED: no verified numbers" not in out.stdout
+    assert "aistudio.google.com/rate-limit" not in out.stdout
+    assert "gemini-3.8-live" in out.stdout      # the validated Live voice route
     assert "mock" in out.stdout                # no key => no network
     assert "hypr" in out.stdout.lower()        # version/syntax verdict present
 

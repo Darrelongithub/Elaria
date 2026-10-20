@@ -32,15 +32,24 @@ the owner agrees with.
 This code was built and tested in a headless container (no Hyprland, no
 PipeWire, no API key — `assist doctor` says so honestly). On your Fedora box:
 
-### 1. Step 0 — quota shape (the load-bearing assumption, blueprint §12.3/§11)
+### 1. Step 0 — quota shape (**now verified in config**)
 
-1. Go to **`aistudio.google.com/rate-limit`** on your account.
-2. Confirm **Live** models are free-tier eligible. If they are not, **stop** —
+The owner-verified shape (2026-10-20) is committed in `[quota]`:
+Flash **5 RPM / 250K TPM / 20 RPD**, Flash-Lite **15 / 250K / 500**,
+Transcribe Live **unlimited / 20K TPM**, batch Transcribe **25 RPD**.
+`[quota] verified = true` makes `assist doctor` print these real figures and
+stops the old assumed-number warning; remove the marker and the warning comes
+back deliberately.
+
+Still confirm, once, on your own account:
+1. **Live** models are free-tier eligible. If they are not, **stop** —
    transcription falls back to batch (§12.7) and Phase 1 changes shape.
-3. Note the real **RPM / TPM / RPD** for Flash and Flash-Lite and the **exact
-   model IDs** offered. Fix the `VERIFY` values in your `config.toml`
-   (from `config.toml.example`). Until then `assist doctor` correctly
-   reports the quota shape as **ASSUMED, UNVERIFIED**.
+2. The **exact Live model id** offered to your project:
+   ```bash
+   assist voice models     # real models.list + the voice catalogue warm will use
+   ```
+   Stage A defaults to `gemini-3.8-live` (GA, Live native audio). The key is
+   `[gemini] gemini_voice_model`; a TTS-preview model there is a doctor FAILURE.
 4. One project, one key (§12.8 — key rotation gets projects zeroed):
    ```bash
    mkdir -p ~/.config/assistant
@@ -175,6 +184,170 @@ voice therefore means editing both keys and running `assist voice warm`:
 spoken audio and the ack cache are keyed on the voice and model that are
 actually live, so old audio can never be served under a new identity.
 
+**Stage A (2026-10-20) — Flare is a Live voice, so native audio rides a Live
+model.** The live repro (`Voice name Flare is not supported`) came from
+`gemini-2.5-flash-preview-tts`. Now:
+- `[gemini] gemini_voice_model = "gemini-3.8-live"` (replaces that TTS id).
+- ack warm, `voice say`, command replies and conversational speech all open a
+  **Live** session (`response_modalities: ["AUDIO"]`), never a TTS-preview call;
+- at warm time the model is checked against a real `models.list` and the voice
+  against that model's **real catalogue** (`voices.list()`, cached in the
+  store). A mismatch fails with the allowed list in the error — never a
+  substitution and never a mid-sentence 400;
+- `voice_identity()` now says *verified* when it passes (the old code claimed
+  `allowed=true` while its `reason` still said "refused … not canonical");
+- `assist doctor` reads quota from config and prints `VERIFIED`, not assumptions.
+- `model_transcribe_batch = "gemini-3.5-transcribe"` (dedicated batch STT, not
+  Flash-Lite).
+
+### Her console + class mode (Stage B, §19.1)
+
+```bash
+assist talk                 # the console in your terminal (interactive)
+assist talk "..."           # one console turn — same conversation as voice
+assist console --json       # the snapshot the Quickshell panel renders
+assist console --follow     # streaming snapshots (one JSON per daemon event)
+assist class on|off|toggle|status
+```
+
+One conversation, two channels: a turn started by voice continues in the
+console with full context, and the reverse works too. The store has a single
+conversation id; `messages.channel` records `voice` or `console` for display
+only. There is no per-channel history to fork.
+
+The console shows the conversation, pending plans, parked review/unsorted
+items, the offline queue, job progress and the **holding shelf** (follow-ups and
+findings that are hers to keep). The Quickshell panel lives at
+`ui/quickshell/console/` and binds the same snapshot — dumb renderer, no logic.
+
+**Class mode** is one toggle. Voice out OFF, spoken acks OFF, knocks become
+silent visual pulses (Stage C), initiative restricted to urgent-only; the
+console and every local tool keep working. It is visible in the console header,
+in Waybar (`·class`) and in `assist status` (`class_mode`). A schedule can
+*suggest* class mode, but it never switches it by itself — the toggle stays the
+owner's. Spoken acks are suppressed in the daemon and the speech route reports
+silence with the reason, so nothing can accidentally speak around the toggle.
+
+### Initiative — the knock (Stage C, §19.2 as amended)
+
+```bash
+assist knock list                 # pending knocks, reason first
+assist knock raise --topic tax --reason "..." --kind finding --referent "the tax folder"
+assist knock accept 3             # opens console/voice with her REASON as line one
+assist knock decline 3            # no follow-up on that topic, ever
+assist knock later 3 --hours 24   # snooze into commitment memory
+assist knock ignore 3             # same topic 3× → retired
+assist knock status               # posture: budget = "none"
+assist commitment add "chase the tax office"   # the user's own follow-up
+```
+
+A knock is the **only** signal that means "Elaria wants to talk". It has its own
+Waybar state (`✦` / `·wants to talk`), its own notification identity
+(`Elaria · knock`) and its own short sound (`ui/sounds/knock.wav`). Errors,
+completions and system events never borrow it, and an AST test enforces that
+`knock_signal.emit` is reachable only from the two knock handlers.
+
+**There is no knock budget.** No daily counter, spacing rule, cooldown or rate
+rationing exists anywhere — `assist knock status` says so, and the tests raise a
+dozen knocks in a row without refusal. The control is the **reason gate**: a
+knock requires a stored, citable reason, enforced by a `NOT NULL CHECK` in SQLite
+and again in `InitiativeService.raise_knock()`. No reason → no knock.
+
+A follow-up can only cite a commitment created by an explicit user request or an
+accepted proposal (`assist commitment add …`, or "later" on a knock). She cannot
+invent an obligation and then use her own invention as a reason.
+
+**Anti-psychosis is runtime, not policy prose.** Needy framing (loneliness,
+missing-you, neglect, "you haven't talked to me", simulated feelings) and
+temporal initiation ("it's been three days…") are refused in the reason text and
+in every rendered opener; the generation prompts carry the same prohibition and
+tests lint both. A check-in needs a concrete referent; an urgency needs a real
+one. Class mode restricts knocks to urgent-only and renders them as silent
+visual pulses — no popup, no sound.
+
+Decline stops that topic. "Later" writes a commitment and snoozes; when it comes
+due, `assist knock due` raises a fresh knock whose reason is the user's own
+request ("You asked me to chase this, and it is due…"). Ignoring the same topic
+three times retires it.
+
+### Show-off mode (Stage D, §19.3)
+
+```bash
+assist showoff status        # active? sandbox? permissions? (always [])
+assist showoff exit          # owner hotkey / local stop
+assist showoff demo --action write --name notes.txt
+```
+
+**Entry is voice-only, and it is the owner's.** "Elaria, show off" / "talk to
+them", spoken with the owner present and verified against the enrolled
+voiceprint. There is deliberately no CLI `enter`: the phrase is not the
+credential, so a guest who says the same words gets nothing. A voiceprint score
+below `voice_test.speaker_threshold` is refused with the reason.
+
+Once in, exactly one gate opens: **speaker verification is off for
+conversation**. Guests may talk, banter and ask what she can do; the persona
+governor takes the brag register one notch up — performative confidence and
+roasting *situations*, never a guest's body, accent, identity, history or real
+traits. Serious-gates still win, so a stressed room gets plain speech.
+
+Everything else stays shut:
+
+* **Authority never transfers.** A guest request to move files, send messages,
+  change settings, buy something or expose owner data is declined in character,
+  counted, logged (category only — never the guest's words) and ends the demo as
+  a never-list attempt. Guest turns never reach intents or tools.
+* **Private memory (§16) is closed.** The only owner facts visible in this mode
+  are the owner-editable `[showoff] demo_safe_facts` allowlist (empty by
+  default). A "what does he usually…" probe is deflected, not answered.
+* **Demonstrations are sandboxed.** They act only inside `[showoff] sandbox`
+  (default `<data dir>/demo-sandbox`). The executor enforces it at the syscall
+  boundary via `safety.assert_within_sandbox`; a real path is refused even if a
+  plan or prompt is fooled.
+* **Zero standing permissions.** Nothing is granted on entry, nothing survives
+  exit, and a daemon restart closes any open session as `daemon_restart`.
+
+Exit paths: owner stop command (voiceprint-verified), ~10-minute timeout, owner
+hotkey, or any never-list attempt. On exit `assist status` reports show-off off,
+`permissions: []`, and the session row keeps a summary — what the room was told,
+how many guest turns were heard, how many requests were declined, why it ended —
+with `audio_retained = 0`. No guest audio is kept.
+
+### Disclosure awareness — memory is allowed, leaking is not
+
+```bash
+assist privacy status        # company present? what is withheld?
+assist privacy company       # "I'm not alone" (also: `assist privacy alone`)
+assist privacy toggle
+```
+
+Or just say it: **"I'm not alone"** / **"we have company"** turns awareness on;
+**"I'm alone now"** / **"they've left"** turns it off. The same flips happen in
+`assist talk` with `/company on|off`.
+
+`disclosure.py` classifies what she remembers:
+
+| Class | Example | Owner alone | Company present / show-off |
+|---|---|---|---|
+| `behaviour` | "files invoices on Fridays", "prefers the window seat" | speakable | **speakable** |
+| `plan` | "we're going to surprise Sam Friday" | speakable | withheld |
+| `secret` | passwords, PINs, API keys, card/bank, passport/ID, "keep this between us" | speakable | **withheld** |
+
+Awareness is not a mode: voice, class mode and surfacing are unaffected. While it
+is on, stored secrets and private plans are filtered out of the model's context,
+and an outgoing guard checks the reply before it is spoken — so a model that
+ignores the prompt still cannot read a password back to the room. A blocked
+reply is replaced with a deflection and logged by category and fact id, never by
+the secret's text.
+
+A voice that is not the owner's gets **no owner memory at all** — not even in
+normal mode. Probes get the deflection in character ("Oh, the boss would kill me
+if I told you that."), instructions get "I only take that kind of instruction
+from the boss." Speaker verification results supplied by the capture path
+(`owner_verified: false`) are honoured at the same boundary.
+
+A knock cannot carry a secret or private plan as its reason while company is
+present — a knock is spoken aloud. Class mode still controls how loud it is.
+
 ## §10 open decisions — defaults taken, awaiting your word
 
 None block Phase 0 (§14). Each defaults to the blueprint's recommendation
@@ -203,7 +376,7 @@ assist doctor                         # paste this into the question, always
 ## Tests
 
 ```bash
-uv run pytest        # or: python -m pytest — passes offline, keyless, ~1s
+uv run pytest        # or: python -m pytest — passes offline, keyless, ~40s
 ```
 
 Tests deliberately strip `GEMINI_API_KEY` and forbid network on the ack path.

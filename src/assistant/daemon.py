@@ -25,14 +25,23 @@ from . import __version__
 from .asr import local_asr_status
 from .capture import PipeWireCapture, SimulatedCapture
 from .config import Config, load_config, load_humour_profile
+from .console import ConsoleService, SessionService
 from .cost import day_start_iso, iso_now, month_start_iso
+from .disclosure import (
+    DisclosureService,
+    detect_company_command,
+    is_instruction,
+)
 from .gemini_client import GeminiClient
+from .initiative import InitiativeError, InitiativeService, KnockSignal
 from .ipc import serve
 from .modes import ModeManager
 from .offline_queue import CloudQueue
 from .organiser import OrganiserService
 from .persona import PersonaGovernor, TurnContext
+from .presence import PresenceService
 from .safety import clear_halt, is_halted, set_halt
+from .showoff import ShowoffError, ShowoffService
 from .store import Store
 from .transcribe import DictationService
 from .tts import STANDARD_ACKS, SpeechService
@@ -64,13 +73,17 @@ class Daemon:
         self.mode = "idle"
         # Phase 8 resident hot paths: connectivity, ONE local voice, queue.
         self.mode_manager = ModeManager(config, self.store)
+        # Stage B: class mode + the one shared conversation.
+        self.presence = PresenceService(config, self.store)
+        self.sessions = SessionService(self.store)
         self.speech = SpeechService(
             config, self.store, client=self.client,
             # INTERIM online voice: Flare speaks only while actually online. Offline
             # turns are text-only (amendment 2026-10-20) - no cloud call, and the
             # dormant local voice does not take them over either.
             is_online=lambda: self.mode_manager.status(refresh=False).effective_mode
-            == "ONLINE")
+            == "ONLINE",
+            presence=self.presence)
         self.cloud_queue = CloudQueue(config, self.store, self.client, self.mode_manager)
         self.dictation = DictationService(
             config, self.store, self.client,
@@ -84,6 +97,23 @@ class Daemon:
         from .meeting import MeetingService
         self.meetings = MeetingService(
             config, self.store, self.client, mode_manager=self.mode_manager)
+        # Disclosure awareness: memory may be used, secrets/plans never spoken
+        # while company is present, and no owner memory to a guest voice.
+        self.disclosure = DisclosureService(config, self.store)
+        # Stage D: show-off is the owner's, voiceprint-verified, and grants
+        # nothing that survives it. Demo actions are sandboxed at the executor.
+        self.showoff = ShowoffService(
+            config, self.store, presence=self.presence, sessions=self.sessions)
+        # Stage C: the knock. Class mode restricts it to urgent-only; the
+        # reason gate — not a budget — decides whether she may speak at all.
+        self.initiative = InitiativeService(
+            config, self.store, presence=self.presence,
+            disclosure=self.disclosure)
+        self.knock_signal = KnockSignal(config)
+        self.console = ConsoleService(
+            config, self.store, presence=self.presence, sessions=self.sessions,
+            initiative=self.initiative, showoff=self.showoff,
+            disclosure=self.disclosure)
         self._meeting: dict | None = None  # {task, dual, mic_frames, sys_frames}
         self._meeting_processing = False
         self._plan_tasks: dict[int, asyncio.Task] = {}
@@ -244,6 +274,7 @@ class Daemon:
             "mode.set": self._mode_set,
             "mode.refresh": self._mode_refresh,
             "speech.status": self._speech_status,
+            "speech.models": self._speech_models,
             "speech.say": self._speech_say,
             "speech.warm": self._speech_warm,
             "speech.audition": self._speech_audition,
@@ -252,6 +283,26 @@ class Daemon:
             "queue.drain": self._queue_drain,
             "queue.approve": self._queue_approve,
             "queue.enqueue_external": self._queue_enqueue_external,
+            "console.state": self._console_state,
+            "knock.list": self._knock_list,
+            "knock.raise": self._knock_raise,
+            "knock.accept": self._knock_accept,
+            "knock.decline": self._knock_decline,
+            "knock.later": self._knock_later,
+            "knock.ignore": self._knock_ignore,
+            "knock.due": self._knock_due,
+            "initiative.status": self._initiative_status,
+            "privacy.status": self._privacy_status,
+            "privacy.set": self._privacy_set,
+            "privacy.toggle": self._privacy_toggle,
+            "showoff.status": self._showoff_status,
+            "showoff.enter": self._showoff_enter,
+            "showoff.exit": self._showoff_exit,
+            "showoff.demo": self._showoff_demo,
+            "console.say": self._console_say,
+            "class.status": self._class_status,
+            "class.set": self._class_set,
+            "class.toggle": self._class_toggle,
             "ask": self._ask,
         }
         if method == "events.subscribe":
@@ -262,7 +313,9 @@ class Daemon:
                                "session.checkin", "session.offline",
                                "transcript.final", "session.ended",
                                "mode.changed", "offline.drained",
-                               "speech.error", "error"]}
+                               "speech.error", "conversation.message",
+                               "class.changed", "knock.raised",
+                               "knock.accepted", "knock.changed", "error"]}
         handler = handlers.get(method)
         if handler is None:
             raise ValueError(f"unknown method '{method}' — supported: "
@@ -302,6 +355,15 @@ class Daemon:
             "connectivity": connectivity.as_dict(),
             "connectivity_mode": connectivity.effective_mode,
             "voice": self.speech.status(),
+            "class_mode": self.presence.status().as_dict(),
+            "knock": self.initiative.status(),
+            "showoff": self.showoff.status(),
+            "company": self.disclosure.status(),
+            "console": {
+                "conversation_id": (self.sessions.history()["id"]),
+                "messages": len(self.sessions.history()["messages"]),
+                "holding": len(self.store.list_holdings("active")),
+            },
             "offline_asr": local_asr_status(self.config),
             "cloud_queue": self.store.cloud_job_counts(),
         }
@@ -322,7 +384,11 @@ class Daemon:
         kind = str(params.get("kind") or "on_it")
         route = self.speech.route(STANDARD_ACKS.get(kind, "On it."))
         cached = self.speech.cached_ack(kind)
-        should_speak = params.get("speak", self.config.section("tts").get("speak_acks", True))
+        class_mode = self.presence.status().enabled
+        should_speak = bool(params.get("speak",
+                                      self.config.section("tts").get("speak_acks", True)))
+        if class_mode:
+            should_speak = False       # spoken acks OFF in class mode
         if should_speak and cached is None and not route["muted"]:
             await self._await_ack_cache()          # VB-13: boot warming, once
             cached = self.speech.cached_ack(kind)
@@ -331,7 +397,10 @@ class Daemon:
                          # A miss while she is supposed to speak is a reported
                          # condition (VB-2), not a verdict: the re-warm below is
                          # what makes the next press audible.
-                         "cache_miss": cached is None and not route["muted"]}
+                         "cache_miss": cached is None and not route["muted"],
+                         "class_mode": class_mode,
+                         "speak_suppressed": ("class mode: spoken acks OFF"
+                                              if class_mode else None)}
         if cached is None:
             self._schedule_rewarm_if_requested()   # VB-2: miss -> one warm cycle
         if should_speak and cached:
@@ -438,8 +507,167 @@ class Daemon:
         await self._note_connectivity_transition(status)
         return {"connectivity": status.as_dict()}
 
+    async def _console_state(self, params: dict) -> dict:
+        return self.console.snapshot()
+
+    async def _console_say(self, params: dict) -> dict:
+        """A text turn in the SAME conversation a voice turn writes to."""
+        text = str(params.get("text") or "").strip()
+        if not text:
+            raise ValueError("console.say needs params.text")
+        result = await self._ask({
+            "text": text, "speak": bool(params.get("speak", False)),
+            "channel": "console",
+        })
+        return {**result, "channel": "console",
+                "conversation": self.sessions.history(limit=int(
+                    params.get("history_limit", 40)))}
+
+    # -- the knock (§19.2 as amended) ----------------------------------------
+    def _knock_dict(self, knock: dict) -> dict:
+        return {**knock, "silent": self.presence.status().enabled,
+                "first_line": knock.get("reason")}
+
+    async def _knock_list(self, params: dict) -> dict:
+        status = params.get("status", "pending")
+        limit = int(params.get("limit", 50))
+        knocks = ([self._knock_dict(k)
+                   for k in self.store.list_knocks(status, limit=limit)]
+                  if status else
+                  [self._knock_dict(k)
+                   for k in self.store.list_knocks(None, limit=limit)])
+        return {"knocks": knocks, "status": self.initiative.status(),
+                "class_mode": self.presence.status().as_dict()}
+
+    async def _knock_raise(self, params: dict) -> dict:
+        try:
+            knock = self.initiative.raise_knock(
+                topic=str(params.get("topic") or ""),
+                reason=str(params.get("reason") or ""),
+                kind=str(params.get("kind") or "follow-up"),
+                urgency=str(params.get("urgency") or "normal"),
+                referent=params.get("referent"),
+                commitment_id=(int(params["commitment_id"])
+                               if params.get("commitment_id") is not None
+                               else None))
+        except InitiativeError as exc:
+            raise ValueError(str(exc)) from exc
+        signal = self.knock_signal.emit(
+            knock, class_mode=self.presence.status().enabled)
+        knock = self._knock_dict(knock)
+        await self.broadcast({"event": "knock.raised", "knock": knock,
+                              "signal": signal})
+        return {"knock": knock, "signal": signal}
+
+    async def _knock_accept(self, params: dict) -> dict:
+        knock_id = int(params.get("id"))
+        class_now = self.presence.status().enabled
+        voice_muted = bool((self.speech.status().get("voice") or {}).get("muted"))
+        try:
+            result = self.initiative.accept(
+                knock_id, class_mode=class_now,
+                voice_available=not voice_muted)
+        except InitiativeError as exc:
+            raise ValueError(str(exc)) from exc
+        opened = result["open"]
+        # Her REASON is the first line of the turn, whichever surface opened.
+        self.sessions.append("assistant", result["first_line"],
+                             channel=opened, via="knock", ts=iso_now())
+        conversation_id = self.sessions.history()["id"]
+        payload = {**result, "conversation_id": conversation_id,
+                   "conversation": self.sessions.history(
+                       limit=int(params.get("history_limit", 40)))}
+        await self.broadcast({"event": "knock.accepted",
+                              "knock": result["knock"],
+                              "open": opened, "first_line": result["first_line"],
+                              "conversation_id": conversation_id})
+        await self.broadcast({"event": "conversation.message",
+                              "conversation_id": conversation_id,
+                              "channel": opened, "role": "assistant"})
+        return payload
+
+    async def _knock_decline(self, params: dict) -> dict:
+        try:
+            result = self.initiative.decline(int(params.get("id")))
+        except InitiativeError as exc:
+            raise ValueError(str(exc)) from exc
+        await self.broadcast({"event": "knock.changed", "knock": result["knock"],
+                              "action": "declined"})
+        return result
+
+    async def _knock_later(self, params: dict) -> dict:
+        try:
+            result = self.initiative.later(
+                int(params.get("id")), hours=params.get("hours"))
+        except InitiativeError as exc:
+            raise ValueError(str(exc)) from exc
+        await self.broadcast({"event": "knock.changed", "knock": result["knock"],
+                              "action": "snoozed"})
+        return result
+
+    async def _knock_ignore(self, params: dict) -> dict:
+        try:
+            result = self.initiative.ignore(int(params.get("id")))
+        except InitiativeError as exc:
+            raise ValueError(str(exc)) from exc
+        await self.broadcast({"event": "knock.changed", "knock": result["knock"],
+                              "action": "retired" if result["retired"] else "ignored"})
+        return result
+
+    async def _knock_due_loop(self) -> None:
+        """Wake the user's own commitments when they come due (§19.2).
+
+        This is NOT time-based initiative: the loop only re-reads snoozes the
+        user created via "later". A topic she invented has no row to wake.
+        """
+        while True:
+            try:
+                await self._knock_due({})
+            except Exception as exc:      # a bad row must not kill the loop
+                print(f"[assistd] knock due-check failed: {exc}", flush=True)
+            await asyncio.sleep(60)
+
+    async def _knock_due(self, params: dict) -> dict:
+        raised = []
+        for knock in self.initiative.check_due():
+            signal = self.knock_signal.emit(
+                knock, class_mode=self.presence.status().enabled)
+            knock = self._knock_dict(knock)
+            raised.append(knock)
+            await self.broadcast({"event": "knock.raised", "knock": knock,
+                                  "signal": signal})
+        return {"raised": raised, "count": len(raised)}
+
+    async def _initiative_status(self, params: dict) -> dict:
+        return {"initiative": self.initiative.status(),
+                "class_mode": self.presence.status().as_dict()}
+
+    async def _class_status(self, params: dict) -> dict:
+        return {"class_mode": self.presence.status().as_dict()}
+
+    async def _class_set(self, params: dict) -> dict:
+        if "enabled" in params:
+            status = self.presence.set_enabled(bool(params["enabled"]))
+        elif str(params.get("action") or "").lower() == "toggle":
+            status = self.presence.toggle()
+        else:
+            raise ValueError("class.set needs params.enabled (bool) or action=toggle")
+        await self.broadcast({"event": "class.changed",
+                              "class_mode": status.as_dict()})
+        return {"class_mode": status.as_dict()}
+
+    async def _class_toggle(self, params: dict) -> dict:
+        status = self.presence.toggle()
+        await self.broadcast({"event": "class.changed",
+                              "class_mode": status.as_dict()})
+        return {"class_mode": status.as_dict()}
+
     async def _speech_status(self, params: dict) -> dict:
         return {"voice": self.speech.status()}
+
+    async def _speech_models(self, params: dict) -> dict:
+        """`assist voice models`: the real list, never a remembered model name."""
+        return await asyncio.to_thread(self.client.list_models)
 
     async def _speech_say(self, params: dict) -> dict:
         text = str(params.get("text") or "").strip()
@@ -840,6 +1068,141 @@ class Daemon:
                 "transcript_preview": result.transcript[:400],
                 "connectivity": self.mode_manager.status(refresh=False).as_dict()}
 
+    # -- disclosure awareness (owner rule 2026-10-20) ------------------------
+    async def _privacy_status(self, params: dict) -> dict:
+        return {"company": self.disclosure.status()}
+
+    async def _privacy_set(self, params: dict) -> dict:
+        if "company" not in params:
+            raise ValueError("privacy.set needs params.company (bool)")
+        status = self.disclosure.set_company(bool(params["company"]),
+                                             source="owner command")
+        await self.broadcast({"event": "privacy.changed", "company": status})
+        return {"company": status}
+
+    async def _privacy_toggle(self, params: dict) -> dict:
+        status = self.disclosure.toggle(source="owner command")
+        await self.broadcast({"event": "privacy.changed", "company": status})
+        return {"company": status}
+
+    async def _guest_turn_normal(self, text: str, params: dict) -> dict:
+        """A non-owner voice outside show-off: no memory, deflection in character."""
+        channel = str(params.get("channel") or "voice")
+        conversation_id = self.sessions.active_id(iso_now())
+        self.sessions.append("user", text, channel=channel, ts=iso_now())
+        reply = self.disclosure.deflection(guest=True,
+                                           action=is_instruction(text))
+        decision = self.governor.decide(TurnContext(user_text=text))
+        self.disclosure.log_guest("guest_turn", category="non-owner voice",
+                                  chars=len(text))
+        speech = await self._maybe_speak_reply(reply, params)
+        self.sessions.append("assistant", reply, channel=channel,
+                             via="guest-deflection", ts=iso_now())
+        await self.broadcast({"event": "conversation.message",
+                              "conversation_id": conversation_id,
+                              "channel": channel, "role": "assistant"})
+        return {
+            "reply": reply, "speaker": "guest", "via": "guest-deflection",
+            "channel": channel, "conversation_id": conversation_id,
+            "model": None, "register": decision.register, "serious_gate": None,
+            "mode": self.config.gemini_mode, "fixture": None,
+            "speech": speech, "memory_closed": True, "withheld": None,
+            "company": self.disclosure.status(),
+        }
+
+    # -- show-off (§19.3) ----------------------------------------------------
+    async def _showoff_status(self, params: dict) -> dict:
+        return {"showoff": self.showoff.status()}
+
+    async def _showoff_enter(self, params: dict) -> dict:
+        try:
+            result = self.showoff.enter(
+                command=str(params.get("command") or ""),
+                embedding=params.get("embedding"),
+                owner_present=bool(params.get("owner_present", False)))
+        except ShowoffError as exc:
+            raise ValueError(str(exc)) from exc
+        speech = await self._maybe_speak_reply(
+            result["announcement"], {"speak": params.get("speak", True)})
+        await self.broadcast({"event": "showoff.entered",
+                              "session_id": result["session_id"],
+                              "announcement": result["announcement"]})
+        return {**result, "speech": speech}
+
+    async def _showoff_exit(self, params: dict) -> dict:
+        try:
+            if params.get("command") or params.get("reason") == "owner_stop":
+                summary = self.showoff.exit_owner(
+                    command=str(params.get("command") or ""),
+                    embedding=params.get("embedding"))
+            elif params.get("reason") == "owner_hotkey" or not params.get("reason"):
+                summary = self.showoff.exit_hotkey()
+            else:
+                raise ValueError(
+                    "show-off exits only by owner stop command, owner hotkey, "
+                    "timeout, or a never-list attempt")
+        except ShowoffError as exc:
+            raise ValueError(str(exc)) from exc
+        await self.broadcast({"event": "showoff.exited", "summary": summary})
+        return {"showoff": self.showoff.status(), "summary": summary}
+
+    async def _showoff_demo(self, params: dict) -> dict:
+        if not self.showoff.active():
+            raise ValueError("show-off mode is not on")
+        if str(params.get("action") or "list") == "write":
+            return self.showoff.demo_write(str(params.get("name") or "demo.txt"),
+                                           str(params.get("content") or ""))
+        return {"sandbox": str(self.showoff.sandbox_path()),
+                "target": str(self.showoff.demo_target(
+                    str(params.get("name") or "")))}
+
+    async def _guest_turn(self, text: str, params: dict,
+                          status: dict) -> dict:
+        """A guest turn in show-off mode: conversation only, authority none."""
+        channel = str(params.get("channel") or "voice")
+        conversation_id = self.sessions.active_id(iso_now())
+        self.sessions.append("user", text, channel=channel, ts=iso_now())
+        verdict = self.showoff.guest_turn(text)
+        model = None
+        if verdict.get("allowed"):
+            prompt = self.showoff.build_guest_prompt(text)
+            connectivity = await self._connectivity_snapshot()
+            if connectivity.is_offline:
+                reply = ("I'm offline, so the demo is text-only right now — "
+                         "the good answers are on hold.")
+                via = "local"
+            else:
+                result = await asyncio.to_thread(
+                    self.client.generate, "chat", prompt)
+                reply, model = result.text, result.model
+                via = "showoff"
+        else:
+            reply, via = verdict["reply"], "showoff-refusal"
+        leak = self.disclosure.leak_in(reply, guest=True) if verdict.get("allowed") else None
+        if leak is not None:
+            self.disclosure.log("leak_blocked", {
+                "kind": leak["kind"], "why": leak["why"],
+                "fact_id": leak.get("fact_id"), "channel": channel,
+                "speaker": "guest", "context": "showoff"})
+            reply, via = self.disclosure.deflection(guest=True), "withheld"
+        speech = await self._maybe_speak_reply(reply, params)
+        self.sessions.append("assistant", reply, channel=channel, via=via,
+                             ts=iso_now())
+        await self.broadcast({"event": "conversation.message",
+                              "conversation_id": conversation_id,
+                              "channel": channel, "role": "assistant"})
+        if verdict.get("exited"):
+            await self.broadcast({"event": "showoff.exited",
+                                  "summary": verdict.get("summary")})
+        return {
+            "reply": reply, "speaker": "guest", "via": via,
+            "channel": channel, "conversation_id": conversation_id,
+            "model": model, "register": "expressive-allowed",
+            "showoff": verdict, "memory_closed": True,
+            "speech": speech, "fixture": None,
+            "serious_gate": None, "mode": self.config.gemini_mode,
+        }
+
     async def _ask(self, params: dict) -> dict:
         """Conversational turn on the §13.4 ladder: governor (local) →
         exact/grammar intents (local) → memory recall (local) → and only
@@ -851,30 +1214,62 @@ class Daemon:
         text = str(params.get("text", "")).strip()
         if not text:
             raise ValueError("ask needs params.text")
+        speaker = str(params.get("speaker") or "owner").lower()
+        showoff_now = self.showoff.status()
+        # Speaker verification, when the caller supplies a verdict, is authority
+        # here too: a voice that is not the owner never sees owner memory.
+        verified = params.get("owner_verified")
+        if verified is False:
+            speaker = "guest"
+        if speaker != "owner":
+            if showoff_now.get("active"):
+                return await self._guest_turn(text, params, showoff_now)
+            return await self._guest_turn_normal(text, params)
+
+        # The owner can tell her the room has company. That is awareness, not a
+        # mode: nothing about voice, class mode or surfacing changes.
+        company_command = detect_company_command(text)
+        if company_command is not None:
+            self.disclosure.set_company(company_command, source="owner speech")
+
         decision = self.governor.decide(TurnContext(user_text=text))
         self.store.log_persona_event(
             iso_now(), "decision",
             json.dumps({"register": decision.register,
                         "serious_gate": decision.serious_gate,
                         "pushback": decision.pushback, "reason": decision.reason}))
-        conversation_id = self.store.get_or_create_conversation(iso_now())
-        self.store.add_message(conversation_id, iso_now(), "user", text)
+        channel = str(params.get("channel") or "voice")
+        conversation_id = self.sessions.active_id(iso_now())
+        self.sessions.append("user", text, channel=channel, ts=iso_now())
 
         reply, via, model, fixture = None, None, None, None
         queued_job_id = None
         connectivity = await self._connectivity_snapshot()
-        intent = route(text)
+        if company_command is not None:
+            # An awareness command answers locally and never reaches a model.
+            reply = ("Noted — company present. Secrets and private plans stay "
+                     "unsaid; habits and ordinary memory are still fine."
+                     if company_command else
+                     "Noted — alone again. Secrets and private plans are back "
+                     "on the table.")
+            via = "local-awareness"
+        intent = None if company_command is not None else route(text)
         if intent is not None:
             reply, via = await self._run_intent(intent)
 
         if reply is None:
             # Rung 5/6: assemble the exact context the cheap model needs.
             hits = await asyncio.to_thread(self.memory.recall, text)
-            context = "\n".join(f"- [{h.source} {h.ref}] {h.text}" for h in hits)
+            restricted = self.disclosure.company() or speaker != "owner"
+            kept = self.disclosure.filter_hits(hits, guest=speaker != "owner")
+            context = "\n".join(f"- [{h.source} {h.ref}] {h.text}" for h in kept)
             prompt = text
             if context:
                 prompt = (f"Context from the user's local memory/index "
                           f"(cite paths plainly):\n{context}\n\nUser: {text}")
+            if restricted:
+                prompt += "\n\n" + self.disclosure.prompt_note(
+                    guest=speaker != "owner")
             if decision.register == "expressive-allowed":
                 prompt += ("\n\nRegister note: the user is bantering; matching "
                            "their playful-teasing register concisely is welcome "
@@ -892,13 +1287,41 @@ class Daemon:
                 if reply:
                     self.mode_manager.observe_success("gemini")
 
+        # The outgoing guard: a model that ignores the prompt still cannot read a
+        # stored secret, plan or owner fact back to the room.
+        leak = self.disclosure.leak_in(
+            reply, guest=speaker != "owner",
+            company=self.disclosure.company())
+        withheld = None
+        if leak is not None:
+            self.disclosure.log("leak_blocked", {
+                "kind": leak["kind"], "why": leak["why"],
+                "fact_id": leak.get("fact_id"), "channel": channel,
+                "speaker": speaker})
+            withheld = {"kind": leak["kind"], "why": leak["why"],
+                        "note": "the reply named something she may not say aloud"}
+            if speaker != "owner":
+                reply = self.disclosure.deflection(guest=True)
+            else:
+                reply = (f"{self.disclosure.deflection(guest=False)} "
+                         "Ask me again when we're alone and I'll tell you plainly.")
+            via = "withheld"
+
         speech = await self._maybe_speak_reply(reply, params)
-        self.store.add_message(conversation_id, iso_now(), "assistant", reply, via)
+        self.sessions.append("assistant", reply, channel=channel, via=via,
+                             ts=iso_now())
+        # One conversation means every surface refreshes on every turn —
+        # a voice turn appears in the console immediately, and vice versa.
+        await self.broadcast({"event": "conversation.message",
+                              "conversation_id": conversation_id,
+                              "channel": channel, "role": "assistant"})
         if params.get("reaction"):
             self.governor.note_user_reaction(str(params["reaction"]))
             self._save_relationship_state()
         return {
             "reply": reply,
+            "channel": channel,
+            "conversation_id": conversation_id,
             "via": via,  # local-intent | local-memory | local-queue | gemini
             "model": model,
             "register": decision.register,
@@ -908,6 +1331,9 @@ class Daemon:
             "connectivity": connectivity.as_dict(),
             "queued_job_id": queued_job_id,
             "speech": speech,
+            "speaker": speaker,
+            "company": self.disclosure.status(),
+            "withheld": withheld,
         }
 
     async def _run_intent(self, intent) -> tuple[str | None, str]:
@@ -1060,6 +1486,7 @@ class Daemon:
         warm_task = asyncio.create_task(self._warm_speech_cache())
         server = await serve(self.config.socket_path, self.handle)
         connectivity_task = asyncio.create_task(self._connectivity_loop())
+        knock_task = asyncio.create_task(self._knock_due_loop())
         _sd_notify("READY=1")
         print(f"[assistd] Elaria up · mode={self.config.gemini_mode} "
               f"· socket={self.config.socket_path}", flush=True)
@@ -1074,7 +1501,8 @@ class Daemon:
             async with server:
                 await stop.wait()
         finally:
-            for task in (connectivity_task, warm_task, *self._background_tasks):
+            for task in (connectivity_task, warm_task, knock_task,
+                         *self._background_tasks):
                 task.cancel()
             self.store.close()
 

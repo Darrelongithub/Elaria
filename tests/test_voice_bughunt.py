@@ -175,7 +175,11 @@ def test_a1b_no_call_site_can_name_a_voice(tmp_path):
     assert found["voices"] == [], f"another voice identity in src: {found['voices']}"
     # The identity of the voice lives in exactly one place, pinned to Flare.
     assert DEFAULTS["gemini"]["voice"] == "Flare"
-    assert DEFAULTS["gemini"]["model_voice"] == "gemini-2.5-flash-preview-tts"
+    # Stage A: native audio rides a LIVE model. Flare is a Live voice; the old
+    # TTS-preview id is the configuration that produced "Voice name Flare is not
+    # supported", so it must never come back as a default.
+    assert DEFAULTS["gemini"]["gemini_voice_model"] == "gemini-3.8-live"
+    assert "model_voice" not in DEFAULTS["gemini"]
 
 
 def test_a1c_daemon_paths_all_flare(tmp_path):

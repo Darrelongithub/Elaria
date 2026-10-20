@@ -78,6 +78,95 @@ def resolve_voice(config, requested: str | None = None) -> tuple[str, bool]:
     return (configured if allowed else ""), allowed
 
 
+# The Live model that owns native audio, validated against the real catalogue at
+# warm time (Stage A, 2026-10-20). `gemini-3.8-live` is the GA Live model and the
+# documented default for low-latency voice agents; the older
+# `gemini-3.1-flash-live-preview` is the Flash Live preview. Both are checked
+# against a real `models.list` before a session is opened, and the catalogue for
+# the resolved model is checked at warm time, so this default is never trusted
+# blindly.
+DEFAULT_VOICE_MODEL = "gemini-3.8-live"
+
+
+def voice_model(config) -> str:
+    """`[gemini] gemini_voice_model`, with the old `model_voice` as an alias.
+
+    `model_voice` used to point at a TTS-preview model, which is exactly the bug
+    that made Flare unsupported. It is still read (so an owner's existing file
+    does not silently revert to a default) but new configs use the explicit key.
+    """
+    gemini = config.section("gemini") if config else {}
+    explicit = gemini.get("gemini_voice_model")
+    legacy = gemini.get("model_voice")
+    # Deprecated alias precedence: an existing `model_voice` keeps working until
+    # the owner renames it, but `gemini_voice_model` wins when it was deliberately
+    # changed away from the shipped default. (Both are validated at warm time, so
+    # a stale alias can never silently pick a TTS model behind a Live key.)
+    if legacy and (not explicit or str(explicit) == DEFAULT_VOICE_MODEL):
+        return str(legacy)
+    return str(explicit or legacy or DEFAULT_VOICE_MODEL)
+
+
+def quota_is_verified(quota: dict) -> bool:
+    """Does `[quota]` carry owner-verified numbers?
+
+    A `verified = true` marker alone is not enough: the doctor must be able to
+    read real figures from config, not print a badge over guesses. Accept either
+    the marker (with per-model rows present) or a `verified_at` stamp.
+    """
+    if not isinstance(quota, dict):
+        return False
+    marked = bool(quota.get("verified") or quota.get("verified_at"))
+    has_rows = isinstance(quota.get("models"), dict) and bool(quota["models"])
+    has_legacy_rows = any(key.endswith("_rpd") for key in quota)
+    return marked and (has_rows or has_legacy_rows)
+
+
+def quota_rows(quota: dict) -> list[dict]:
+    """Normalised quota rows from config — never invented here.
+
+    Supports both the structured `[quota.models.*]` shape and the flat
+    `flash_rpd` / `flash_lite_rpd` / `transcribe_*` keys. Returns only what the
+    config actually carries; an absent figure is None, never a remembered guess.
+    """
+    if not isinstance(quota, dict):
+        return []
+    rows: list[dict] = []
+    models = quota.get("models")
+    if isinstance(models, dict):
+        for name, row in models.items():
+            if not isinstance(row, dict):
+                continue
+            rows.append({
+                "model": name,
+                "rpm": row.get("rpm"),
+                "tpm": row.get("tpm"),
+                "rpd": row.get("rpd"),
+                "unlimited_rpm": bool(row.get("rpm") in (0, "unlimited")),
+                "unlimited_rpd": bool(row.get("rpd") in (0, "unlimited")),
+            })
+    if rows:
+        return rows
+    key_map = {
+        "flash": "flash",
+        "flash_lite": "flash-lite",
+        "transcribe_live": "transcribe-live",
+        "transcribe_batch": "transcribe-batch",
+    }
+    for prefix, label in key_map.items():
+        rpm = quota.get(f"{prefix}_rpm")
+        tpm = quota.get(f"{prefix}_tpm")
+        rpd = quota.get(f"{prefix}_rpd")
+        if rpm is None and tpm is None and rpd is None:
+            continue
+        rows.append({
+            "model": label, "rpm": rpm, "tpm": tpm, "rpd": rpd,
+            "unlimited_rpm": rpm in (0, "unlimited"),
+            "unlimited_rpd": rpd in (0, "unlimited"),
+        })
+    return rows
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     out = dict(base)
     for key, value in override.items():
@@ -99,12 +188,18 @@ DEFAULTS: dict = {
         "model_cleanup": "gemini-flash-lite-latest",
         "model_chat": "gemini-flash-latest",
         "model_transcribe_live": "gemini-3.5-transcribe-live",
-        "model_transcribe_batch": "gemini-flash-lite-latest",
+        # Batch/pre-recorded transcription is a dedicated model, not a chat
+        # Flash-Lite. Gemini 3.5 Transcribe (2026-08-26) is the real batch model;
+        # its Live sibling above is already pinned. Both are checked against a
+        # live models.list by `assist voice models` / doctor-on-owner-machine.
+        "model_transcribe_batch": "gemini-3.5-transcribe",
         # INTERIM speaking voice (owner choice 2026-10-20). Flare is the only
         # voice Elaria ever speaks with; offline is text-only and the local Piper
-        # voice is dormant (see [tts]). `model_voice` must be a native-audio/TTS
-        # capable model.
-        "model_voice": "gemini-2.5-flash-preview-tts",
+        # voice is dormant (see [tts]). Native audio is produced by a LIVE model,
+        # never by a TTS-preview model: Flare is a Live voice, and
+        # `gemini-2.5-flash-preview-tts` rejects it with
+        # "Voice name Flare is not supported" (Stage A live repro).
+        "gemini_voice_model": DEFAULT_VOICE_MODEL,
         "voice": "Flare",
         # The one-voice rule, expressed in config (VB-4): `[gemini] voice` must be
         # one of these or she refuses to speak and `assist doctor` fails. Widening
@@ -116,9 +211,34 @@ DEFAULTS: dict = {
         "max_scaffold_calls": 6,
         "mode": "mock",
     },
+    # Owner-verified quota shape (Step 0, 2026-10-20). These are MEASURED numbers
+    # from the owner's AI Studio rate-limit page, not defaults: Flash 5 RPM /
+    # 250K TPM / 20 RPD; Flash-Lite 15 RPM / 250K TPM / 500 RPD; Transcribe Live
+    # unlimited RPM / 20K TPM; batch Transcribe 25 RPD. `verified = true` is the
+    # marker that stops doctor/cost printing the old assumed figures — when it is
+    # absent or false the warning comes back, loudly and by design (§11).
     "quota": {
-        "flash_rpm": 10,
+        "verified": True,
+        "verified_at": "2026-10-20",
+        "verified_source": "owner's AI Studio rate-limit page",
+        "models": {
+            "flash": {"rpm": 5, "tpm": 250_000, "rpd": 20},
+            "flash-lite": {"rpm": 15, "tpm": 250_000, "rpd": 500},
+            "transcribe-live": {"rpm": 0, "tpm": 20_000, "rpd": 0},
+            "transcribe-batch": {"rpm": None, "tpm": None, "rpd": 25},
+        },
+        # Flat aliases remain readable by older code/configs and by the client's
+        # limiter. `0` means "not rate-limited" (Transcribe Live).
+        "flash_rpm": 5,
+        "flash_tpm": 250_000,
+        "flash_rpd": 20,
         "flash_lite_rpm": 15,
+        "flash_lite_tpm": 250_000,
+        "flash_lite_rpd": 500,
+        "transcribe_live_rpm": 0,
+        "transcribe_live_tpm": 20_000,
+        "transcribe_live_rpd": 0,
+        "transcribe_batch_rpd": 25,
         "max_requests_per_day": 1200,
         "max_requests_per_minute": 12,
     },
@@ -254,6 +374,51 @@ DEFAULTS: dict = {
         "min_chars": 40,                  # short utterances aren't worth a call (§13.4)
         "glossary_file": "~/.config/assistant/glossary.toml",
     },
+    "presence": {
+        # Stage B / §19.1. Class mode is a MANUAL toggle; the schedule only
+        # suggests it (an assistant that changes its social posture because the
+        # clock moved is the exact initiative §19.2 forbids).
+        "class_mode": False,
+        "class_schedule_suggest": True,
+        # e.g. [{days=["mon","tue","wed","thu","fri"], start="08:00",
+        #        end="15:00", label="lecture block"}]
+        "class_schedule": [],
+    },
+    "console": {
+        "history_limit": 200,      # one conversation; no per-channel fork
+        "snapshot_limit": 20,
+    },
+    "disclosure": {
+        # Owner rule 2026-10-20: memory is allowed, leaking is not. Behaviour is
+        # speakable; secrets and private plans are not — not even to the owner
+        # while they have company. Awareness comes from the owner saying they are
+        # not alone, and from show-off mode. A guest voice gets no memory at all.
+        "owner_name": "",            # how she refers to you in a deflection
+    },
+    "showoff": {
+        # §19.3. Entry happens through a voiceprint-verified command only; this
+        # section carries no grant of authority, only the demo's own bounds.
+        "timeout_s": 600,            # ~10 minutes, then it ends itself
+        "sandbox": "",               # "" -> <data_dir>/demo-sandbox
+        # The ONLY owner facts visible to guests. Empty by default: private
+        # memory (§16) is closed in this mode, not merely discouraged.
+        "demo_safe_facts": [],
+        "announce": True,
+    },
+    "initiative": {
+        # §19.2 as amended: NO BUDGET. There is deliberately no per-day count,
+        # spacing rule or rate key in this section — the reason gate controls
+        # knocks (a stored, citable reason or no knock at all).
+        "snooze_hours": 24,             # "later" -> commitment memory
+        "retire_after_ignores": 3,      # same topic ignored 3x retires it
+        "urgent_in_class_mode": True,   # class mode = urgent-only, silently
+        # A knock has its OWN notification identity and its OWN short sound.
+        # Nothing else ever uses these (§19.2: not errors, not completions).
+        "notify_identity": "Elaria · knock",
+        "sound": "~/.local/share/assistant/sounds/knock.oga",
+        "notify": True,
+        "play_sound": True,
+    },
     "persona": {
         "name": "Elaria",
         "candour": 0.7,
@@ -332,7 +497,13 @@ class Config:
 
     def model_for_role(self, role: str) -> str:
         gemini = self.raw["gemini"]
+        if role == "voice":
+            return voice_model(self)
         return gemini.get(f"model_{role}", gemini["model_default"])
+
+    def voice_model(self) -> str:
+        """The Live model that owns native audio (Stage A: `gemini_voice_model`)."""
+        return voice_model(self)
 
     @property
     def api_key(self) -> str | None:

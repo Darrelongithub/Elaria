@@ -1,0 +1,37 @@
+{
+  "_comment": "BASELINE catalogue used only when a live catalogue cannot be fetched. The authoritative catalogue is queried at warm time (Voices API voices.list() and, for Live sessions, a real session open) and cached in the store. Committed on 2026-10-20 because the owner's machine is the only place with a key; every entry below is traceable to Google's published docs or to the Gemini Live app voice roster.",
+  "retrieved": "2026-10-20",
+  "sources": [
+    "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/live-api/configure-language-voice (30 Live/TTS studio voices, retrieved 2026-10-14)",
+    "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live (gemini-3.8-live, GA 2026-09-15)",
+    "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-live-preview (gemini-3.1-flash-live-preview)",
+    "https://ai.google.dev/api/voices (Voices API ListVoices; prebuilt id = speaker name)",
+    "Gemini Live app voice roster: Flare, Glow, Ursa, Vega, Pegasus, Dipper, Eclipse, Capella, Orbit, Orion (rolled out 2026-05-28; Flare/Glow replaced Nova/Lyra)"
+  ],
+  "studio_voices": [
+    "Zephyr", "Puck", "Kore", "Orus", "Autonoe", "Umbriel", "Erinome",
+    "Laomedeia", "Schedar", "Achird", "Sadachbia", "Fenrir", "Aoede",
+    "Enceladus", "Algieba", "Algenib", "Achernar", "Gacrux",
+    "Zubenelgenubi", "Sadaltager", "Charon", "Leda", "Callirrhoe",
+    "Iapetus", "Despina", "Rasalgethi", "Alnilam", "Pulcherrima",
+    "Vindemiatrix", "Sulafat"
+  ],
+  "app_voices": [
+    "Flare", "Glow", "Ursa", "Vega", "Pegasus", "Dipper", "Eclipse",
+    "Capella", "Orbit", "Orion"
+  ],
+  "models": {
+    "gemini-3.8-live": {
+      "live": true,
+      "notes": "GA 2026-09-15; default Live model for low-latency voice agents. Runtime validation fetches the real catalogue; this baseline lists the documented studio voices plus the Gemini Live app roster (Flare/Glow are app voices and are the ones most likely to differ per project)."
+    },
+    "gemini-3.8-live-extended-thinking": {
+      "live": true,
+      "notes": "High-reasoning Live variant; same native-audio output contract."
+    },
+    "gemini-3.1-flash-live-preview": {
+      "live": true,
+      "notes": "Flash Live preview on the Gemini Developer API (2026-03-26)."
+    }
+  }
+}

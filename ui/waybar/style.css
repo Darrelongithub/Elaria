@@ -51,3 +51,56 @@
 #custom-elaria-voicetest.voice-test-idle {
   color: #6272a4;
 }
+
+/* Stage B: class mode is a posture, visible at a glance. */
+#custom-elaria.class-mode {
+  color: #8be9fd;
+  font-weight: bold;
+}
+
+#custom-elaria.class-suggested {
+  color: #6272a4;
+  font-style: italic;
+}
+
+/* Stage C: THE KNOCK — the only state that means "Elaria wants to talk".
+   Deliberately unlike errors/completions: a unique glyph (set in
+   assistant/waybar.py) and this animation. In class mode the sound is off and
+   this visual pulse is the whole signal. */
+#custom-elaria.knock {
+  color: #ffb86c;
+  font-weight: bold;
+}
+
+#custom-elaria.knock-loud {
+  animation: elaria-knock 1.6s ease-in-out infinite;
+}
+
+#custom-elaria.knock-silent {
+  animation: elaria-knock-silent 2.4s ease-in-out infinite;
+}
+
+@keyframes elaria-knock {
+  0%   { opacity: 1; }
+  40%  { opacity: 0.55; }
+  100% { opacity: 1; }
+}
+
+@keyframes elaria-knock-silent {
+  0%   { opacity: 1; }
+  60%  { opacity: 0.7; }
+  100% { opacity: 1; }
+}
+
+/* Stage D — show-off mode: the room is invited; authority is not. */
+#custom-elaria.showoff {
+  color: #e08cff;
+}
+#custom-elaria.showoff.knock {
+  color: #ffb86c;
+}
+
+/* Disclosure awareness — company present: memory allowed, secrets not. */
+#custom-elaria.company {
+  color: #7fe3d4;
+}
