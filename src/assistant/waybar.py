@@ -10,7 +10,8 @@ One formatter, two delivery modes sharing it:
 
 Classes emitted here are styled in ui/waybar/style.css — keep them in sync:
 idle | listening | transcribing | halted | down | mock | offline |
-forced-offline (combinable).
+forced-offline | class-mode | class-suggested | knock | knock-loud |
+knock-silent (combinable).
 
 The offline marker follows §13.9 rule 1: one small suffix, while the
 tooltip carries the exact connectivity mode, queue and local voice.
@@ -51,6 +52,19 @@ def format_waybar(status: dict) -> dict:
     elif connectivity_mode == "OFFLINE":
         classes.append("offline")
         suffix = " ·offline"
+    class_mode = status.get("class_mode") or {}
+    if class_mode.get("enabled"):
+        classes.append("class-mode")
+        suffix += " ·class"
+    elif class_mode.get("suggested"):
+        classes.append("class-suggested")
+    knock = status.get("knock") or {}
+    pending_knocks = int(knock.get("pending") or 0)
+    if pending_knocks:
+        classes.append("knock")
+        classes.append("knock-silent" if class_mode.get("enabled") else "knock-loud")
+        glyph = "✦"
+        suffix = " ·wants to talk"
     last = status.get("last_transcript") or {}
     tooltip_lines = [
         f"Elaria — {mode_label} (gemini: {status.get('gemini_mode')})",
@@ -65,6 +79,15 @@ def format_waybar(status: dict) -> dict:
     if queue_counts:
         tooltip_lines.append("cloud queue: " + ", ".join(
             f"{k}={v}" for k, v in sorted(queue_counts.items())))
+    if class_mode.get("enabled"):
+        tooltip_lines.append("class mode: voice out OFF · spoken acks OFF · "
+                             "knocks silent · initiative urgent-only")
+    elif class_mode.get("suggested"):
+        tooltip_lines.append("class suggestion: " + str(class_mode.get("suggestion")))
+    if pending_knocks:
+        tooltip_lines.append(
+            f"{pending_knocks} knock(s) — she has a stated reason; click to open "
+            "the console")
     voice = status.get("voice") or {}
     if voice:
         tooltip_lines.append(format_voice_line(voice))

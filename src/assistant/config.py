@@ -374,6 +374,20 @@ DEFAULTS: dict = {
         "min_chars": 40,                  # short utterances aren't worth a call (§13.4)
         "glossary_file": "~/.config/assistant/glossary.toml",
     },
+    "presence": {
+        # Stage B / §19.1. Class mode is a MANUAL toggle; the schedule only
+        # suggests it (an assistant that changes its social posture because the
+        # clock moved is the exact initiative §19.2 forbids).
+        "class_mode": False,
+        "class_schedule_suggest": True,
+        # e.g. [{days=["mon","tue","wed","thu","fri"], start="08:00",
+        #        end="15:00", label="lecture block"}]
+        "class_schedule": [],
+    },
+    "console": {
+        "history_limit": 200,      # one conversation; no per-channel fork
+        "snapshot_limit": 20,
+    },
     "persona": {
         "name": "Elaria",
         "candour": 0.7,

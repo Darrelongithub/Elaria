@@ -412,6 +412,231 @@ def _meeting_command(args, config) -> int:
     return 0
 
 
+def _class_command(args, config) -> int:
+    """`assist class [on|off|toggle|status]` — one toggle, visible everywhere."""
+    from .presence import PresenceService
+
+    action = getattr(args, "action", "status") or "status"
+    try:
+        if action == "status":
+            out = call(config.socket_path, "class.status", timeout=5.0)
+        elif action == "toggle":
+            out = call(config.socket_path, "class.toggle", timeout=5.0)
+        else:
+            out = call(config.socket_path, "class.set",
+                       {"enabled": action == "on"}, timeout=5.0)
+    except (DaemonUnavailable, RuntimeError, OSError):
+        store = _local_store(config)
+        presence = PresenceService(config, store)
+        if action == "toggle":
+            status = presence.toggle()
+        elif action in ("on", "off"):
+            status = presence.set_enabled(action == "on")
+        else:
+            status = presence.status()
+        out = {"class_mode": status.as_dict(),
+               "note": "stored locally; the daemon will observe it"}
+        store.close()
+    mode = out["class_mode"]
+    if action == "status":
+        print(json.dumps(out, indent=2))
+    else:
+        print("Class mode: " + ("ON — voice out OFF, spoken acks OFF, knocks "
+                                "silent, initiative urgent-only; console fully usable"
+                                if mode["enabled"] else "OFF — normal voice and initiative"))
+    return 0
+
+
+def _print_snapshot(snapshot: dict, *, messages: int = 12) -> None:
+    """Human rendering of the same snapshot the QML panel binds to."""
+    conversation = snapshot.get("conversation") or {}
+    counts = snapshot.get("counts") or {}
+    mode = snapshot.get("class_mode") or {}
+    print("── Elaria · console ─────────────────────────────────────────")
+    print(f"class mode: {'ON' if mode.get('enabled') else 'off'}"
+          + (f" · suggestion: {mode['suggestion']}" if mode.get("suggestion") else "")
+          + f" · conversation #{conversation.get('id')}"
+          + f" · holding {counts.get('holding', 0)} · parked {counts.get('parked', 0)}")
+    if snapshot.get("daemon", {}).get("running") is False:
+        print(f"daemon down: {snapshot['daemon'].get('reason')}")
+    for message in (conversation.get("messages") or [])[-messages:]:
+        who = "you" if message["role"] == "user" else "elaria"
+        channel = f"[{message.get('channel', 'voice')}]"
+        print(f"{who} {channel}: {message['text']}")
+    knocks = snapshot.get("knocks") or []
+    if knocks:
+        print("\nwants to talk (a knock always carries its reason):")
+        for knock in knocks:
+            print(f"  #{knock['id']} [{knock['urgency']}] {knock['topic']}: {knock['reason']}")
+    plans = snapshot.get("pending_plans") or []
+    if plans:
+        print("\npending plans:")
+        for plan in plans:
+            print(f"  #{plan['id']} {plan['root']} · {plan['status']} "
+                  f"({plan['placed']}/{plan['total']})")
+    jobs = snapshot.get("job_progress") or []
+    if jobs:
+        print("\njob progress:")
+        for job in jobs:
+            print(f"  {job['label']} · {job['status']}")
+    parked = snapshot.get("parked_items") or []
+    if parked:
+        print(f"\nparked for review: {len(parked)} item(s) — `assist review list`")
+    queue = snapshot.get("offline_queue") or {}
+    if queue.get("counts"):
+        print("offline queue: " + ", ".join(f"{k}={v}" for k, v in sorted(queue["counts"].items())))
+    holding = snapshot.get("holding") or []
+    if holding:
+        print("\nholding for you:")
+        for item in holding:
+            print(f"  #{item['id']} [{item['kind']}] {item['title']}"
+                  + (f" — {item['detail']}" if item.get("detail") else ""))
+    showoff = snapshot.get("showoff") or {}
+    if showoff.get("active"):
+        print(f"\nSHOW-OFF MODE ON — {showoff.get('announcement', '')}")
+    print("─────────────────────────────────────────────────────────────")
+
+
+def _talk_command(args, config) -> int:
+    """`assist talk` — CLI parity with the console panel.
+
+    One conversation: `console.say` goes through the same `_ask` handler the
+    voice path uses, so a session started by voice continues here with full
+    context. The panel and this command render the same daemon snapshot.
+    """
+    text = (getattr(args, "text", None) or "").strip()
+    try:
+        if text:
+            result = call(config.socket_path, "console.say",
+                          {"text": text}, timeout=120.0)
+            print(result["reply"])
+            return 0
+        snapshot = call(config.socket_path, "console.state", timeout=5.0)
+    except DaemonUnavailable as exc:
+        print(f"assist talk: the console lives in the daemon ({exc}). "
+              "Start it with: systemctl --user start assistant", file=sys.stderr)
+        return 1
+    except (RuntimeError, OSError) as exc:
+        print(f"assist talk: {exc}", file=sys.stderr)
+        return 1
+    _print_snapshot(snapshot)
+    print("Continue here, or /state /class on|off /knock /accept N /decline N "
+          "/later N /showoff /quit")
+    while True:
+        try:
+            line = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not line:
+            continue
+        if line in ("/quit", "/exit"):
+            return 0
+        if line == "/help":
+            print("/state · /class on|off|toggle · /knock · /accept N · "
+                  "/decline N · /later N · /showoff status|exit · /quit")
+            continue
+        if line == "/state":
+            try:
+                _print_snapshot(call(config.socket_path, "console.state", timeout=5.0))
+            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+                print(f"state unavailable: {exc}", file=sys.stderr)
+            continue
+        if line.startswith("/class"):
+            parts = line.split()
+            action = parts[1] if len(parts) > 1 else "status"
+            try:
+                if action == "status":
+                    out = call(config.socket_path, "class.status", timeout=5.0)
+                    print(json.dumps(out["class_mode"], indent=2))
+                elif action == "toggle":
+                    out = call(config.socket_path, "class.toggle", timeout=5.0)
+                    print("class mode " + ("ON" if out["class_mode"]["enabled"] else "OFF"))
+                else:
+                    out = call(config.socket_path, "class.set",
+                               {"enabled": action == "on"}, timeout=5.0)
+                    print("class mode " + ("ON" if out["class_mode"]["enabled"] else "OFF"))
+            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+                print(f"class command failed: {exc}", file=sys.stderr)
+            continue
+        if line.startswith("/knock"):
+            try:
+                out = call(config.socket_path, "knock.list", timeout=5.0)
+                for knock in out["knocks"]:
+                    print(f"#{knock['id']} [{knock['urgency']}] {knock['topic']}: "
+                          f"{knock['reason']}")
+                if not out["knocks"]:
+                    print("no knocks — she has no reason to interrupt")
+            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+                print(f"knock list unavailable: {exc}", file=sys.stderr)
+            continue
+        if line.split()[0] in ("/accept", "/decline", "/later"):
+            parts = line.split()
+            if len(parts) != 2 or not parts[1].lstrip("#").isdigit():
+                print("usage: /accept N | /decline N | /later N")
+                continue
+            method = {"accept": "knock.accept", "decline": "knock.decline",
+                      "later": "knock.later"}[parts[0][1:]]
+            try:
+                out = call(config.socket_path, method, {"id": int(parts[1].lstrip("#"))},
+                           timeout=30.0)
+                print(json.dumps(out, indent=2))
+            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+                print(f"{parts[0]} failed: {exc}", file=sys.stderr)
+            continue
+        if line.startswith("/showoff"):
+            parts = line.split()
+            action = parts[1] if len(parts) > 1 else "status"
+            try:
+                if action in ("exit", "stop", "off"):
+                    out = call(config.socket_path, "showoff.exit",
+                               {"reason": "owner_stop"}, timeout=10.0)
+                else:
+                    out = call(config.socket_path, "showoff.status", timeout=5.0)
+                print(json.dumps(out, indent=2))
+            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+                print(f"show-off: {exc}", file=sys.stderr)
+            continue
+        try:
+            result = call(config.socket_path, "console.say", {"text": line},
+                          timeout=120.0)
+            print(f"elaria [console]: {result['reply']}")
+            speech = result.get("speech") or {}
+            if speech.get("muted"):
+                print(f"  (voice silent: {speech.get('reason', 'class mode')})")
+        except (DaemonUnavailable, RuntimeError, OSError) as exc:
+            print(f"assist talk: {exc}", file=sys.stderr)
+
+
+def _console_command(args, config) -> int:
+    if getattr(args, "follow", False):
+        from .console import stream_console
+
+        try:
+            for snapshot in stream_console(config.socket_path):
+                print(json.dumps(snapshot), flush=True)
+        except KeyboardInterrupt:
+            pass
+        return 0
+    try:
+        snapshot = call(config.socket_path, "console.state", timeout=5.0)
+    except (DaemonUnavailable, RuntimeError, OSError):
+        from .console import ConsoleService
+        from .presence import PresenceService
+
+        store = _local_store(config)
+        snapshot = ConsoleService(config, store,
+                                  presence=PresenceService(config, store)).snapshot()
+        store.close()
+        snapshot.setdefault("daemon", {"running": False,
+                                       "reason": "daemon down — local snapshot"})
+    if getattr(args, "json", False):
+        print(json.dumps(snapshot, indent=2))
+    else:
+        _print_snapshot(snapshot)
+    return 0
+
+
 def _mode_command(args, config) -> int:
     value = getattr(args, "mode_value", None)
     try:
@@ -696,6 +921,19 @@ def build_parser() -> argparse.ArgumentParser:
     status_p.add_argument("--follow", action="store_true",
                           help="with --waybar: stream a line per state change (no poll lag)")
     sub.add_parser("cost", help="request/token spend from the ledger")
+    talk_p = sub.add_parser(
+        "talk", help="her console: one conversation, voice + text (CLI parity)")
+    talk_p.add_argument("text", nargs="?",
+                        help="one console turn; omit for the interactive console")
+    console_p = sub.add_parser(
+        "console", help="console state: conversation, plans, parked, queue, holding")
+    console_p.add_argument("--json", action="store_true")
+    console_p.add_argument("--follow", action="store_true",
+                           help="stream a snapshot per daemon event (Quickshell feed)")
+    class_p = sub.add_parser(
+        "class", help="class mode: voice out OFF, spoken acks OFF, console usable")
+    class_p.add_argument("action", nargs="?", default="status",
+                         choices=["on", "off", "toggle", "status"])
     mode_p = sub.add_parser("mode", help="connectivity: show or set auto|online|offline")
     mode_p.add_argument("mode_value", nargs="?", choices=["auto", "online", "offline"])
     ask_p = sub.add_parser("ask", help="one conversational turn (governor + harness)")
@@ -842,10 +1080,13 @@ def main(argv: list[str] | None = None) -> int:
 
                 store = _local_store(config)
                 connectivity = ModeManager(config, store).status(refresh=False)
+                from .presence import PresenceService
+
                 status = {"running": False, "mode": "down",
                           "name": config.section("persona").get("name", "Elaria"),
                           "connectivity": connectivity.as_dict(),
                           "connectivity_mode": connectivity.effective_mode,
+                          "class_mode": PresenceService(config, store).status().as_dict(),
                           "cloud_queue": store.cloud_job_counts()}
                 store.close()
             if args.waybar:
@@ -872,6 +1113,15 @@ def main(argv: list[str] | None = None) -> int:
             from .cost import format_cost_report
             print(format_cost_report(data["month"], data["today"], data["quota"], data["tier"]))
             return 0
+
+        if args.command == "class":
+            return _class_command(args, config)
+
+        if args.command == "talk":
+            return _talk_command(args, config)
+
+        if args.command == "console":
+            return _console_command(args, config)
 
         if args.command == "mode":
             return _mode_command(args, config)

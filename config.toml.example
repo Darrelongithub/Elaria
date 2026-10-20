@@ -75,6 +75,19 @@ flash_lite_rpm = 15
 max_requests_per_day = 1200
 max_requests_per_minute = 12
 
+[presence]
+# Stage B / §19.1: one toggle, schedule only SUGGESTS (never auto-switches).
+class_mode = false
+class_schedule_suggest = true
+# class_schedule = [
+#   { days = ["mon", "tue", "wed", "thu", "fri"], start = "08:00",
+#     end = "15:00", label = "lecture block" },
+# ]
+
+[console]
+history_limit = 200      # one conversation shared by voice + console
+snapshot_limit = 20
+
 [asr]
 primary  = "gemini_live"            # chain: live -> batch -> local (§12.7)
 fallback = ["gemini_batch", "local"]

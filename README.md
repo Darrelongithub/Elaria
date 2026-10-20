@@ -200,6 +200,34 @@ model.** The live repro (`Voice name Flare is not supported`) came from
 - `model_transcribe_batch = "gemini-3.5-transcribe"` (dedicated batch STT, not
   Flash-Lite).
 
+### Her console + class mode (Stage B, §19.1)
+
+```bash
+assist talk                 # the console in your terminal (interactive)
+assist talk "..."           # one console turn — same conversation as voice
+assist console --json       # the snapshot the Quickshell panel renders
+assist console --follow     # streaming snapshots (one JSON per daemon event)
+assist class on|off|toggle|status
+```
+
+One conversation, two channels: a turn started by voice continues in the
+console with full context, and the reverse works too. The store has a single
+conversation id; `messages.channel` records `voice` or `console` for display
+only. There is no per-channel history to fork.
+
+The console shows the conversation, pending plans, parked review/unsorted
+items, the offline queue, job progress and the **holding shelf** (follow-ups and
+findings that are hers to keep). The Quickshell panel lives at
+`ui/quickshell/console/` and binds the same snapshot — dumb renderer, no logic.
+
+**Class mode** is one toggle. Voice out OFF, spoken acks OFF, knocks become
+silent visual pulses (Stage C), initiative restricted to urgent-only; the
+console and every local tool keep working. It is visible in the console header,
+in Waybar (`·class`) and in `assist status` (`class_mode`). A schedule can
+*suggest* class mode, but it never switches it by itself — the toggle stays the
+owner's. Spoken acks are suppressed in the daemon and the speech route reports
+silence with the reason, so nothing can accidentally speak around the toggle.
+
 ## §10 open decisions — defaults taken, awaiting your word
 
 None block Phase 0 (§14). Each defaults to the blueprint's recommendation

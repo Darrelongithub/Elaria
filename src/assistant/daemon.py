@@ -25,6 +25,7 @@ from . import __version__
 from .asr import local_asr_status
 from .capture import PipeWireCapture, SimulatedCapture
 from .config import Config, load_config, load_humour_profile
+from .console import ConsoleService, SessionService
 from .cost import day_start_iso, iso_now, month_start_iso
 from .gemini_client import GeminiClient
 from .ipc import serve
@@ -32,6 +33,7 @@ from .modes import ModeManager
 from .offline_queue import CloudQueue
 from .organiser import OrganiserService
 from .persona import PersonaGovernor, TurnContext
+from .presence import PresenceService
 from .safety import clear_halt, is_halted, set_halt
 from .store import Store
 from .transcribe import DictationService
@@ -64,13 +66,17 @@ class Daemon:
         self.mode = "idle"
         # Phase 8 resident hot paths: connectivity, ONE local voice, queue.
         self.mode_manager = ModeManager(config, self.store)
+        # Stage B: class mode + the one shared conversation.
+        self.presence = PresenceService(config, self.store)
+        self.sessions = SessionService(self.store)
         self.speech = SpeechService(
             config, self.store, client=self.client,
             # INTERIM online voice: Flare speaks only while actually online. Offline
             # turns are text-only (amendment 2026-10-20) - no cloud call, and the
             # dormant local voice does not take them over either.
             is_online=lambda: self.mode_manager.status(refresh=False).effective_mode
-            == "ONLINE")
+            == "ONLINE",
+            presence=self.presence)
         self.cloud_queue = CloudQueue(config, self.store, self.client, self.mode_manager)
         self.dictation = DictationService(
             config, self.store, self.client,
@@ -84,6 +90,8 @@ class Daemon:
         from .meeting import MeetingService
         self.meetings = MeetingService(
             config, self.store, self.client, mode_manager=self.mode_manager)
+        self.console = ConsoleService(
+            config, self.store, presence=self.presence, sessions=self.sessions)
         self._meeting: dict | None = None  # {task, dual, mic_frames, sys_frames}
         self._meeting_processing = False
         self._plan_tasks: dict[int, asyncio.Task] = {}
@@ -253,6 +261,11 @@ class Daemon:
             "queue.drain": self._queue_drain,
             "queue.approve": self._queue_approve,
             "queue.enqueue_external": self._queue_enqueue_external,
+            "console.state": self._console_state,
+            "console.say": self._console_say,
+            "class.status": self._class_status,
+            "class.set": self._class_set,
+            "class.toggle": self._class_toggle,
             "ask": self._ask,
         }
         if method == "events.subscribe":
@@ -303,6 +316,12 @@ class Daemon:
             "connectivity": connectivity.as_dict(),
             "connectivity_mode": connectivity.effective_mode,
             "voice": self.speech.status(),
+            "class_mode": self.presence.status().as_dict(),
+            "console": {
+                "conversation_id": (self.sessions.history()["id"]),
+                "messages": len(self.sessions.history()["messages"]),
+                "holding": len(self.store.list_holdings("active")),
+            },
             "offline_asr": local_asr_status(self.config),
             "cloud_queue": self.store.cloud_job_counts(),
         }
@@ -323,7 +342,11 @@ class Daemon:
         kind = str(params.get("kind") or "on_it")
         route = self.speech.route(STANDARD_ACKS.get(kind, "On it."))
         cached = self.speech.cached_ack(kind)
-        should_speak = params.get("speak", self.config.section("tts").get("speak_acks", True))
+        class_mode = self.presence.status().enabled
+        should_speak = bool(params.get("speak",
+                                      self.config.section("tts").get("speak_acks", True)))
+        if class_mode:
+            should_speak = False       # spoken acks OFF in class mode
         if should_speak and cached is None and not route["muted"]:
             await self._await_ack_cache()          # VB-13: boot warming, once
             cached = self.speech.cached_ack(kind)
@@ -332,7 +355,10 @@ class Daemon:
                          # A miss while she is supposed to speak is a reported
                          # condition (VB-2), not a verdict: the re-warm below is
                          # what makes the next press audible.
-                         "cache_miss": cached is None and not route["muted"]}
+                         "cache_miss": cached is None and not route["muted"],
+                         "class_mode": class_mode,
+                         "speak_suppressed": ("class mode: spoken acks OFF"
+                                              if class_mode else None)}
         if cached is None:
             self._schedule_rewarm_if_requested()   # VB-2: miss -> one warm cycle
         if should_speak and cached:
@@ -438,6 +464,42 @@ class Daemon:
         status = await asyncio.to_thread(self.mode_manager.refresh, force=True)
         await self._note_connectivity_transition(status)
         return {"connectivity": status.as_dict()}
+
+    async def _console_state(self, params: dict) -> dict:
+        return self.console.snapshot()
+
+    async def _console_say(self, params: dict) -> dict:
+        """A text turn in the SAME conversation a voice turn writes to."""
+        text = str(params.get("text") or "").strip()
+        if not text:
+            raise ValueError("console.say needs params.text")
+        result = await self._ask({
+            "text": text, "speak": bool(params.get("speak", False)),
+            "channel": "console",
+        })
+        return {**result, "channel": "console",
+                "conversation": self.sessions.history(limit=int(
+                    params.get("history_limit", 40)))}
+
+    async def _class_status(self, params: dict) -> dict:
+        return {"class_mode": self.presence.status().as_dict()}
+
+    async def _class_set(self, params: dict) -> dict:
+        if "enabled" in params:
+            status = self.presence.set_enabled(bool(params["enabled"]))
+        elif str(params.get("action") or "").lower() == "toggle":
+            status = self.presence.toggle()
+        else:
+            raise ValueError("class.set needs params.enabled (bool) or action=toggle")
+        await self.broadcast({"event": "class.changed",
+                              "class_mode": status.as_dict()})
+        return {"class_mode": status.as_dict()}
+
+    async def _class_toggle(self, params: dict) -> dict:
+        status = self.presence.toggle()
+        await self.broadcast({"event": "class.changed",
+                              "class_mode": status.as_dict()})
+        return {"class_mode": status.as_dict()}
 
     async def _speech_status(self, params: dict) -> dict:
         return {"voice": self.speech.status()}
@@ -862,8 +924,9 @@ class Daemon:
             json.dumps({"register": decision.register,
                         "serious_gate": decision.serious_gate,
                         "pushback": decision.pushback, "reason": decision.reason}))
-        conversation_id = self.store.get_or_create_conversation(iso_now())
-        self.store.add_message(conversation_id, iso_now(), "user", text)
+        channel = str(params.get("channel") or "voice")
+        conversation_id = self.sessions.active_id(iso_now())
+        self.sessions.append("user", text, channel=channel, ts=iso_now())
 
         reply, via, model, fixture = None, None, None, None
         queued_job_id = None
@@ -898,12 +961,20 @@ class Daemon:
                     self.mode_manager.observe_success("gemini")
 
         speech = await self._maybe_speak_reply(reply, params)
-        self.store.add_message(conversation_id, iso_now(), "assistant", reply, via)
+        self.sessions.append("assistant", reply, channel=channel, via=via,
+                             ts=iso_now())
+        # One conversation means every surface refreshes on every turn —
+        # a voice turn appears in the console immediately, and vice versa.
+        await self.broadcast({"event": "conversation.message",
+                              "conversation_id": conversation_id,
+                              "channel": channel, "role": "assistant"})
         if params.get("reaction"):
             self.governor.note_user_reaction(str(params["reaction"]))
             self._save_relationship_state()
         return {
             "reply": reply,
+            "channel": channel,
+            "conversation_id": conversation_id,
             "via": via,  # local-intent | local-memory | local-queue | gemini
             "model": model,
             "register": decision.register,

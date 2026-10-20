@@ -217,11 +217,16 @@ class SpeechService:
     """The only speech-output service. Callers never pick a voice."""
 
     def __init__(self, config, store=None, *, backend: TtsBackend | None = None,
-                 runner=None, player_runner=None, client=None, is_online=None):
+                 runner=None, player_runner=None, client=None, is_online=None,
+                 presence=None):
         self.config = config
         self.store = store
         self._client = client
         self._is_online = is_online
+        # Stage B: class mode is posture, not a caller decision. Injecting the
+        # presence service here means every speech path (ack, say, reply, warm)
+        # obeys the toggle without each caller remembering to check it.
+        self._presence = presence
         self.last_voice_error: str | None = None
         self._backend_override = backend
         self._runner = runner
@@ -360,6 +365,8 @@ class SpeechService:
             "gemini_voice": identity["effective"] or gemini.get("voice", "Flare"),
             "gemini_voice_model": config_voice_model(self.config),
             "gemini_voice_api": "live",
+            "class_mode": (self._presence.status().as_dict()
+                           if self._presence is not None else None),
             "voice_identity": identity,
             "cache_identity": (self.cloud_cache_identity() if speaking_gemini else
                                {"voice": backend.voice_id,
@@ -491,7 +498,19 @@ class SpeechService:
         notification, log). The local Piper path stays in the tree but dormant - it
         speaks only when a config key explicitly asks for it, which is also the
         single switch for the future one-owned-voice endgame.
+
+        Stage B: class mode is checked FIRST and is absolute — voice out OFF,
+        spoken acks OFF — while the console stays fully usable.
         """
+        if self._presence is not None:
+            try:
+                presence = self._presence.status()
+            except Exception:            # a broken presence read must not speak
+                presence = None
+            if presence is not None and getattr(presence, "enabled", False):
+                return "silent", (
+                    "class mode: voice out OFF and spoken acks OFF; the console, "
+                    "text replies and local tools remain fully usable")
         settings = self.config.section("tts") if self.config else {}
         online = str(settings.get("online_voice", "gemini")).lower()
         offline = str(settings.get("offline_voice", "none")).lower()
