@@ -326,6 +326,42 @@ FILLER_PHRASES = (
     "i'm here to help",
 )
 
+def chat_reply_violation(reply: str, *, original_user_text: str = "") -> str | None:
+    """The delivery-spec rule this reply breaks, or None when it is acceptable.
+
+    Returns a stable rule name ("empty", "filler", "asterisk", "narration",
+    "verbosity") so a rejection can be LOGGED with the rule that hit — Bug 8:
+    silent replacement is how wrong answers hid behind a working ledger. The
+    bool form (`is_valid_chat_reply`) wraps this.
+    """
+    if not reply or not reply.strip():
+        return "empty"
+    lowered = reply.lower()
+    # BUG5: filler violates persona register (restraint default, not verbosity)
+    for phrase in FILLER_PHRASES:
+        if phrase in lowered:
+            return "filler"
+    # No asterisk narration: any '*' is a stage-direction marker in this context.
+    # The spec forbids "*A soft rustle...*" and similar.
+    if "*" in reply:
+        return "asterisk"
+    # No bracketed stage directions either
+    if reply.strip().startswith("[") or reply.strip().startswith("("):
+        # Allow normal bracket citations, but not scene-setting like
+        # "[A soft rustle...]" — we check for narration keywords inside
+        lowered2 = reply.lower()
+        narration_markers = ("rustle", "breath", "soft", "slow", "quiet", "sigh", "chuckle", "pause", "whisper")
+        if any(m in lowered2 for m in narration_markers):
+            return "narration"
+    if is_simple_turn(original_user_text):
+        lines = [line for line in reply.splitlines() if line.strip()]
+        if len(lines) > SIMPLE_TURN_MAX_LINES:
+            return "verbosity"
+        if len(reply.strip()) > SIMPLE_TURN_MAX_CHARS:
+            return "verbosity"
+    return None
+
+
 def is_valid_chat_reply(reply: str, *, original_user_text: str = "") -> bool:
     """Check that a chat reply respects the persona delivery spec.
 
@@ -336,33 +372,34 @@ def is_valid_chat_reply(reply: str, *, original_user_text: str = "") -> bool:
     This is used as a harness verifier and in tests; a model that violates
     it is considered a failed attempt and earns a retry (§17).
     """
-    if not reply or not reply.strip():
-        return False
-    lowered = reply.lower()
-    # BUG5: filler violates persona register (restraint default, not verbosity)
-    for phrase in FILLER_PHRASES:
-        if phrase in lowered:
-            return False
-    # No asterisk narration: any '*' is a stage-direction marker in this context.
-    # The spec forbids "*A soft rustle...*" and similar. We treat any asterisk
-    # as a violation for simple turns, and as a strong signal always.
-    if "*" in reply:
-        return False
-    # No bracketed stage directions either
-    if reply.strip().startswith("[") or reply.strip().startswith("("):
-        # Allow normal bracket citations, but not scene-setting like
-        # "[A soft rustle...]" — we check for narration keywords inside
-        lowered2 = reply.lower()
-        narration_markers = ("rustle", "breath", "soft", "slow", "quiet", "sigh", "chuckle", "pause", "whisper")
-        if any(m in lowered2 for m in narration_markers):
-            return False
-    if is_simple_turn(original_user_text):
-        lines = [l for l in reply.splitlines() if l.strip()]
-        if len(lines) > SIMPLE_TURN_MAX_LINES:
-            return False
-        if len(reply.strip()) > SIMPLE_TURN_MAX_CHARS:
-            return False
-    return True
+    return chat_reply_violation(reply, original_user_text=original_user_text) is None
+
+
+CHECKIN_REPLY = "I am now. What do you need?"
+
+
+def checkin_reply() -> str:
+    """The settled check-in line (wake phrase alone, 'are you awake', …)."""
+    return CHECKIN_REPLY
+
+
+def timeout_fallback_reply(user_text: str = "") -> str:
+    """The reply for a turn that timed out or failed — TURN-AWARE (Bug 8/BUG F).
+
+    A fallback must never answer a different question than the one asked. The
+    settled check-in line IS the turn-aware answer for a check-in turn; any
+    real question gets an honest "give me a moment" admission that quotes the
+    question back so the user knows exactly which turn died.
+    """
+    if is_simple_turn(user_text or ""):
+        return CHECKIN_REPLY
+    question = " ".join((user_text or "").split())
+    if len(question) > 48:
+        question = question[:48] + "…"
+    if question:
+        return (f'Give me a moment — that one timed out before I could answer '
+                f'"{question}". Ask again?')
+    return "Give me a moment — that one timed out before I could answer. Ask again?"
 
 
 def build_chat_prompt(prompt: str, *, decision: object | None = None,

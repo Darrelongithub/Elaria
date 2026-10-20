@@ -38,20 +38,25 @@ def parse_wpctl_status(text: str) -> dict[str, list[dict]]:
 
     Names here are display names; the record target must be resolved to
     node.name/object.serial via `wpctl inspect` on the real machine.
+
+    BUG 7 follow-up: real `wpctl status` prefixes every line with tree
+    glyphs (" │  *   53. …"), which the old line-anchored regexes never
+    matched — the parser only worked on flat sample text. `search` + the
+    section-name-at-end rule handle both shapes.
     """
     sections: dict[str, list[dict]] = {}
     current = None
     for line in text.splitlines():
-        header = re.match(r"\s*(Sinks|Sources|Sink endpoints|Source endpoints):", line)
+        header = re.search(r"\b(Sinks|Sources|Sink endpoints|Source endpoints):\s*$", line)
         if header:
             current = header.group(1)
             sections[current] = []
             continue
-        entry = re.match(r"\s*([*]?\s*)(\d+)\.\s+(.+)", line)
+        entry = re.search(r"([*]?)\s*(\d+)\.\s+(.+)", line)
         if entry and current:
             sections[current].append({
                 "id": int(entry.group(2)),
-                "is_default": "*" in entry.group(1),
+                "is_default": entry.group(1) == "*",
                 "display_name": entry.group(3).split("[")[0].strip(),
             })
     return sections
@@ -69,6 +74,28 @@ def list_nodes(runner=subprocess.run) -> dict:
         return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
+def list_pw_nodes(runner=subprocess.run) -> list[dict]:
+    """Flattened node list for `assist meeting setup` (BUG 7, 2026-10-20).
+
+    The CLI imports this helper (cli.py `_meeting_command`); a dead-code sweep
+    removed it without seeing the late import, so `assist meeting setup` died
+    with ImportError while 1,280 tests stayed green. Each node is
+    {id, name, kind, is_default} — display names from `wpctl status`, exactly
+    what meeting_setup_text() prints. An empty list is honest "nothing found"
+    (container/absent wpctl), never an exception.
+    """
+    status = list_nodes(runner=runner)
+    if not status.get("available"):
+        return []
+    out: list[dict] = []
+    for section, kind in (("Sinks", "sink"), ("Sink endpoints", "sink"),
+                          ("Sources", "source"), ("Source endpoints", "source")):
+        for node in status.get("nodes", {}).get(section, []):
+            out.append({"id": node["id"], "name": node["display_name"],
+                        "kind": kind, "is_default": bool(node.get("is_default"))})
+    return out
+
+
 # --------------------------------------------------------------------------
 # PCM utilities (Phase 1): energy, rolling buffer, WAV sink, VAD gate
 # --------------------------------------------------------------------------
@@ -78,6 +105,62 @@ def frame_rms(pcm: bytes) -> float:
         return 0.0
     samples = struct.unpack(f"<{len(pcm) // 2}h", pcm[: len(pcm) - len(pcm) % 2])
     return math.sqrt(sum(s * s for s in samples) / len(samples)) / 32768
+
+
+def pcm_peak(pcm: bytes) -> float:
+    """Normalised peak amplitude of an s16le buffer (0.0 silence … 1.0 clip).
+
+    The per-session level check (BUG 6 diagnostics): bytes tell you a process
+    wrote something; peak tells you a human could have been heard in it.
+    """
+    if len(pcm) < 2:
+        return 0.0
+    samples = struct.unpack(f"<{len(pcm) // 2}h", pcm[: len(pcm) - len(pcm) % 2])
+    return max((abs(s) for s in samples), default=0) / 32768
+
+
+def live_level_check(target: str | None = None, seconds: float = 1.2,
+                     runner=subprocess.run) -> dict:
+    """Brief real-microphone level probe for `assist doctor` (BUG 6).
+
+    Records ~`seconds` of raw PCM from the configured (or default) source and
+    reports bytes + peak + RMS — the "speak now and watch it move" check that
+    turns 'the mic should work' into facts. Structurally honest off-Fedora:
+    no pw-record => {'available': False, reason}, never a guess.
+    """
+    if not tool_available("pw-record"):
+        return {"available": False, "target": target or "(default source)",
+                "reason": "pw-record not found (pipewire-utils) — level check "
+                          "runs on the Fedora target, absent in containers"}
+    command = pw_record_pcm_stream_command(target, sample_rate=SAMPLE_RATE)
+    data = b""
+    detail = ""
+    try:
+        # pw-record runs until killed; the timeout IS the recording window.
+        proc = runner(command, capture_output=True, timeout=seconds + 2.0)
+        data = proc.stdout or b""
+        if proc.returncode not in (0, None) and not data:
+            err = (proc.stderr or b"")[:200].decode("utf-8", "replace")
+            return {"available": False, "target": target or "(default source)",
+                    "reason": f"pw-record exited {proc.returncode}: {err}"}
+    except subprocess.TimeoutExpired as exc:
+        data = exc.stdout or b""
+        detail = f"recorded {seconds:.1f}s"
+    except Exception as exc:
+        return {"available": False, "target": target or "(default source)",
+                "reason": f"{type(exc).__name__}: {exc}"}
+    peak = pcm_peak(data)
+    return {
+        "available": True,
+        "target": target or "(default source)",
+        "seconds": round(len(data) / BYTES_PER_SAMPLE / SAMPLE_RATE, 2),
+        "bytes": len(data),
+        "peak": round(peak, 4),
+        "rms": round(frame_rms(data), 4),
+        # Anything under the frame gate is digital silence / a dead node.
+        "signal": bool(data) and peak >= 0.01,
+        "detail": detail,
+    }
 
 
 def pcm_duration_s(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> float:
@@ -181,15 +264,26 @@ class AsyncFrameSource(Protocol):
 
 
 class PipeWireCapture:
-    """One pw-record process per session (§3.4) — never per-chunk spawns."""
+    """One pw-record process per session (§3.4) — never per-chunk spawns.
+
+    BUG 6 (2026-10-20): a wedged pw-record (spawned, delivering no bytes)
+    left `readexactly` hanging forever — the dictation loop could not observe
+    `stop_event`, so `ptt.result` sat its full 60 s on a dead session. Frames
+    now come with a stall deadline: pw-record emits samples continuously even
+    in digital silence, so NO bytes within `stall_timeout_s` means the capture
+    is dead, and the stream ends (`stalled = True`) instead of hanging.
+    """
 
     def __init__(self, target: str | None = None, *, sample_rate: int = SAMPLE_RATE,
-                 frame_ms: int = 30):
+                 frame_ms: int = 30, stall_timeout_s: float = 8.0):
         if not tool_available("pw-record"):
             raise RuntimeError(
                 "pw-record not found (pipewire-utils) — live capture needs the "
                 "Fedora target. Headless/test runs use SimulatedCapture."
             )
+        self.target = target            # node.name/object.serial, or None = default
+        self.stall_timeout_s = float(stall_timeout_s)
+        self.stalled = False
         self._command = pw_record_pcm_stream_command(target, sample_rate=sample_rate)
         self._frame_bytes = sample_rate * frame_ms // 1000 * BYTES_PER_SAMPLE
         self._proc: asyncio.subprocess.Process | None = None
@@ -208,7 +302,14 @@ class PipeWireCapture:
         assert self._proc.stdout is not None
         while True:
             try:
-                chunk = await self._proc.stdout.readexactly(self._frame_bytes)
+                chunk = await asyncio.wait_for(
+                    self._proc.stdout.readexactly(self._frame_bytes),
+                    timeout=self.stall_timeout_s)
+            except TimeoutError:
+                # Dead capture: report it, end the stream, let the session
+                # fail fast with "no speech captured" instead of hanging.
+                self.stalled = True
+                return
             except asyncio.IncompleteReadError as partial:
                 if partial.partial:
                     yield partial.partial
@@ -232,6 +333,8 @@ class SimulatedCapture:
         self.silent_frames = silent_frames
         self.frame_ms = frame_ms
         self.realtime = realtime
+        self.target = "simulated"        # diagnostics: never a mystery node
+        self.stalled = False
         self._stopped = asyncio.Event()
 
     def stop(self) -> None:

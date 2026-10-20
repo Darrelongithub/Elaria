@@ -234,6 +234,15 @@ DEFAULTS: dict = {
         "escalation_ladder": ["gemini-flash-lite-latest", "gemini-flash-latest"],
         "escalate_after_failures": 2,
         "max_scaffold_calls": 6,
+        # BUG F / Bug 8 (2026-10-20): the old single 4 s total-turn bound
+        # cancelled `asyncio.to_thread(generate)` — which does NOT stop the
+        # worker thread. The call completed and hit the ledger while the
+        # timeout path substituted a canned reply. Deadlines are now split:
+        # a streaming FIRST-TOKEN deadline (a transport that has produced
+        # nothing is dead) and a GENEROUS total bound (a generation that
+        # started is delivered verbatim).
+        "chat_first_token_s": 5.0,
+        "chat_timeout_s": 30.0,
         "mode": "mock",
     },
     # Owner-verified quota shape (Step 0, 2026-10-20). These are MEASURED numbers
@@ -368,7 +377,21 @@ DEFAULTS: dict = {
             },
         ],
     },
-    "capture": {"source": "mic", "sample_rate": 16000, "chunk_ms": 30, "retention_days": 30},
+    "capture": {
+        "source": "mic",
+        # BUG 6 (2026-10-20): dictate/meeting capture resolves its pw-record
+        # --target from here first (then [meeting] mic_target). Empty = the
+        # PipeWire default source. Find the node name with `wpctl status` +
+        # `wpctl inspect <id>` (node.name, NOT object.id).
+        "mic_target": "",
+        "sample_rate": 16000,
+        "chunk_ms": 30,
+        # No bytes at all for this long = a dead capture process (pw-record
+        # emits samples even in digital silence). The session ends with
+        # "no speech captured" instead of hanging (BUG 6).
+        "stall_timeout_s": 8.0,
+        "retention_days": 30,
+    },
     "transcribe": {
         # §3.5: rolling local buffer replayed into a resumed session so a
         # mid-sentence reset doesn't lose the utterance.

@@ -40,6 +40,12 @@ allowed_voices             = ["Flare"]
 escalation_ladder    = ["gemini-flash-lite-latest", "gemini-flash-latest"]
 escalate_after_failures = 2
 max_scaffold_calls      = 6
+# BUG F / Bug 8: two deadlines, not one. The FIRST-TOKEN deadline catches a
+# dead transport (nothing streamed = fail fast with a turn-aware fallback);
+# the TOTAL bound is generous so a generation that started is delivered
+# VERBATIM. A successful reply is never replaced by a canned line.
+chat_first_token_s   = 5.0
+chat_timeout_s       = 30.0
 # live | record | mock. Env GEMINI_MODE overrides. No key present => mock.
 mode = "mock"
 
@@ -222,8 +228,15 @@ notes = "Round-2 polished contrast; not selected."
 [capture]
 source = "mic"                      # §10.1 OPEN — blueprint recommendation:
                                     # mic first (Phase 1), mix in Phase 6.
+# BUG 6: dictate/ptt capture resolves pw-record --target from here first
+# (then [meeting] mic_target). Node.name / object.serial — NOT object.id.
+# Find it with `wpctl status` + `wpctl inspect <id>`. Empty = default source.
+mic_target = ""
 sample_rate = 16000
 chunk_ms = 30
+# No bytes at all for this long = a dead capture process (pw-record emits
+# samples even in digital silence). The session ends "no speech captured".
+stall_timeout_s = 8.0
 retention_days = 30
 
 [transcribe]

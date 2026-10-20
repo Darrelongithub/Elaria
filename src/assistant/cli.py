@@ -172,6 +172,30 @@ def run_doctor(config) -> dict:
          else nodes.get("reason", "unavailable"))
         + " · capture source=config 'mic' (§10.1 open; mic-first is the blueprint recommendation)"))
 
+    # BUG 6: a LIVE level check — record ~1 s from the configured/default mic
+    # and report bytes + peak. "The mic should work" becomes facts; a silent
+    # node is named here instead of discovered as a null transcript later.
+    from .capture import live_level_check
+
+    mic_target = (config.section("capture").get("mic_target")
+                  or config.section("meeting").get("mic_target") or None)
+    level = live_level_check(mic_target, seconds=1.2)
+    if level.get("available"):
+        level_detail = (
+            f"node={level.get('target')} · {level.get('bytes', 0)} bytes "
+            f"({level.get('seconds', 0)}s) · peak {level.get('peak')} · "
+            f"rms {level.get('rms')}"
+            + (" — SIGNAL present (speak now: peak should move)"
+               if level.get("signal") else
+               " — digital silence: wrong node? `wpctl status`, then set "
+               "[capture] mic_target (node.name, not object.id)"))
+    else:
+        level_detail = f"node={level.get('target')}: {level.get('reason')}"
+    checks.append(_check(
+        "mic level",
+        bool(level.get("available") and level.get("bytes", 0) > 0),
+        level_detail))
+
     # Phase 7: language pinning + code-switch guard state (§12.4/§12.5).
     from .asr import code_switching_enabled, configured_languages
     from .cleanup import SW_MARKERS, load_extra_markers
@@ -920,6 +944,11 @@ def _voice_command(args, config) -> int:
                 out = {"selected": selected.as_dict(), "voice": speech.status()}
             else:
                 out = {"speech": speech.speak(args.text, play=not args.no_play).as_dict()}
+        except ValueError as exc:
+            # A refused candidate/text is an ANSWER, not a crash (BUG 7 class:
+            # every entry point must return, never raise into a traceback).
+            print(_refusal_text(exc), file=sys.stderr)
+            return 2
         finally:
             store.close()
     print(json.dumps(out, indent=2))
@@ -965,6 +994,10 @@ def _queue_command(args, config) -> int:
             else:
                 out = {"job_id": queue.enqueue_external(args.action_name, args.description),
                        "status": "awaiting_approval"}
+        except ValueError as exc:
+            # A refused job id is an ANSWER, not a traceback (BUG 7 class).
+            print(_refusal_text(exc), file=sys.stderr)
+            return 2
         finally:
             store.close()
     if action == "list":
@@ -1384,6 +1417,17 @@ def main(argv: list[str] | None = None) -> int:
                 data["today"]["quota_calls"] = data["today"]["user_turn_calls"]
                 data["month"]["failures_detail"] = store.failure_summary_since(
                     month_start_iso())
+                # Bug 8: discards must be visible here too (daemon-down path).
+                subs = []
+                for row in store.list_persona_events(kind="reply_substituted",
+                                                     limit=10):
+                    try:
+                        detail = json.loads(row.get("detail") or "{}")
+                    except ValueError:
+                        detail = {"reason": "unreadable"}
+                    detail["ts"] = row.get("ts")
+                    subs.append(detail)
+                data["today"]["reply_substitutions"] = subs
                 store.close()
             from .cost import format_cost_report
             print(format_cost_report(data["month"], data["today"], data["quota"], data["tier"]))
@@ -1611,8 +1655,20 @@ def main(argv: list[str] | None = None) -> int:
                 except (DaemonUnavailable, RuntimeError, OSError) as exc:
                     print(f"assist: transcript not delivered: {exc}", file=sys.stderr)
             result = result or {}
-            print(result.get("narration", ""))
-            print(result.get("text", result.get("error", "(no transcript)")))
+            if result.get("no_speech") and not (result.get("text") or "").strip():
+                # BUG 6 fail-fast: an empty session says so clearly — the CLI
+                # must never sit a full ptt.result budget on a dead capture.
+                print(result.get("narration") or "no speech captured")
+                if result.get("error"):
+                    print(f"({result['error']})", file=sys.stderr)
+                capture = result.get("capture") or {}
+                if capture:
+                    print(f"[capture: node={capture.get('node')} · "
+                          f"bytes={capture.get('bytes')} · "
+                          f"peak={capture.get('peak_rms')}]", file=sys.stderr)
+            else:
+                print(result.get("narration", ""))
+                print(result.get("text") or result.get("error") or "(no transcript)")
             print(f"[inbox: {result.get('inbox_path')} · clipboard: "
                   f"{(result.get('clipboard') or {}).get('copied')}]", file=sys.stderr)
             return 0

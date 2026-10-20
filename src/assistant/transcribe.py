@@ -31,6 +31,7 @@ local TTS; this is the other half of the same rule, not a replacement.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -39,7 +40,12 @@ from datetime import datetime
 from pathlib import Path
 
 from . import asr
-from .capture import FrameGate, RollingAudioBuffer, WavSink, frame_rms
+from .capture import (
+    FrameGate,
+    RollingAudioBuffer,
+    WavSink,
+    frame_rms,
+)
 from .cleanup import CleanupPass
 from .clipboard import copy_text
 from .cost import iso_now, shadow_cost_usd
@@ -124,6 +130,10 @@ class SessionResult:
     cloud_status: str = "complete"
     queued_job_ids: list[int] = field(default_factory=list)
     connectivity_mode: str | None = None
+    # BUG 6 capture diagnostics (2026-10-20): the node, bytes and peak level
+    # per session — "captured nothing" must be provable, not guessable.
+    capture: dict | None = None
+    no_speech: bool = False
 
 
 def _final_texts(events) -> list[str]:
@@ -212,6 +222,34 @@ class DictationService:
         return result
 
     # -- public entry points ---------------------------------------------------
+    async def _next_frame(self, frame_iter, stop_event):
+        """One frame, or None when PTT was released mid-read (BUG 6).
+
+        The old loop only checked `stop_event` between frames; a wedged
+        pw-record (readexactly never returning) meant Enter did nothing and
+        `ptt.result` sat its full wait on a session that would never end.
+        Racing the read against the release makes the release always win.
+        """
+        nxt = asyncio.ensure_future(frame_iter.__anext__())
+        stop_wait = None
+        if stop_event is not None:
+            if stop_event.is_set():
+                nxt.cancel()
+                await asyncio.gather(nxt, return_exceptions=True)
+                return None
+            stop_wait = asyncio.ensure_future(stop_event.wait())
+        try:
+            await asyncio.wait({t for t in (nxt, stop_wait) if t is not None},
+                               return_when=asyncio.FIRST_COMPLETED)
+            if nxt.done():
+                return nxt.result()      # StopAsyncIteration propagates = end
+            return None                  # stop_event won: PTT released
+        finally:
+            for task in (nxt, stop_wait):
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
     async def dictate(self, source, *, transport_factory=None,
                       mode: str = "narration",
                       sink: EventSink | None = None,
@@ -258,6 +296,12 @@ class DictationService:
         gated_frames = 0
         gate_announced = False
         live_failures: list[str] = []
+        # BUG 6 capture diagnostics: what the mic actually delivered this
+        # session (before any gate) — node, bytes, peak. Logged + reported.
+        captured_bytes = 0
+        peak_rms = 0.0
+        frames_seen = 0
+        capture_label = str(getattr(source, "target", None) or "default")
 
         def uplink_blocked(current: LiveTransport | None) -> str | None:
             """Why the mic must stay shut right now, or None when it may open."""
@@ -349,9 +393,23 @@ class DictationService:
                             "session_id": session_id})
 
         try:
-            async for frame in source.frames():
+            # BUG 6: the release must win against a capture process that is
+            # delivering nothing — see _next_frame. PTT released mid-read ends
+            # the session now, not after the CLI's ptt.result wait expires.
+            frame_iter = source.frames().__aiter__()
+            while True:
                 if stop_event and stop_event.is_set():
                     break
+                try:
+                    frame = await self._next_frame(frame_iter, stop_event)
+                except StopAsyncIteration:
+                    break
+                if frame is None:
+                    break                # PTT released mid-read
+                frames_seen += 1
+                captured_bytes += len(frame)
+                level = frame_rms(frame)
+                peak_rms = max(peak_rms, level)
                 frame_s = len(frame) / 2 / 16000
                 # BUG6: half-duplex inside the Live session. While her output
                 # is playing (or inside the ~400 ms guard), a frame is her own
@@ -480,8 +538,39 @@ class DictationService:
                 await transport.close()
             await source.aclose()
 
+        # BUG 6 capture diagnostics — every session logs the node, bytes and
+        # peak level, so "it captured nothing" is a fact, not a guess.
+        stalled = bool(getattr(source, "stalled", False))
+        # ~zero audio = a dead session: no bytes at all (wedged/dead capture)
+        # or nothing above the digital-noise floor (a silent node). A real
+        # word is brief sometimes but never silent — it has peak. Report in
+        # seconds; never wait a full ptt.result budget on an empty session.
+        no_speech = captured_bytes == 0 or peak_rms < 0.003
+        capture_stats = {
+            "node": capture_label, "bytes": captured_bytes,
+            "peak_rms": round(peak_rms, 4), "frames": frames_seen,
+            "duration_s": round(duration_s, 3), "gated_frames": gated_frames,
+            "stalled": stalled, "no_speech": no_speech,
+        }
+        if stalled:
+            notes.append("capture stalled — the capture process delivered no data")
+        if no_speech:
+            # §8: a transcript from ~zero audio is a hallucination, whatever
+            # produced it. The words are not there to report.
+            if final_text:
+                notes.append(
+                    "transcript discarded: the session captured no usable audio (§8)")
+            final_text = ""
+            notes.append(
+                f"no speech captured (node={capture_label}, bytes={captured_bytes}, "
+                f"peak={peak_rms:.4f})")
+        await emit({"event": "capture.stats", "session_id": session_id,
+                    **capture_stats})
+        self.store.log_persona_event(
+            iso_now(), "capture.stats", json.dumps(capture_stats))
+
         use_offline_chain = offline_at_start or network_drop
-        if live_failed or not final_text:
+        if (live_failed or not final_text) and not no_speech:
             if audio_path is not None:
                 try:
                     fallback = await asyncio.to_thread(
@@ -515,6 +604,8 @@ class DictationService:
             connectivity_mode=connectivity.effective_mode if connectivity else None)
         result = self._enqueue_offline_work(
             result, offline=use_offline_chain, skip_cleanup=use_offline_chain)
+        result.capture = capture_stats
+        result.no_speech = no_speech
         # BUG5: filter echo of own TTS — if transcript looks like filler/own speech, treat as empty
         # This uses a simple heuristic: filler phrases + very short echo without user content
         from .persona import FILLER_PHRASES
@@ -534,7 +625,8 @@ class DictationService:
                     audio_path=str(audio_path) if audio_path else None,
                     inbox_path=None, clipboard={"copied": False, "reason": "echo filtered"},
                     flagged=False, duration_s=duration_s, transcript_id=None, notes=notes,
-                    confidence=confidence, cloud_status="complete")
+                    confidence=confidence, cloud_status="complete",
+                    capture=capture_stats, no_speech=no_speech)
                 await emit({"event": "transcript.filtered", "reason": "echo", "session_id": session_id})
                 await emit({"event": "session.ended", "session_id": session_id,
                             "backend": backend, "duration_s": round(duration_s, 2)})
@@ -546,7 +638,9 @@ class DictationService:
         await emit({"event": "transcript.final", "text": shown,
                     "inbox_path": result.inbox_path, "session_id": session_id})
         await emit({"event": "session.ended", "session_id": session_id,
-                    "backend": backend, "duration_s": round(duration_s, 2)})
+                    "backend": backend, "duration_s": round(duration_s, 2),
+                    "no_speech": no_speech,
+                    "capture": capture_stats})
         return result
 
     async def transcribe_file(self, audio_path: Path) -> SessionResult:
