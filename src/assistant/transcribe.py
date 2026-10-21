@@ -401,6 +401,13 @@ class DictationService:
         gated_frames = 0
         gate_announced = False
         live_failures: list[str] = []
+        # BH-K3 tail accounting, in AUDIO time (not wall clock, so burst
+        # and realtime sources agree): seconds of speech-level audio sent,
+        # and how much had been sent when the last committed final arrived.
+        # Speech sent AFTER the last final is by construction not covered
+        # by any committed segment.
+        sent_speech_s = 0.0
+        speech_s_at_last_final: float | None = None
         # BUG 6 capture diagnostics: what the mic actually delivered this
         # session (before any gate) — node, bytes, peak. Logged + reported.
         captured_bytes = 0
@@ -427,7 +434,7 @@ class DictationService:
 
         async def collect_events(current: LiveTransport,
                                  terminal_event: asyncio.Event) -> None:
-            nonlocal resumption_handle, live_failed
+            nonlocal resumption_handle, live_failed, speech_s_at_last_final
             try:
                 async for event in current.events():
                     live_event_counts[event.type] = live_event_counts.get(event.type, 0) + 1
@@ -440,8 +447,16 @@ class DictationService:
                         collected.append(event)
                     # A final is sufficient to make the transcript terminal; Live
                     # implementations have also been observed to omit turn_complete.
-                    if event.type in ("final", "error", "turn_complete"):
+                    # BH-K3: turn_complete is deliberately NOT a terminal here:
+                    # on the transcription-only model a committed segment can
+                    # arrive AFTER the boundary (test_bug6f), so treating it
+                    # as terminal would close the wait just before the tail
+                    # final lands. (Conversational models flush their final
+                    # BEFORE the boundary, so they lose nothing.)
+                    if event.type in ("final", "error"):
                         terminal_event.set()
+                    if event.type == "final":
+                        speech_s_at_last_final = sent_speech_s
                     if event.type == "interim":
                         await emit({"event": "transcript.interim", "text": event.text,
                                     "session_id": session_id})
@@ -612,6 +627,8 @@ class DictationService:
                         collected[:] = [e for e in collected if e.type != "go_away"]
                         raise LiveUnavailable("server GoAway — rotating session")
                     await transport.send_audio(frame)
+                    if level >= self.vad_threshold:
+                        sent_speech_s += frame_s
                     # Yield so the event collector can surface interims /
                     # GoAway promptly even with burst (non-realtime) sources.
                     await asyncio.sleep(0)
@@ -686,7 +703,7 @@ class DictationService:
                 except Exception as exc:
                     live_failed = True
                     live_failures.append(f"activity_end: {exc}")
-                    notes.append(f"Live activity_end failed ({exc}); saved-WAV fallback will run")
+                    notes.append(f"Live activity_end failed ({exc}); will use committed text or saved-WAV fallback")
 
                 if activity_end_ok and collector is not None:
                     try:
@@ -700,12 +717,12 @@ class DictationService:
                         live_terminal_missing = True
                         notes.append(
                             "Live final transcript timed out after activity_end; "
-                            "saved-WAV fallback will run")
+                            "will use committed text or saved-WAV fallback")
                     except Exception as exc:
                         live_terminal_missing = True
                         live_failed = True
                         live_failures.append(f"final wait: {exc}")
-                        notes.append(f"Live final wait failed ({exc}); saved-WAV fallback will run")
+                        notes.append(f"Live final wait failed ({exc}); will use committed text or saved-WAV fallback")
                 diagnostics = {}
                 try:
                     describe = getattr(transport, "diagnostics", None)
@@ -745,7 +762,7 @@ class DictationService:
             live_failed = True
             live_terminal_missing = not bool(final_text)
             live_failures.append(f"dictate: {type(exc).__name__}: {exc}")
-            notes.append(f"dictation pipeline failed ({exc}); saved-WAV fallback will run")
+            notes.append(f"dictation pipeline failed ({exc}); will use committed text or saved-WAV fallback")
             self._log("dictate.pipeline_failed", session_id=session_id,
                       error=f"{type(exc).__name__}: {exc}"[:200])
         finally:
@@ -851,7 +868,39 @@ class DictationService:
                           error=f"{type(exc).__name__}: {exc}"[:200])
 
         use_offline_chain = offline_at_start or network_drop
-        needs_fallback = (live_failed or live_terminal_missing or not final_text) and not no_speech
+        # BH-K3: when may the saved-WAV batch result replace Live text?
+        # Only with positive evidence the Live text is missing or
+        # incomplete:
+        #   * nothing was committed at all, or
+        #   * speech-level audio was sent after the last committed final
+        #     (no segment can cover it) AND the session did not reach a
+        #     clean terminal after release (the wait resolved on a
+        #     post-release final without timing out or failing).
+        # A bare timeout after activity_end is NOT such evidence: when
+        # every segment committed during speech and no speech followed
+        # the last final, the old code still re-transcribed the WAV and
+        # silently swapped the user's Live transcript for the batch one
+        # (doubling the cost of every affected dictation).
+        uncommitted_speech_s = (
+            sent_speech_s - speech_s_at_last_final
+            if speech_s_at_last_final is not None else 0.0)
+        # The post-release wait ended because a terminal actually arrived
+        # (not the timeout, not a failure). turn_complete alone does not
+        # count: the collector no longer treats it as terminal (above).
+        clean_terminal = not live_terminal_missing and not live_failed
+        tail_unconfirmed = uncommitted_speech_s > 0 and not clean_terminal
+        needs_fallback = (not final_text or tail_unconfirmed) and not no_speech
+        if final_text and needs_fallback:
+            notes.append(
+                f"Live transcript may be incomplete: {uncommitted_speech_s:.2f}s "
+                "of speech followed the last committed segment and no clean "
+                "terminal arrived; recovering from saved audio")
+        elif final_text and (live_failed or live_terminal_missing):
+            notes.append(
+                "Live session ended without a clean terminal, but no speech "
+                "followed the last committed segment; committed Live "
+                "transcript kept (batch re-transcription not substituted; "
+                "saved audio retained)")
         if needs_fallback:
             if audio_path is not None:
                 try:
@@ -871,6 +920,11 @@ class DictationService:
                         confidence = getattr(fallback, "confidence", None)
                         language = str(getattr(fallback, "language", language))
                         notes.append(f"transcribed via fallback backend '{backend}'")
+                        if not getattr(fallback, "language_ok", True):
+                            notes.append(
+                                f"language assertion failed: backend reported "
+                                f"{language!r} outside the pinned set — "
+                                "transcript may be silently translated (§12.4)")
                     else:
                         notes.append("saved-WAV fallback returned no transcript")
                 except Exception as exc:
@@ -942,37 +996,17 @@ class DictationService:
         result.capture = capture_stats
         result.no_speech = no_speech
         result.no_final = no_final
-        # BUG5: filter echo of own TTS — if transcript looks like filler/own speech, treat as empty
-        # This uses a simple heuristic: filler phrases + very short echo without user content
-        from .persona import FILLER_PHRASES
-        if final_text:
-            lowered = final_text.lower()
-            # Also check if daemon is speaking (if we have a reference) — but transcribe doesn't have daemon
-            # So we rely on textual fingerprint of echo
-            is_filler_echo = any(phrase in lowered for phrase in FILLER_PHRASES)
-            if is_filler_echo:
-                final_text = ""
-                backend = "local"
-                notes.append("BUG5: filtered echo/filler transcript (own TTS)")
-                # Re-persist with empty? Return empty result
-                result = SessionResult(
-                    session_id=session_id, raw_text="", cleaned_text=None,
-                    backend=backend, language=language,
-                    audio_path=str(audio_path) if audio_path else None,
-                    inbox_path=None, clipboard={"copied": False, "reason": "echo filtered"},
-                    flagged=False, duration_s=duration_s, transcript_id=None, notes=notes,
-                    confidence=confidence, cloud_status="complete",
-                    capture=capture_stats, no_speech=no_speech, no_final=False)
-                await emit_lifecycle_event(
-                    "dictate.transcript_filtered_emit",
-                    {"event": "transcript.filtered", "reason": "echo",
-                     "session_id": session_id})
-                await emit_lifecycle_event(
-                    "dictate.session_ended_emit",
-                    {"event": "session.ended", "session_id": session_id,
-                     "backend": backend, "duration_s": round(duration_s, 2),
-                     "no_speech": no_speech, "no_final": False})
-                return result
+        # BH-K1: there is deliberately NO post-hoc "filler echo" filter here.
+        # The old BUG5 block ran AFTER _persist and, on any FILLER_PHRASES
+        # substring, replaced the returned result with an empty one
+        # (raw/cleaned/inbox/clipboard/transcript_id all falsified) while
+        # the store row kept the real words — dictating an email ending in
+        # "let me know how I can help" returned nothing at all. Echo defence
+        # is upstream and evidence-based: frames captured while she plays
+        # never reach the uplink or the WAV, DuplexLiveTransport refuses
+        # self-audio finals, and the daemon strips by comparing against the
+        # exact text she spoke (Daemon._strip_self_echo). A substring
+        # resemblance to her filler is not evidence about user speech.
         self._ledger_live_session(
             backend, duration_s, ok=bool(final_text),
             error=(" | ".join(live_failures) if live_failures else None))
@@ -1011,6 +1045,12 @@ class DictationService:
         cloud_status = self._cloud_status(
             backend=transcript.backend, confidence=transcript.confidence,
             raw=transcript.text, audio_path=audio_path, offline=offline)
+        notes = []
+        if not getattr(transcript, "language_ok", True):
+            notes.append(
+                f"language assertion failed: backend reported "
+                f"{transcript.language!r} outside the pinned set — "
+                "transcript may be silently translated (§12.4)")
         result = await self._persist(
             session_id=session_id, when=datetime.now().astimezone(),
             raw=transcript.text, backend=transcript.backend,
@@ -1019,7 +1059,7 @@ class DictationService:
             model=(self.config.section("asr").get("offline_model", "small")
                    if transcript.backend == "local"
                    else self.config.model_for_role("transcribe_batch")),
-            notes=[], confidence=transcript.confidence, cloud_status=cloud_status,
+            notes=notes, confidence=transcript.confidence, cloud_status=cloud_status,
             skip_cleanup=offline,
             connectivity_mode=connectivity.effective_mode if connectivity else None)
         return self._enqueue_offline_work(result, offline=offline, skip_cleanup=offline)

@@ -21,7 +21,6 @@ total confidence, so the wake phrase only counts at the very start of the turn.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
 # Longest first so "hey elaria" wins over "elaria".
@@ -29,7 +28,6 @@ WAKE_PHRASES: tuple[str, ...] = ("hey elaria", "ok elaria", "hi elaria", "elaria
 
 # After the phrase: end of string, or a separator (never a word character —
 # "Elariaish"/"Elarians" must not wake).
-_WAKE_BOUNDARY = re.compile(r"^(?P<rest>.*)$", re.DOTALL)
 _SEPARATORS = ",.!?;:—-\"'()[]{} \t"
 
 

@@ -245,12 +245,15 @@ retention_days = 30
 # grants command authority: the voiceprint verdict or a human accept does.
 [hotword]
 phrase = "Elaria"
+sample_rate = 16000                 # wake capture sample rate
+unit_path = ""                      # installed unit path (crash-safety report); "" = standard
 ring_window_s = 2.0                 # pre-wake ring, RAM only (hard cap 2.0s)
 pending_window_s = 2.5              # post-trigger buffer, 2-3s band
 pending_speech_threshold_s = 0.5    # below this speechful audio: wake-clip-only
 speech_rms = 0.01                   # frame gate for "speechful" detection
 keyword_model = ""                  # path to the real .onnx keyword model
 keyword_threshold = 0.5
+keyword_window_s = 1.0              # trailing audio scored per frame (<= ring)
 # ECAPA backend (hardware-side): command `cmd <clip.wav>` printing either
 # {"embedding": [...]} (cosine vs ecapa_reference) or {"score": 0..1}.
 ecapa_cmd = ""
@@ -340,6 +343,8 @@ confidence_review = 0.60
 tier0_min_confidence = 0.85
 max_ops_per_run = 200
 max_ops_per_hour = 500
+tier1_batch_size = 50               # files per Tier-1 LLM classification call
+tier2_batch_size = 10               # files per Tier-2 (escalation) call
 tree_tripwire_pct = 25
 roots = []
 watch = false

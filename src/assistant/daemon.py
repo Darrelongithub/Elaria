@@ -89,6 +89,24 @@ def _sd_notify(message: str) -> None:
         pass
 
 
+def _int_param(params: dict, name: str) -> int:
+    """Coerce a required integer IPC param (BH-K29).
+
+    Bare ``int(params.get(...))`` / ``int(params[...])`` turned a
+    client's missing or mistyped id into TypeError/KeyError text on the
+    wire. ValueError is the daemon's refusal type — it reaches the user
+    as an actionable message and the CLI's exit-2 path.
+    """
+    value = params.get(name)
+    if value is None:
+        raise ValueError(f"parameter {name!r} is required (integer)")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"parameter {name!r} must be an integer, got {value!r}") from exc
+
+
 class Daemon:
     def __init__(self, config: Config):
         self.config = config
@@ -263,7 +281,11 @@ class Daemon:
             # Guard interval after playback before mic reopens
             guard_s = 0.4
             self._speaking_until = __import__("time").monotonic() + est_s + guard_s
-            self._speaking_text = text
+            # text=None means "non-speech output" (e.g. the knock sound):
+            # hold the gate without clobbering the last spoken text that
+            # _strip_self_echo compares against.
+            if text is not None:
+                self._speaking_text = text
         else:
             # Keep guard interval even after speak completes
             guard_s = 0.4
@@ -334,29 +356,65 @@ class Daemon:
     def _wrap_muted(self, source):
         return self._MutedCapture(source, self)
 
+    @staticmethod
+    def _echo_words(text: str) -> list[str]:
+        """Comparison form for echo matching: lowercase, punctuation-free."""
+        words = []
+        for word in text.split():
+            cleaned = "".join(
+                ch for ch in word.lower() if ch.isalnum() or ch == "'")
+            if cleaned:
+                words.append(cleaned)
+        return words
+
+    def _strip_self_echo(self, transcript_text: str) -> str:
+        """Remove HER OWN WORDS from a transcript; never remove the user's.
+
+        BH-K2: the old _is_echo judged by TIMING (a transcript landing
+        inside the ack window was "echo" whatever it said) or by
+        filler-phrase resemblance, and _finish_dictation wiped the whole
+        text on that basis — real dictation finished within ~1.5 s of an
+        ack, or merely containing "how can i help", vanished. Echo is a
+        textual claim: the mic heard the words she actually spoke
+        (`_speaking_text`). Compare words instead: an exact match or a
+        >=2-word contiguous run of her sentence is hers; her words as a
+        PREFIX are excised and the user's remainder kept. Timing is not
+        consulted: frame-level gating means her audio should never reach
+        ASR at all, and when it leaks, the words themselves prove it.
+        """
+        spoken = self._speaking_text
+        if not transcript_text or not spoken:
+            return transcript_text
+        t_norm = self._echo_words(transcript_text)
+        s_norm = self._echo_words(spoken)
+        if not t_norm or not s_norm:
+            return transcript_text
+        if t_norm == s_norm:
+            return ""
+        if len(t_norm) > len(s_norm) and t_norm[:len(s_norm)] == s_norm:
+            # Her sentence, then the user's: walk the raw words, dropping
+            # the first len(s_norm) comparable ones, keep the rest verbatim.
+            kept: list[str] = []
+            seen = 0
+            for word in transcript_text.split():
+                if seen < len(s_norm):
+                    if self._echo_words(word):
+                        seen += 1
+                    continue
+                kept.append(word)
+            return " ".join(kept).strip(" .,!?")
+        if len(t_norm) >= 2 and any(
+                s_norm[i:i + len(t_norm)] == t_norm
+                for i in range(len(s_norm) - len(t_norm) + 1)):
+            # A fragment of her sentence (mic opened mid-playback). The
+            # >=2-word floor keeps BH-I5: "No." answered after she said
+            # "No. Not at this hour." is the USER's one-word reply.
+            return ""
+        return transcript_text
+
     def _is_echo(self, transcript_text: str) -> bool:
-        """BUG5: own TTS output must never enter transcript."""
-        if not transcript_text or not self._speaking_text:
-            return False
-        # If speaking recently, check transcript matches spoken text
-        if self.is_speaking() or self.speaking_guard_remaining() > 0:
-            return True
-        # Also check textual similarity to last spoken text (echo captured)
-        norm_spoken = " ".join(self._speaking_text.lower().split())
-        norm_trans = " ".join(transcript_text.lower().split())
-        if norm_spoken and norm_spoken in norm_trans:
-            return True
-        # Reverse containment needs substance: "No." is a legitimate answer
-        # even when her last sentence contained the word (BH-I5). Two words
-        # are still ambiguous, three words of her own sentence are not.
-        if len(norm_trans.split()) >= 3 and norm_trans in norm_spoken:
-            return True
-        # Filter the filler even without timing match
-        from .persona import FILLER_PHRASES
-        for phrase in FILLER_PHRASES:
-            if phrase in norm_trans:
-                return True
-        return False
+        """True when the transcript is ENTIRELY her own recent speech."""
+        return bool(transcript_text) and not self._strip_self_echo(transcript_text)
 
     def _track_task(self, task: asyncio.Task) -> asyncio.Task:
         self._background_tasks.add(task)
@@ -604,8 +662,9 @@ class Daemon:
                 last_capture = json.loads(event.get("detail") or "{}")
                 last_capture["ts"] = event.get("ts")
                 break
-        except Exception:
-            last_capture = None
+        except Exception as exc:  # BH-K31: a broken diagnostics read must
+            # be visible in status, not indistinguishable from "never happened"
+            last_capture = {"error": f"{type(exc).__name__}: {exc}"}
         return {
             "running": True,
             "name": self.config.section("persona").get("name", "Elaria"),
@@ -839,20 +898,33 @@ class Daemon:
                 kind=str(params.get("kind") or "follow-up"),
                 urgency=str(params.get("urgency") or "normal"),
                 referent=params.get("referent"),
-                commitment_id=(int(params["commitment_id"])
+                commitment_id=(_int_param(params, "commitment_id")
                                if params.get("commitment_id") is not None
                                else None))
         except InitiativeError as exc:
             raise ValueError(str(exc)) from exc
-        signal = self.knock_signal.emit(
-            knock, class_mode=self.presence.status().enabled)
+        # BH-K9: delivering the knock runs subprocesses (desktop
+        # notification + player, up to 5s each) — on this event loop it
+        # froze every IPC call, ptt.stop included, and the knock played
+        # outside the speaking gate into any open capture. Thread + gate;
+        # class mode is a silent pulse (BH-H13: emit stays in-handler).
+        knock_emit = self.knock_signal.emit
+        if self.presence.status().enabled:
+            signal = knock_emit(knock, class_mode=True)
+        else:
+            self._set_speaking(True)
+            try:
+                signal = await asyncio.to_thread(
+                    knock_emit, knock, class_mode=False)
+            finally:
+                self._set_speaking(False)
         knock = self._knock_dict(knock)
         await self.broadcast({"event": "knock.raised", "knock": knock,
                               "signal": signal})
         return {"knock": knock, "signal": signal}
 
     async def _knock_accept(self, params: dict) -> dict:
-        knock_id = int(params.get("id"))
+        knock_id = _int_param(params, "id")
         knock_row = self.store.get_knock(knock_id)
         if knock_row is not None and knock_row.get("kind") == "wake":
             return await self._wake_knock_accept(knock_id, params)
@@ -931,7 +1003,7 @@ class Daemon:
         return payload
 
     async def _knock_decline(self, params: dict) -> dict:
-        knock_id = int(params.get("id"))
+        knock_id = _int_param(params, "id")
         try:
             result = self.initiative.decline(knock_id)
         except InitiativeError as exc:
@@ -951,7 +1023,7 @@ class Daemon:
     async def _knock_later(self, params: dict) -> dict:
         try:
             result = self.initiative.later(
-                int(params.get("id")), hours=params.get("hours"))
+                _int_param(params, "id"), hours=params.get("hours"))
         except InitiativeError as exc:
             raise ValueError(str(exc)) from exc
         await self.broadcast({"event": "knock.changed", "knock": result["knock"],
@@ -959,7 +1031,7 @@ class Daemon:
         return result
 
     async def _knock_ignore(self, params: dict) -> dict:
-        knock_id = int(params.get("id"))
+        knock_id = _int_param(params, "id")
         try:
             result = self.initiative.ignore(knock_id)
         except InitiativeError as exc:
@@ -985,8 +1057,18 @@ class Daemon:
     async def _knock_due(self, params: dict) -> dict:
         raised = []
         for knock in self.initiative.check_due():
-            signal = self.knock_signal.emit(
-                knock, class_mode=self.presence.status().enabled)
+            # BH-K9: see _knock_raise — knock delivery runs subprocesses;
+            # never on this event loop, never outside the speaking gate.
+            knock_emit = self.knock_signal.emit
+            if self.presence.status().enabled:
+                signal = knock_emit(knock, class_mode=True)
+            else:
+                self._set_speaking(True)
+                try:
+                    signal = await asyncio.to_thread(
+                        knock_emit, knock, class_mode=False)
+                finally:
+                    self._set_speaking(False)
             knock = self._knock_dict(knock)
             raised.append(knock)
             await self.broadcast({"event": "knock.raised", "knock": knock,
@@ -1005,10 +1087,16 @@ class Daemon:
         capture_cfg = self.config.section("capture")
         target = (capture_cfg.get("mic_target")
                   or self.config.section("meeting").get("mic_target") or None)
+        # BH-K7: the constructor takes frame_ms (this said chunk_ms — a
+        # TypeError on every real hotword start, invisible to tests that
+        # replace the factory), and the [hotword] stall timeout must reach
+        # the capture or a wedged pw-record streams for the 8s default.
         return PipeWireCapture(
             target=target or None,
             sample_rate=int(capture_cfg.get("sample_rate", 16000)),
-            chunk_ms=int(capture_cfg.get("chunk_ms", 30)))
+            frame_ms=int(capture_cfg.get("chunk_ms", 30)),
+            stall_timeout_s=float(
+                self.config.section("hotword").get("stall_timeout_s", 2.0)))
 
     async def _hotword_loop(self) -> None:
         """Feed always-on frames through the guard + watchdog.
@@ -1030,6 +1118,15 @@ class Daemon:
                     await self.broadcast({"event": "hotword.stalled",
                                           "state": "stalled"})
                     break
+            # BH-K7: the stream ending underneath an armed guard IS the
+            # stall (PipeWireCapture ends frames() at its stall deadline).
+            # The old loop just fell out, leaving status claiming "armed"
+            # over a dead capture — and its finally called a sync close()
+            # PipeWireCapture does not have, leaking the pw-record process.
+            if guard.armed:
+                guard.disarm(reason="stalled")
+                await self.broadcast({"event": "hotword.stalled",
+                                      "state": "stalled"})
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1037,9 +1134,24 @@ class Daemon:
             await self.broadcast({"event": "hotword.stalled",
                                   "state": "stalled", "error": str(exc)[:200]})
         finally:
-            close = getattr(source, "close", None)
-            if callable(close):
-                close()
+            if source is not None:
+                aclose = getattr(source, "aclose", None)
+                if callable(aclose):
+                    # Shielded: hotword.stop cancels this task, and the
+                    # capture must still be reaped (K6 escalates inside).
+                    close_task = asyncio.ensure_future(aclose())
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(close_task), timeout=3.0)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        print(f"[assistd] hotword capture close failed: "
+                              f"{type(exc).__name__}: {exc}", flush=True)
+                else:
+                    close = getattr(source, "close", None)
+                    if callable(close):
+                        close()
 
     async def _hotword_start(self, params: dict) -> dict:
         from .wake_guard import KeywordModelUnavailable
@@ -1142,7 +1254,7 @@ class Daemon:
         return await self._drain_queue_and_announce()
 
     async def _queue_approve(self, params: dict) -> dict:
-        job = self.cloud_queue.approve(int(params["job_id"]))
+        job = self.cloud_queue.approve(_int_param(params, "job_id"))
         return {"job": job, "note": "approved; run queue.drain to process it"}
 
     async def _queue_enqueue_external(self, params: dict) -> dict:
@@ -1628,6 +1740,19 @@ class Daemon:
                                   {"words": len(session.raw_text.split()),
                                    "seconds": session.duration_s})),
             }
+            # BH-K2: excise her own words if the mic caught them — a textual
+            # match against what she actually said, never timing and never
+            # filler resemblance. raw_text stays the ASR record (it matches
+            # the stored transcript row); only the shown/routed text loses
+            # her words, and the user's remainder is always kept.
+            stripped = self._strip_self_echo(result["text"])
+            if stripped != result["text"]:
+                result["text"] = stripped
+                result["echo_suppressed"] = True
+                if not stripped:
+                    result["narration"] = "echo suppressed — own TTS captured as input"
+                    if session_mode == "command":
+                        result["command"] = None
             # The mode is captured at release time: a new dictation started
             # while this one is finishing must not reroute these words.
             if session_mode == "command" and result["text"].strip():
@@ -1641,73 +1766,63 @@ class Daemon:
                 else:
                     # Known grammar climbs the local ladder first; open text
                     # follows the same offline queue policy as `ask`.
-                    # BUG5: drop echo of own TTS before routing to ask
-                    if self._is_echo(result["text"]):
-                        result["command"] = None
-                        result["narration"] = "echo suppressed — own TTS captured as input"
-                    else:
-                        reply_timeout_s = max(
-                            0.1, min(10.0, float(self._chat_timeout_s)))
-                        self._dictate_log(
-                            "dictate.reply_generation_start",
-                            session_id=str(session_id or ""),
-                            timeout_s=reply_timeout_s)
-                        reply_started = time.monotonic()
-                        reply_task = asyncio.create_task(self._ask({
-                            "text": result["text"],
-                            "speak": params.get("speak", True),
-                        }))
-                        try:
-                            done, _pending = await asyncio.wait(
-                                {reply_task}, timeout=reply_timeout_s,
-                                return_when=asyncio.FIRST_COMPLETED)
-                            if not done:
-                                reply_task.cancel()
-                                reply_task.add_done_callback(self._consume_task_result)
-                                self._dictate_log(
-                                    "dictate.reply_generation_timeout",
-                                    session_id=str(session_id or ""),
-                                    timeout_s=reply_timeout_s,
-                                    elapsed_s=round(time.monotonic() - reply_started, 3))
-                                result["command"] = {
-                                    "reply": ("Dictation saved, but reply generation "
-                                              "timed out."),
-                                    "error": "reply generation timed out",
-                                }
-                            else:
-                                result["command"] = reply_task.result()
-                                self._dictate_log(
-                                    "dictate.reply_generation_done",
-                                    session_id=str(session_id or ""),
-                                    elapsed_s=round(time.monotonic() - reply_started, 3))
-                        except asyncio.CancelledError:
-                            if not reply_task.done():
-                                reply_task.cancel()
-                                reply_task.add_done_callback(self._consume_task_result)
+                    # Her own words were already stripped from result["text"]
+                    # above (BH-K2); what remains is the user's and may route.
+                    reply_timeout_s = max(
+                        0.1, min(10.0, float(self._chat_timeout_s)))
+                    self._dictate_log(
+                        "dictate.reply_generation_start",
+                        session_id=str(session_id or ""),
+                        timeout_s=reply_timeout_s)
+                    reply_started = time.monotonic()
+                    reply_task = asyncio.create_task(self._ask({
+                        "text": result["text"],
+                        "speak": params.get("speak", True),
+                    }))
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {reply_task}, timeout=reply_timeout_s,
+                            return_when=asyncio.FIRST_COMPLETED)
+                        if not done:
+                            reply_task.cancel()
+                            reply_task.add_done_callback(self._consume_task_result)
                             self._dictate_log(
-                                "dictate.reply_generation_cancelled",
-                                session_id=str(session_id or ""))
-                            raise
-                        except Exception as exc:
-                            self._dictate_log(
-                                "dictate.reply_generation_failed",
+                                "dictate.reply_generation_timeout",
                                 session_id=str(session_id or ""),
-                                error=f"{type(exc).__name__}: {exc}"[:200])
+                                timeout_s=reply_timeout_s,
+                                elapsed_s=round(time.monotonic() - reply_started, 3))
                             result["command"] = {
                                 "reply": ("Dictation saved, but reply generation "
-                                          "failed."),
-                                "error": str(exc)[:200],
+                                          "timed out."),
+                                "error": "reply generation timed out",
                             }
+                        else:
+                            result["command"] = reply_task.result()
+                            self._dictate_log(
+                                "dictate.reply_generation_done",
+                                session_id=str(session_id or ""),
+                                elapsed_s=round(time.monotonic() - reply_started, 3))
+                    except asyncio.CancelledError:
+                        if not reply_task.done():
+                            reply_task.cancel()
+                            reply_task.add_done_callback(self._consume_task_result)
+                        self._dictate_log(
+                            "dictate.reply_generation_cancelled",
+                            session_id=str(session_id or ""))
+                        raise
+                    except Exception as exc:
+                        self._dictate_log(
+                            "dictate.reply_generation_failed",
+                            session_id=str(session_id or ""),
+                            error=f"{type(exc).__name__}: {exc}"[:200])
+                        result["command"] = {
+                            "reply": ("Dictation saved, but reply generation "
+                                      "failed."),
+                            "error": str(exc)[:200],
+                        }
                 if isinstance(result.get("command"), dict):
                     result["narration"] = result["command"].get(
                         "reply", result["narration"])
-            # BUG5: general echo suppression for any ptt result
-            if result.get("text") and self._is_echo(result["text"]):
-                result["text"] = ""
-                result["raw_text"] = ""
-                result["flagged"] = False
-                result["narration"] = "echo suppressed — own TTS captured as input"
-                result["echo_suppressed"] = True
         except Exception as exc:
             timed_out = isinstance(exc, TimeoutError)
             error = ("session never finished — treating as no speech captured"
@@ -1883,10 +1998,22 @@ class Daemon:
                             "note": "Tier 0 is local; Tier 1/2 judgement is parked",
                         })
                 except Exception as exc:
+                    # BH-K30: build_plan marks its own failures, but a
+                    # failure before its try (bad root mode) or after it
+                    # (tier enqueue) left this row 'building' forever.
+                    plan = self.store.get_plan(plan_id)
+                    if plan is not None and plan.get("status") == "building":
+                        self.store.finish_plan(
+                            plan_id, total=0, placed=0, abstained=0,
+                            shadow_log_path=None, stats_json="{}",
+                            error=f"{type(exc).__name__}: {exc}")
                     await self.broadcast({"event": "error", "error": str(exc),
                                           "plan_id": plan_id})
 
-            self._plan_tasks[plan_id] = asyncio.create_task(_run())
+            task = asyncio.create_task(_run())
+            self._plan_tasks[plan_id] = task
+            task.add_done_callback(
+                lambda _t, pid=plan_id: self._plan_tasks.pop(pid, None))
             started.append({"plan_id": plan_id, "root": spec["path"], "status": "building",
                             "tiers": "queued-offline" if queue_tiers else (
                                 "enabled" if wants_tiers else "tier0-only")})
@@ -1947,7 +2074,7 @@ class Daemon:
         return {"review_items": items}
 
     async def _review_decide(self, params: dict) -> dict:
-        item_id = int(params["item_id"])
+        item_id = _int_param(params, "item_id")
         verdict = params.get("verdict")
         if verdict not in ("approve", "reject"):
             raise ValueError("verdict must be approve|reject")
@@ -2007,7 +2134,13 @@ class Daemon:
             except RuntimeError:  # headless: simulated keeps pipeline exercisable
                 return SimulatedCapture(speech_frames=100_000, frame_ms=30, realtime=True)
 
-        mic = make_source(meeting_cfg.get("mic_target") or None)
+        # BH-K21: [meeting] mic_target overrides, but the documented
+        # [capture] mic_target is the fallback (dictate/hotword resolve
+        # capture -> meeting; meeting used to ignore [capture] entirely
+        # and silently record the PipeWire default).
+        mic = make_source(meeting_cfg.get("mic_target")
+                          or self.config.section("capture").get("mic_target")
+                          or None)
         system = make_source(meeting_cfg.get("system_target") or None)
         dual = DualCapture(mic, system)
         frames: dict[str, list[bytes]] = {"mic": [], "sys": []}
@@ -2785,7 +2918,8 @@ class Daemon:
             print(f"[assistd] audio-orphan sweep failed: {exc}", flush=True)
         self._warm_pending = True
         warm_task = asyncio.create_task(self._warm_speech_cache())
-        server = await serve(self.config.socket_path, self.handle)
+        server = await serve(self.config.socket_path, self.handle,
+                             on_disconnect=self._subscribers.discard)
         connectivity_task = asyncio.create_task(self._connectivity_loop())
         knock_task = asyncio.create_task(self._knock_due_loop())
         _sd_notify("READY=1")
@@ -2819,7 +2953,13 @@ class Daemon:
 
 
 def main() -> None:
-    config = load_config()
+    try:
+        config = load_config()
+    except ValueError as exc:
+        # BH-K24: a malformed config must be one readable line in the
+        # journal, not a traceback on every restart attempt.
+        print(f"assistd: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(2) from None
     try:
         asyncio.run(Daemon(config).run())
     except RuntimeError as exc:

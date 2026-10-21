@@ -215,7 +215,11 @@ class PiperTtsBackend:
         config = self.descriptor.config or f"{model}.json"
         if config:
             args += ["--config", str(Path(config).expanduser())]
-        result = self._runner(args, input=text, text=True, capture_output=True, timeout=120)
+        # BH-K25: scale with the work (~20 chars/s is far below Piper's
+        # real rate; the floor still catches a wedged process quickly).
+        synth_timeout = min(600.0, max(60.0, 30.0 + len(text) / 20.0))
+        result = self._runner(args, input=text, text=True, capture_output=True,
+                              timeout=synth_timeout)
         if getattr(result, "returncode", 0) != 0:
             detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
             raise TtsUnavailable(f"Piper failed ({result.returncode}): {detail[:300]}")
@@ -662,6 +666,18 @@ class SpeechService:
         return SpeechResult(text=text, backend=backend.name, voice_id=backend.voice_id,
                             audio_path=str(path), cached=False)
 
+    @staticmethod
+    def _playback_timeout_s(path: Path) -> float:
+        """BH-K25: bound playback by the audio's own duration, not a flat
+        120 s (which killed long utterances mid-speech and let a hung
+        player sit on a 1 s chirp for two minutes)."""
+        try:
+            with wave.open(str(path), "rb") as wav:
+                seconds = wav.getnframes() / max(1, wav.getframerate())
+        except (wave.Error, OSError, EOFError):
+            return 120.0
+        return min(1800.0, max(15.0, seconds * 1.5 + 10.0))
+
     def _player_command(self) -> list[str] | None:
         setting = str(self.config.section("tts").get("player", "auto"))
         if setting == "none":
@@ -685,7 +701,7 @@ class SpeechService:
         protect = self._player_runner is subprocess.run
         try:
             result = self._player_runner([*command, str(path)], capture_output=True,
-                                         timeout=120,
+                                         timeout=self._playback_timeout_s(path),
                                          **(child_kwargs() if protect else {}))
         except (subprocess.TimeoutExpired, OSError) as exc:
             # A hung or missing player is reported silence, like any other

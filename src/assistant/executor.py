@@ -23,10 +23,17 @@ is itself journaled, so undo is undoable.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
 import shutil
+import threading
+
+try:                                  # Linux/Fedora target; tests may run anywhere
+    import fcntl
+except ImportError:                   # pragma: no cover - non-Unix developer box
+    fcntl = None
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -42,6 +49,7 @@ from .safety import (
     is_protected,
     is_safe_filename,
     sha256_file,
+    try_sha256_file,
 )
 
 
@@ -57,11 +65,21 @@ class ApplyReport:
     op_ids: list[int] = field(default_factory=list)
 
 
+# BH-K15: mutation gate. One organise operation at a time — across
+# threads (this lock) and across processes (an flock next to the DB).
+# The refuses are NON-blocking: a second runner gets a clear refusal,
+# never a silent queue or a raced journal.
+_PROCESS_GATE = threading.Lock()
+_GATE_STATE = threading.local()
+
+
 class Executor:
     def __init__(self, config, store):
         self.config = config
         self.store = store
         self.journal = Journal(store)
+        self._lock_path = store.db_path.with_name(
+            store.db_path.name + ".executor.lock")
         organise = config.section("organise")
         policy = config.section("policy")
         self.protected = policy.get("protected") or []
@@ -72,11 +90,66 @@ class Executor:
         self.trash_dir = config.data_dir / "trash"
         self.runtime = config.socket_path.parent
 
+    @contextlib.contextmanager
+    def _operation_gate(self):
+        """Serialise apply/undo/trash across threads AND processes (BH-K15).
+
+        The daemon applies in a thread; the CLI can run the same plan in
+        its own process. Both read the hourly budget (ops_since) before
+        journaling, so without this gate they double-spend the cap and
+        race the same files. Re-entrant on the holding thread (undo
+        retires duplicates via trash).
+        """
+        depth = getattr(_GATE_STATE, "depth", 0)
+        if depth:
+            _GATE_STATE.depth = depth + 1
+            try:
+                yield
+            finally:
+                _GATE_STATE.depth = depth
+            return
+        if not _PROCESS_GATE.acquire(blocking=False):
+            raise RuntimeError(
+                "another organise operation is already running in this "
+                "process — refusing to race it")
+        handle = None
+        try:
+            if fcntl is not None:
+                self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+                handle = open(self._lock_path, "a+", encoding="utf-8")  # noqa: SIM115
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    handle.close()
+                    handle = None
+                    raise RuntimeError(
+                        "another organise operation is in progress (daemon "
+                        "or CLI) — refusing to race it; retry when it "
+                        "finishes") from None
+            _GATE_STATE.depth = 1
+            try:
+                yield
+            finally:
+                _GATE_STATE.depth = 0
+        finally:
+            if handle is not None:
+                handle.close()  # closing the fd releases the flock
+            _PROCESS_GATE.release()
+
     # -- public -----------------------------------------------------------------
     def apply_plan(self, plan_id: int, root_spec: dict, *,
                    include_review: bool = False,
                    allow_tripwire: bool = False,
                    sandbox_root: Path | None = None) -> ApplyReport:
+        with self._operation_gate():
+            return self._apply_plan_gated(
+                plan_id, root_spec, include_review=include_review,
+                allow_tripwire=allow_tripwire, sandbox_root=sandbox_root)
+
+    def _apply_plan_gated(self, plan_id: int, root_spec: dict, *,
+                          include_review: bool = False,
+                          allow_tripwire: bool = False,
+                          sandbox_root: Path | None = None) -> ApplyReport:
         """Apply a ready plan's auto items (+ approved review items).
 
         `allow_tripwire` is the owner's explicit 'yes, move >25% of my
@@ -243,7 +316,7 @@ class Executor:
         doc = self.store.document_by_path(str(src))
         if doc is None or doc["status"] != "indexed":
             return {"src": str(src), "reason": "unindexed or stale — refused, re-index first"}
-        current_hash = sha256_file(src)
+        current_hash = try_sha256_file(src)
         if current_hash != doc["sha256"] or src.stat().st_size != doc["size"]:
             return {"src": str(src),
                     "reason": "file changed since indexing (sha256/size) — refused (§4.1)"}
@@ -323,6 +396,10 @@ class Executor:
     # -- trash (the only 'delete' shape allowed) ----------------------------------
     def trash(self, path: Path, *, plan_id: int | None = None) -> dict:
         """Move to assistant trash with a manifest. Nothing is ever rm'd."""
+        with self._operation_gate():
+            return self._trash_gated(path, plan_id=plan_id)
+
+    def _trash_gated(self, path: Path, *, plan_id: int | None = None) -> dict:
         path = Path(path)
         if is_halted(self.runtime):
             return {"trashed_as": None, "result": {"src": str(path), "reason": "halted"},
@@ -334,18 +411,40 @@ class Executor:
         self.trash_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         dest = self.trash_dir / f"{stamp}-{path.name}"
-        sha = sha256_file(path)
+        counter = 2
+        while os.path.lexists(dest):
+            # BH-K16: the stamp is second-resolution; two same-name
+            # files in one second used to collide and FAIL the move while
+            # the manifest/return still claimed the trashed_as path.
+            dest = self.trash_dir / f"{stamp}-{path.stem} ({counter}){path.suffix}"
+            counter += 1
+        sha = try_sha256_file(path)
+        if sha is None:
+            return {"trashed_as": None,
+                    "result": {"src": str(path),
+                               "reason": "unreadable (dangling symlink or not a "
+                                         "regular file) — refused"},
+                    "manifest": None}
         result = self._journaled_move(path, dest, plan_id, sha, op="trash")
+        applied = result == "applied"
         manifest = self.trash_dir / "manifest.jsonl"
         with manifest.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"ts": iso_now(), "original": str(path),
-                                     "trashed_as": str(dest), "sha256": sha,
+                                     "trashed_as": str(dest) if applied else None,
+                                     "sha256": sha,
                                      "result": result}) + "\n")
-        return {"trashed_as": str(dest), "result": result, "manifest": str(manifest)}
+        return {"trashed_as": str(dest) if applied else None,
+                "result": result, "manifest": str(manifest)}
 
     # -- undo: journaled reversal, itself undoable (§4.2) ----------------------------
     def undo(self, *, op_id: int | None = None, plan_id: int | None = None,
              since_iso: str | None = None) -> dict:
+        with self._operation_gate():
+            return self._undo_gated(op_id=op_id, plan_id=plan_id,
+                                    since_iso=since_iso)
+
+    def _undo_gated(self, *, op_id: int | None = None, plan_id: int | None = None,
+                    since_iso: str | None = None) -> dict:
         if op_id is None and plan_id is None and since_iso is None:
             raise ValueError(
                 "undo requires an explicit scope (op_id, plan_id, or since_iso)"
@@ -366,20 +465,42 @@ class Executor:
             if not src.exists():
                 problems.append({"op": op["id"], "reason": f"{src} no longer exists"})
                 continue
-            if expected_sha and sha256_file(src) != expected_sha:
+            if expected_sha and try_sha256_file(src) != expected_sha:
                 problems.append({"op": op["id"],
                                  "reason": "content changed since the op — undo "
                                            "refused rather than clobber your edits"})
                 continue
-            if dst.exists() and sha256_file(dst) != (expected_sha or ""):
+            if dst.exists() and try_sha256_file(dst) != (expected_sha or ""):
                 problems.append({"op": op["id"],
                                  "reason": f"original location {dst} now occupied "
                                            "by different content — refused"})
                 continue
+            if dst.exists():
+                # BH-K17: identical content at BOTH locations — the
+                # signature of a crash between copy-verify and source
+                # unlink (status 'copied'), or the owner copying the file
+                # back by hand. _journaled_move cannot proceed (its
+                # no-overwrite rule correctly refuses), which used to
+                # surface as a misleading FileExists problem. The undo
+                # goal — bytes living at the original location — already
+                # holds, so reconcile explicitly: retire the duplicate
+                # through the journaled trash path (recoverable, never a
+                # bare unlink) and roll the op back.
+                retired = self.trash(src, plan_id=op["plan_id"])
+                if retired.get("result") == "applied":
+                    self.store.mark_rolled_back(op["id"])
+                    undone += 1
+                else:
+                    reason = retired.get("result")
+                    problems.append({
+                        "op": op["id"],
+                        "reason": (reason.get("reason") if isinstance(reason, dict)
+                                   else f"duplicate retirement failed: {reason}")})
+                continue
             # Reuse the one journaled move path: create + verify destination
             # first, only then unlink the current home (cross-device safe).
             result = self._journaled_move(
-                src, dst, op["plan_id"], expected_sha or sha256_file(src),
+                src, dst, op["plan_id"], expected_sha or try_sha256_file(src) or "",
                 op=op["op"])
             if result == "applied":
                 self.store.mark_rolled_back(op["id"])
@@ -404,7 +525,7 @@ class Executor:
             dst = Path(op["dst"])
             if not dst.exists():
                 bad.append({"op": op["id"], "path": str(dst), "reason": "missing"})
-            elif op["sha256_after"] and sha256_file(dst) != op["sha256_after"]:
+            elif op["sha256_after"] and try_sha256_file(dst) != op["sha256_after"]:
                 bad.append({"op": op["id"], "path": str(dst), "reason": "hash drift"})
             else:
                 ok += 1

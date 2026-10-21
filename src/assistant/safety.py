@@ -114,6 +114,21 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def try_sha256_file(path: Path) -> str | None:
+    """Hash, or None when the path cannot be read as a file (BH-K28).
+
+    Dangling symlinks, symlinks to directories and files vanishing
+    mid-operation are ordinary folder contents, not exceptional
+    control flow: refusal/comparison sites use this so one unhashable
+    path yields a per-item refusal instead of crashing the batch.
+    Post-move verification keeps the strict `sha256_file`.
+    """
+    try:
+        return sha256_file(path)
+    except OSError:
+        return None
+
+
 def check_operation(
     op: str,
     src: str | Path,
@@ -153,7 +168,8 @@ def check_operation(
                 )
             # Never overwrite. Identical content is a no-op duplicate;
             # different content sends both to _Conflicts/ (§4.1).
-            if source.exists() and sha256_file(source) == sha256_file(dest):
+            source_sha = try_sha256_file(source) if source.exists() else None
+            if source_sha is not None and source_sha == try_sha256_file(dest):
                 return PolicyDecision(False, "destination already holds identical content", "deny")
             return PolicyDecision(
                 False,

@@ -1298,3 +1298,302 @@ running the documented command chain).
   receive diagnostics, and a synchronous ack gate reservation held through actual
   playback plus the 400 ms tail guard. Genuine failures retain 6e's bounded WAV
   recovery and durable capture stats; speculative/output text is not a final.
+
+## BUG HUNT 2026-10-21 — BH-K series (see BUGHUNT-2026-10-21.md)
+
+### BH-K1 — Dictated text containing a filler phrase was silently discarded
+
+- **Severity:** data-loss
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_transcript_integrity.py::test_dictated_email_with_filler_signoff_is_kept` (fails pre-fix)
+- **Expected:** dictating "Dear team, … Let me know how I can help with the board pack." returns that text with a transcript id and an inbox file.
+- **Was:** a post-persist "BUG5 echo filter" in `DictationService.dictate` matched the final text against persona `FILLER_PHRASES` substrings ("let me know how i can", "how can i help", …) and, on any hit, replaced the already-persisted `SessionResult` with a fabricated empty one — raw/cleaned text, inbox path, clipboard and transcript_id all falsified while the store row kept the real words. The user got nothing; the record lied about it.
+- **Fix:** block removed. Echo defence is upstream and evidence-based (frames during playback never reach uplink/WAV; duplex refuses self-audio finals; the daemon strips by exact spoken-text comparison, BH-K2). Resemblance to her filler is not evidence about user speech.
+
+### BH-K2 — Daemon echo check wiped real dictation on timing alone
+
+- **Severity:** data-loss
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_transcript_integrity.py` (`test_echo_requires_textual_match_not_timing`, `test_finish_dictation_keeps_text_that_lands_during_ack`, …)
+- **Expected:** a transcript is echo only when its words are the words she just spoke; her words as a prefix are excised and the user's remainder kept.
+- **Was:** `Daemon._is_echo` returned True whenever a transcript merely *finished* while an ack was playing (or inside the guard), with no textual comparison — `_speaking_text` is never cleared, so the timing branch was armed forever — and also on any `FILLER_PHRASES` substring. `_finish_dictation` then emptied `text`/`raw_text` in `ptt.result`. In command mode the general check ran *after* `_ask` had spoken its reply, so a routed command's own text was reported back as "" with "echo suppressed".
+- **Fix:** `Daemon._strip_self_echo` compares normalised word sequences against `_speaking_text`: exact match or a ≥2-word contiguous run of her sentence is hers (the ≥2 floor preserves BH-I5's one-word "No."); her sentence as a prefix is stripped and the user's words kept. Applied once, before routing; `raw_text` remains the ASR record. Two assertions in `test_bugs_1_to_5_regressions.py` encoded the old rule and were updated with justification inline — the BUG5 incident line is still caught when she actually spoke it.
+
+### BH-K3 — Committed Live finals were overwritten by the saved-WAV batch redo
+
+- **Severity:** data-loss (silent substitution) + wrong-action (double transcription cost)
+- **Status:** fixed in this pass; hardware sequence still to confirm (BH-K4/S2)
+- **Repro:** `tests/test_bughunt_k_transcript_integrity.py` (`test_pause_then_release_silence_after_end_keeps_live`, `test_turn_complete_only_with_uncommitted_tail_recovers_via_batch`)
+- **Expected:** the batch fallback replaces Live text only with positive evidence the Live text is missing or incomplete: nothing committed, or speech was sent after the last committed final and no clean post-release terminal arrived.
+- **Was:** `needs_fallback = live_failed or live_terminal_missing or not final_text`. Any post-`activity_end` wait timeout — including the benign case where every segment committed during speech and the user simply paused before releasing — re-transcribed the WAV and assigned `final_text = fallback_text`, silently swapping the Live transcript (the one interims had shown) for a different batch transcription. Contributing cause: `GenaiLiveTransport` swallowed the server's `turn_complete` for the transcription-only model, so the boundary was invisible to collector, diagnostics and fixtures alike.
+- **Fix:** (a) the parser surfaces `turn_complete` for both model shapes (finals in the same message are queued first); for the transcription-only model `events()` does not end there and the collector does not treat it as a terminal, because a committed segment can arrive *after* the boundary (test_bug6f) — it is evidence for diagnostics, not a completeness proof. (b) `dictate` now accounts in audio time: seconds of speech-level audio sent vs. sent at the moment the last final arrived. Batch runs only when no text was committed, or speech followed the last final *and* no clean post-release terminal arrived; every branch is stated in `notes`. The 6f guarantee is preserved: an unconfirmed tail is still recovered from the WAV, never truncated.
+
+### BH-K4 — `GEMINI_MODE=record` never recorded Live session sequences
+
+- **Severity:** wrong-action (broken debugging contract)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_record_mode.py`
+- **Expected:** record mode = real API + fixtures saved (§12.9), including the streaming message sequence as `fixtures/seq-live.jsonl`.
+- **Was:** `asr.make_live_transport` returned the bare `GenaiLiveTransport` for record mode; `RecordingTransport` existed and was tested in isolation but was wired into no production path. The documented way to capture evidence for the hardware "no final after activity_end" bug produced nothing.
+- **Fix:** the factory wraps the real transport in `RecordingTransport(..., "live")` when `gemini_mode == "record"` (audio is logged as hash+size only, sequence written on close).
+
+### BH-K5 — Voice render could hang a worker thread forever
+
+- **Severity:** wrong-action (unbounded wait / thread-pool starvation)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_waits.py::test_run_coroutine_sync_*`
+- **Expected:** a wedged Live voice session surfaces as a TimeoutError in bounded time.
+- **Was:** `gemini_client._run_coroutine_sync` ran the render with no timeout in both branches (`asyncio.run` and `thread.join()`), and `render()`'s `async for message in session.receive()` can wait forever. TTS runs on the shared `to_thread` executor, so each hang permanently consumed a daemon worker thread.
+- **Fix:** `_run_coroutine_sync(factory, timeout_s=60)` wraps the coroutine in `asyncio.wait_for`; the thread branch joins with a margin and raises `TimeoutError` (thread is daemonized). Voice render passes 30s.
+
+### BH-K6 — Capture close could hang or leave pw-record running
+
+- **Severity:** wrong-action / privacy (unbounded wait, orphaned microphone)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_waits.py::test_aclose_*`
+- **Expected:** `PipeWireCapture.aclose()` always ends with the process dead, bounded, even if the caller cancels.
+- **Was:** `terminate()` then `await proc.wait()` with no bound and no SIGKILL escalation; if the caller's lifecycle timeout cancelled the wait, the process was simply abandoned.
+- **Fix:** bounded wait (`TERMINATE_TIMEOUT_S = 2.0`) then `kill()` + reap; on `CancelledError`, `kill()` before re-raising. The process handle is detached first so a second close is a no-op.
+
+### BH-K7 — Hotword capture path: factory TypeError, leaked pw-record, silent stall
+
+- **Severity:** crash-with-safe-state (factory) + privacy (orphaned live mic) + wrong-action (false "armed")
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_hotword_knock.py::test_hotword_*`
+- **Expected:** `hotword start` builds a real capture; stop/stall always terminates pw-record and reports the true guard state.
+- **Was:** three root causes, all invisible to tests that replace the factory: (1) `_hotword_capture_factory` passed `chunk_ms=` to `PipeWireCapture(frame_ms=...)` → TypeError on every production start; (2) `_hotword_loop`'s finally called a sync `close()` that does not exist on `PipeWireCapture` (only `aclose()`), so a running capture was never closed; (3) a capture stall ends `frames()`, but the loop then exited without disarming or broadcasting — `hotword status` claimed armed over a dead stream. The `[hotword] stall_timeout_s` (2s) was also never passed, silently using the 8s capture default.
+- **Fix:** factory maps `[capture] chunk_ms` → `frame_ms` and passes the hotword stall timeout; the loop treats stream-end-while-armed as the stall (disarm + `hotword.stalled` broadcast); the finally awaits a shielded `aclose()` (with sync-`close()` fallback for test doubles) so cancellation by `hotword.stop` still reaps the process.
+
+### BH-K8 — `assist plan build` polled a stuck "building" plan forever
+
+- **Severity:** wrong-action (unbounded wait)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_waits.py::test_plan_build_poll_gives_up_on_a_stuck_building_plan`
+- **Expected:** polling ends with a clear message if the plan never leaves `building`.
+- **Was:** `while True` poll with no deadline. A daemon restart mid-build orphans the plan row in `building` (its build task died with the old process), so the CLI spun forever.
+- **Fix:** total deadline `_PLAN_BUILD_POLL_DEADLINE_S = 600` in cli.py; on expiry it prints that the daemon may have restarted mid-build, points at `assist plan show`, and exits 1. Nothing was moved (build is shadow-only).
+
+### BH-K9 — Knock delivery blocked the daemon event loop and bypassed the speaking gate
+
+- **Severity:** wrong-action (loop stall) + duplex hole
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_hotword_knock.py::test_knock_emit_does_not_block_the_event_loop_and_is_gated`
+- **Expected:** `knock.raise`/`knock.due` stay responsive while the notification/player subprocesses run, and the knock sound is treated as speaker output by capture gating.
+- **Was:** `KnockSignal.emit` (two `subprocess.run(timeout=5)` calls) was invoked synchronously inside the async `_knock_raise`/`_knock_due` handlers — up to ~10s where every IPC call, including `ptt.stop`, waited — and the sound played with no speaking-gate marks, straight into any open microphone.
+- **Fix:** both handlers now run emit via `asyncio.to_thread` with `_set_speaking` held (class mode short-circuits: silent pulse, no thread, no gate). `_set_speaking(True, text=None)` no longer clobbers `_speaking_text` (the BH-K2 echo reference). The code is inlined at both handlers so the BH-H13 boundary (knock emit reachable only from `_knock_raise`/`_knock_due`) is preserved unchanged.
+
+### BH-K10 — Wake-guard posture probes failed OPEN
+
+- **Severity:** wrong-action (authority/privacy leak)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_authority.py::test_*_probe_failure_fails_closed`
+- **Expected:** if the presence/showoff probe cannot answer, the wake path takes the restrictive branch (console-not-PTT; guest door blocked).
+- **Was:** `WakeGuard._in_class_mode()` and `_guest_door_blocked()` returned `False` on any exception from the wired probe, so a broken presence/showoff read let an accepted wake-knock open voice listening in class mode or during show-off — despite `WakeGuardError`'s own "fail closed" contract.
+- **Fix:** exceptions now fail closed (`True`) and are recorded as `posture_error`, surfaced in `status()` so the restriction is diagnosable. Unwired probes (`None`, headless/tests) keep meaning "no such concept" and are unchanged.
+
+### BH-K11 — Daemon's company posture was cached forever per-process
+
+- **Severity:** wrong-action (privacy: disclosure on stale posture)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_authority.py::test_company_state_is_read_fresh_from_the_store`
+- **Expected:** `DisclosureService.company()` reflects the stored state, whoever wrote it.
+- **Was:** the first read was cached in `_company` for the process lifetime. The CLI's local path writes company state directly to the same SQLite store; the daemon never observed it — it could keep treating the room as private with company present (or stay restricted after they left). `PresenceService` already read fresh; disclosure did not.
+- **Fix:** `company()` reads the store on every call; the cache field is removed. `set_company` is unchanged apart from dropping the cache write.
+
+### BH-K12 — CLI treated daemon refusals as "daemon unavailable" and re-ran them locally
+
+- **Severity:** wrong-action (silent substitution / split-brain writes; refusals reported as success)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_error_surfacing.py` — with the daemon UP, `assist review approve 999` printed "item 999: approved" and exited 0.
+- **Expected:** a daemon `ok:false` reply is an authoritative refusal: printed as one, exit 2, no local retry. Local fallback happens only when the daemon is genuinely unreachable.
+- **Was:** `ipc.call` raised plain `RuntimeError` for `ok:false`, and 37 CLI sites caught `(DaemonUnavailable, RuntimeError, OSError)` around the call and silently re-ran the operation against the local store/services. Refusals were masked (and sometimes converted to printed success: the local review path ignored `set_item_decision`'s rowcount and printed "approved" for nonexistent items); writes could also split-brain against a live daemon (see BH-K11 for the posture instance).
+- **Fix:** `ipc.DaemonError(RuntimeError)` is raised for `ok:false`. CLI fallback sites now catch `DaemonUnavailable` only (print-and-continue surfaces — the console REPL and the ptt.result wait — catch both and print the real message). `main` gains a `DaemonError` net: `_refusal_text` + exit 2. Special cases kept honest: doctor distinguishes down vs erroring; `assist halt` still sets the flag file when the daemon errors (a kill switch must land) but now says so. The local review path checks the rowcount and exits 1 on a missing item.
+
+### BH-K13 — wpctl parser offered the camera as a microphone
+
+- **Severity:** wrong-action (mock-fidelity: green tests, dead hardware path)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_wpctl.py` with a full real-shape `wpctl status` (Audio + Video groups, Devices, Streams, Settings)
+- **Expected:** `Sources` contains audio input nodes only.
+- **Was:** sections were keyed by name alone and `current` was never reset on unknown headers — the Video group's `Sources:` (the camera) merged into audio Sources, `Streams:` entries (Firefox, pw-record) became "Source endpoints", and `Default Configured Devices:` entries polluted the last section. `meeting setup`/doctor thus offered cameras and streams as mic/system nodes. The existing fixture had an Audio group only, so this was invisible.
+- **Fix:** track the top-level group (Audio/Video/Settings) and collect only under Audio; any other header line ends the current section.
+
+### BH-K14 — Disconnected event subscribers were never removed
+
+- **Severity:** wrong-action (slow leak; false status)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_subscribers.py`
+- **Expected:** when an `events.subscribe` client disconnects, its writer leaves `Daemon._subscribers` immediately.
+- **Was:** `ipc.serve` closed the writer in the connection's finally but never told the daemon; pruning happened only when a later broadcast failed writing to the corpse. Owner observed 2 leaked subscribers in `status`.
+- **Fix:** `ipc.serve(..., on_disconnect=...)` is invoked in the connection finally (before close, teardown-safe); the daemon passes `self._subscribers.discard`. The broadcast-time prune remains as backstop.
+
+### BH-K15 — Executor operations raced across processes (cap double-spend)
+
+- **Severity:** wrong-action
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_executor.py::test_executor_refuses_to_race_another_process`
+- **Expected:** one organise mutation at a time, daemon and CLI combined; the second runner is refused clearly.
+- **Was:** no serialisation at all. The daemon applies in a thread while a CLI invocation can apply/undo in its own process; both read the hourly budget (`ops_since`) before either journaled — double-spending `max_ops_per_hour` — and could move the same files concurrently.
+- **Fix:** `Executor._operation_gate()` wraps apply/undo/trash: a non-blocking process lock plus an `flock` on `<db>.executor.lock`. Contention raises a clear `RuntimeError` (surfaced via IPC/CLI, BH-K12). Re-entrant on the holding thread (undo retires duplicates via trash). `verify()` is read-only and deliberately ungated.
+
+### BH-K16 — trash() claimed success for moves that had failed
+
+- **Severity:** wrong-action (false report; file believed trashed)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_executor.py::test_trash_same_name_twice_both_land_and_report_truly`
+- **Expected:** `trashed_as` names a file that actually landed in trash; failures say so.
+- **Was:** the destination name had second resolution, so two same-name files trashed within one second collided; the journaled move failed, yet the manifest and the return value still claimed `trashed_as=<dest>`.
+- **Fix:** destination uniquified (`name (2)`, `(3)`, … — same style as `_Conflicts`); `trashed_as` in both the manifest and the return is set only when the move actually applied.
+
+### BH-K17 — Undo of a `copied` op failed with a misleading FileExists
+
+- **Severity:** wrong-action (undo unavailable precisely for crash-interrupted ops)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_executor.py::test_undo_of_copied_op_reconciles_identical_duplicate`
+- **Expected:** undoing an op whose both copies exist identically (crash between copy-verify and source unlink) reconciles: bytes stay at the original location, the duplicate is retired journaled, the op rolls back.
+- **Was:** undo fell through to `_journaled_move`, whose no-overwrite rule (correctly) refused the occupied destination; the op reported a raw FileExists problem and could never be undone.
+- **Fix:** when the original location already holds identical content, undo retires the duplicate through the journaled trash path (recoverable — never a bare unlink) and marks the op rolled back.
+
+### BH-K22 — Shared SQLite store had no WAL / busy-timeout posture
+
+- **Severity:** wrong-action (cross-process "database is locked" failures)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_store.py`
+- **Expected:** daemon + CLI + doctor share the DB without lock failures under brief contention.
+- **Was:** default rollback journal, implicit timeout — the exact multi-process shape (daemon resident, CLI one-shots writing state/facts/queue rows) that produces locked-database errors.
+- **Fix:** `PRAGMA journal_mode=WAL` + `busy_timeout=5000` at open (with an explicit connect timeout). Companion honesty fix: `forget_facts` by-id now also filters `active = 1`, so double-forget counts 0 instead of recounting.
+
+### BH-K20 — Config keys the code read were undeclared and undocumented
+
+- **Severity:** cosmetic (doctor false "unknown key"; undiscoverable knobs)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_config.py::test_keys_the_code_reads_are_declared_and_documented`
+- **Was:** `[organise] tier1_batch_size`/`tier2_batch_size` (planner_llm), `[hotword] sample_rate` (daemon) and `[hotword] unit_path` (wake_guard) were read with in-code defaults but absent from DEFAULTS and config.toml.example.
+- **Fix:** declared in DEFAULTS with the code's defaults (50/10/16000/"") and documented in the example.
+
+### BH-K21 — meeting.start ignored the documented [capture] mic_target
+
+- **Severity:** wrong-action (meetings recorded the PipeWire default mic)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_config.py::test_meeting_mic_*`
+- **Was:** dictate/hotword resolve `param → [capture] → [meeting]`, but `_meeting_start` read `[meeting] mic_target` only — an owner who set their mic under `[capture]` (as the example documents) got the default source in meetings.
+- **Fix:** meeting resolves `[meeting] mic_target → [capture] mic_target → default` (its own section wins, the documented capture mic is the fallback).
+
+### BH-K24 — Malformed config.toml crashed every command with a traceback
+
+- **Severity:** crash-with-safe-state (every invocation, until fixed by hand)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_config.py::test_malformed_config_is_a_one_line_error_exit_2`
+- **Was:** `load_config()` ran before `main()`'s try and the raw `TOMLDecodeError` (no filename in the message) propagated as a traceback; same in `assistd`.
+- **Fix:** `load_config` wraps parse/IO errors as `ValueError("cannot parse config <path>: …")`; both entry points print one line and exit 2.
+
+### BH-K18 — Per-model quota (RPD) was configured but never enforced
+
+- **Severity:** wrong-action (quota burned into opaque 429s; two drifting sources of truth)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_quota.py`
+- **Expected:** the verified per-model limits in `[quota.models.*]` (flash 20 RPD!) stop calls locally with a clear refusal; flat keys and structured rows cannot silently disagree.
+- **Was:** only the flat `flash_rpm`/`flash_lite_rpm` fed the limiter and only a global 1200/day cap existed. The 21st flash call of the day went out, earned a 429, and burned backoff time before failing opaquely. Also latent: `PerModelLimiter` clamped rpm to `max(1, …)`, so a configured `0` ("not rate-limited", per the config comments) meant 1/minute.
+- **Fix:** `quota_family()` maps model ids to quota rows; `rpm_for` takes the stricter of structured vs flat (0/unlimited in a row disables the limiter for that model, which now honours ≤0); `_check_daily_cap(model)` additionally enforces the family's RPD from the ledger with a clear `QuotaExhausted`; `validate_config` warns when flat and structured values disagree.
+
+### BH-K23 — Keyword spotter scored a single 30 ms frame, not a window
+
+- **Severity:** dead-hardware-path (acoustic arming could never fire with a real model)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_keyword_window.py`
+- **Expected:** `score_window` receives a trailing window of audio (the ring exists precisely to hold it).
+- **Was:** `WakeGuard.feed()` passed the single 30 ms frame just received. No keyword model recognises a phrase in 30 ms; the energy test model masked it because RMS works on any length.
+- **Fix:** `feed()` scores the trailing `[hotword] keyword_window_s` (default 1.0 s, validated 0.1–2.0) slice of the pre-wake ring, ending with the frame just fed.
+
+### BH-K19 — `[asr] assert_output_language` was never called
+
+- **Severity:** dead promise (silent-translation guard, §12.4)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_language_assert.py`
+- **Expected:** with the flag on (default), a transcript whose language tag falls outside the pinned set is caught — the exact silent-translation failure mode the blueprint says this key catches.
+- **Was:** the helper `asr.assert_output_language` and the config key both existed; zero call sites in `src/` (only a unit test of the helper itself). The content-level marker gate in cleanup was wired; the tag gate was not.
+- **Fix:** enforced at the one seam every batch transcript crosses (`asr.transcribe_file`): an out-of-set result is passed over for the next backend; if the chain exhausts it returns degraded-but-marked (`Transcript.language_ok=False`), and both `Transcriber` batch call sites surface a loud session note. Flag off restores first-result-wins.
+
+### BH-K25 — Flat 120 s timeouts on audio playback and Piper synthesis
+
+- **Severity:** wrong-output / bounded-wait (long speech truncated; hung player stalls)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_tts_timeout.py`
+- **Expected:** waits proportional to the work: a 200 s utterance plays to the end; a wedged player on a 1 s chirp is caught in seconds.
+- **Was:** `play_audio` and Piper `synthesize` both used a flat `timeout=120` — long read-alouds were killed mid-speech and misreported as player failures, while a hung player blocked its thread for two minutes on any clip.
+- **Fix:** playback bound derived from the WAV header (duration × 1.5 + 10 s, floor 15 s, cap 30 min; 120 s only when unreadable); synth bound scales with text length (60 s floor, 600 s cap). Both remain finite.
+
+### BH-K26 — Doctor drift check covered only one of the shipped-and-copied files
+
+- **Severity:** stale-deployment (disease 5; the LimitCORE pattern, generalized)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_doctor_drift.py`
+- **Expected:** every file the install instructions copy elsewhere is drift-checked by doctor.
+- **Was:** only `systemd/assistant.service` was compared. `elaria-overlay.service`, `elaria-console.service`, the installed knock sound (which shadows the repo asset), and the appended Hyprland binds could all go stale invisibly; the UI units' hardcoded `%h/Elaria` quickshell path was never sanity-checked against the actual checkout.
+- **Fix:** `_deployment_drift_checks()` byte-compares all three units + knock.wav (LimitCORE callout retained), verifies each UI unit's `quickshell -p` target exists, and checks the load-bearing bind markers in an existing Hyprland config. Merged files (Waybar module/style) remain unchecked — they are not byte copies.
+
+### BH-K27 — ECAPA scoring wrote the wake clip to /tmp
+
+- **Severity:** privacy (wake audio on a persistent filesystem, contradicting the RAM-only design)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_ecapa_memfd.py`
+- **Expected:** wake audio never touches disk — the ring/pending buffers are anonymous mmap + MADV_DONTDUMP precisely so a crash leaves nothing.
+- **Was:** `EcapaCommandScorer.score_owner` used `NamedTemporaryFile(delete=False)` in the default temp dir and unlinked after the run; a SIGKILL in between (or a non-tmpfs /tmp) left the wake utterance on disk.
+- **Fix:** the clip travels in an anonymous memfd inherited by the child (`/proc/self/fd/N`, `pass_fds`); a `/dev/shm` file remains only as the non-Linux fallback.
+
+### BH-K28 — Dangling symlinks / unhashable paths crashed executor operations
+
+- **Severity:** crash (batch operations die on ordinary folder contents)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_symlink_hash.py`
+- **Expected:** one dangling symlink (routine in ~/Downloads) yields a per-item refusal, like every neighbouring guard.
+- **Was:** `trash()` and `verify()` (and the apply/undo hash comparisons) called `sha256_file` unguarded; a dangling symlink raised FileNotFoundError and a symlink-to-directory raised IsADirectoryError, escaping as a raw daemon error mid-batch.
+- **Fix:** `safety.try_sha256_file` returns None on OSError; comparison/refusal sites use it (None never equals an expected hash, so existing refusal branches fire). `trash` returns its standard refusal dict ("unreadable…"); strict `sha256_file` remains for post-move verification, where raising is correct and journaled.
+
+### BH-K29 — Missing/mistyped IPC ids surfaced as TypeError/KeyError gibberish
+
+- **Severity:** error-surfacing (traceback-flavoured text to users of the IPC surface)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_param_coercion.py`
+- **Expected:** a client that omits `id` gets "parameter 'id' is required (integer)" via the daemon's ValueError refusal channel.
+- **Was:** `int(params.get("id"))` / `int(params["item_id"])` / `int(params["job_id"])` raised TypeError/KeyError, which the IPC layer stringified verbatim ("TypeError: int() argument must be…").
+- **Fix:** `daemon._int_param()` coerces with a named ValueError at the knock, review, queue-approve and knock-raise commitment sites.
+
+### BH-K30 — Plan-build tasks leaked; early build failures stranded plans at 'building'
+
+- **Severity:** wrong-output + unbounded growth (minor)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_plan_tasks.py`
+- **Expected:** finished build tasks are forgotten; a failed build's plan row says `failed` with the error.
+- **Was:** `_plan_tasks` only ever grew. And while `Organiser.build_plan` marks its own failures, a failure before its try (invalid root mode) or after it (tier enqueue) left the daemon-reserved row at 'building' forever — `plan.show` reported a build that would never end.
+- **Fix:** done-callback prunes the task; `_run`'s failure path marks a still-'building' plan failed via `finish_plan(error=…)`.
+
+### BH-K31 — `status` silently swallowed its last-capture diagnostics failure
+
+- **Severity:** cosmetic/diagnostics (silent discard)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_status_surface.py`
+- **Expected:** a broken capture-stats read is visible in the status payload.
+- **Was:** `except Exception: last_capture = None` — indistinguishable from "no capture session ever ran", hiding the failure exactly when capture debugging needs it.
+- **Fix:** `last_capture = {"error": …}`; the aggregator stays up, the hole is labelled. Also in this commit: removed a fully-shadowed dead `is_user` assignment in `GeminiClient._call_once` (every branch below it reassigned before use; quota attribution unchanged, pinned by existing tests) and the unused `_WAKE_BOUNDARY` regex in `hotword.py` (zero references repo-wide).
+
+### BH-K32 — `assist knock accept|decline|…` bypassed the running daemon (recon S10, proven)
+
+- **Severity:** authority/privacy plumbing + fabricated output
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_knock_daemon_first.py`
+- **Expected:** knock actions settle where the state lives: the daemon (WakeGuard authentication, conversation, signal delivery). A wake-knock voice-accept must verify.
+- **Was:** every mutating knock action drove a local `InitiativeService` directly, even with the daemon up. Accept printed "voice · first line: <reason>" while the reason was never appended to the daemon's conversation nor spoken (the local service has no sessions). A wake-knock could be "accepted" with zero WakeGuard involvement while the guard stayed in `wake_knock` holding its pending utterance; decline/ignore never zeroed that RAM-only audio via the deny path; raise/due delivered no knock signal at all.
+- **Fix:** `_knock_command` calls the daemon first for raise/accept/decline/later/ignore/due (refusals surface as exit 2 per BH-K12). The local store remains the fallback for a stopped daemon only, and there a wake-knock *accept* refuses — only the guard can settle it, and its pending audio died with the daemon process.
+
+## SUSPECTS from the 2026-10-21 hunt — unproven, NOT fixed (evidence + settling check in BUGHUNT-2026-10-21.md)
+
+- **S1** Live model ids exist for the owner's key → `assist voice models`.
+- **S2** Final segment vs `turn_complete` ordering after `activityEnd` → `GEMINI_MODE=record` dictate, read `fixtures/seq-live.jsonl` (possible after BH-K4).
+- **S3** `generate_audio` fallback `send_realtime_input(text=…)` may not end the turn → `assist voice say "test"` on hardware.
+- **S4** `ipc.subscribe_events` has no read timeout (a wedged-but-alive daemon freezes Waybar/console feeds silently) → design call; needs an owner decision on feed-liveness semantics.
+- **S5** `no_speech` gate (peak RMS < 0.003) may discard very quiet real speech → quiet dictation + compare `capture.stats`.
+- **S6** Duplex guard may drop a genuine user `final` inside the 400 ms output window → record-mode session with an interjection during her reply.
+- **S7** Hotword scoring/verify run on the event loop (onnx + ECAPA subprocess) → ack-latency measurement on hardware.
+- **S8** `_sdk_transcribe` never deletes the Files-API upload → list files in AI Studio after a batch transcription.
+- **S9** `meeting.stop` awaits `transcribe_dual` with no overall bound; a wedged backend parks mode switches (`_meeting_processing`) indefinitely → stop a meeting with the ASR backend wedged and watch `assist status`. (Proper fix is progress-heartbeat based; a blind timeout would silently discard a finished transcript.)

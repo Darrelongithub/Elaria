@@ -19,6 +19,7 @@ import os
 import socket
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path
 
 try:                                  # Linux/Fedora target; tests may run anywhere
@@ -123,7 +124,8 @@ def parse_event_line(line: bytes) -> dict | None:
 
 
 async def serve(socket_path: Path, handler: Handler,
-                event_sink: Callable[[asyncio.StreamWriter], None] | None = None):
+                event_sink: Callable[[asyncio.StreamWriter], None] | None = None,
+                on_disconnect: Callable[[asyncio.StreamWriter], None] | None = None):
     """Start the daemon's Unix server. Returns the asyncio Server."""
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     lock_handle = _acquire_daemon_lock(socket_path)
@@ -175,6 +177,14 @@ async def serve(socket_path: Path, handler: Handler,
         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
             pass
         finally:
+            # BH-K14: tell the owner this connection is gone NOW. Without
+            # this, event subscribers lingered in the daemon's set until
+            # some later broadcast happened to fail writing to them —
+            # ghost subscribers in `status`, growing without bound.
+            if on_disconnect is not None:
+                # Teardown must finish; the close below matters more.
+                with suppress(Exception):
+                    on_disconnect(writer)
             try:
                 writer.close()
             except RuntimeError:
@@ -192,6 +202,18 @@ async def serve(socket_path: Path, handler: Handler,
 
 class DaemonUnavailable(RuntimeError):
     pass
+
+
+class DaemonError(RuntimeError):
+    """The daemon ANSWERED and refused (ok: false) — BH-K12.
+
+    Distinct from DaemonUnavailable (no answer at all): a refusal is an
+    authoritative answer. Callers that fall back to local state when the
+    daemon is down must never silently re-run an operation the live
+    daemon just refused; distinguishing the two is what makes that
+    enforceable. Subclasses RuntimeError so generic error printers keep
+    working and see the daemon's real message.
+    """
 
 
 def subscribe_events(socket_path: Path):
@@ -286,5 +308,5 @@ def call(socket_path: Path, method: str, params: dict | None = None, timeout: fl
     if reply is None:
         reply = {"ok": False, "error": "empty reply"}
     if not reply.get("ok"):
-        raise RuntimeError(reply.get("error", "daemon error"))
+        raise DaemonError(reply.get("error", "daemon error"))
     return reply["result"]

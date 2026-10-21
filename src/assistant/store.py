@@ -272,10 +272,20 @@ class Store:
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db_path = db_path
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False,
+                                     timeout=5.0)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         with self._lock:
+            # BH-K22: this DB is opened by the daemon AND short-lived CLI
+            # processes (local fallbacks, doctor). WAL lets readers and a
+            # writer coexist instead of serialising on the rollback
+            # journal; busy_timeout makes brief contention wait rather
+            # than fail a user command with "database is locked".
+            # (journal_mode returns the mode actually set — on a
+            # filesystem that cannot do WAL it quietly stays 'delete'.)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(SCHEMA)
             # Additive migration (Phase 5): chunk embeddings alongside text.
             columns = {r[1] for r in self._conn.execute("PRAGMA table_info(doc_chunks)")}
@@ -814,8 +824,9 @@ class Store:
         exact id ('#7' / '7') or a text substring."""
         with self._lock:
             if topic.lstrip("#").isdigit():
-                cur = self._conn.execute("UPDATE facts SET active = 0 WHERE id = ?",
-                                         (int(topic.lstrip("#")),))
+                cur = self._conn.execute(
+                    "UPDATE facts SET active = 0 WHERE id = ? AND active = 1",
+                    (int(topic.lstrip("#")),))
             else:
                 # Topic is user text, not a SQL pattern: `%` and `_` must
                 # stay literal or `forget %` would deactivate every fact.

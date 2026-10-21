@@ -107,6 +107,39 @@ class EcapaCommandScorer:
     def available(self) -> bool:
         return bool(self.command)
 
+    def _run_backend(self, wav: bytes) -> subprocess.CompletedProcess:
+        """Invoke the backend with the clip in RAM only (BH-K27).
+
+        Wake audio must never touch a persistent filesystem (the ring is
+        anonymous mmap for the same reason). The clip travels in a
+        memfd the child inherits and opens as /proc/self/fd/N; the
+        /dev/shm named file is only a non-Linux fallback.
+        """
+        argv = self.command.split()
+        if hasattr(os, "memfd_create"):
+            fd = os.memfd_create("elaria-wake-clip")
+            try:
+                os.write(fd, wav)
+                os.lseek(fd, 0, os.SEEK_SET)
+                return subprocess.run(
+                    [*argv, f"/proc/self/fd/{fd}"],
+                    capture_output=True, text=True, timeout=self.timeout_s,
+                    check=False, pass_fds=(fd,))
+            finally:
+                os.close(fd)
+        shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False,
+                                         dir=shm) as tmp:
+            tmp.write(wav)
+            wav_path = tmp.name
+        try:
+            return subprocess.run(
+                [*argv, wav_path],
+                capture_output=True, text=True, timeout=self.timeout_s,
+                check=False)
+        finally:
+            os.unlink(wav_path)
+
     def score_owner(self, pcm: bytes) -> float | None:
         self.last_error = None
         if not self.command:
@@ -116,16 +149,7 @@ class EcapaCommandScorer:
             self.last_error = "empty clip"
             return None
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(_wav_s16(pcm, self.sample_rate))
-                wav_path = tmp.name
-            try:
-                proc = subprocess.run(
-                    [*self.command.split(), wav_path],
-                    capture_output=True, text=True, timeout=self.timeout_s,
-                    check=False)
-            finally:
-                os.unlink(wav_path)
+            proc = self._run_backend(_wav_s16(pcm, self.sample_rate))
         except (OSError, subprocess.SubprocessError) as exc:
             self.last_error = f"scoring command failed: {exc}"
             return None

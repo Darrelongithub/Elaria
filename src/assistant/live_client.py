@@ -697,10 +697,17 @@ class GenaiLiveTransport:
             self._receive_counts["turn_complete"] += 1
             if not self._transcription_only:
                 await self._flush_input()
-                await self._queue.put(LiveEvent("turn_complete"))
-            # A model-turn boundary is NOT a transcription boundary on the
-            # transcription-only model. Input text is independently ordered
-            # and can arrive after it; keep receiving until a real final.
+            # BH-K3: surface the boundary for BOTH model shapes (it was
+            # swallowed for the transcription-only model, so neither the
+            # diagnostics nor a recorded fixture could show where the
+            # server put it). Any final carried by THIS message is queued
+            # above, before the boundary, so ordering is preserved. NOTE:
+            # for the transcription-only model this boundary is NOT a
+            # completeness proof — a committed segment can arrive AFTER it,
+            # in a later receive() turn (test_bug6f) — so events() does not
+            # end here for that model, and DictationService does not treat
+            # it as a terminal.
+            await self._queue.put(LiveEvent("turn_complete"))
 
     async def _receive_loop(self) -> None:
         try:
@@ -760,7 +767,15 @@ class GenaiLiveTransport:
         while True:
             event = await self._queue.get()
             yield event
-            if event.type in ("turn_complete", "error"):
+            if event.type == "error":
+                return
+            # Conversational models: turn_complete ends the model turn (the
+            # accumulated input was flushed as a final just above it).
+            # Transcription-only models: a committed segment can still
+            # arrive after the boundary, so the stream stays open until
+            # error/close; the consumer cancels its collector at session
+            # end (BH-K3).
+            if event.type == "turn_complete" and not self._transcription_only:
                 return
 
     async def close(self) -> None:

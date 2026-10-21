@@ -29,6 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from .config import quota_rows
 from .config import voice_model as configured_voice_model
 from .cost import estimate_tokens, iso_now, shadow_cost_usd
 from .fixtures import FixtureStore, fixture_key
@@ -39,30 +40,45 @@ from .voice_catalogue import (
 )
 
 
-def _run_coroutine_sync(factory):
+def _run_coroutine_sync(factory, timeout_s: float = 60.0):
     """Run an async SDK call from sync code, safely from any thread.
 
     TTS calls arrive on a worker thread (asyncio.to_thread), so there is no
     running loop there and asyncio.run() is correct. If a caller ever has a loop
     running, a private thread keeps the event loop contract intact instead of
     exploding with "asyncio.run() cannot be called from a running event loop".
+
+    BH-K5: the wait is BOUNDED (TimeoutError past `timeout_s`). The voice
+    render's receive() can wait forever on a wedged Live session; unbounded,
+    each such call permanently occupied a worker thread — and TTS runs on
+    the shared to_thread executor the whole daemon relies on.
     """
+
+    async def bounded():
+        return await asyncio.wait_for(factory(), timeout_s)
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(factory())
+        return asyncio.run(bounded())
 
     box: dict = {}
 
     def runner():
         try:
-            box["value"] = asyncio.run(factory())
+            box["value"] = asyncio.run(bounded())
         except BaseException as exc:  # re-raised in the caller's thread
             box["error"] = exc
 
     thread = threading.Thread(target=runner, daemon=True)
     thread.start()
-    thread.join()
+    # The inner wait_for should fire first; the join margin only guards a
+    # thread that cannot even start its loop. daemon=True: an abandoned
+    # render can never block interpreter exit.
+    thread.join(timeout_s + 5.0)
+    if thread.is_alive():
+        raise TimeoutError(
+            f"async SDK call did not finish within {timeout_s:g}s")
     if "error" in box:
         raise box["error"]
     return box.get("value")
@@ -247,7 +263,7 @@ class _SdkTransport:
                     "completed": completed,
                     "usage": {"tokens_in": tokens_in, "tokens_out": tokens_out}}
 
-        result = _run_coroutine_sync(render)
+        result = _run_coroutine_sync(render, timeout_s=30.0)
         if not result.get("pcm"):
             raise RuntimeError(
                 f"the Live model {model} returned no audio for voice {voice_name!r}; "
@@ -287,6 +303,24 @@ def _is_retryable(exc: Exception) -> bool:
     return any(marker in text for marker in ("429", "rate", "quota", "resource_exhausted", "503"))
 
 
+def quota_family(model: str) -> str | None:
+    """Map a model id to its [quota.models.*] row label (BH-K18).
+
+    Order matters: transcribe-live before generic transcribe (batch),
+    flash-lite before flash.
+    """
+    m = model.rsplit("/", 1)[-1].lower().replace("_", "-")
+    if "transcribe-live" in m:
+        return "transcribe-live"
+    if "transcribe" in m:
+        return "transcribe-batch"
+    if "lite" in m:
+        return "flash-lite"
+    if "flash" in m:
+        return "flash"
+    return None
+
+
 class PerModelLimiter:
     """Sliding-window RPM limiter per model (§3.2, load-bearing on free tier)."""
 
@@ -297,8 +331,10 @@ class PerModelLimiter:
 
     def acquire(self, model: str, *, sleep: Callable[[float], None] = time.sleep,
                 now: Callable[[], float] = time.monotonic, max_wait_s: float = 65.0) -> None:
+        limit = self._rpm(model)
+        if limit <= 0:
+            return  # config says not rate-limited (BH-K18; was max(1, ...) = 1/min!)
         stamps = self._stamps.setdefault(model, deque())
-        limit = max(1, self._rpm(model))
         waited = 0.0
         while True:
             current = now()
@@ -334,11 +370,28 @@ class GeminiClient:
                 )
             self._transport = _SdkTransport(config.api_key)
         quota = config.section("quota")
+        # BH-K18: the structured [quota.models.*] rows are the owner's
+        # verified limits; the flat keys are aliases. Enforcement takes
+        # the STRICTER of the two wherever both speak (validate_config
+        # warns when they disagree) — previously only the flat RPM keys
+        # were enforced and per-model RPD was decorative.
+        self._quota_by_family = {
+            row["model"].lower().replace("_", "-"): row
+            for row in quota_rows(quota)}
 
         def rpm_for(model: str) -> int:
-            if "lite" in model:
-                return int(quota.get("flash_lite_rpm", 15))
-            return int(quota.get("flash_rpm", 10))
+            family = quota_family(model)
+            flat = int(quota.get("flash_lite_rpm", 15)) if family == "flash-lite" \
+                else int(quota.get("flash_rpm", 10))
+            row = self._quota_by_family.get(family or "")
+            if row is None:
+                return flat
+            if row.get("unlimited_rpm"):
+                return 0  # limiter treats <= 0 as not rate-limited
+            rpm = row.get("rpm")
+            if isinstance(rpm, (int, float)) and rpm > 0:
+                return min(int(rpm), flat) if flat > 0 else int(rpm)
+            return flat
 
         self._limiter = PerModelLimiter(rpm_for)
         gemini = config.section("gemini")
@@ -360,7 +413,7 @@ class GeminiClient:
         error: str | None = None
         try:
             if self.mode != "mock":
-                self._check_daily_cap()
+                self._check_daily_cap(model)
                 self._limiter.acquire(model, sleep=self._sleep)
                 response = self._with_backoff(model, contents, gen_config,
                                               on_first_token)
@@ -383,8 +436,6 @@ class GeminiClient:
             estimated = 1
         # BUG3: attribute every live call by purpose
         purpose_val = purpose or role
-        is_user = 1 if is_user_turn else (1 if purpose_val == "user_turn" or role == "chat" and purpose_val == "user_turn" else 0)
-        # More precise: if purpose explicitly user_turn, mark true; otherwise false for housekeeping
         if purpose_val in ("user_turn", "user_chat"):
             is_user = 1
         elif purpose is not None and purpose.startswith("housekeeping"):
@@ -551,7 +602,7 @@ class GeminiClient:
         error: str | None = None
         response: dict = {}
         try:
-            self._check_daily_cap()
+            self._check_daily_cap(model)
             self._limiter.acquire(model, sleep=self._sleep)
             delay = 1.0
             for try_no in range(4):
@@ -634,7 +685,7 @@ class GeminiClient:
                 raise
             return self._transport.generate(model, contents, gen_config)
 
-    def _check_daily_cap(self) -> None:
+    def _check_daily_cap(self, model: str | None = None) -> None:
         from .cost import day_start_iso
 
         used = self.store.calls_since(day_start_iso())
@@ -644,6 +695,23 @@ class GeminiClient:
                 "Queue and wait for the reset (midnight Pacific) — cascade "
                 "instead of key rotation (§12.8)."
             )
+        # BH-K18: the per-model RPD is the limit actually hit in daily use
+        # (flash: 20/day). Enforce it locally with a clear refusal instead
+        # of sending the call out to earn an opaque 429 + backoff burn.
+        # Counted per exact model id (the ledger's grain).
+        if model:
+            family = quota_family(model)
+            row = self._quota_by_family.get(family or "")
+            if row and not row.get("unlimited_rpd"):
+                rpd = row.get("rpd")
+                if isinstance(rpd, (int, float)) and rpd > 0:
+                    used_model = self.store.calls_since(day_start_iso(), model=model)
+                    if used_model >= int(rpd):
+                        raise QuotaExhausted(
+                            f"per-model daily quota reached for {model} "
+                            f"({used_model}/{int(rpd)} today — "
+                            f"[quota.models.{family}] rpd). Resets midnight "
+                            "Pacific; use another model or wait (§12.8).")
 
     # -- the harness (§17): cheapest first, escalate on verified failure -------
     def generate(self, role: str, contents, *, gen_config: dict | None = None,
