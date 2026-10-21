@@ -1541,3 +1541,12 @@ running the documented command chain).
 - **Was:** `EcapaCommandScorer.score_owner` used `NamedTemporaryFile(delete=False)` in the default temp dir and unlinked after the run; a SIGKILL in between (or a non-tmpfs /tmp) left the wake utterance on disk.
 - **Fix:** the clip travels in an anonymous memfd inherited by the child (`/proc/self/fd/N`, `pass_fds`); a `/dev/shm` file remains only as the non-Linux fallback.
 
+### BH-K28 — Dangling symlinks / unhashable paths crashed executor operations
+
+- **Severity:** crash (batch operations die on ordinary folder contents)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_symlink_hash.py`
+- **Expected:** one dangling symlink (routine in ~/Downloads) yields a per-item refusal, like every neighbouring guard.
+- **Was:** `trash()` and `verify()` (and the apply/undo hash comparisons) called `sha256_file` unguarded; a dangling symlink raised FileNotFoundError and a symlink-to-directory raised IsADirectoryError, escaping as a raw daemon error mid-batch.
+- **Fix:** `safety.try_sha256_file` returns None on OSError; comparison/refusal sites use it (None never equals an expected hash, so existing refusal branches fire). `trash` returns its standard refusal dict ("unreadable…"); strict `sha256_file` remains for post-move verification, where raising is correct and journaled.
+
