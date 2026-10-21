@@ -1550,3 +1550,12 @@ running the documented command chain).
 - **Was:** `trash()` and `verify()` (and the apply/undo hash comparisons) called `sha256_file` unguarded; a dangling symlink raised FileNotFoundError and a symlink-to-directory raised IsADirectoryError, escaping as a raw daemon error mid-batch.
 - **Fix:** `safety.try_sha256_file` returns None on OSError; comparison/refusal sites use it (None never equals an expected hash, so existing refusal branches fire). `trash` returns its standard refusal dict ("unreadable…"); strict `sha256_file` remains for post-move verification, where raising is correct and journaled.
 
+### BH-K29 — Missing/mistyped IPC ids surfaced as TypeError/KeyError gibberish
+
+- **Severity:** error-surfacing (traceback-flavoured text to users of the IPC surface)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_param_coercion.py`
+- **Expected:** a client that omits `id` gets "parameter 'id' is required (integer)" via the daemon's ValueError refusal channel.
+- **Was:** `int(params.get("id"))` / `int(params["item_id"])` / `int(params["job_id"])` raised TypeError/KeyError, which the IPC layer stringified verbatim ("TypeError: int() argument must be…").
+- **Fix:** `daemon._int_param()` coerces with a named ValueError at the knock, review, queue-approve and knock-raise commitment sites.
+
