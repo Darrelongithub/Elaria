@@ -1409,3 +1409,21 @@ running the documented command chain).
 - **Was:** `ipc.call` raised plain `RuntimeError` for `ok:false`, and 37 CLI sites caught `(DaemonUnavailable, RuntimeError, OSError)` around the call and silently re-ran the operation against the local store/services. Refusals were masked (and sometimes converted to printed success: the local review path ignored `set_item_decision`'s rowcount and printed "approved" for nonexistent items); writes could also split-brain against a live daemon (see BH-K11 for the posture instance).
 - **Fix:** `ipc.DaemonError(RuntimeError)` is raised for `ok:false`. CLI fallback sites now catch `DaemonUnavailable` only (print-and-continue surfaces — the console REPL and the ptt.result wait — catch both and print the real message). `main` gains a `DaemonError` net: `_refusal_text` + exit 2. Special cases kept honest: doctor distinguishes down vs erroring; `assist halt` still sets the flag file when the daemon errors (a kill switch must land) but now says so. The local review path checks the rowcount and exits 1 on a missing item.
 
+### BH-K13 — wpctl parser offered the camera as a microphone
+
+- **Severity:** wrong-action (mock-fidelity: green tests, dead hardware path)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_wpctl.py` with a full real-shape `wpctl status` (Audio + Video groups, Devices, Streams, Settings)
+- **Expected:** `Sources` contains audio input nodes only.
+- **Was:** sections were keyed by name alone and `current` was never reset on unknown headers — the Video group's `Sources:` (the camera) merged into audio Sources, `Streams:` entries (Firefox, pw-record) became "Source endpoints", and `Default Configured Devices:` entries polluted the last section. `meeting setup`/doctor thus offered cameras and streams as mic/system nodes. The existing fixture had an Audio group only, so this was invisible.
+- **Fix:** track the top-level group (Audio/Video/Settings) and collect only under Audio; any other header line ends the current section.
+
+### BH-K14 — Disconnected event subscribers were never removed
+
+- **Severity:** wrong-action (slow leak; false status)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_subscribers.py`
+- **Expected:** when an `events.subscribe` client disconnects, its writer leaves `Daemon._subscribers` immediately.
+- **Was:** `ipc.serve` closed the writer in the connection's finally but never told the daemon; pruning happened only when a later broadcast failed writing to the corpse. Owner observed 2 leaked subscribers in `status`.
+- **Fix:** `ipc.serve(..., on_disconnect=...)` is invoked in the connection finally (before close, teardown-safe); the daemon passes `self._subscribers.discard`. The broadcast-time prune remains as backstop.
+

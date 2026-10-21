@@ -54,7 +54,9 @@ def running_daemon(config):
 
     daemon = Daemon(config)
     loop = asyncio.new_event_loop()
-    server = loop.run_until_complete(serve(config.socket_path, daemon.handle))
+    server = loop.run_until_complete(serve(
+        config.socket_path, daemon.handle,
+        on_disconnect=daemon._subscribers.discard))
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
     yield daemon, server
