@@ -1532,3 +1532,12 @@ running the documented command chain).
 - **Was:** only `systemd/assistant.service` was compared. `elaria-overlay.service`, `elaria-console.service`, the installed knock sound (which shadows the repo asset), and the appended Hyprland binds could all go stale invisibly; the UI units' hardcoded `%h/Elaria` quickshell path was never sanity-checked against the actual checkout.
 - **Fix:** `_deployment_drift_checks()` byte-compares all three units + knock.wav (LimitCORE callout retained), verifies each UI unit's `quickshell -p` target exists, and checks the load-bearing bind markers in an existing Hyprland config. Merged files (Waybar module/style) remain unchecked — they are not byte copies.
 
+### BH-K27 — ECAPA scoring wrote the wake clip to /tmp
+
+- **Severity:** privacy (wake audio on a persistent filesystem, contradicting the RAM-only design)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_ecapa_memfd.py`
+- **Expected:** wake audio never touches disk — the ring/pending buffers are anonymous mmap + MADV_DONTDUMP precisely so a crash leaves nothing.
+- **Was:** `EcapaCommandScorer.score_owner` used `NamedTemporaryFile(delete=False)` in the default temp dir and unlinked after the run; a SIGKILL in between (or a non-tmpfs /tmp) left the wake utterance on disk.
+- **Fix:** the clip travels in an anonymous memfd inherited by the child (`/proc/self/fd/N`, `pass_fds`); a `/dev/shm` file remains only as the non-Linux fallback.
+
