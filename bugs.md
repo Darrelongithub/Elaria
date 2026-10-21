@@ -1514,3 +1514,12 @@ running the documented command chain).
 - **Was:** the helper `asr.assert_output_language` and the config key both existed; zero call sites in `src/` (only a unit test of the helper itself). The content-level marker gate in cleanup was wired; the tag gate was not.
 - **Fix:** enforced at the one seam every batch transcript crosses (`asr.transcribe_file`): an out-of-set result is passed over for the next backend; if the chain exhausts it returns degraded-but-marked (`Transcript.language_ok=False`), and both `Transcriber` batch call sites surface a loud session note. Flag off restores first-result-wins.
 
+### BH-K25 — Flat 120 s timeouts on audio playback and Piper synthesis
+
+- **Severity:** wrong-output / bounded-wait (long speech truncated; hung player stalls)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_tts_timeout.py`
+- **Expected:** waits proportional to the work: a 200 s utterance plays to the end; a wedged player on a 1 s chirp is caught in seconds.
+- **Was:** `play_audio` and Piper `synthesize` both used a flat `timeout=120` — long read-alouds were killed mid-speech and misreported as player failures, while a hung player blocked its thread for two minutes on any clip.
+- **Fix:** playback bound derived from the WAV header (duration × 1.5 + 10 s, floor 15 s, cap 30 min; 120 s only when unreadable); synth bound scales with text length (60 s floor, 600 s cap). Both remain finite.
+
