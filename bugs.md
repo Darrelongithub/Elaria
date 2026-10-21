@@ -1382,3 +1382,21 @@ running the documented command chain).
 - **Was:** `KnockSignal.emit` (two `subprocess.run(timeout=5)` calls) was invoked synchronously inside the async `_knock_raise`/`_knock_due` handlers — up to ~10s where every IPC call, including `ptt.stop`, waited — and the sound played with no speaking-gate marks, straight into any open microphone.
 - **Fix:** both handlers now run emit via `asyncio.to_thread` with `_set_speaking` held (class mode short-circuits: silent pulse, no thread, no gate). `_set_speaking(True, text=None)` no longer clobbers `_speaking_text` (the BH-K2 echo reference). The code is inlined at both handlers so the BH-H13 boundary (knock emit reachable only from `_knock_raise`/`_knock_due`) is preserved unchanged.
 
+### BH-K10 — Wake-guard posture probes failed OPEN
+
+- **Severity:** wrong-action (authority/privacy leak)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_authority.py::test_*_probe_failure_fails_closed`
+- **Expected:** if the presence/showoff probe cannot answer, the wake path takes the restrictive branch (console-not-PTT; guest door blocked).
+- **Was:** `WakeGuard._in_class_mode()` and `_guest_door_blocked()` returned `False` on any exception from the wired probe, so a broken presence/showoff read let an accepted wake-knock open voice listening in class mode or during show-off — despite `WakeGuardError`'s own "fail closed" contract.
+- **Fix:** exceptions now fail closed (`True`) and are recorded as `posture_error`, surfaced in `status()` so the restriction is diagnosable. Unwired probes (`None`, headless/tests) keep meaning "no such concept" and are unchanged.
+
+### BH-K11 — Daemon's company posture was cached forever per-process
+
+- **Severity:** wrong-action (privacy: disclosure on stale posture)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_authority.py::test_company_state_is_read_fresh_from_the_store`
+- **Expected:** `DisclosureService.company()` reflects the stored state, whoever wrote it.
+- **Was:** the first read was cached in `_company` for the process lifetime. The CLI's local path writes company state directly to the same SQLite store; the daemon never observed it — it could keep treating the room as private with company present (or stay restricted after they left). `PresenceService` already read fresh; disclosure did not.
+- **Fix:** `company()` reads the store on every call; the cache field is removed. `set_company` is unchanged apart from dropping the cache write.
+

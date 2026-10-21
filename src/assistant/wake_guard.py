@@ -47,7 +47,7 @@ from pathlib import Path
 from .capture import frame_rms
 from .cost import iso_now
 from .transcribe import SilenceLadder
-from .wake_buffers import SAMPLE_RATE, PendingWindow, PreWakeRing
+from .wake_buffers import SAMPLE_RATE, PendingWindow, PreWakeRing, bytes_for
 
 # -- states ----------------------------------------------------------------
 IDLE = "idle"
@@ -444,6 +444,11 @@ class WakeGuard:
             self.now = iso_now
         s = self.settings
         self.ring = PreWakeRing(min(2.0, float(s.get("ring_window_s", 2.0))))
+        # BH-K23: the keyword model scores a trailing WINDOW of the ring,
+        # not the single 30 ms frame just received (no spotter can hear a
+        # phrase in one frame). Capped by the ring residence (<= 2.0 s).
+        self.keyword_window_bytes = bytes_for(min(
+            2.0, max(0.05, float(s.get("keyword_window_s", 1.0)))))
         self.pending = PendingWindow(float(s.get("pending_window_s", 2.5)))
         self.gate = AuthorityGate(
             high=float(s.get("ecapa_high", 0.75)),
@@ -465,6 +470,7 @@ class WakeGuard:
         self.armed = False
         self.armed_with = "none"          # onnx | unsafe-energy-test | none
         self.last_trigger: TriggerRecord | None = None
+        self.posture_error: str | None = None  # BH-K10: last failed posture probe
         self.session: ListenSession | None = None
         self._hit: dict = {}
         self._wake_clip: bytes = b""
@@ -526,7 +532,8 @@ class WakeGuard:
         self.note_frame(frame, now)
         if not self.armed or self.keyword_model is None:
             return None
-        score = float(self.keyword_model.score_window(frame))
+        window = self.ring.snapshot()[-self.keyword_window_bytes:] or frame
+        score = float(self.keyword_model.score_window(window))
         if isinstance(self.keyword_model, EnergyTestModel):
             threshold = getattr(self.keyword_model, "threshold", 0.05)
         else:
@@ -767,20 +774,32 @@ class WakeGuard:
 
     def _in_class_mode(self) -> bool:
         if self.class_mode is None:
-            return False
+            return False  # not wired (headless/tests): no class-mode concept
         try:
-            return bool(self.class_mode())
-        except Exception:
-            return False
+            result = bool(self.class_mode())
+        except Exception as exc:
+            # BH-K10: fail CLOSED. A wired-but-broken presence probe used
+            # to read as "not in class" — an accepted wake-knock then
+            # opened voice listening in a classroom. Unknown posture is
+            # restrictive posture (WakeGuardError's own contract).
+            self.posture_error = f"class_mode: {type(exc).__name__}: {exc}"
+            return True
+        self.posture_error = None
+        return result
 
     def _guest_door_blocked(self) -> bool:
         if self.showoff is None:
-            return False
+            return False  # not wired: no show-off concept
         try:
             status = self.showoff.status()
-            return bool(status.get("active"))
-        except Exception:
-            return False
+            result = bool(status.get("active"))
+        except Exception as exc:
+            # BH-K10: fail CLOSED — a broken showoff probe must block the
+            # guest door, never wave a wake accept through it.
+            self.posture_error = f"showoff: {type(exc).__name__}: {exc}"
+            return True
+        self.posture_error = None
+        return result
 
     # -- inspection surface ------------------------------------------------
     def status(self) -> dict:
@@ -791,6 +810,7 @@ class WakeGuard:
                   f"{getattr(self.scorer, 'name', 'none')}(unavailable)")
         return {
             "armed": self.armed,
+            "posture_error": self.posture_error,
             "armed_with": self.armed_with,
             "state": self.state,
             "attending_detail": self.attending_detail,

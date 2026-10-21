@@ -188,16 +188,17 @@ def detect_company_command(text: str) -> bool | None:
 class DisclosureService:
     config: object
     store: object
-    _company: bool | None = None
 
     # -- awareness state ----------------------------------------------------
     def company(self) -> bool:
-        if self._company is None:
-            self._company = self.store.get_state(STATE_KEY) == "1"
-        return self._company
+        # BH-K11: read the store on every call (PresenceService already
+        # does). The old per-process cache meant the daemon never observed
+        # company state written by another process — the CLI's local path
+        # writes this same store — so disclosure posture silently diverged
+        # from the stored truth for the daemon's whole lifetime.
+        return self.store.get_state(STATE_KEY) == "1"
 
     def set_company(self, enabled: bool, *, source: str = "owner") -> dict:
-        self._company = bool(enabled)
         self.store.set_state(STATE_KEY, "1" if enabled else "0")
         self.log("company_changed", {"enabled": bool(enabled), "source": source})
         return self.status()
