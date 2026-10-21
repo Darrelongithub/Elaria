@@ -33,6 +33,7 @@ from .live_client import (
     FixtureLiveTransport,
     GenaiLiveTransport,
     LiveTransport,
+    RecordingTransport,
     ScriptedLiveTransport,
 )
 
@@ -43,6 +44,11 @@ class Transcript:
     language: str
     backend: str
     confidence: float | None = None
+    # BH-K19: False when the backend's language tag fell outside the
+    # pinned set and no better backend produced text — degraded but
+    # marked, so the caller can surface it instead of silently
+    # trusting possibly-translated output (§12.4).
+    language_ok: bool = True
 
 
 class BatchBackend(Protocol):
@@ -233,18 +239,36 @@ def transcribe_file(config, client, audio_path: str, *, offline: bool = False,
     """Walk the fallback chain until one backend produces text (§12.7:
     quota exhaustion degrades instead of failing)."""
     language = primary_language(config)
+    # BH-K19: [asr] assert_output_language promised this check since the
+    # blueprint (§12.4) but nothing called it. Enforced here, at the one
+    # seam every batch transcript crosses: an out-of-set tag is passed
+    # over for the next backend, and only returned (marked) if nothing
+    # better produced text.
+    assert_language = bool(config.section("asr").get(
+        "assert_output_language", True))
+    expected = configured_languages(config)
     errors: list[str] = []
     last_empty: Transcript | None = None
+    last_flagged: Transcript | None = None
     for backend in batch_chain(config, client, offline=offline,
                                local_backend=local_backend):
         try:
             result = backend.transcribe(audio_path, language)
             if result.text and result.text.strip():
+                if assert_language and not assert_output_language(result, expected):
+                    errors.append(
+                        f"{backend.name}: language tag {result.language!r} "
+                        f"outside pinned set {expected}")
+                    result.language_ok = False
+                    last_flagged = result
+                    continue
                 return result
             last_empty = result
             errors.append(f"{backend.name}: empty transcript")
         except Exception as exc:
             errors.append(f"{backend.name}: {exc}")
+    if last_flagged is not None:
+        return last_flagged
     if last_empty is not None:
         return last_empty
     raise RuntimeError("all ASR backends failed — " + " | ".join(errors))
@@ -284,7 +308,16 @@ def make_live_transport(config, *, fixture_name: str | None = None) -> LiveTrans
     if config.gemini_mode == "mock":
         return ScriptedLiveTransport()
     model = config.model_for_role("transcribe_live")
-    return GenaiLiveTransport(config.api_key, model, primary_language(config))
+    transport = GenaiLiveTransport(config.api_key, model, primary_language(config))
+    if config.gemini_mode == "record":
+        # §12.9: record = real API + fixtures saved, streaming included.
+        # BH-K4: this wrap was missing, so record mode never produced a
+        # seq-live.jsonl — the exact evidence needed to debug the hardware
+        # "no final after activity_end" report. RecordingTransport logs
+        # audio as hash+size only; the sequence lands on close().
+        return RecordingTransport(
+            transport, FixtureStore(config.fixtures_dir), "live")
+    return transport
 
 
 def primary_language(config) -> str:

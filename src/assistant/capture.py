@@ -46,11 +46,30 @@ def parse_wpctl_status(text: str) -> dict[str, list[dict]]:
     """
     sections: dict[str, list[dict]] = {}
     current = None
+    in_audio_group = False
     for line in text.splitlines():
+        # BH-K13: real `wpctl status` has top-level Audio / Video /
+        # Settings groups, EACH with Sinks/Sources of its own, plus
+        # Devices, Streams and "Default Configured Devices" blocks whose
+        # entries also look like `N. name`. The old parser keyed sections
+        # by name alone and never reset on unknown headers, so the laptop
+        # camera (Video → Sources) merged into the audio sources offered
+        # as microphones, and Streams/Settings entries polluted whatever
+        # section came last. Track the group; collect Audio only; any
+        # header line that is not one of ours ends the current section.
+        group = line.strip()
+        if group in ("Audio", "Video", "Settings"):
+            in_audio_group = group == "Audio"
+            current = None
+            continue
         header = re.search(r"\b(Sinks|Sources|Sink endpoints|Source endpoints):\s*$", line)
         if header:
-            current = header.group(1)
-            sections.setdefault(current, [])
+            current = header.group(1) if in_audio_group else None
+            if current:
+                sections.setdefault(current, [])
+            continue
+        if line.rstrip().endswith(":"):
+            current = None  # Devices / Streams / Clients / Default Configured…
             continue
         entry = re.search(r"([*]?)\s*(\d+)\.\s+(.+)", line)
         if entry and current:
@@ -316,10 +335,26 @@ class PipeWireCapture:
                 return
             yield chunk
 
+    # BH-K6: SIGTERM grace before SIGKILL escalation in aclose().
+    TERMINATE_TIMEOUT_S = 2.0
+
     async def aclose(self) -> None:
-        if self._proc and self._proc.returncode is None:
-            self._proc.terminate()
-            await self._proc.wait()
+        proc, self._proc = self._proc, None
+        if proc is None or proc.returncode is not None:
+            return
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=self.TERMINATE_TIMEOUT_S)
+        except TimeoutError:
+            # SIGTERM was ignored: SIGKILL cannot be. (The old code awaited
+            # wait() with no bound and no escalation.)
+            proc.kill()
+            await proc.wait()
+        except asyncio.CancelledError:
+            # The caller stopped waiting (its own lifecycle timeout): a
+            # live microphone must not outlive the close attempt.
+            proc.kill()
+            raise
 
 
 class SimulatedCapture:

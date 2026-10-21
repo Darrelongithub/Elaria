@@ -30,7 +30,11 @@ from pathlib import Path
 
 from . import __version__
 from .config import load_config, load_humour_profile
-from .ipc import DaemonUnavailable, call
+from .ipc import DaemonError, DaemonUnavailable, call
+
+# BH-K8: total time `assist plan build` will poll a daemon build before
+# concluding the plan row is stuck (e.g. daemon restarted mid-build).
+_PLAN_BUILD_POLL_DEADLINE_S = 600.0
 
 
 # --------------------------------------------------------------------------
@@ -39,6 +43,125 @@ from .ipc import DaemonUnavailable, call
 def _check(name: str, ok: bool, detail: str, warn_only: bool = True) -> dict:
     status = "ok" if ok else ("warn" if warn_only else "fail")
     return {"check": name, "status": status, "detail": detail}
+
+
+_DEPLOYED_UNITS = ("assistant.service", "elaria-overlay.service",
+                   "elaria-console.service")
+
+
+def _deployment_drift_checks(repo_root: Path, home: Path, environ: dict, *,
+                             sound: str = "") -> list[dict]:
+    """Repo-vs-installed drift for EVERY shipped-and-copied file (BH-K26).
+
+    The LimitCORE incident (repo unit fixed, installed copy stale) was
+    checked for assistant.service only, while the overlay/console units
+    and the knock sound share the same copy-on-deploy pattern and the
+    Hyprland binds are appended into the compositor config. Byte-compare
+    what is copied; sanity-check the quickshell path the UI units
+    hardcode; check bind markers where a Hyprland config exists.
+    """
+    checks: list[dict] = []
+    config_home = Path(environ.get("XDG_CONFIG_HOME") or home / ".config")
+    unit_dirs = [config_home / "systemd" / "user",
+                 home / ".config" / "systemd" / "user",
+                 Path("/etc/systemd/user")]
+    for unit in _DEPLOYED_UNITS:
+        primary = unit == "assistant.service"
+        name = "systemd unit" if primary else f"systemd unit ({unit})"
+        repo_unit = repo_root / "systemd" / unit
+        installed = next((d / unit for d in unit_dirs if (d / unit).exists()),
+                         None)
+        try:
+            if repo_unit.exists() and installed is not None:
+                repo_text = repo_unit.read_text()
+                installed_text = installed.read_text()
+                if repo_text != installed_text:
+                    detail = f"installed unit {installed} differs from repo {repo_unit}"
+                    if primary:
+                        repo_core = "LimitCORE=0" in repo_text
+                        inst_core = "LimitCORE=0" in installed_text
+                        if repo_core != inst_core:
+                            detail += (
+                                f" — LimitCORE drift (repo={'0' if repo_core else 'missing'} "
+                                f"vs installed={'0' if inst_core else 'missing'}); "
+                                f"copy repo unit: cp {repo_unit} {installed} "
+                                "&& systemctl --user daemon-reload")
+                    else:
+                        detail += (f"; copy repo unit: cp {repo_unit} {installed} "
+                                   "&& systemctl --user daemon-reload")
+                    checks.append(_check(name, False, detail))
+                else:
+                    checks.append(_check(
+                        name, True,
+                        f"installed {installed} matches repo {repo_unit}"))
+                if not primary:
+                    m = re.search(r"quickshell\s+-p\s+(\S+)", installed_text)
+                    if m:
+                        qpath = Path(m.group(1).replace("%h", str(home)))
+                        ok = qpath.is_dir()
+                        checks.append(_check(
+                            f"quickshell path ({unit})", ok,
+                            f"{installed} runs quickshell -p {qpath} — "
+                            + ("present" if ok else
+                               "MISSING: the unit hardcodes the checkout path; "
+                               "edit ExecStart to this repo's ui/ location")))
+            elif repo_unit.exists():
+                checks.append(_check(
+                    name, True,
+                    f"no installed unit at {unit_dirs[0] / unit} — repo "
+                    f"{repo_unit} is source of truth (copy on deploy)",
+                    warn_only=True))
+            else:
+                checks.append(_check(
+                    name, True,
+                    f"repo unit {repo_unit} not found — skip drift check",
+                    warn_only=True))
+        except Exception as exc:
+            checks.append(_check(name, True, f"drift check skipped: {exc}",
+                                 warn_only=True))
+
+    # Knock sound: the configured copy shadows the repo asset when present.
+    repo_sound = repo_root / "ui" / "sounds" / "knock.wav"
+    if sound and repo_sound.exists():
+        installed_sound = Path(str(sound).replace("~", str(home), 1)) \
+            if str(sound).startswith("~") else Path(sound)
+        try:
+            if not installed_sound.exists():
+                checks.append(_check(
+                    "knock sound", True,
+                    f"{installed_sound} not installed — repo fallback "
+                    f"{repo_sound} in use"))
+            elif installed_sound.read_bytes() == repo_sound.read_bytes():
+                checks.append(_check(
+                    "knock sound", True,
+                    f"installed {installed_sound} matches repo {repo_sound}"))
+            else:
+                checks.append(_check(
+                    "knock sound", False,
+                    f"installed {installed_sound} differs from repo "
+                    f"{repo_sound} — the installed copy shadows the "
+                    "repo asset; refresh it or own the difference"))
+        except OSError as exc:
+            checks.append(_check("knock sound", True,
+                                 f"sound check skipped: {exc}", warn_only=True))
+
+    # Hyprland binds are appended, not copied: check load-bearing markers.
+    for hypr_cfg in (config_home / "hypr" / "hyprland.conf",
+                     config_home / "hypr" / "hyprland.lua"):
+        if hypr_cfg.exists():
+            try:
+                text = hypr_cfg.read_text()
+            except OSError:
+                break
+            missing = [m for m in ("assist ptt start", "assist ptt stop",
+                                   "assist halt") if m not in text]
+            checks.append(_check(
+                "hyprland binds", not missing,
+                (f"{hypr_cfg} carries the Elaria binds" if not missing else
+                 f"{hypr_cfg} is missing bind(s) for: {', '.join(missing)} — "
+                 "append ui/hyprland/elaria-binds.conf (or .lua)")))
+            break
+    return checks
 
 
 def hyprland_info(runner=subprocess.run) -> dict:
@@ -209,37 +332,14 @@ def run_doctor(config) -> dict:
         "(both must hold on the always-on path: no core dumps, RAM buffers "
         "dump-exempt)"))
 
-    # BUG 6 follow-up: stale user unit (LimitCORE) drift — repo vs installed.
-    # The owner fixed by copying the repo unit; doctor must flag drift.
-    try:
-        from pathlib import Path as _P
-        repo_unit = _P(__file__).resolve().parents[2] / "systemd" / "assistant.service"
-        # Installed user units live in XDG config; system units are secondary.
-        candidates = []
-        xdg = __import__("os").environ.get("XDG_CONFIG_HOME") or str(_P.home() / ".config")
-        candidates.append(_P(xdg) / "systemd" / "user" / "assistant.service")
-        candidates.append(_P.home() / ".config" / "systemd" / "user" / "assistant.service")
-        candidates.append(_P("/etc/systemd/user/assistant.service"))
-        installed = next((c for c in candidates if c.exists()), None)
-        if repo_unit.exists() and installed is not None:
-            repo_text = repo_unit.read_text()
-            installed_text = installed.read_text()
-            if repo_text != installed_text:
-                # Highlight LimitCORE drift specifically
-                repo_core = "LimitCORE=0" in repo_text
-                inst_core = "LimitCORE=0" in installed_text
-                detail = f"installed unit {installed} differs from repo {repo_unit}"
-                if repo_core != inst_core:
-                    detail += f" — LimitCORE drift (repo={'0' if repo_core else 'missing'} vs installed={'0' if inst_core else 'missing'}); copy repo unit: cp {repo_unit} {installed} && systemctl --user daemon-reload"
-                checks.append(_check("systemd unit", False, detail))
-            else:
-                checks.append(_check("systemd unit", True, f"installed {installed} matches repo {repo_unit}"))
-        elif repo_unit.exists() and installed is None:
-            checks.append(_check("systemd unit", True, f"no installed unit at {candidates[0]} — repo {repo_unit} is source of truth (copy on deploy)" , warn_only=True))
-        else:
-            checks.append(_check("systemd unit", True, f"repo unit {repo_unit} not found — skip drift check", warn_only=True))
-    except Exception as exc:
-        checks.append(_check("systemd unit", True, f"drift check skipped: {exc}", warn_only=True))
+    # BUG 6 follow-up + BH-K26: stale deployed copies (LimitCORE lesson),
+    # generalized to every shipped-and-copied file.
+    import os as _os
+    from pathlib import Path as _P
+
+    checks.extend(_deployment_drift_checks(
+        _P(__file__).resolve().parents[2], _P.home(), dict(_os.environ),
+        sound=str(config.section("initiative").get("sound", "") or "")))
     from .wake_guard import KeywordModelUnavailable, OnnxKeywordModel
 
     keyword_model = config.section("hotword").get("keyword_model") or ""
@@ -377,8 +477,10 @@ def run_doctor(config) -> dict:
         status = call(config.socket_path, "status", timeout=2.0)
         daemon_detail = f"running, mode={status.get('mode')}, uptime={status.get('uptime_s')}s"
         daemon_ok = True
-    except (DaemonUnavailable, RuntimeError, OSError) as exc:
+    except DaemonUnavailable as exc:
         daemon_detail, daemon_ok = f"down ({exc})", False
+    except DaemonError as exc:
+        daemon_detail, daemon_ok = f"answering but 'status' errored ({exc})", False
     checks.append(_check("daemon", daemon_ok, daemon_detail))
 
     blockers = [c for c in checks if c["status"] == "fail"]
@@ -414,7 +516,7 @@ def _memory_command(args, config) -> int:
         try:
             out = call(config.socket_path, "memory.remember",
                        {"text": args.text, "kind": args.kind}, timeout=10.0)
-        except (DaemonUnavailable, RuntimeError, OSError):
+        except DaemonUnavailable:
             store, memory = local()
             out = {"fact_id": memory.remember(args.text, kind=args.kind)}
             store.close()
@@ -424,7 +526,7 @@ def _memory_command(args, config) -> int:
         try:
             facts = call(config.socket_path, "memory.list",
                          {"kind": args.kind} if args.kind else {}, timeout=10.0)["facts"]
-        except (DaemonUnavailable, RuntimeError, OSError):
+        except DaemonUnavailable:
             store, memory = local()
             facts = memory.beliefs(args.kind)
             store.close()
@@ -438,7 +540,7 @@ def _memory_command(args, config) -> int:
         try:
             out = call(config.socket_path, "memory.forget",
                        {"topic": args.topic}, timeout=10.0)
-        except (DaemonUnavailable, RuntimeError, OSError):
+        except DaemonUnavailable:
             store, memory = local()
             out = {"forgotten": memory.forget(args.topic)}
             store.close()
@@ -447,7 +549,7 @@ def _memory_command(args, config) -> int:
     # embed
     try:
         out = call(config.socket_path, "embed.run", timeout=600.0)
-    except (DaemonUnavailable, RuntimeError, OSError):
+    except DaemonUnavailable:
         store = _local_store(config)
         embedder = make_embedder(config)
         out = {"embedded": backfill_embeddings(store, embedder), "embedder": embedder.name}
@@ -468,12 +570,10 @@ def _hotword_command(args, config) -> int:
         out = call(config.socket_path, method, params, timeout=30.0)
         print(json.dumps(out, indent=2))
         return 0
-    except (DaemonUnavailable, RuntimeError, OSError) as exc:
+    except DaemonUnavailable as exc:
+        # BH-K12: only "unreachable" lands here now — a daemon refusal is
+        # DaemonError and surfaces via main as an exit-2 refusal.
         text = str(exc)
-        if text.startswith("refused"):
-            # A refusal is an answer (fail closed, cleanly) — exit 2.
-            print(_refusal_text(exc), file=sys.stderr)
-            return 2
         if action == "status":
             from .wake_guard import crash_safety_report
 
@@ -554,7 +654,7 @@ def _class_command(args, config) -> int:
         else:
             out = call(config.socket_path, "class.set",
                        {"enabled": action == "on"}, timeout=5.0)
-    except (DaemonUnavailable, RuntimeError, OSError):
+    except DaemonUnavailable:
         store = _local_store(config)
         presence = PresenceService(config, store)
         if action == "toggle":
@@ -610,43 +710,81 @@ def _knock_command(args, config) -> int:
                 print(f"#{knock['id']} [{knock['kind']}/{knock['urgency']}] "
                       f"{knock['topic']}\n    reason: {knock['reason']}")
             return 0
-        except (DaemonUnavailable, RuntimeError, OSError):
+        except DaemonUnavailable:
             pass  # the store is local and authoritative; fall through
 
-    service, store, owned = _initiative(config)
-    try:
-        if action == "list":
-            status = None if getattr(args, "all", False) else "pending"
-            knocks = [service.get(k["id"]) if status == "pending" else k
-                      for k in store.list_knocks(status, limit=100)]
-            out = {"knocks": knocks, "status": service.status()}
-        elif action == "status":
-            out = {"initiative": service.status(),
-                   "class_mode": service.presence.status().as_dict()
-                   if service.presence else {}}
-        elif action == "due":
-            out = {"raised": service.check_due()}
-        elif action == "raise":
-            out = {"knock": service.raise_knock(
-                topic=args.topic, reason=args.reason, kind=args.kind,
-                urgency=args.urgency, referent=args.referent,
-                commitment_id=args.commitment)}
-        elif action == "accept":
-            out = service.accept(args.id)
-        elif action == "decline":
-            out = service.decline(args.id)
+    # BH-K32: mutating actions go to the daemon FIRST — it owns the
+    # WakeGuard (wake-knock authentication + pending-audio zeroing),
+    # the conversation the accepted reason opens, and signal delivery.
+    # The old local-only path fabricated "voice · first line" success,
+    # wedged the guard in wake_knock, and delivered no signal at all.
+    # The local store is the fallback for a stopped daemon only.
+    out = None
+    if action in ("raise", "accept", "decline", "later", "ignore", "due") \
+            and not getattr(args, "local", False):
+        if action == "raise":
+            params = {"topic": args.topic, "reason": args.reason,
+                      "kind": args.kind, "urgency": args.urgency,
+                      "referent": args.referent,
+                      "commitment_id": args.commitment}
         elif action == "later":
-            out = service.later(args.id, hours=args.hours)
-        elif action == "ignore":
-            out = service.ignore(args.id)
-        else:
-            raise ValueError(f"unknown knock action {action!r}")
-    except Exception as exc:
-        print(_refusal_text(exc), file=sys.stderr)
-        return 2
-    finally:
-        if owned:
-            store.close()
+            params = {"id": args.id, "hours": args.hours}
+        elif action == "due":
+            params = {}
+        else:  # accept / decline / ignore
+            params = {"id": args.id}
+        try:
+            out = call(config.socket_path, f"knock.{action}", params,
+                       timeout=30.0 if action in ("accept", "raise", "due")
+                       else 10.0)
+        except DaemonUnavailable:
+            out = None  # local fallback below
+        except Exception as exc:  # a daemon refusal is an answer (BH-K12)
+            print(_refusal_text(exc), file=sys.stderr)
+            return 2
+
+    if out is None:
+        service, store, owned = _initiative(config)
+        try:
+            if action == "list":
+                status = None if getattr(args, "all", False) else "pending"
+                knocks = [service.get(k["id"]) if status == "pending" else k
+                          for k in store.list_knocks(status, limit=100)]
+                out = {"knocks": knocks, "status": service.status()}
+            elif action == "status":
+                out = {"initiative": service.status(),
+                       "class_mode": service.presence.status().as_dict()
+                       if service.presence else {}}
+            elif action == "due":
+                out = {"raised": service.check_due()}
+            elif action == "raise":
+                out = {"knock": service.raise_knock(
+                    topic=args.topic, reason=args.reason, kind=args.kind,
+                    urgency=args.urgency, referent=args.referent,
+                    commitment_id=args.commitment)}
+            elif action == "accept":
+                knock = service.get(args.id)
+                if knock.get("kind") == "wake":
+                    raise ValueError(
+                        f"refused: wake-knock #{args.id} can only be accepted "
+                        "by the running daemon's wake guard — its pending "
+                        "audio is RAM-only and died with the daemon. Start "
+                        "the daemon, or decline the knock instead.")
+                out = service.accept(args.id)
+            elif action == "decline":
+                out = service.decline(args.id)
+            elif action == "later":
+                out = service.later(args.id, hours=args.hours)
+            elif action == "ignore":
+                out = service.ignore(args.id)
+            else:
+                raise ValueError(f"unknown knock action {action!r}")
+        except Exception as exc:
+            print(_refusal_text(exc), file=sys.stderr)
+            return 2
+        finally:
+            if owned:
+                store.close()
 
     if getattr(args, "json", False):
         print(json.dumps(out, indent=2))
@@ -665,7 +803,7 @@ def _knock_command(args, config) -> int:
               + (" — topic retired" if out["retired"] else
                  f" (retires at {out['threshold']})"))
     elif action == "due":
-        print(f"{out['raised'].__len__()} due follow-up(s) raised")
+        print(f"{len(out['raised'])} due follow-up(s) raised")
     else:
         print(json.dumps(out, indent=2))
     return 0
@@ -699,7 +837,7 @@ def _privacy_command(args, config) -> int:
             out = call(config.socket_path, method, params, timeout=5.0)
         else:
             out = call(config.socket_path, "privacy.status", timeout=5.0)
-    except (DaemonUnavailable, RuntimeError, OSError):
+    except DaemonUnavailable:
         from .disclosure import DisclosureService
 
         store = _local_store(config)
@@ -731,7 +869,7 @@ def _showoff_command(args, config) -> int:
                        {"action": getattr(args, "demo_action", "list"),
                         "name": getattr(args, "name", None),
                         "content": getattr(args, "content", "")}, timeout=30.0)
-    except (DaemonUnavailable, RuntimeError, OSError) as exc:
+    except DaemonUnavailable as exc:
         if action == "status":
             out = {"showoff": {"active": False, "permissions": [],
                                "note": f"daemon unavailable: {exc}"}}
@@ -856,7 +994,7 @@ def _talk_command(args, config) -> int:
         if line == "/state":
             try:
                 _print_snapshot(call(config.socket_path, "console.state", timeout=5.0))
-            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+            except (DaemonUnavailable, DaemonError) as exc:
                 print(f"state unavailable: {exc}", file=sys.stderr)
             continue
         if line.startswith("/class"):
@@ -873,7 +1011,7 @@ def _talk_command(args, config) -> int:
                     out = call(config.socket_path, "class.set",
                                {"enabled": action == "on"}, timeout=5.0)
                     print("class mode " + ("ON" if out["class_mode"]["enabled"] else "OFF"))
-            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+            except (DaemonUnavailable, DaemonError) as exc:
                 print(f"class command failed: {exc}", file=sys.stderr)
             continue
         if line.startswith("/company"):
@@ -886,7 +1024,7 @@ def _talk_command(args, config) -> int:
                 else:
                     out = call(config.socket_path, "privacy.status", timeout=5.0)
                 print(json.dumps(out["company"], indent=2))
-            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+            except (DaemonUnavailable, DaemonError) as exc:
                 print(f"privacy command failed: {exc}", file=sys.stderr)
             continue
         if line.startswith("/knock"):
@@ -897,7 +1035,7 @@ def _talk_command(args, config) -> int:
                           f"{knock['reason']}")
                 if not out["knocks"]:
                     print("no knocks — she has no reason to interrupt")
-            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+            except (DaemonUnavailable, DaemonError) as exc:
                 print(f"knock list unavailable: {exc}", file=sys.stderr)
             continue
         if line.split()[0] in ("/accept", "/decline", "/later"):
@@ -911,7 +1049,7 @@ def _talk_command(args, config) -> int:
                 out = call(config.socket_path, method, {"id": int(parts[1].lstrip("#"))},
                            timeout=30.0)
                 print(json.dumps(out, indent=2))
-            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+            except (DaemonUnavailable, DaemonError) as exc:
                 print(f"{parts[0]} failed: {exc}", file=sys.stderr)
             continue
         if line.startswith("/showoff"):
@@ -924,7 +1062,7 @@ def _talk_command(args, config) -> int:
                 else:
                     out = call(config.socket_path, "showoff.status", timeout=5.0)
                 print(json.dumps(out, indent=2))
-            except (DaemonUnavailable, RuntimeError, OSError) as exc:
+            except (DaemonUnavailable, DaemonError) as exc:
                 print(f"show-off: {exc}", file=sys.stderr)
             continue
         try:
@@ -934,7 +1072,7 @@ def _talk_command(args, config) -> int:
             speech = result.get("speech") or {}
             if speech.get("muted"):
                 print(f"  (voice silent: {speech.get('reason', 'class mode')})")
-        except (DaemonUnavailable, RuntimeError, OSError) as exc:
+        except (DaemonUnavailable, DaemonError) as exc:
             print(f"assist talk: {exc}", file=sys.stderr)
 
 
@@ -950,7 +1088,7 @@ def _console_command(args, config) -> int:
         return 0
     try:
         snapshot = call(config.socket_path, "console.state", timeout=5.0)
-    except (DaemonUnavailable, RuntimeError, OSError):
+    except DaemonUnavailable:
         from .console import ConsoleService
         from .presence import PresenceService
 
@@ -974,7 +1112,7 @@ def _mode_command(args, config) -> int:
             out = call(config.socket_path, "mode.set", {"mode": value}, timeout=10.0)
         else:
             out = call(config.socket_path, "mode.status", timeout=5.0)
-    except (DaemonUnavailable, RuntimeError, OSError):
+    except DaemonUnavailable:
         from .modes import ModeManager
 
         store = _local_store(config)
@@ -1025,7 +1163,7 @@ def _voice_command(args, config) -> int:
     try:
         out = call(config.socket_path, method, params,
                    timeout=600.0 if action in ("audition", "warm", "say") else 30.0)
-    except (DaemonUnavailable, RuntimeError, OSError):
+    except DaemonUnavailable:
         store = _local_store(config)
         speech = SpeechService(config, store)
         try:
@@ -1075,7 +1213,7 @@ def _queue_command(args, config) -> int:
             out = call(config.socket_path, "queue.enqueue_external",
                        {"action": args.action_name, "description": args.description},
                        timeout=15.0)
-    except (DaemonUnavailable, RuntimeError, OSError):
+    except DaemonUnavailable:
         from .gemini_client import GeminiClient
         from .modes import ModeManager
         from .offline_queue import CloudQueue
@@ -1118,7 +1256,7 @@ def _plan_command(args, config) -> int:
                   "allow_tripwire": args.allow_tripwire}
         try:
             report = call(config.socket_path, "plan.apply", params, timeout=900.0)
-        except (DaemonUnavailable, RuntimeError, OSError) as exc:
+        except DaemonUnavailable as exc:
             if isinstance(exc, RuntimeError) and "socket" not in str(exc):
                 print(f"assist: {exc}", file=sys.stderr)
                 return 1
@@ -1153,7 +1291,7 @@ def _plan_command(args, config) -> int:
     if args.plan_action == "list":
         try:
             plans = call(config.socket_path, "plan.list", timeout=10.0)["plans"]
-        except (DaemonUnavailable, RuntimeError, OSError):
+        except DaemonUnavailable:
             from .store import Store
             store = Store(config.db_path)
             plans = store.list_plans()
@@ -1168,7 +1306,7 @@ def _plan_command(args, config) -> int:
         try:
             data = call(config.socket_path, "plan.show",
                         {"plan_id": args.plan_id, "decision": args.decision}, timeout=30.0)
-        except (DaemonUnavailable, RuntimeError, OSError):
+        except DaemonUnavailable:
             from .store import Store
             store = Store(config.db_path)
             plan = store.get_plan(args.plan_id)
@@ -1190,7 +1328,7 @@ def _plan_command(args, config) -> int:
         build_params = {"root": args.root, "tiers": args.tiers}
         started = call(config.socket_path, "plan.build", build_params,
                        timeout=10.0)["started"]
-    except (DaemonUnavailable, RuntimeError, OSError):
+    except DaemonUnavailable:
         from .gemini_client import GeminiClient
         from .modes import ModeManager
         from .offline_queue import CloudQueue
@@ -1217,10 +1355,21 @@ def _plan_command(args, config) -> int:
         print(f"Building shadow plan #{plan_id} for {entry['root']}…", file=sys.stderr)
         if entry.get("tiers") == "queued-offline":
             print("Offline: Tier 0 now; Tier 1/2 judgement will be queued.", file=sys.stderr)
+        # BH-K8: total poll deadline. A plan row can be stuck in
+        # "building" forever (the daemon restarted mid-build and its
+        # build task died with it); polling it unbounded hung the CLI.
+        deadline = _time.monotonic() + _PLAN_BUILD_POLL_DEADLINE_S
         while True:
             data = call(config.socket_path, "plan.show", {"plan_id": plan_id}, timeout=30.0)
             if data["plan"]["status"] != "building":
                 break
+            if _time.monotonic() > deadline:
+                print(
+                    f"plan #{plan_id} still 'building' after "
+                    f"{_PLAN_BUILD_POLL_DEADLINE_S:g}s — the daemon may have "
+                    f"restarted mid-build. Check `assist plan show {plan_id}`; "
+                    "nothing was moved.", file=sys.stderr)
+                return 1
             _time.sleep(0.5)
         plan = data["plan"]
         if plan["status"] == "failed":
@@ -1478,7 +1627,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    config = load_config()
+    try:
+        config = load_config()
+    except ValueError as exc:
+        # BH-K24: one line naming the file, exit 2 — never a traceback
+        # from inside tomllib for every invocation until it's fixed.
+        print(f"assist: {exc}", file=sys.stderr)
+        return 2
 
     try:
         if args.command == "doctor":
@@ -1499,7 +1654,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             try:
                 status = call(config.socket_path, "status", timeout=3.0)
-            except (DaemonUnavailable, RuntimeError, OSError):
+            except DaemonUnavailable:
                 from .modes import ModeManager
 
                 store = _local_store(config)
@@ -1529,7 +1684,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "cost":
             try:
                 data = call(config.socket_path, "cost", timeout=3.0)
-            except (DaemonUnavailable, RuntimeError, OSError):
+            except DaemonUnavailable:
                 # Ledger reads fine without the daemon — cost must always answer.
                 from .cost import day_start_iso, month_start_iso
                 from .store import Store
@@ -1600,7 +1755,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "halt":
             try:
                 call(config.socket_path, "halt", timeout=3.0)
-            except (DaemonUnavailable, RuntimeError, OSError):
+            except DaemonError as exc:
+                # BH-K12 exception: the kill switch must land even when the
+                # daemon errors — set the flag directly AND say so.
+                from .safety import set_halt
+                set_halt(config.socket_path.parent)
+                print(f"assist halt: daemon reported an error ({exc}); "
+                      "halt flag set directly.", file=sys.stderr)
+            except DaemonUnavailable:
                 from .safety import set_halt
                 set_halt(config.socket_path.parent)  # flag file works daemon-down too
             print("Halted. The flag is honoured between every operation; `assist resume` clears it.")
@@ -1609,7 +1771,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "resume":
             try:
                 call(config.socket_path, "resume", timeout=3.0)
-            except (DaemonUnavailable, RuntimeError, OSError):
+            except DaemonUnavailable:
                 from .safety import clear_halt
                 clear_halt(config.socket_path.parent)
             print("Resumed.")
@@ -1619,7 +1781,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 result = call(config.socket_path, "transcribe.file",
                               {"path": args.file}, timeout=180.0)
-            except (DaemonUnavailable, RuntimeError, OSError):
+            except DaemonUnavailable:
                 # Same module, no extra design (§3.6): run the service locally.
                 import asyncio as _asyncio
                 from pathlib import Path as _Path
@@ -1651,7 +1813,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 result = call(config.socket_path, "index.run", timeout=600.0)
                 roots = result["roots"]
-            except (DaemonUnavailable, RuntimeError, OSError):
+            except DaemonUnavailable:
                 from .organiser import OrganiserService
                 from .store import Store
                 store = Store(config.db_path)
@@ -1671,7 +1833,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.review_action == "list":
                 try:
                     items = call(config.socket_path, "review.list", timeout=30.0)["review_items"]
-                except (DaemonUnavailable, RuntimeError, OSError):
+                except DaemonUnavailable:
                     store = _local_store(config)
                     items = [i for p in store.list_plans(5)
                              for i in store.plan_items(p["id"], "review")]
@@ -1685,11 +1847,17 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     call(config.socket_path, "review.decide",
                          {"item_id": args.item_id, "verdict": verdict}, timeout=10.0)
-                except (DaemonUnavailable, RuntimeError, OSError):
+                except DaemonUnavailable:
                     store = _local_store(config)
-                    store.set_item_decision(args.item_id,
-                                            "auto" if verdict == "approve" else "rejected")
+                    decided = store.set_item_decision(
+                        args.item_id,
+                        "auto" if verdict == "approve" else "rejected")
                     store.close()
+                    if not decided:
+                        # BH-K12: the rowcount was ignored — "approved"
+                        # printed (exit 0) for items that do not exist.
+                        print(f"no review item {args.item_id}", file=sys.stderr)
+                        return 1
                 print(f"item {args.item_id}: {verdict}d")
             return 0
 
@@ -1700,7 +1868,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             try:
                 result = call(config.socket_path, "undo", params, timeout=900.0)
-            except (DaemonUnavailable, RuntimeError, OSError):
+            except DaemonUnavailable:
                 from .executor import Executor, parse_since
                 store = _local_store(config)
                 result = Executor(config, store).undo(
@@ -1716,7 +1884,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 result = call(config.socket_path, "verify",
                               {"since": args.since} if args.since else {}, timeout=300.0)
-            except (DaemonUnavailable, RuntimeError, OSError):
+            except DaemonUnavailable:
                 from .executor import Executor, parse_since
                 store = _local_store(config)
                 result = Executor(config, store).verify(
@@ -1743,7 +1911,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 result = call(config.socket_path, "docs.search",
                               {"query": args.query}, timeout=30.0)
-            except (DaemonUnavailable, RuntimeError, OSError):
+            except DaemonUnavailable:
                 from .store import Store
                 store = Store(config.db_path)
                 result = {"results": store.search_documents(args.query),
@@ -1783,7 +1951,7 @@ def main(argv: list[str] | None = None) -> int:
                                  {"session_id": stopped.get("session_id"),
                                   "wait_s": 60.0}, timeout=75.0)
                     result = final.get("result")
-                except (DaemonUnavailable, RuntimeError, OSError) as exc:
+                except (DaemonUnavailable, DaemonError) as exc:
                     print(f"assist: transcript not delivered: {exc}", file=sys.stderr)
             result = result or {}
             if result.get("no_speech") and not (result.get("text") or "").strip():
@@ -1869,6 +2037,11 @@ def main(argv: list[str] | None = None) -> int:
                           timeout=95.0 if (action == "stop" and args.wait) else 3.0)
             print(json.dumps(result))
             return 0
+    except DaemonError as exc:
+        # BH-K12: the daemon answered and refused — an ANSWER (exit 2),
+        # never reported as unavailability and never retried locally.
+        print(_refusal_text(exc), file=sys.stderr)
+        return 2
     except (DaemonUnavailable, RuntimeError, OSError) as exc:
         print(f"assist: {exc}", file=sys.stderr)
         return 1

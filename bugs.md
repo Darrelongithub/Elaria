@@ -1328,3 +1328,57 @@ running the documented command chain).
 - **Was:** `needs_fallback = live_failed or live_terminal_missing or not final_text`. Any post-`activity_end` wait timeout — including the benign case where every segment committed during speech and the user simply paused before releasing — re-transcribed the WAV and assigned `final_text = fallback_text`, silently swapping the Live transcript (the one interims had shown) for a different batch transcription. Contributing cause: `GenaiLiveTransport` swallowed the server's `turn_complete` for the transcription-only model, so the boundary was invisible to collector, diagnostics and fixtures alike.
 - **Fix:** (a) the parser surfaces `turn_complete` for both model shapes (finals in the same message are queued first); for the transcription-only model `events()` does not end there and the collector does not treat it as a terminal, because a committed segment can arrive *after* the boundary (test_bug6f) — it is evidence for diagnostics, not a completeness proof. (b) `dictate` now accounts in audio time: seconds of speech-level audio sent vs. sent at the moment the last final arrived. Batch runs only when no text was committed, or speech followed the last final *and* no clean post-release terminal arrived; every branch is stated in `notes`. The 6f guarantee is preserved: an unconfirmed tail is still recovered from the WAV, never truncated.
 
+### BH-K4 — `GEMINI_MODE=record` never recorded Live session sequences
+
+- **Severity:** wrong-action (broken debugging contract)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_record_mode.py`
+- **Expected:** record mode = real API + fixtures saved (§12.9), including the streaming message sequence as `fixtures/seq-live.jsonl`.
+- **Was:** `asr.make_live_transport` returned the bare `GenaiLiveTransport` for record mode; `RecordingTransport` existed and was tested in isolation but was wired into no production path. The documented way to capture evidence for the hardware "no final after activity_end" bug produced nothing.
+- **Fix:** the factory wraps the real transport in `RecordingTransport(..., "live")` when `gemini_mode == "record"` (audio is logged as hash+size only, sequence written on close).
+
+### BH-K5 — Voice render could hang a worker thread forever
+
+- **Severity:** wrong-action (unbounded wait / thread-pool starvation)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_waits.py::test_run_coroutine_sync_*`
+- **Expected:** a wedged Live voice session surfaces as a TimeoutError in bounded time.
+- **Was:** `gemini_client._run_coroutine_sync` ran the render with no timeout in both branches (`asyncio.run` and `thread.join()`), and `render()`'s `async for message in session.receive()` can wait forever. TTS runs on the shared `to_thread` executor, so each hang permanently consumed a daemon worker thread.
+- **Fix:** `_run_coroutine_sync(factory, timeout_s=60)` wraps the coroutine in `asyncio.wait_for`; the thread branch joins with a margin and raises `TimeoutError` (thread is daemonized). Voice render passes 30s.
+
+### BH-K6 — Capture close could hang or leave pw-record running
+
+- **Severity:** wrong-action / privacy (unbounded wait, orphaned microphone)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_waits.py::test_aclose_*`
+- **Expected:** `PipeWireCapture.aclose()` always ends with the process dead, bounded, even if the caller cancels.
+- **Was:** `terminate()` then `await proc.wait()` with no bound and no SIGKILL escalation; if the caller's lifecycle timeout cancelled the wait, the process was simply abandoned.
+- **Fix:** bounded wait (`TERMINATE_TIMEOUT_S = 2.0`) then `kill()` + reap; on `CancelledError`, `kill()` before re-raising. The process handle is detached first so a second close is a no-op.
+
+### BH-K7 — Hotword capture path: factory TypeError, leaked pw-record, silent stall
+
+- **Severity:** crash-with-safe-state (factory) + privacy (orphaned live mic) + wrong-action (false "armed")
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_hotword_knock.py::test_hotword_*`
+- **Expected:** `hotword start` builds a real capture; stop/stall always terminates pw-record and reports the true guard state.
+- **Was:** three root causes, all invisible to tests that replace the factory: (1) `_hotword_capture_factory` passed `chunk_ms=` to `PipeWireCapture(frame_ms=...)` → TypeError on every production start; (2) `_hotword_loop`'s finally called a sync `close()` that does not exist on `PipeWireCapture` (only `aclose()`), so a running capture was never closed; (3) a capture stall ends `frames()`, but the loop then exited without disarming or broadcasting — `hotword status` claimed armed over a dead stream. The `[hotword] stall_timeout_s` (2s) was also never passed, silently using the 8s capture default.
+- **Fix:** factory maps `[capture] chunk_ms` → `frame_ms` and passes the hotword stall timeout; the loop treats stream-end-while-armed as the stall (disarm + `hotword.stalled` broadcast); the finally awaits a shielded `aclose()` (with sync-`close()` fallback for test doubles) so cancellation by `hotword.stop` still reaps the process.
+
+### BH-K8 — `assist plan build` polled a stuck "building" plan forever
+
+- **Severity:** wrong-action (unbounded wait)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_waits.py::test_plan_build_poll_gives_up_on_a_stuck_building_plan`
+- **Expected:** polling ends with a clear message if the plan never leaves `building`.
+- **Was:** `while True` poll with no deadline. A daemon restart mid-build orphans the plan row in `building` (its build task died with the old process), so the CLI spun forever.
+- **Fix:** total deadline `_PLAN_BUILD_POLL_DEADLINE_S = 600` in cli.py; on expiry it prints that the daemon may have restarted mid-build, points at `assist plan show`, and exits 1. Nothing was moved (build is shadow-only).
+
+### BH-K9 — Knock delivery blocked the daemon event loop and bypassed the speaking gate
+
+- **Severity:** wrong-action (loop stall) + duplex hole
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_hotword_knock.py::test_knock_emit_does_not_block_the_event_loop_and_is_gated`
+- **Expected:** `knock.raise`/`knock.due` stay responsive while the notification/player subprocesses run, and the knock sound is treated as speaker output by capture gating.
+- **Was:** `KnockSignal.emit` (two `subprocess.run(timeout=5)` calls) was invoked synchronously inside the async `_knock_raise`/`_knock_due` handlers — up to ~10s where every IPC call, including `ptt.stop`, waited — and the sound played with no speaking-gate marks, straight into any open microphone.
+- **Fix:** both handlers now run emit via `asyncio.to_thread` with `_set_speaking` held (class mode short-circuits: silent pulse, no thread, no gate). `_set_speaking(True, text=None)` no longer clobbers `_speaking_text` (the BH-K2 echo reference). The code is inlined at both handlers so the BH-H13 boundary (knock emit reachable only from `_knock_raise`/`_knock_due`) is preserved unchanged.
+
