@@ -1298,3 +1298,33 @@ running the documented command chain).
   receive diagnostics, and a synchronous ack gate reservation held through actual
   playback plus the 400 ms tail guard. Genuine failures retain 6e's bounded WAV
   recovery and durable capture stats; speculative/output text is not a final.
+
+## BUG HUNT 2026-10-21 — BH-K series (see BUGHUNT-2026-10-21.md)
+
+### BH-K1 — Dictated text containing a filler phrase was silently discarded
+
+- **Severity:** data-loss
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_transcript_integrity.py::test_dictated_email_with_filler_signoff_is_kept` (fails pre-fix)
+- **Expected:** dictating "Dear team, … Let me know how I can help with the board pack." returns that text with a transcript id and an inbox file.
+- **Was:** a post-persist "BUG5 echo filter" in `DictationService.dictate` matched the final text against persona `FILLER_PHRASES` substrings ("let me know how i can", "how can i help", …) and, on any hit, replaced the already-persisted `SessionResult` with a fabricated empty one — raw/cleaned text, inbox path, clipboard and transcript_id all falsified while the store row kept the real words. The user got nothing; the record lied about it.
+- **Fix:** block removed. Echo defence is upstream and evidence-based (frames during playback never reach uplink/WAV; duplex refuses self-audio finals; the daemon strips by exact spoken-text comparison, BH-K2). Resemblance to her filler is not evidence about user speech.
+
+### BH-K2 — Daemon echo check wiped real dictation on timing alone
+
+- **Severity:** data-loss
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_transcript_integrity.py` (`test_echo_requires_textual_match_not_timing`, `test_finish_dictation_keeps_text_that_lands_during_ack`, …)
+- **Expected:** a transcript is echo only when its words are the words she just spoke; her words as a prefix are excised and the user's remainder kept.
+- **Was:** `Daemon._is_echo` returned True whenever a transcript merely *finished* while an ack was playing (or inside the guard), with no textual comparison — `_speaking_text` is never cleared, so the timing branch was armed forever — and also on any `FILLER_PHRASES` substring. `_finish_dictation` then emptied `text`/`raw_text` in `ptt.result`. In command mode the general check ran *after* `_ask` had spoken its reply, so a routed command's own text was reported back as "" with "echo suppressed".
+- **Fix:** `Daemon._strip_self_echo` compares normalised word sequences against `_speaking_text`: exact match or a ≥2-word contiguous run of her sentence is hers (the ≥2 floor preserves BH-I5's one-word "No."); her sentence as a prefix is stripped and the user's words kept. Applied once, before routing; `raw_text` remains the ASR record. Two assertions in `test_bugs_1_to_5_regressions.py` encoded the old rule and were updated with justification inline — the BUG5 incident line is still caught when she actually spoke it.
+
+### BH-K3 — Committed Live finals were overwritten by the saved-WAV batch redo
+
+- **Severity:** data-loss (silent substitution) + wrong-action (double transcription cost)
+- **Status:** fixed in this pass; hardware sequence still to confirm (BH-K4/S2)
+- **Repro:** `tests/test_bughunt_k_transcript_integrity.py` (`test_pause_then_release_silence_after_end_keeps_live`, `test_turn_complete_only_with_uncommitted_tail_recovers_via_batch`)
+- **Expected:** the batch fallback replaces Live text only with positive evidence the Live text is missing or incomplete: nothing committed, or speech was sent after the last committed final and no clean post-release terminal arrived.
+- **Was:** `needs_fallback = live_failed or live_terminal_missing or not final_text`. Any post-`activity_end` wait timeout — including the benign case where every segment committed during speech and the user simply paused before releasing — re-transcribed the WAV and assigned `final_text = fallback_text`, silently swapping the Live transcript (the one interims had shown) for a different batch transcription. Contributing cause: `GenaiLiveTransport` swallowed the server's `turn_complete` for the transcription-only model, so the boundary was invisible to collector, diagnostics and fixtures alike.
+- **Fix:** (a) the parser surfaces `turn_complete` for both model shapes (finals in the same message are queued first); for the transcription-only model `events()` does not end there and the collector does not treat it as a terminal, because a committed segment can arrive *after* the boundary (test_bug6f) — it is evidence for diagnostics, not a completeness proof. (b) `dictate` now accounts in audio time: seconds of speech-level audio sent vs. sent at the moment the last final arrived. Batch runs only when no text was committed, or speech followed the last final *and* no clean post-release terminal arrived; every branch is stated in `notes`. The 6f guarantee is preserved: an unconfirmed tail is still recovered from the WAV, never truncated.
+

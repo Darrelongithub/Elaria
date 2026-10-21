@@ -322,20 +322,30 @@ def test_bug5_playback_capture_half_duplex_and_filler_suppression(config, runnin
     assert len(collected_while_speaking) == 0, \
         "Half-duplex: all capture frames must be dropped while speaking"
 
-    # 4. Echo detection suppresses own TTS from entering transcript as a user turn
-    # While speaking or during guard, any input is recognized as mic leakage
+    # 4. Echo detection suppresses own TTS from entering transcript as a user turn.
+    # BH-K2 correction: echo is a TEXTUAL claim — the transcript must match
+    # what she actually said. The old rule ("any input while speaking is
+    # leakage" + a filler-phrase list) also wiped genuine dictation that
+    # merely finished inside the ack window or contained "how can i help",
+    # which is why these assertions changed: the BUG5 incident line is
+    # still caught when she actually spoke it (it is in _speaking_text),
+    # and is the user's own words when she did not.
     assert daemon._is_echo("I am now. What do you need?"), \
         "Own spoken text must be recognized as echo"
+    assert not daemon._is_echo("Understood, what are you working on that I can help with"), \
+        "Filler-shaped text she did NOT just say is user dictation, not echo (BH-K2)"
+    daemon._set_speaking(True, text="Understood, what are you working on that I can help with")
     assert daemon._is_echo("Understood, what are you working on that I can help with"), \
-        "Corporate filler must be recognized as echo"
+        "The BUG5 incident line, when she actually spoke it, is echo"
+    daemon._set_speaking(True, text="I am now. What do you need?")
 
     # After speaking finishes and guard expires:
     daemon._speaking_until = 0.0  # guard elapsed
     # Spoken text is still remembered as echo
     assert daemon._is_echo("I am now. What do you need?"), \
         "Textual match to own recent speech is echo"
-    # Corporate filler is always recognized as echo
-    assert daemon._is_echo("Understood, what are you working on that I can help with")
+    # Filler-shaped user text is NOT echo merely for resembling her filler.
+    assert not daemon._is_echo("Understood, what are you working on that I can help with")
     # Legitimate user instruction is NOT echo
     assert not daemon._is_echo("Organise the downloads folder into invoices and receipts"), \
         "Real user instruction is not echo"
