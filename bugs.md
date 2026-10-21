@@ -1487,3 +1487,12 @@ running the documented command chain).
 - **Was:** `load_config()` ran before `main()`'s try and the raw `TOMLDecodeError` (no filename in the message) propagated as a traceback; same in `assistd`.
 - **Fix:** `load_config` wraps parse/IO errors as `ValueError("cannot parse config <path>: …")`; both entry points print one line and exit 2.
 
+### BH-K18 — Per-model quota (RPD) was configured but never enforced
+
+- **Severity:** wrong-action (quota burned into opaque 429s; two drifting sources of truth)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_quota.py`
+- **Expected:** the verified per-model limits in `[quota.models.*]` (flash 20 RPD!) stop calls locally with a clear refusal; flat keys and structured rows cannot silently disagree.
+- **Was:** only the flat `flash_rpm`/`flash_lite_rpm` fed the limiter and only a global 1200/day cap existed. The 21st flash call of the day went out, earned a 429, and burned backoff time before failing opaquely. Also latent: `PerModelLimiter` clamped rpm to `max(1, …)`, so a configured `0` ("not rate-limited", per the config comments) meant 1/minute.
+- **Fix:** `quota_family()` maps model ids to quota rows; `rpm_for` takes the stricter of structured vs flat (0/unlimited in a row disables the limiter for that model, which now honours ≤0); `_check_daily_cap(model)` additionally enforces the family's RPD from the ledger with a clear `QuotaExhausted`; `validate_config` warns when flat and structured values disagree.
+
