@@ -1505,3 +1505,12 @@ running the documented command chain).
 - **Was:** `WakeGuard.feed()` passed the single 30 ms frame just received. No keyword model recognises a phrase in 30 ms; the energy test model masked it because RMS works on any length.
 - **Fix:** `feed()` scores the trailing `[hotword] keyword_window_s` (default 1.0 s, validated 0.1–2.0) slice of the pre-wake ring, ending with the frame just fed.
 
+### BH-K19 — `[asr] assert_output_language` was never called
+
+- **Severity:** dead promise (silent-translation guard, §12.4)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_language_assert.py`
+- **Expected:** with the flag on (default), a transcript whose language tag falls outside the pinned set is caught — the exact silent-translation failure mode the blueprint says this key catches.
+- **Was:** the helper `asr.assert_output_language` and the config key both existed; zero call sites in `src/` (only a unit test of the helper itself). The content-level marker gate in cleanup was wired; the tag gate was not.
+- **Fix:** enforced at the one seam every batch transcript crosses (`asr.transcribe_file`): an out-of-set result is passed over for the next backend; if the chain exhausts it returns degraded-but-marked (`Transcript.language_ok=False`), and both `Transcriber` batch call sites surface a loud session note. Flag off restores first-result-wins.
+
