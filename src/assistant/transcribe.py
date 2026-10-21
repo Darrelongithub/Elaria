@@ -390,6 +390,7 @@ class DictationService:
         collector: asyncio.Task | None = None
         collector_terminal_event: asyncio.Event | None = None
         collected: list[LiveEvent] = []
+        live_event_counts: dict[str, int] = {}
         live_failed = False
         started = time.monotonic()
         rotations = 0
@@ -426,9 +427,10 @@ class DictationService:
 
         async def collect_events(current: LiveTransport,
                                  terminal_event: asyncio.Event) -> None:
-            nonlocal resumption_handle
+            nonlocal resumption_handle, live_failed
             try:
                 async for event in current.events():
+                    live_event_counts[event.type] = live_event_counts.get(event.type, 0) + 1
                     # BUG6: only transcribable INPUT belongs in the transcript
                     # record. Output audio/text from the session are her own voice
                     # and are deliberately never appended to `collected`, so they
@@ -460,6 +462,11 @@ class DictationService:
                                     "session_id": session_id})
                     elif event.type == "resumption" and event.handle:
                         resumption_handle = event.handle
+                    elif event.type == "error":
+                        live_failed = True
+                        error = event.error or "Live receiver failed"
+                        live_failures.append(f"receive: {error}")
+                        self._ledger_live_failure(stage="receive", error=error)
             finally:
                 # EOF/error is terminal too, even if no final text was emitted.
                 terminal_event.set()
@@ -661,6 +668,13 @@ class DictationService:
             # server may omit its final/turn_complete after activity_end, so
             # both the signal and the receive-loop wait are explicitly bounded.
             if transport is not None:
+                # A committed segment received while the mic was still open
+                # is not confirmation of the *last* activity. Do not let an
+                # earlier final skip the wait for the tail after release (6f).
+                # Clear BEFORE sending activity_end so an immediate final
+                # delivered during the send cannot be lost.
+                if collector_terminal_event is not None:
+                    collector_terminal_event.clear()
                 activity_end_ok = False
                 try:
                     await self._await_lifecycle(
@@ -692,6 +706,16 @@ class DictationService:
                         live_failed = True
                         live_failures.append(f"final wait: {exc}")
                         notes.append(f"Live final wait failed ({exc}); saved-WAV fallback will run")
+                diagnostics = {}
+                try:
+                    describe = getattr(transport, "diagnostics", None)
+                    if callable(describe):
+                        diagnostics = describe()
+                except Exception:
+                    diagnostics = {"unavailable": True}
+                self._log("dictate.live_receive_summary", session_id=session_id,
+                          activity_end_ok=activity_end_ok, frames_seen=frames_seen,
+                          event_counts=dict(live_event_counts), transport=diagnostics)
                 finals = _final_texts(collected)
                 final_text = " ".join(finals).strip()
                 if not final_text:
@@ -827,7 +851,7 @@ class DictationService:
                           error=f"{type(exc).__name__}: {exc}"[:200])
 
         use_offline_chain = offline_at_start or network_drop
-        needs_fallback = (live_failed or not final_text) and not no_speech
+        needs_fallback = (live_failed or live_terminal_missing or not final_text) and not no_speech
         if needs_fallback:
             if audio_path is not None:
                 try:

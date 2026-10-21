@@ -211,6 +211,11 @@ class Daemon:
         # BUG5 half-duplex: capture muted while she is speaking (+ guard)
         self._speaking_until: float = 0.0
         self._speaking_text: str | None = None
+        # BUG 6f: cached acks are real playback too. Reserve the gate before
+        # scheduling them, and hold it for the actual player's lifetime (not a
+        # text-duration estimate). Separate workers survive waiter cancellation:
+        # cancelling to_thread cannot stop audio already playing in that thread.
+        self._ack_playbacks: set[asyncio.Task] = set()
         # BUG F / Bug 8 (2026-10-20): the single 4 s total-turn bound is gone.
         # Two deadlines from [gemini]: a streaming first-token deadline (a
         # transport with no first token is dead) and a generous total bound (a
@@ -266,10 +271,41 @@ class Daemon:
             # Don't clear text immediately; let guard expire
 
     def is_speaking(self) -> bool:
-        return __import__("time").monotonic() < self._speaking_until
+        return bool(self._ack_playbacks) or time.monotonic() < self._speaking_until
 
     def speaking_guard_remaining(self) -> float:
-        return max(0.0, self._speaking_until - __import__("time").monotonic())
+        return max(0.4 if self._ack_playbacks else 0.0,
+                   self._speaking_until - time.monotonic())
+
+    def _queue_ack_playback(self, kind: str) -> asyncio.Task:
+        """Queue cached audio behind the SAME gate as capture and Live uplink.
+
+        Close synchronously, before the playback worker or a newly started mic
+        can run. Only actual worker completion opens the 400 ms tail guard;
+        cancelling a fire-and-forget waiter must not reopen the mic while its
+        uncancellable thread is still sending audio to the speakers.
+        """
+        text = STANDARD_ACKS.get(kind, "")
+        self._set_speaking(True, text=text)
+        playback = asyncio.create_task(asyncio.to_thread(self.speech.play_ack, kind))
+        self._ack_playbacks.add(playback)
+
+        def finished(task: asyncio.Task) -> None:
+            self._ack_playbacks.discard(task)
+            self._set_speaking(False, text=text)
+            self._consume_task_result(task)
+
+        playback.add_done_callback(finished)
+
+        async def wait_for_playback():
+            try:
+                return await asyncio.shield(playback)
+            except Exception as exc:
+                await self.broadcast({"event": "speech.error", "ack_kind": kind,
+                                      "error": str(exc)})
+                return {"played": False, "error": str(exc)}
+
+        return self._track_task(asyncio.create_task(wait_for_playback()))
 
     # -- Phase 8 connectivity / speech helpers --------------------------------
     # BUG5: capture wrapper that mutes while she is speaking + guard
@@ -661,8 +697,7 @@ class Daemon:
         if cached is None:
             self._schedule_rewarm_if_requested()   # VB-2: miss -> one warm cycle
         if should_speak and cached:
-            self._track_task(asyncio.create_task(
-                asyncio.to_thread(self.speech.play_ack, kind)))
+            self._queue_ack_playback(kind)
             ack["speech"]["queued"] = True
         self.store.log_persona_event(iso_now(), "ack", json.dumps(ack))
         return ack
@@ -1260,8 +1295,7 @@ class Daemon:
         async def dictation_sink(event: dict) -> None:
             # Cached audio only: the soft check-in must never wait on TTS.
             if event.get("event") == "session.checkin" and self.speech.cached_ack("checkin"):
-                self._track_task(asyncio.create_task(
-                    asyncio.to_thread(self.speech.play_ack, "checkin")))
+                self._queue_ack_playback("checkin")
             await self.broadcast(event)
 
         # BUG5: wrap source to mute while speaking. BUG6: the Live transport

@@ -40,7 +40,7 @@ import asyncio
 import hashlib
 import re
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -310,6 +310,11 @@ class DuplexLiveTransport:
                 continue
             yield event
 
+    def diagnostics(self) -> dict:
+        describe = getattr(self._inner, "diagnostics", None)
+        return describe() if callable(describe) else {
+            "transport": getattr(self._inner, "name", type(self._inner).__name__)}
+
     async def close(self) -> None:
         self.gate.playback_ended()
         await self._inner.close()
@@ -564,12 +569,20 @@ class FixtureLiveTransport:
         return None
 
 
-class GenaiLiveTransport:  # pragma: no cover - needs owner's key + network
+class GenaiLiveTransport:
     """Real Gemini Live session via google-genai (manual VAD, TEXT out).
+
+    BUG 6f: the transcription-only model has two distinct envelopes:
+    interim_input_transcription is speculative; input_transcription is a
+    committed segment, WITHOUT a required `finished` or model turn_complete.
+    Conversational Live models instead stream input_transcription fragments;
+    those are accumulated until `finished` or turn_complete, not guessed final
+    on a timeout. Output/model text is never a source of user transcription.
 
     Response-shape parsing is defensive (getattr chains) because Live
     message types churn between SDK versions; anything unrecognised is
-    ignored rather than fatal. Verify on first live run (§11).
+    ignored rather than fatal. Hardware verification still needs the owner's
+    key/network (§11); the parser/lifecycle are tested offline.
 
     Language: Live input transcription has no explicit multi-language
     pin in this config surface (verify against current SDK at Step 0);
@@ -591,10 +604,15 @@ class GenaiLiveTransport:  # pragma: no cover - needs owner's key + network
                                     http_options={"api_version": "v1beta"})
         self._model = model
         self._language = language
+        self._transcription_only = "transcribe-live" in model.rsplit("/", 1)[-1]
         self._session = None
         self._context = None
         self._queue: asyncio.Queue[LiveEvent] = asyncio.Queue()
         self._receiver: asyncio.Task | None = None
+        self._input_parts: list[str] = []
+        # Counters/flags only: no audio or transcript text in lifecycle logs.
+        self._receive_counts: Counter[str] = Counter()
+        self._audio_frames_sent = 0
 
     async def connect(self, resumption_handle: str | None = None) -> None:
         from google.genai import types
@@ -616,47 +634,110 @@ class GenaiLiveTransport:  # pragma: no cover - needs owner's key + network
             raise LiveUnavailable(f"Live connect failed: {exc}") from exc
         self._receiver = asyncio.create_task(self._receive_loop())
 
+    async def _flush_input(self) -> None:
+        text = "".join(self._input_parts).strip()
+        self._input_parts.clear()
+        if text:
+            await self._queue.put(LiveEvent("final", text=text))
+
+    async def _receive_content(self, content) -> None:
+        # BUG6: output audio and output transcription are HER OWN speech.
+        # Neither model text nor output transcription may become user input.
+        turn = getattr(content, "model_turn", None)
+        for part in getattr(turn, "parts", None) or []:
+            inline = getattr(part, "inline_data", None)
+            data = getattr(inline, "data", None) if inline is not None else None
+            if data:
+                mime = str(getattr(inline, "mime_type", "") or "")
+                match = re.search(r"rate=(\d+)", mime)
+                rate = int(match.group(1)) if match else 24000
+                await self._queue.put(LiveEvent(
+                    "output_audio", audio=data, sample_rate=rate,
+                    duration_s=len(data) / 2 / max(1, rate)))
+        output = getattr(content, "output_transcription", None)
+        if output is not None and getattr(output, "text", None):
+            self._receive_counts["output_transcription"] += 1
+            await self._queue.put(LiveEvent(
+                "output_final" if getattr(output, "finished", False) else "output_interim",
+                text=output.text))
+
+        # Transcribe Live previews replace one another; they are display-only,
+        # never appended to the committed transcript or promoted on a timeout.
+        interim = getattr(content, "interim_input_transcription", None)
+        if interim is not None and getattr(interim, "text", None):
+            self._receive_counts["interim_input_transcription"] += 1
+            await self._queue.put(LiveEvent("interim", text=interim.text))
+
+        transcription = getattr(content, "input_transcription", None)
+        if transcription is not None:
+            self._receive_counts["input_transcription"] += 1
+            text = getattr(transcription, "text", None) or ""
+            finished = getattr(transcription, "finished", None)
+            if finished:
+                self._receive_counts["input_finished"] += 1
+            if self._transcription_only:
+                # This envelope IS the committed segment on transcribe-live.
+                # Requiring its optional `finished` flag misclassified these
+                # finals as interims and forced saved-WAV batch fallback (6f).
+                if text.strip():
+                    await self._queue.put(LiveEvent("final", text=text))
+            else:
+                # Conversational Live uses text deltas in this SAME field.
+                # Preserve whitespace between deltas and support an empty
+                # finished marker as well as one carrying the last fragment.
+                if text:
+                    self._input_parts.append(text)
+                if finished:
+                    await self._flush_input()
+                elif text:
+                    await self._queue.put(LiveEvent(
+                        "interim", text="".join(self._input_parts)))
+
+        if getattr(content, "turn_complete", False):
+            self._receive_counts["turn_complete"] += 1
+            if not self._transcription_only:
+                await self._flush_input()
+                await self._queue.put(LiveEvent("turn_complete"))
+            # A model-turn boundary is NOT a transcription boundary on the
+            # transcription-only model. Input text is independently ordered
+            # and can arrive after it; keep receiving until a real final.
+
     async def _receive_loop(self) -> None:
         try:
-            async for response in self._session.receive():
-                if getattr(response, "go_away", None) is not None:
-                    await self._queue.put(LiveEvent("go_away"))
-                update = getattr(response, "session_resumption_update", None)
-                if update is not None and getattr(update, "resumable", False):
-                    await self._queue.put(LiveEvent(
-                        "resumption", handle=getattr(update, "new_handle", None)))
-                content = getattr(response, "server_content", None)
-                if content is None:
-                    continue
-                # BUG6: output audio and output transcription are HER OWN
-                # speech. They are surfaced with output_* types (never
-                # final/interim), which also drives the duplex gate.
-                turn = getattr(content, "model_turn", None)
-                for part in getattr(turn, "parts", None) or []:
-                    inline = getattr(part, "inline_data", None)
-                    data = getattr(inline, "data", None) if inline is not None else None
-                    if data:
-                        mime = str(getattr(inline, "mime_type", "") or "")
-                        match = re.search(r"rate=(\d+)", mime)
-                        rate = int(match.group(1)) if match else 24000
+            # SDK receive() yields ONE MODEL TURN, not the whole connection.
+            # Re-enter it for late input transcription / subsequent turns.
+            while True:
+                received = False
+                self._receive_counts["receive_calls"] += 1
+                async for response in self._session.receive():
+                    received = True
+                    self._receive_counts["responses"] += 1
+                    if getattr(response, "go_away", None) is not None:
+                        await self._queue.put(LiveEvent("go_away"))
+                    update = getattr(response, "session_resumption_update", None)
+                    if update is not None and getattr(update, "resumable", False):
                         await self._queue.put(LiveEvent(
-                            "output_audio", audio=data, sample_rate=rate,
-                            duration_s=len(data) / 2 / max(1, rate)))
-                output = getattr(content, "output_transcription", None)
-                if output is not None and getattr(output, "text", None):
-                    finished = getattr(output, "finished", False)
-                    await self._queue.put(LiveEvent(
-                        "output_final" if finished else "output_interim",
-                        text=output.text))
-                transcription = getattr(content, "input_transcription", None)
-                if transcription is not None and getattr(transcription, "text", None):
-                    finished = getattr(transcription, "finished", False)
-                    await self._queue.put(LiveEvent(
-                        "final" if finished else "interim", text=transcription.text))
-                if getattr(content, "turn_complete", False):
-                    await self._queue.put(LiveEvent("turn_complete"))
+                            "resumption", handle=getattr(update, "new_handle", None)))
+                    content = getattr(response, "server_content", None)
+                    if content is not None:
+                        await self._receive_content(content)
+                if not received:
+                    # Do not spin on EOF or leave events() parked forever on
+                    # a queue whose producer has silently exited (6e).
+                    raise LiveUnavailable("Live receive stream ended without a response")
+                await asyncio.sleep(0)
         except Exception as exc:
             await self._queue.put(LiveEvent("error", error=str(exc)))
+
+    def diagnostics(self) -> dict:
+        return {
+            "transport": self.name, "model": self._model,
+            "sdk_version": getattr(self._genai, "__version__", "unknown"),
+            "transcription_only": self._transcription_only,
+            "audio_frames_sent": self._audio_frames_sent,
+            "receive_counts": dict(self._receive_counts),
+            "receiver_done": self._receiver is not None and self._receiver.done(),
+        }
 
     async def activity_start(self) -> None:
         from google.genai import types
@@ -668,6 +749,7 @@ class GenaiLiveTransport:  # pragma: no cover - needs owner's key + network
 
         await self._session.send_realtime_input(
             audio=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000"))
+        self._audio_frames_sent += 1
 
     async def activity_end(self) -> None:
         from google.genai import types
@@ -684,5 +766,8 @@ class GenaiLiveTransport:  # pragma: no cover - needs owner's key + network
     async def close(self) -> None:
         if self._receiver:
             self._receiver.cancel()
-        if self._context is not None:
-            await self._context.__aexit__(None, None, None)
+            await asyncio.gather(self._receiver, return_exceptions=True)
+            self._receiver = None
+        context, self._context = self._context, None
+        if context is not None:
+            await context.__aexit__(None, None, None)

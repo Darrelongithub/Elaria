@@ -1276,3 +1276,25 @@ running the documented command chain).
   `running: false` snapshot but exits 1 (service-down signal), so `&&` skips
   `cost` — the command you most want when the daemon is down.
 - **Expected:** the documented command always shows cost.
+
+## BUG 6f — Residual dictation latency and startup speaker self-capture (2026-10-20)
+
+- **Severity:** wrong-action / record contamination, with avoidable batch latency.
+- **Status:** fixed with offline protocol/audio-state regressions; owner hardware
+  recheck remains outstanding (see `change.md`).
+- **Repro:** `tests/test_bug6f_live_final_and_startup_ack.py`; the initial run
+  against the old code was **12 failed, 1 passed**. The fixtures send 356 speech
+  frames and the transcription-only model's committed `input_transcription`
+  without `finished`/`turn_complete`, and play a queued ack while capture is open.
+- **Expected:** committed Live input is saved directly without the final timeout
+  or batch call; opening ack and speaker-tail frames reach neither Live uplink
+  nor saved WAV, so inbox/clipboard contain only the user's sentence.
+- **Was:** parser required an optional `finished=True` and ignored the separate
+  interim envelope; ack playback bypassed the daemon speaking-state guard.
+  Live consequently fell back despite valid committed text, while both the Live
+  and saved-WAV paths could prepend `On it.` to the record.
+- **Fix:** model-aware input-envelope normalization, continued SDK receive across
+  model turns, final-wait re-arming for the released activity, privacy-safe
+  receive diagnostics, and a synchronous ack gate reservation held through actual
+  playback plus the 400 ms tail guard. Genuine failures retain 6e's bounded WAV
+  recovery and durable capture stats; speculative/output text is not a final.
