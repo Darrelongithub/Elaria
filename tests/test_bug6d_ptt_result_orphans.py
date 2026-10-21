@@ -47,7 +47,7 @@ from pathlib import Path
 
 import pytest
 
-from assistant.ipc import DaemonUnavailable, call
+from assistant.ipc import DaemonOutcomeUnknown, call
 from assistant.transcribe import SessionResult
 
 REPO = Path(__file__).resolve().parents[1]
@@ -317,7 +317,7 @@ def test_call_is_bounded_by_total_deadline_while_events_trickle(tmp_path):
     thread.start()
     try:
         began = time.monotonic()
-        with pytest.raises(DaemonUnavailable):
+        with pytest.raises(DaemonOutcomeUnknown):
             call(sock_path, "ptt.result", {"session_id": "x", "wait_s": 60.0},
                  timeout=1.0)
         elapsed = time.monotonic() - began

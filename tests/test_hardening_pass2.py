@@ -27,7 +27,7 @@ from assistant.config import (
 )
 from assistant.daemon import Daemon
 from assistant.initiative import InitiativeService, NeedinessError, ensure_not_needy
-from assistant.ipc import DaemonUnavailable, call, serve, subscribe_events
+from assistant.ipc import DaemonOutcomeUnknown, call, serve, subscribe_events
 from assistant.showoff import ShowoffService
 from assistant.store import Store
 from assistant.tts import SpeechService
@@ -413,11 +413,19 @@ def test_ipc_serve_reclaims_stale_lock(tmp_path: Path):
 # --------------------------------------------------------------------------
 
 
-def test_ipc_call_malformed_reply_is_daemon_unavailable(tmp_path: Path):
+def test_ipc_call_malformed_reply_has_unknown_outcome_after_send(tmp_path: Path):
     path = tmp_path / "fake.sock"
     _fake_server(path, reply=b"{not json}\n")
-    with pytest.raises(DaemonUnavailable, match="malformed"):
+    with pytest.raises(DaemonOutcomeUnknown, match="may have processed"):
         call(path, "ping", timeout=2.0)
+
+
+def test_ipc_call_empty_reply_after_send_has_unknown_outcome(tmp_path: Path):
+    path = tmp_path / "empty.sock"
+    thread = _fake_server(path, reply=b"")
+    with pytest.raises(DaemonOutcomeUnknown, match="closed without replying"):
+        call(path, "queue.enqueue_external", {"action": "download"}, timeout=2.0)
+    thread.join(timeout=2.0)
 
 
 def test_subscribe_events_skips_malformed_lines(tmp_path: Path):

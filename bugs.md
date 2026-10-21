@@ -1606,6 +1606,16 @@ running the documented command chain).
 - **Verifier:** `.venv/bin/pytest -q tests/test_bug_record_elaria_samples.py tests/test_wake_knock_package.py` — **50 passed**; `.venv/bin/ruff check scripts/record_elaria_samples.py tests/test_bug_record_elaria_samples.py` and `git diff --check` passed. Real `pw-record`/PipeWire behavior was not tested.
 - **Fix:** validate bucket names and root containment; refuse symlinks; use UUID filenames and reject existing capture destinations; validate positive finite recording parameters and a finite `[0, 1]` eval fraction; move with a no-overwrite same-filesystem link/unlink; enforce the one-shot `.frozen` marker; update the manifest atomically; roll back pre-commit failures and keep an in-progress marker if recovery may be incomplete. Cross-filesystem splits fail safely instead of falling back to an overwriting move.
 
+### BH-K35 — IPC timeout after dispatch triggered a duplicate local enqueue
+
+- **Severity:** wrong-action (a duplicate external job can be approved and executed twice)
+- **Status:** fixed in this pass
+- **Invariant (prose / I1):** each CLI request causes at most one durable side effect; local fallback is allowed only when the daemon request was never sent.
+- **Root cause:** `ipc.call()` translated all socket `OSError`s and malformed/empty replies into `DaemonUnavailable`, even after `sendall()`. `_queue_command()` interpreted that as safe daemon absence and enqueued the same external action in the local SQLite store although the daemon had already committed it.
+- **Repro:** `tests/test_bug_queue_timeout_duplicate.py::test_bug_queue_timeout_after_commit_does_not_enqueue_again` uses the real Unix-socket server and real `CloudQueue`: the daemon commits the job, delays the reply 300 ms, and the client deadline is 50 ms. Before the fix the CLI returned success with **two** matching durable `external_action` rows. After the fix it returns 1, explains that the result is unknown and not retried, and leaves exactly one row. `tests/test_hardening_pass2.py` also proves malformed and empty replies after send are outcome-unknown; the missing-socket and offline-queue tests prove definite pre-send unavailability still uses the local fallback.
+- **Verifier:** `.venv/bin/pytest -q tests/test_bug_queue_timeout_duplicate.py tests/test_hardening_pass2.py tests/test_bughunt_k_error_surfacing.py tests/test_bug6d_ptt_result_orphans.py tests/test_phase8_offline_voice.py` — **70 passed**. Full Ruff and `git diff --check` passed.
+- **Fix:** `DaemonUnavailable` now means the request was not sent; `DaemonOutcomeUnknown` means sending may have begun but no authoritative reply arrived. The latter is not caught by local fallback handlers. Queue and knock commands report the ambiguity without replaying. A valid `ok: false` still remains an authoritative `DaemonError`.
+
 ## SUSPECTS from the 2026-10-21 hunt — unproven, NOT fixed (evidence + settling check in BUGHUNT-2026-10-21.md)
 
 - **S1** Live model ids exist for the owner's key → `assist voice models`.

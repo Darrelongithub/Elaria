@@ -30,7 +30,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import load_config, load_humour_profile
-from .ipc import DaemonError, DaemonUnavailable, call
+from .ipc import DaemonError, DaemonOutcomeUnknown, DaemonUnavailable, call
 
 # BH-K8: total time `assist plan build` will poll a daemon build before
 # concluding the plan row is stuck (e.g. daemon restarted mid-build).
@@ -737,6 +737,10 @@ def _knock_command(args, config) -> int:
             out = call(config.socket_path, f"knock.{action}", params,
                        timeout=30.0 if action in ("accept", "raise", "due")
                        else 10.0)
+        except DaemonOutcomeUnknown as exc:
+            print(f"assist knock {action}: outcome unknown; not retried locally: {exc}",
+                  file=sys.stderr)
+            return 1
         except DaemonUnavailable:
             out = None  # local fallback below
         except Exception as exc:  # a daemon refusal is an answer (BH-K12)
@@ -1213,6 +1217,10 @@ def _queue_command(args, config) -> int:
             out = call(config.socket_path, "queue.enqueue_external",
                        {"action": args.action_name, "description": args.description},
                        timeout=15.0)
+    except DaemonOutcomeUnknown as exc:
+        print(f"queue: daemon may have applied the request; not retried locally: {exc}",
+              file=sys.stderr)
+        return 1
     except DaemonUnavailable:
         from .gemini_client import GeminiClient
         from .modes import ModeManager
