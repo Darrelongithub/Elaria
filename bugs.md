@@ -1559,3 +1559,21 @@ running the documented command chain).
 - **Was:** `int(params.get("id"))` / `int(params["item_id"])` / `int(params["job_id"])` raised TypeError/KeyError, which the IPC layer stringified verbatim ("TypeError: int() argument must be…").
 - **Fix:** `daemon._int_param()` coerces with a named ValueError at the knock, review, queue-approve and knock-raise commitment sites.
 
+### BH-K30 — Plan-build tasks leaked; early build failures stranded plans at 'building'
+
+- **Severity:** wrong-output + unbounded growth (minor)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_plan_tasks.py`
+- **Expected:** finished build tasks are forgotten; a failed build's plan row says `failed` with the error.
+- **Was:** `_plan_tasks` only ever grew. And while `Organiser.build_plan` marks its own failures, a failure before its try (invalid root mode) or after it (tier enqueue) left the daemon-reserved row at 'building' forever — `plan.show` reported a build that would never end.
+- **Fix:** done-callback prunes the task; `_run`'s failure path marks a still-'building' plan failed via `finish_plan(error=…)`.
+
+### BH-K31 — `status` silently swallowed its last-capture diagnostics failure
+
+- **Severity:** cosmetic/diagnostics (silent discard)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_status_surface.py`
+- **Expected:** a broken capture-stats read is visible in the status payload.
+- **Was:** `except Exception: last_capture = None` — indistinguishable from "no capture session ever ran", hiding the failure exactly when capture debugging needs it.
+- **Fix:** `last_capture = {"error": …}`; the aggregator stays up, the hole is labelled. Also in this commit: removed a fully-shadowed dead `is_user` assignment in `GeminiClient._call_once` (every branch below it reassigned before use; quota attribution unchanged, pinned by existing tests) and the unused `_WAKE_BOUNDARY` regex in `hotword.py` (zero references repo-wide).
+
