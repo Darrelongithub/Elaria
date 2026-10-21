@@ -1627,6 +1627,16 @@ running the documented command chain).
 - **Verifier:** `.venv/bin/pytest -q tests/test_bug_generate_worker_cancellation.py tests/test_hotword_and_reply_delivery.py tests/test_disclosure.py tests/test_fixtures_and_harness.py tests/test_bughunt_k_quota.py` — **75 passed**; full `.venv/bin/ruff check .` and `git diff --check` passed. Installed `google-genai==2.0.0` locally and verified `_SdkTransport`'s SDK streaming method is a coroutine; no Gemini key/network call was made.
 - **Hardware check (UNVERIFIED):** after installing the live extra and restarting the owner daemon, run the forced-deadline probe recorded in `BUGHUNT-ARENA-2026-10-21.md`; it requires the owner's valid key and checks the real SDK stream cancels with no remaining `_background_tasks`.
 
+### BH-K37 — `ptt.result` accepted infinite wait budgets and orphaned handlers
+
+- **Severity:** unbounded wait / daemon handler leak (I3 total-deadline violation)
+- **Status:** fixed in this pass
+- **Invariant (prose / I3):** a request-supplied PTT wait budget is finite and bounded; untrusted `Infinity`, NaN, negative, or oversized values cannot create a handler that outlives its deadline.
+- **Root cause:** `float(params.get("wait_s") or 0)` accepted `Infinity`; `_ptt_wait_for()` then built an infinite deadline and awaited an event with no expiry. The IPC server awaits each handler inline and does not notice a client disconnect until the handler returns.
+- **Red repro:** `tests/test_bug_ptt_infinite_wait.py` sends `ptt.result` over a real Unix socket with `wait_s=float("inf")` and a 1 s client deadline. Before the fix, the request ended as `DaemonOutcomeUnknown` rather than an immediate refusal, and the instrumented daemon-side waiter remained pending after the client timed out. The same regression now covers `ptt.stop`.
+- **Fix:** `_ptt_wait_budget()` rejects booleans, parse failures, non-finite, negative, and greater-than-90-second budgets. Both `ptt.result` and `ptt.stop` use it; `ptt.stop` validates before emitting an ack or changing session state. The 90-second cap matches the existing CLI's largest explicit wait and does not widen it.
+- **Verifier:** `.venv/bin/pytest -q tests/test_bug_ptt_infinite_wait.py tests/test_bug6d_ptt_result_orphans.py tests/test_phase2_surfaces.py tests/test_phase1_dictation.py tests/test_phase8_offline_voice.py tests/test_bug6_live_duplex_and_stop.py` — **90 passed**. No audio hardware or Gemini key/network was involved.
+
 ## SUSPECTS from the 2026-10-21 hunt — unproven, NOT fixed (evidence + settling check in BUGHUNT-2026-10-21.md)
 
 - **S1** Live model ids exist for the owner's key → `assist voice models`.

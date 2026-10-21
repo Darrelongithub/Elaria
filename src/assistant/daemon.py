@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 import signal
 import socket as socket_mod
@@ -58,6 +59,8 @@ from .showoff import ShowoffError, ShowoffService
 from .store import Store
 from .transcribe import DictationService
 from .tts import STANDARD_ACKS, SpeechResult, SpeechService
+
+MAX_PTT_WAIT_S = 90.0
 
 
 class ChatTimeout(TimeoutError):
@@ -1470,6 +1473,28 @@ class Daemon:
                                       or "default"),
                 "connectivity": connectivity.as_dict()}
 
+    @staticmethod
+    def _ptt_wait_budget(params: dict) -> float:
+        """Validate the caller's optional PTT wait before allocating a waiter."""
+        raw = params.get("wait_s", 0)
+        if raw is None:
+            return 0.0
+        if isinstance(raw, bool):
+            raise TypeError("parameter 'wait_s' must be a finite number of seconds")
+        try:
+            wait_s = float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "parameter 'wait_s' must be a finite number of seconds") from exc
+        if not math.isfinite(wait_s):
+            raise ValueError("parameter 'wait_s' must be finite")
+        if wait_s < 0:
+            raise ValueError("parameter 'wait_s' must be non-negative")
+        if wait_s > MAX_PTT_WAIT_S:
+            raise ValueError(
+                f"parameter 'wait_s' must not exceed {MAX_PTT_WAIT_S:g} seconds")
+        return wait_s
+
     async def _ptt_stop(self, params: dict) -> dict:
         """Release: acknowledge in-process, finish the session in the background.
 
@@ -1486,6 +1511,7 @@ class Daemon:
         open for a moment, more of her own audio to transcribe. `speak=False`
         also means the reply cannot wait on the boot-time ack cache warm.
         """
+        wait_s = self._ptt_wait_budget(params)
         self._ptt_log("ptt.stop.received", session_id=str(self._ptt_session_id or ""))
         ack = await self._ack({"kind": "on_it", "speak": False})
         task = self._dictation_task
@@ -1532,7 +1558,6 @@ class Daemon:
                     "connectivity": self.mode_manager.status(refresh=False).as_dict()}
         # Explicit opt-in for scripts/tests that want the old one-shot shape.
         # The hotkey path never sets it; nothing here waits by default.
-        wait_s = float(params.get("wait_s") or 0)
         if wait_s > 0:
             # BUG 6c/6d: bounded wait for THIS session's terminal answer —
             # the real result, a fail-fast dead capture, or an explicit
@@ -1923,7 +1948,7 @@ class Daemon:
         requested = params.get("session_id") or None
         if requested is None:
             requested = self._ptt_session_id or self._ptt_last_session_id
-        wait_s = float(params.get("wait_s") or 0)
+        wait_s = self._ptt_wait_budget(params)
         answer = None
         if requested is not None and wait_s > 0:
             answer = await self._ptt_wait_for(requested, wait_s)
