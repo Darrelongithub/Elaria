@@ -1596,6 +1596,16 @@ running the documented command chain).
 - **Verifier:** `pytest -q tests/test_bug_meeting_raw_collision.py tests/test_bug_meeting_stop_failure.py tests/test_phase6_meeting.py tests/test_bughunt_k_config.py tests/test_bughunt_systems.py -k meeting` — **14 passed, 60 deselected**; Ruff on touched Python files passed.
 - **Fix:** assign a UUID to each meeting at start, include it in the raw WAV names, track processing session IDs in a set, recompute global mode from active capture/processing state, and restore mode/apply parked switches in `finally` on success or failure.
 
+### BH-K34 — Sample capture and eval splitting could escape or corrupt the dataset
+
+- **Severity:** data-loss (out-of-root writes, take replacement, or a changed/stale eval split); wrong-action for invalid capture arguments reported as success
+- **Status:** fixed in this pass
+- **Invariant (prose):** captured WAVs stay beneath the selected sample root; existing samples are never replaced; a frozen eval split, its files, and manifest paths agree and cannot silently change; invalid recording requests do not reach capture or report success.
+- **Root cause:** bucket text was inserted into filesystem paths without component validation; second-resolution filenames plus per-invocation indices collided across commands; `Path.rename()` could replace an existing eval file; bucket/manifest symlinks were followed; `freeze_eval()` clamped fractions, allowed repeated runs, and did not update manifest paths; `takes` and `seconds` were not validated.
+- **Repros:** `tests/test_bug_record_elaria_samples.py` covers bucket traversal, same-second replacement, invalid counts/durations, manifest symlink refusal, symlinked train/eval buckets, destination collision, zero/out-of-range/non-finite fractions, stale manifest paths, repeat freeze, partial-move rollback, manifest-write rollback, and retention of an in-progress marker when recovery is uncertain. The first red run failed on bucket escape, symlink traversal, eval overwrite, fraction-zero movement, and stale manifest; the second red run failed on bucket escape, same-second replacement, and invalid capture arguments. The Phase 0 fraction-2 probe moved every take. Existing coverage is in `tests/test_wake_knock_package.py`.
+- **Verifier:** `.venv/bin/pytest -q tests/test_bug_record_elaria_samples.py tests/test_wake_knock_package.py` — **50 passed**; `.venv/bin/ruff check scripts/record_elaria_samples.py tests/test_bug_record_elaria_samples.py` and `git diff --check` passed. Real `pw-record`/PipeWire behavior was not tested.
+- **Fix:** validate bucket names and root containment; refuse symlinks; use UUID filenames and reject existing capture destinations; validate positive finite recording parameters and a finite `[0, 1]` eval fraction; move with a no-overwrite same-filesystem link/unlink; enforce the one-shot `.frozen` marker; update the manifest atomically; roll back pre-commit failures and keep an in-progress marker if recovery may be incomplete. Cross-filesystem splits fail safely instead of falling back to an overwriting move.
+
 ## SUSPECTS from the 2026-10-21 hunt — unproven, NOT fixed (evidence + settling check in BUGHUNT-2026-10-21.md)
 
 - **S1** Live model ids exist for the owner's key → `assist voice models`.
