@@ -1496,3 +1496,12 @@ running the documented command chain).
 - **Was:** only the flat `flash_rpm`/`flash_lite_rpm` fed the limiter and only a global 1200/day cap existed. The 21st flash call of the day went out, earned a 429, and burned backoff time before failing opaquely. Also latent: `PerModelLimiter` clamped rpm to `max(1, …)`, so a configured `0` ("not rate-limited", per the config comments) meant 1/minute.
 - **Fix:** `quota_family()` maps model ids to quota rows; `rpm_for` takes the stricter of structured vs flat (0/unlimited in a row disables the limiter for that model, which now honours ≤0); `_check_daily_cap(model)` additionally enforces the family's RPD from the ledger with a clear `QuotaExhausted`; `validate_config` warns when flat and structured values disagree.
 
+### BH-K23 — Keyword spotter scored a single 30 ms frame, not a window
+
+- **Severity:** dead-hardware-path (acoustic arming could never fire with a real model)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_keyword_window.py`
+- **Expected:** `score_window` receives a trailing window of audio (the ring exists precisely to hold it).
+- **Was:** `WakeGuard.feed()` passed the single 30 ms frame just received. No keyword model recognises a phrase in 30 ms; the energy test model masked it because RMS works on any length.
+- **Fix:** `feed()` scores the trailing `[hotword] keyword_window_s` (default 1.0 s, validated 0.1–2.0) slice of the pre-wake ring, ending with the frame just fed.
+
