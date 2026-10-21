@@ -715,3 +715,89 @@ second-daemon exit, and the two CLI message helpers).
   on|off|status knock status|list|accept|raise showoff status|exit|demo
   memory|forget console --json verify mode auto taxonomy suggest transcribe
   ask ptt start`, plus the new `forget`/`knock raise` messages.
+
+## 2026-10-20 — BUG 6f: Live final-envelope parsing + startup ack self-capture
+
+Owner hardware report after 6e: saved-WAV fallback now saves the transcript,
+updates inbox/clipboard and populates `last_capture`, but every session logs
+`transcript_final_wait_timeout -> live_no_final`; the opening speaker ack is
+also prepended to the user's words.
+
+### Cause and fix
+
+- `live_client.py`: the default `gemini-3.5-transcribe-live` protocol separates
+  **speculative** `interim_input_transcription` from **committed**
+  `input_transcription`. The old parser ignored the first field and required
+  `input_transcription.finished=True` for the second. That flag is optional;
+  this transcription-only model does not need a model `turn_complete` either.
+  Thus valid committed text was classified as an interim and discarded by
+  `_final_texts`, forcing 6e's batch path. The parser now handles the two
+  envelopes explicitly (including model resource prefixes / preview suffixes).
+  This matches Google's [transcription-only protocol example](https://github.com/google-gemini/jot-gemini-transcribe-macOS/blob/main/JotCore/Sources/TranscriptionClient/Live/LiveProtocol.swift).
+- Conversational Live models retain different semantics: their
+  `input_transcription` text fragments are accumulated and only committed on
+  `finished` (including a textless marker) or a real `turn_complete`. Neither
+  arbitrary interims nor model/output text are promoted on timeout.
+- SDK `session.receive()` is scoped to a model turn, not the whole connection.
+  The receive worker re-enters it to read later input transcription, does not
+  treat a model-turn marker as a transcription-only final, and surfaces an
+  empty receive/EOF as an error rather than silently abandoning `events()`.
+  Closing the transport now awaits the cancelled receive worker.
+- `transcribe.py`: the activity-end wait is re-armed **before** sending
+  `activity_end`, so a prefix committed while recording cannot skip waiting for
+  the tail. A missing tail or receive error still tries the bounded WAV
+  fallback, preserving already-committed text if that recovery also fails.
+  Genuine no-final/close timeouts and 6e's durable capture diagnostics remain.
+- New `dictate.live_receive_summary` lifecycle record: normalized event counts,
+  actual audio frames sent, response-envelope counts, model, SDK version and
+  receive-worker status. It contains **no transcript text or audio** and is
+  logged for both successful and unsuccessful final waits.
+- `daemon.py`: `_ack` previously scheduled `speech.play_ack` directly, without
+  `_set_speaking`, so neither `_MutedCapture` nor Live's external playback probe
+  knew the speakers were active. Cached opening acks and in-session check-ins
+  now share `_queue_ack_playback`: reserve the gate synchronously before
+  queueing, hold it for the actual playback worker's lifetime (even beyond a
+  duration estimate or cancellation of its waiter), then retain the 400 ms
+  speaker-tail guard. Acks stay fire-and-forget; release stays silent. Frames
+  heard during the ack/guard reach neither Live nor the WAV/batch path. This is
+  audio gating, not deleting matching words from the user's transcript.
+
+### Verification
+
+- Added `tests/test_bug6f_live_final_and_startup_ack.py`: **24 offline cases**.
+  The first 13 cases were run against the old code: **12 failed, 1 passed**,
+  including both observed state defects (batch fallback despite a committed
+  envelope, and `On it.` prepended via Live and saved-WAV ASR). Added edge pins
+  cover same-message preview/final, delayed final after a model turn, deltas /
+  empty markers, preview-only fallback, early segment plus delayed/missing tail,
+  receive EOF/error, output-text isolation, cancelled/failed ack playback,
+  suppressed acks, and the cached check-in path.
+- Real `google-genai 2.31.0` offline schema smoke: camelCase wire payload with
+  `interimInputTranscription` + `inputTranscription` decodes and produces interim
+  + final with `finished=None`, without contacting the API.
+- Full suite: **1,417 passed, 6 skipped**. `ruff check .`: **All checks passed**.
+  `git diff --check`: clean.
+- No real Gemini call, microphone, or speakers were available for verification;
+  this is a protocol-shaped offline reproduction, **not a claim of a new
+  hardware pass**.
+
+### Owner hardware recheck
+
+After installing this checkout and restarting the daemon:
+
+```sh
+systemctl --user restart assistant.service
+assist dictate
+assist status
+assist events --recent 120 --kind dictate.lifecycle
+```
+
+Use speakers (not headphones), let the opening ack finish, then dictate a new
+sentence and release. Check that the transcript/inbox/clipboard contain only
+that sentence and the WAV starts with the user's audio. For the same session,
+expect `dictate.live_receive_summary.event_counts.final >= 1`, a nonzero
+`transport.audio_frames_sent`, and no `dictate.transcript_final_wait_timeout`,
+`dictate.live_no_final` or `dictate.saved_wav_fallback_start` on a healthy Live
+response. Keep checking `last_capture` for the real mic node/bytes/peak. If Live
+still stalls, the summary now distinguishes "no input envelope received" from
+"input received but no commit", and reports the exact SDK/model in use.
