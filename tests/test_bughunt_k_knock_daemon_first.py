@@ -24,7 +24,6 @@ with the daemon process.
 from __future__ import annotations
 
 from assistant.cli import _initiative, main
-from assistant.ipc import call
 
 REASON = "While filing, I noticed the Q3 invoice is still unsorted."
 
@@ -70,7 +69,6 @@ def test_wake_knock_accept_refuses_without_the_daemon(config, capsys):
     assert rc == 2
     err = capsys.readouterr().err
     assert "wake" in err.lower() and "daemon" in err.lower(), err
-    knock = call  # (import used by other tests' shape; silence linters)
     service, store, owned = _initiative(config)
     try:
         assert service.get(knock_id)["status"] == "pending"
