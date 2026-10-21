@@ -2426,14 +2426,15 @@ class Daemon:
 
         BUG F / Bug 8 (2026-10-20): the old single 4 s total bound cancelled
         the `asyncio.to_thread(...)` await — which does NOT stop the worker
-        thread. The generation ran to success, hit the cost ledger, and its
-        text was discarded for a canned reply. Deadlines are split now:
+        thread. Live chat now uses the SDK's native async HTTP stream, which is
+        cancelled at the total deadline; only finite fixture/legacy transports
+        retain the thread-backed compatibility path. Deadlines are split:
 
         * first-token deadline — a transport that has produced NOTHING by
           then is dead (streaming transports signal `on_first_token`; a
           non-streaming double counts only its completion as progress);
-        * generous total bound — a generation that started is awaited to
-          completion and delivered verbatim.
+        * total bound — a generation that finishes in time is delivered
+          verbatim; an unfinished live async request is cancelled at the bound.
 
         BUG 8b (2026-10-20 hardware): the real SDK transport never fires
         mid-generation, so the first-token deadline acted as a hard 5s total
@@ -2449,6 +2450,7 @@ class Daemon:
         first_token_s = min(float(self._chat_first_token_s),
                             float(self._chat_timeout_s))
         total_s = float(self._chat_timeout_s)
+        deadline = time.monotonic() + total_s
         first_token = asyncio.Event()
         signalled = {"done": False}
 
@@ -2476,6 +2478,23 @@ class Daemon:
                         raise
             raise AssertionError("unreachable")  # pragma: no cover
 
+        async_generate = getattr(self.client, "generate_async", None)
+        async_support = getattr(self.client, "supports_cancellable_async", None)
+        use_async = callable(async_generate) and async_support is not False
+
+        async def run_async():
+            # The live SDK path is natively async: cancelling it closes the
+            # request instead of abandoning a synchronous worker thread.
+            attempts = ({**full_kwargs, "deadline": deadline}, full_kwargs,
+                        base_kwargs, {"gen_config": gen_config}, {})
+            for i, kwargs in enumerate(attempts):
+                try:
+                    return await async_generate("chat", prompt, **kwargs)
+                except TypeError as exc:
+                    if "unexpected keyword" not in str(exc) or i == len(attempts) - 1:
+                        raise
+            raise AssertionError("unreachable")  # pragma: no cover
+
         abandoned = {"flag": False, "reason": "first_token"}
 
         def _late_completion(done_task: asyncio.Task) -> None:
@@ -2494,37 +2513,48 @@ class Daemon:
                 original_len=len(text), replacement="",
                 turn=prompt[-60:])
 
-        task = self._track_task(asyncio.ensure_future(asyncio.to_thread(run)))
+        generation = run_async() if use_async else asyncio.to_thread(run)
+        task = self._track_task(asyncio.ensure_future(generation))
         task.add_done_callback(_late_completion)
+
+        async def _await_generation(timeout: float):
+            awaited = task if use_async else asyncio.shield(task)
+            result = await asyncio.wait_for(awaited, timeout=timeout)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("chat total deadline expired")
+            return result
+
         progress = asyncio.ensure_future(first_token.wait())
         try:
             done, _pending = await asyncio.wait(
                 {task, progress}, timeout=first_token_s,
                 return_when=asyncio.FIRST_COMPLETED)
             if task in done:
+                if time.monotonic() >= deadline:
+                    abandoned["flag"] = True
+                    abandoned["reason"] = "total"
+                    raise ChatTimeout("total", total_s)
                 return task.result()      # success: delivered verbatim
             if progress in done:
                 # Streaming: first token arrived within deadline — generous total.
-                remaining = max(0.0, total_s - first_token_s)
+                remaining = max(0.0, deadline - time.monotonic())
                 try:
-                    return await asyncio.wait_for(asyncio.shield(task),
-                                                  timeout=remaining)
+                    return await _await_generation(remaining)
                 except TimeoutError as exc:
                     abandoned["flag"] = True
                     abandoned["reason"] = "total"
                     raise ChatTimeout("total", total_s) from exc
             # Neither completed nor signaled within first-token deadline.
-            # For blocking transports (real SDK on hardware) this is NOT failure:
-            # the generation may still complete within the total bound and must
-            # be DELIVERED (marked late, not substituted) — BUG 8b.
-            remaining = max(0.0, total_s - first_token_s)
+            # A legacy non-streaming transport is not dead just because it
+            # missed the first-token threshold: it may still finish inside the
+            # total bound and must be DELIVERED (marked late, not substituted).
+            remaining = max(0.0, deadline - time.monotonic())
             if remaining <= 0:
                 abandoned["flag"] = True
                 abandoned["reason"] = "first_token"
                 raise ChatTimeout("first_token", first_token_s)
             try:
-                result = await asyncio.wait_for(asyncio.shield(task),
-                                                timeout=remaining)
+                result = await _await_generation(remaining)
                 # Delivered late but within total — mark late, don't substitute.
                 try:
                     text = getattr(result, "text", "") or ""
@@ -2547,6 +2577,11 @@ class Daemon:
             if not progress.done():
                 progress.cancel()
                 await asyncio.gather(progress, return_exceptions=True)
+            if use_async and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            if task.done():
+                self._background_tasks.discard(task)
 
     async def _ask(self, params: dict) -> dict:
         """Conversational turn on the §13.4 ladder: governor (local) →

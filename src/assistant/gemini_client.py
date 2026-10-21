@@ -155,6 +155,23 @@ class _SdkTransport:
                 "`uv sync --extra live` (or pip install 'assistant[live]'). "
                 "Until then GEMINI_MODE=mock works fully offline."
             ) from exc
+        from importlib import metadata
+
+        try:
+            sdk_version = metadata.version("google-genai")
+            sdk_major = int(sdk_version.split(".", 1)[0])
+        except (metadata.PackageNotFoundError, ValueError) as exc:
+            raise RuntimeError(
+                "live chat needs google-genai>=2.0.0 for cancellable async "
+                "requests; run `uv sync --extra live` (or pip install -U "
+                "'assistant[live]')."
+            ) from exc
+        if sdk_major < 2:
+            raise RuntimeError(
+                f"live chat needs google-genai>=2.0.0 for cancellable async "
+                f"requests (found {sdk_version}); upgrade with `uv sync "
+                f"--extra live` (or pip install -U 'assistant[live]')."
+            )
         self._client = genai.Client(api_key=api_key)
 
     def generate(self, model: str, contents, config: dict,
@@ -188,6 +205,54 @@ class _SdkTransport:
         usage = getattr(response, "usage_metadata", None)
         return {
             "text": response.text or "",
+            "usage": {
+                "tokens_in": getattr(usage, "prompt_token_count", 0) or 0,
+                "tokens_out": getattr(usage, "candidates_token_count", 0) or 0,
+            },
+        }
+
+    async def generate_async(self, model: str, contents, config: dict,
+                             on_first_token: Callable[[], None] | None = None,
+                             deadline: float | None = None) -> dict:
+        """Stream chat on the SDK's native async HTTP transport.
+
+        The SDK's 1.x async facade delegated requests to ``asyncio.to_thread``;
+        cancelling it still left the synchronous request running. The live
+        extra therefore requires the 2.x async HTTP implementation, and this
+        path passes the remaining wall-clock budget as the request timeout too.
+        """
+        request_config = dict(config or {})
+        if deadline is not None:
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            options = request_config.get("http_options") or {}
+            if not isinstance(options, dict):
+                dump = getattr(options, "model_dump", None)
+                options = dump() if callable(dump) else {
+                    "timeout": getattr(options, "timeout", None)}
+            else:
+                options = dict(options)
+            existing_timeout = options.get("timeout")
+            if isinstance(existing_timeout, (int, float)) and existing_timeout > 0:
+                remaining_ms = min(remaining_ms, int(existing_timeout))
+            options["timeout"] = remaining_ms
+            request_config["http_options"] = options
+
+        stream = await self._client.aio.models.generate_content_stream(
+            model=model, contents=contents, config=request_config or None)
+        chunks: list[str] = []
+        usage = None
+        saw_text = False
+        async for chunk in stream:
+            text = getattr(chunk, "text", "") or ""
+            if text and not saw_text:
+                if on_first_token is not None:
+                    on_first_token()
+                saw_text = True
+            chunks.append(text)
+            if getattr(chunk, "usage_metadata", None) is not None:
+                usage = chunk.usage_metadata
+        return {
+            "text": "".join(chunks),
             "usage": {
                 "tokens_in": getattr(usage, "prompt_token_count", 0) or 0,
                 "tokens_out": getattr(usage, "candidates_token_count", 0) or 0,
@@ -328,25 +393,54 @@ class PerModelLimiter:
         self._rpm = rpm_by_model
         self._window = window_s
         self._stamps: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
 
     def acquire(self, model: str, *, sleep: Callable[[float], None] = time.sleep,
                 now: Callable[[], float] = time.monotonic, max_wait_s: float = 65.0) -> None:
         limit = self._rpm(model)
         if limit <= 0:
             return  # config says not rate-limited (BH-K18; was max(1, ...) = 1/min!)
-        stamps = self._stamps.setdefault(model, deque())
         waited = 0.0
         while True:
-            current = now()
-            while stamps and current - stamps[0] > self._window:
-                stamps.popleft()
-            if len(stamps) < limit:
-                stamps.append(current)
-                return
-            wait = self._window - (current - stamps[0]) + 0.01
+            with self._lock:
+                current = now()
+                stamps = self._stamps.setdefault(model, deque())
+                while stamps and current - stamps[0] > self._window:
+                    stamps.popleft()
+                if len(stamps) < limit:
+                    stamps.append(current)
+                    return
+                wait = self._window - (current - stamps[0]) + 0.01
             if waited + wait > max_wait_s:
                 raise RateLimitError(f"local RPM limiter: {model} at {limit}/min — queued, not sent")
             sleep(wait)
+            waited += wait
+
+    async def acquire_async(self, model: str, *, deadline: float | None = None,
+                            max_wait_s: float = 65.0) -> None:
+        """Quota wait on the event loop, cancellable by the chat deadline."""
+        limit = self._rpm(model)
+        if limit <= 0:
+            return
+        waited = 0.0
+        while True:
+            with self._lock:
+                current = time.monotonic()
+                stamps = self._stamps.setdefault(model, deque())
+                while stamps and current - stamps[0] > self._window:
+                    stamps.popleft()
+                if len(stamps) < limit:
+                    stamps.append(current)
+                    return
+                wait = self._window - (current - stamps[0]) + 0.01
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("chat deadline expired while waiting for model quota")
+                wait = min(wait, remaining)
+            if waited + wait > max_wait_s:
+                raise RateLimitError(f"local RPM limiter: {model} at {limit}/min — queued, not sent")
+            await asyncio.sleep(wait)
             waited += wait
 
 
@@ -457,6 +551,86 @@ class GeminiClient:
         if error:
             raise RuntimeError(error)
         return response
+
+    @property
+    def supports_cancellable_async(self) -> bool:
+        """Whether raw chat calls use a genuinely async transport."""
+        return callable(getattr(self._transport, "generate_async", None))
+
+    async def _call_once_async(self, role: str, model: str, contents,
+                               gen_config: dict, *, correlation_id: str,
+                               attempt: int, audio_seconds: float = 0.0,
+                               purpose: str | None = None,
+                               is_user_turn: bool | None = None,
+                               on_first_token: Callable[[], None] | None = None,
+                               deadline: float | None = None) -> dict:
+        key = fixture_key(model, contents, gen_config)
+        request = {"model": model, "contents": contents, "config": gen_config}
+        started = time.monotonic()
+        response: dict | None = None
+        error: str | None = None
+        original_error: Exception | None = None
+        cancelled: asyncio.CancelledError | None = None
+        request_started = False
+        try:
+            if self.mode != "mock":
+                self._check_daily_cap(model)
+                await self._limiter.acquire_async(model, deadline=deadline)
+                request_started = True
+                response = await self._with_backoff_async(
+                    model, contents, gen_config, on_first_token,
+                    deadline=deadline)
+                if self.mode == "record":
+                    self._fixtures.record(key, request, response)
+            else:
+                request_started = True
+                response = await self._transport_generate_async(
+                    model, contents, gen_config, on_first_token,
+                    deadline=deadline)
+        except asyncio.CancelledError as exc:
+            if not request_started:
+                raise
+            error = "CancelledError: chat generation cancelled before completion"
+            cancelled = exc
+        except Exception as exc:  # ledger must see failures too (§3.2)
+            original_error = exc
+            error = f"{type(exc).__name__}: {exc}"
+            response = {"text": "", "usage": {"tokens_in": 0, "tokens_out": 0}}
+
+        latency_ms = (time.monotonic() - started) * 1000
+        usage = (response or {}).get("usage") or {}
+        tokens_in = int(usage.get("tokens_in") or 0)
+        tokens_out = int(usage.get("tokens_out") or 0)
+        estimated = 0
+        if not tokens_in and not tokens_out and error is None:
+            tokens_in = estimate_tokens(str(contents))
+            tokens_out = estimate_tokens((response or {}).get("text", ""))
+            estimated = 1
+        purpose_val = purpose or role
+        if purpose_val in ("user_turn", "user_chat"):
+            is_user = 1
+        elif purpose is not None and purpose.startswith("housekeeping"):
+            is_user = 0
+        elif is_user_turn is not None:
+            is_user = 1 if is_user_turn else 0
+        else:
+            is_user = 1 if role == "chat" and purpose_val == "user_turn" else 0
+        self.store.log_llm_call(
+            ts=iso_now(), correlation_id=correlation_id, role=role, model=model,
+            mode=self.mode, tokens_in=tokens_in, tokens_out=tokens_out,
+            tokens_estimated=estimated, audio_seconds=audio_seconds,
+            cost_usd=shadow_cost_usd(model, tokens_in, tokens_out, audio_seconds),
+            latency_ms=latency_ms, ok=0 if error else 1, verified=None,
+            attempt=attempt, fixture_key=key, error=error,
+            purpose=purpose_val, is_user_turn=is_user,
+        )
+        if cancelled is not None:
+            raise cancelled
+        if error:
+            if isinstance(original_error, TimeoutError):
+                raise original_error
+            raise RuntimeError(error)
+        return response or {"text": "", "usage": {}}
 
     def voice_request(self, text: str, *, voice: str | None = None) -> dict:
         """The exact request that would go out - inspectable without a network call.
@@ -667,6 +841,47 @@ class GeminiClient:
                 delay *= 2
         raise last  # pragma: no cover
 
+    async def _with_backoff_async(self, model: str, contents, gen_config: dict,
+                                  on_first_token: Callable[[], None] | None = None,
+                                  *, deadline: float | None = None) -> dict:
+        delay = 1.0
+        last: Exception | None = None
+        for try_no in range(4):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("chat deadline expired before SDK request")
+            try:
+                return await self._transport_generate_async(
+                    model, contents, gen_config, on_first_token,
+                    deadline=deadline)
+            except Exception as exc:
+                last = exc
+                if not _is_retryable(exc) or try_no == 3:
+                    raise
+                if deadline is None:
+                    await asyncio.sleep(delay)
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("chat deadline expired during SDK retry") from exc
+                    await asyncio.sleep(min(delay, remaining))
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("chat deadline expired during SDK retry") from exc
+                delay *= 2
+        raise last  # pragma: no cover
+
+    async def _transport_generate_async(
+            self, model: str, contents, gen_config: dict,
+            on_first_token: Callable[[], None] | None = None, *,
+            deadline: float | None = None) -> dict:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("chat deadline expired before SDK request")
+        generate_async = getattr(self._transport, "generate_async", None)
+        if not callable(generate_async):
+            raise TypeError("async chat selected without an async transport")
+        return await generate_async(
+            model, contents, gen_config, on_first_token=on_first_token,
+            deadline=deadline)
+
     def _transport_generate(self, model: str, contents, gen_config: dict,
                             on_first_token: Callable[[], None] | None = None) -> dict:
         """One transport round-trip; tolerates doubles without the streaming kwarg.
@@ -774,6 +989,65 @@ class GeminiClient:
                                      correlation_id, response.get("fixture"))
             failures_on_tier += 1
             # Retry with feedback, then climb a tier (§17.1).
+            prompt = (f"{contents}\n\n[Your previous answer failed verification. "
+                      f"Previous answer: {last_text[:400]}. Correct it.]")
+            if failures_on_tier >= self._escalate_after and tier < len(ladder) - 1:
+                tier += 1
+                failures_on_tier = 0
+        return HarnessResult(last_text, ladder[min(tier, len(ladder) - 1)],
+                             attempts, tier > 0, last_verified, correlation_id)
+
+    async def generate_async(self, role: str, contents, *,
+                             gen_config: dict | None = None,
+                             verify: Callable[[str], bool] | None = None,
+                             audio_seconds: float = 0.0,
+                             purpose: str | None = None,
+                             is_user_turn: bool | None = None,
+                             on_first_token: Callable[[], None] | None = None,
+                             max_attempts: int | None = None,
+                             deadline: float | None = None) -> HarnessResult:
+        """Async twin of ``generate`` for cancellable daemon chat turns."""
+        if not self.supports_cancellable_async:
+            raise RuntimeError("this Gemini transport has no cancellable async path")
+        gen_config = gen_config or {}
+        correlation_id = uuid.uuid4().hex[:12]
+        start_model = self.config.model_for_role(role)
+        if start_model in self._ladder:
+            ladder = self._ladder[self._ladder.index(start_model):]
+        else:
+            ladder = [start_model] + [m for m in self._ladder if m != start_model]
+        attempts = 0
+        failures_on_tier = 0
+        tier = 0
+        prompt = contents
+        last_text, last_verified = "", None
+        attempt_cap = self._max_scaffold if max_attempts is None else max(1, int(max_attempts))
+        while attempts < attempt_cap:
+            model = ladder[min(tier, len(ladder) - 1)]
+            attempts += 1
+            response = await self._call_once_async(
+                role, model, prompt, gen_config,
+                correlation_id=correlation_id, attempt=attempts,
+                audio_seconds=audio_seconds,
+                purpose=purpose or ("user_turn" if role == "chat" and is_user_turn else role),
+                is_user_turn=is_user_turn,
+                on_first_token=on_first_token, deadline=deadline,
+            )
+            last_text = response.get("text", "")
+            if verify is None:
+                return HarnessResult(last_text, model, attempts, tier > 0, None,
+                                     correlation_id, response.get("fixture"))
+            last_verified = bool(verify(last_text))
+            with self.store._lock:
+                self.store._conn.execute(
+                    "UPDATE llm_calls SET verified = ? WHERE correlation_id = ? AND attempt = ?",
+                    (1 if last_verified else 0, correlation_id, attempts),
+                )
+                self.store._conn.commit()
+            if last_verified:
+                return HarnessResult(last_text, model, attempts, tier > 0, True,
+                                     correlation_id, response.get("fixture"))
+            failures_on_tier += 1
             prompt = (f"{contents}\n\n[Your previous answer failed verification. "
                       f"Previous answer: {last_text[:400]}. Correct it.]")
             if failures_on_tier >= self._escalate_after and tier < len(ladder) - 1:

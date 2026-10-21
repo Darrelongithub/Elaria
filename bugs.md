@@ -1616,6 +1616,17 @@ running the documented command chain).
 - **Verifier:** `.venv/bin/pytest -q tests/test_bug_queue_timeout_duplicate.py tests/test_hardening_pass2.py tests/test_bughunt_k_error_surfacing.py tests/test_bug6d_ptt_result_orphans.py tests/test_phase8_offline_voice.py` — **70 passed**. Full Ruff and `git diff --check` passed.
 - **Fix:** `DaemonUnavailable` now means the request was not sent; `DaemonOutcomeUnknown` means sending may have begun but no authoritative reply arrived. The latter is not caught by local fallback handlers. Queue and knock commands report the ambiguity without replaying. A valid `ok: false` still remains an authoritative `DaemonError`.
 
+### BH-K36 — Total chat timeout left live generation work running
+
+- **Severity:** unbounded work / I3 total-deadline and cancellation violation
+- **Status:** fixed in this pass; real Gemini network cancellation remains UNVERIFIED on hardware
+- **Invariant (prose / I3):** once a chat's total deadline expires, no live generation request or worker may continue running in the background; cancellation must not be replaced by a larger timeout.
+- **Root cause:** `Daemon._generate()` used `asyncio.to_thread()` and shielded its task. Raising `ChatTimeout` stopped waiting but could not stop the synchronous SDK call, leaving its task tracked and its worker blocked. The Google SDK 1.x `aio` facade also delegated HTTP requests to `asyncio.to_thread`, so switching method names alone would not cancel the request.
+- **Red repro:** before the fix, `tests/test_bug_generate_worker_cancellation.py` blocked a synchronous backend on a threading event and set first-token/total deadlines to 20/80 ms. The caller raised `ChatTimeout` at the total bound with **one pending `to_thread` task** still blocked until the test released the worker.
+- **Fix:** live chat now uses `_SdkTransport.generate_async()` and the SDK's native async HTTP stream; `GeminiClient.generate_async()` retains quota checks, cancellable async RPM waiting, retries, verification, and ledger writes. The absolute caller deadline is passed through retries and into the SDK request timeout; `_generate()` cancels rather than shields the async task. The live extra/runtime guard requires `google-genai>=2.0.0` because 1.x implements its async request through a synchronous worker. Fixture/legacy synchronous transports retain the existing compatibility path.
+- **Verifier:** `.venv/bin/pytest -q tests/test_bug_generate_worker_cancellation.py tests/test_hotword_and_reply_delivery.py tests/test_disclosure.py tests/test_fixtures_and_harness.py tests/test_bughunt_k_quota.py` — **75 passed**; full `.venv/bin/ruff check .` and `git diff --check` passed. Installed `google-genai==2.0.0` locally and verified `_SdkTransport`'s SDK streaming method is a coroutine; no Gemini key/network call was made.
+- **Hardware check (UNVERIFIED):** after installing the live extra and restarting the owner daemon, run the forced-deadline probe recorded in `BUGHUNT-ARENA-2026-10-21.md`; it requires the owner's valid key and checks the real SDK stream cancels with no remaining `_background_tasks`.
+
 ## SUSPECTS from the 2026-10-21 hunt — unproven, NOT fixed (evidence + settling check in BUGHUNT-2026-10-21.md)
 
 - **S1** Live model ids exist for the owner's key → `assist voice models`.
