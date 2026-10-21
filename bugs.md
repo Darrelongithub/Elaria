@@ -1400,3 +1400,12 @@ running the documented command chain).
 - **Was:** the first read was cached in `_company` for the process lifetime. The CLI's local path writes company state directly to the same SQLite store; the daemon never observed it — it could keep treating the room as private with company present (or stay restricted after they left). `PresenceService` already read fresh; disclosure did not.
 - **Fix:** `company()` reads the store on every call; the cache field is removed. `set_company` is unchanged apart from dropping the cache write.
 
+### BH-K12 — CLI treated daemon refusals as "daemon unavailable" and re-ran them locally
+
+- **Severity:** wrong-action (silent substitution / split-brain writes; refusals reported as success)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_error_surfacing.py` — with the daemon UP, `assist review approve 999` printed "item 999: approved" and exited 0.
+- **Expected:** a daemon `ok:false` reply is an authoritative refusal: printed as one, exit 2, no local retry. Local fallback happens only when the daemon is genuinely unreachable.
+- **Was:** `ipc.call` raised plain `RuntimeError` for `ok:false`, and 37 CLI sites caught `(DaemonUnavailable, RuntimeError, OSError)` around the call and silently re-ran the operation against the local store/services. Refusals were masked (and sometimes converted to printed success: the local review path ignored `set_item_decision`'s rowcount and printed "approved" for nonexistent items); writes could also split-brain against a live daemon (see BH-K11 for the posture instance).
+- **Fix:** `ipc.DaemonError(RuntimeError)` is raised for `ok:false`. CLI fallback sites now catch `DaemonUnavailable` only (print-and-continue surfaces — the console REPL and the ptt.result wait — catch both and print the real message). `main` gains a `DaemonError` net: `_refusal_text` + exit 2. Special cases kept honest: doctor distinguishes down vs erroring; `assist halt` still sets the flag file when the daemon errors (a kill switch must land) but now says so. The local review path checks the rowcount and exits 1 on a missing item.
+
