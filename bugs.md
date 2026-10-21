@@ -1427,3 +1427,30 @@ running the documented command chain).
 - **Was:** `ipc.serve` closed the writer in the connection's finally but never told the daemon; pruning happened only when a later broadcast failed writing to the corpse. Owner observed 2 leaked subscribers in `status`.
 - **Fix:** `ipc.serve(..., on_disconnect=...)` is invoked in the connection finally (before close, teardown-safe); the daemon passes `self._subscribers.discard`. The broadcast-time prune remains as backstop.
 
+### BH-K15 — Executor operations raced across processes (cap double-spend)
+
+- **Severity:** wrong-action
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_executor.py::test_executor_refuses_to_race_another_process`
+- **Expected:** one organise mutation at a time, daemon and CLI combined; the second runner is refused clearly.
+- **Was:** no serialisation at all. The daemon applies in a thread while a CLI invocation can apply/undo in its own process; both read the hourly budget (`ops_since`) before either journaled — double-spending `max_ops_per_hour` — and could move the same files concurrently.
+- **Fix:** `Executor._operation_gate()` wraps apply/undo/trash: a non-blocking process lock plus an `flock` on `<db>.executor.lock`. Contention raises a clear `RuntimeError` (surfaced via IPC/CLI, BH-K12). Re-entrant on the holding thread (undo retires duplicates via trash). `verify()` is read-only and deliberately ungated.
+
+### BH-K16 — trash() claimed success for moves that had failed
+
+- **Severity:** wrong-action (false report; file believed trashed)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_executor.py::test_trash_same_name_twice_both_land_and_report_truly`
+- **Expected:** `trashed_as` names a file that actually landed in trash; failures say so.
+- **Was:** the destination name had second resolution, so two same-name files trashed within one second collided; the journaled move failed, yet the manifest and the return value still claimed `trashed_as=<dest>`.
+- **Fix:** destination uniquified (`name (2)`, `(3)`, … — same style as `_Conflicts`); `trashed_as` in both the manifest and the return is set only when the move actually applied.
+
+### BH-K17 — Undo of a `copied` op failed with a misleading FileExists
+
+- **Severity:** wrong-action (undo unavailable precisely for crash-interrupted ops)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_executor.py::test_undo_of_copied_op_reconciles_identical_duplicate`
+- **Expected:** undoing an op whose both copies exist identically (crash between copy-verify and source unlink) reconciles: bytes stay at the original location, the duplicate is retired journaled, the op rolls back.
+- **Was:** undo fell through to `_journaled_move`, whose no-overwrite rule (correctly) refused the occupied destination; the op reported a raw FileExists problem and could never be undone.
+- **Fix:** when the original location already holds identical content, undo retires the duplicate through the journaled trash path (recoverable — never a bare unlink) and marks the op rolled back.
+
