@@ -1463,3 +1463,27 @@ running the documented command chain).
 - **Was:** default rollback journal, implicit timeout — the exact multi-process shape (daemon resident, CLI one-shots writing state/facts/queue rows) that produces locked-database errors.
 - **Fix:** `PRAGMA journal_mode=WAL` + `busy_timeout=5000` at open (with an explicit connect timeout). Companion honesty fix: `forget_facts` by-id now also filters `active = 1`, so double-forget counts 0 instead of recounting.
 
+### BH-K20 — Config keys the code read were undeclared and undocumented
+
+- **Severity:** cosmetic (doctor false "unknown key"; undiscoverable knobs)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_config.py::test_keys_the_code_reads_are_declared_and_documented`
+- **Was:** `[organise] tier1_batch_size`/`tier2_batch_size` (planner_llm), `[hotword] sample_rate` (daemon) and `[hotword] unit_path` (wake_guard) were read with in-code defaults but absent from DEFAULTS and config.toml.example.
+- **Fix:** declared in DEFAULTS with the code's defaults (50/10/16000/"") and documented in the example.
+
+### BH-K21 — meeting.start ignored the documented [capture] mic_target
+
+- **Severity:** wrong-action (meetings recorded the PipeWire default mic)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_config.py::test_meeting_mic_*`
+- **Was:** dictate/hotword resolve `param → [capture] → [meeting]`, but `_meeting_start` read `[meeting] mic_target` only — an owner who set their mic under `[capture]` (as the example documents) got the default source in meetings.
+- **Fix:** meeting resolves `[meeting] mic_target → [capture] mic_target → default` (its own section wins, the documented capture mic is the fallback).
+
+### BH-K24 — Malformed config.toml crashed every command with a traceback
+
+- **Severity:** crash-with-safe-state (every invocation, until fixed by hand)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_config.py::test_malformed_config_is_a_one_line_error_exit_2`
+- **Was:** `load_config()` ran before `main()`'s try and the raw `TOMLDecodeError` (no filename in the message) propagated as a traceback; same in `assistd`.
+- **Fix:** `load_config` wraps parse/IO errors as `ValueError("cannot parse config <path>: …")`; both entry points print one line and exit 2.
+

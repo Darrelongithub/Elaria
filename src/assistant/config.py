@@ -398,6 +398,12 @@ DEFAULTS: dict = {
     # crashes and logs. No energy fallback is a wake path.
     "hotword": {
         "phrase": "Elaria",
+        # Capture sample rate for the wake path (BH-K20: read by the
+        # daemon, previously undeclared).
+        "sample_rate": 16000,
+        # Installed systemd unit path for the crash-safety report
+        # ("" = standard locations).
+        "unit_path": "",
         # Pre-wake ring: capped at 2.0 s in code regardless of this value.
         "ring_window_s": 2.0,
         # Post-trigger pending window: clamped to the 2-3 s band in code.
@@ -410,6 +416,7 @@ DEFAULTS: dict = {
         # refuses cleanly. There is no energy/loudness fallback.
         "keyword_model": "",
         "keyword_threshold": 0.5,
+        "keyword_window_s": 1.0,
         # ECAPA backend (hardware-side): a command `cmd <clip.wav>` printing
         # {"embedding": [...]} (cosine vs ecapa_reference) or {"score": 0..1}.
         "ecapa_cmd": "",
@@ -543,6 +550,9 @@ DEFAULTS: dict = {
         "tier0_min_confidence": 0.85,  # below: would escalate to LLM tiers (§3.7)
         "max_ops_per_run": 200,
         "max_ops_per_hour": 500,
+        # LLM planner batch sizes (Tier 1 sweeps wide, Tier 2 narrow).
+        "tier1_batch_size": 50,
+        "tier2_batch_size": 10,
         "tree_tripwire_pct": 25,
         # NO roots by default: nothing is indexed until the owner names a
         # root in config (new roots ALWAYS start in shadow mode, §4.3).
@@ -732,8 +742,14 @@ def load_config() -> Config:
     found = config_path.exists()
     explicit_keys: dict[str, set[str]] = {}
     if found:
-        with config_path.open("rb") as handle:
-            user_raw = tomllib.load(handle)
+        try:
+            with config_path.open("rb") as handle:
+                user_raw = tomllib.load(handle)
+        except (tomllib.TOMLDecodeError, OSError) as exc:
+            # BH-K24: name the file — a bare TOML error ("line 1 column 8")
+            # left owners guessing WHICH config every command died on.
+            raise ValueError(
+                f"cannot parse config {config_path}: {exc}") from exc
         raw = _deep_merge(raw, user_raw)
         explicit_keys = {
             section: set(values)
@@ -949,6 +965,8 @@ def validate_config(config: Config) -> dict:
                   minimum=0.1, maximum=2.0)
     _number_error(errors, "[hotword] pending_window_s",
                   hotword.get("pending_window_s"), minimum=2.0, maximum=3.0)
+    _number_error(errors, "[hotword] keyword_window_s",
+                  hotword.get("keyword_window_s"), minimum=0.1, maximum=2.0)
     _number_error(errors, "[hotword] pending_speech_threshold_s",
                   hotword.get("pending_speech_threshold_s"), minimum=0.0)
     _number_error(errors, "[hotword] ecapa_high", hotword.get("ecapa_high"),
@@ -1063,6 +1081,24 @@ def validate_config(config: Config) -> dict:
                     errors.append(
                         f"[quota.models.{mname}] {rkey}={rval!r} must be >= 0 "
                         "or 'unlimited'")
+    # BH-K18: the flat aliases and the structured rows are two statements
+    # of the same limits; where both speak and disagree, say so (the
+    # client enforces the stricter — silence here hid real drift).
+    if isinstance(models, dict):
+        _FLAT_FOR = {"flash": "flash", "flash-lite": "flash_lite",
+                     "transcribe-live": "transcribe_live",
+                     "transcribe-batch": "transcribe_batch"}
+        for mname, mrow in models.items():
+            prefix = _FLAT_FOR.get(str(mname).lower().replace("_", "-"))
+            if not prefix or not isinstance(mrow, dict):
+                continue
+            for rkey in ("rpm", "tpm", "rpd"):
+                rval, fval = mrow.get(rkey), quota.get(f"{prefix}_{rkey}")
+                if _is_number(rval) and _is_number(fval) and rval != fval:
+                    warnings.append(
+                        f"[quota] {prefix}_{rkey}={fval} and "
+                        f"[quota.models.{mname}] {rkey}={rval} disagree — "
+                        "the stricter value is enforced")
 
     if errors:
         detail = "INVALID: " + "; ".join(errors + warnings)
