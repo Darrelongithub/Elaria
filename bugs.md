@@ -1637,6 +1637,17 @@ running the documented command chain).
 - **Fix:** `_ptt_wait_budget()` rejects booleans, parse failures, non-finite, negative, and greater-than-90-second budgets. Both `ptt.result` and `ptt.stop` use it; `ptt.stop` validates before emitting an ack or changing session state. The 90-second cap matches the existing CLI's largest explicit wait and does not widen it.
 - **Verifier:** `.venv/bin/pytest -q tests/test_bug_ptt_infinite_wait.py tests/test_bug6d_ptt_result_orphans.py tests/test_phase2_surfaces.py tests/test_phase1_dictation.py tests/test_phase8_offline_voice.py tests/test_bug6_live_duplex_and_stop.py` — **90 passed**. No audio hardware or Gemini key/network was involved.
 
+### BH-K38 — daemon shutdown left active meeting capture running
+
+- **Severity:** privacy/capture-lifetime leak (microphone/system capture survives owner-daemon shutdown)
+- **Status:** fixed in this pass
+- **Invariant (prose):** daemon shutdown releases every active audio source and stops the collector that owns it.
+- **Root cause:** `Daemon.aclose()` cancelled dictation/background tasks but omitted `_meeting`, whose `DualCapture` and collector task are stored separately.
+- **Red repro:** `tests/test_bug_daemon_aclose_meeting_capture.py` creates an active meeting plus a pending collector, calls `Daemon.aclose()`, and checks capture closure, collector completion, and detachment. Before the fix, all three assertions failed. It uses a device-free capture double.
+- **Fix:** shutdown detaches the active meeting, cancels its collector, calls `DualCapture.aclose()`, includes that task in cleanup gathering, resets mode when needed, and reports capture-close errors without skipping remaining shutdown.
+- **Verifier:** `.venv/bin/pytest -q tests/test_bug_daemon_aclose_meeting_capture.py tests/test_bug_meeting_stop_failure.py tests/test_bug_meeting_raw_collision.py tests/test_phase6_meeting.py` — **10 passed**. No microphone, PipeWire, or Gemini key/network was used.
+- **Hardware check (UNVERIFIED):** on Fedora with live PipeWire sources, run `assist meeting start`, record the `pw-record` child PIDs with `pgrep -af '[p]w-record'`, then run `systemctl --user stop assistant`. Confirm those exact PIDs exit and the mic/system nodes are released; restart with `systemctl --user start assistant`.
+
 ## SUSPECTS from the 2026-10-21 hunt — unproven, NOT fixed (evidence + settling check in BUGHUNT-2026-10-21.md)
 
 - **S1** Live model ids exist for the owner's key → `assist voice models`.

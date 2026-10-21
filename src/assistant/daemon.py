@@ -3013,15 +3013,32 @@ class Daemon:
     async def aclose(self, *, extra_tasks=()) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
+        meeting, self._meeting = self._meeting, None
+        meeting_task = meeting.get("task") if meeting is not None else None
+        capture_error = None
+        if meeting is not None:
+            if meeting_task is not None:
+                meeting_task.cancel()
+            try:
+                await meeting["dual"].aclose()
+            except Exception as exc:
+                capture_error = exc
         tasks = [
-            t for t in (*extra_tasks, self._dictation_task, *self._background_tasks)
+            t for t in (*extra_tasks, self._dictation_task, meeting_task,
+                        *self._background_tasks)
             if t is not None
         ]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if meeting is not None:
+            self.mode = self._meeting_mode()
         self.store.close()
+        if capture_error is not None:
+            print(f"[assistd] meeting capture cleanup failed: "
+                  f"{type(capture_error).__name__}: {capture_error}",
+                  file=sys.stderr, flush=True)
 
 
 def main() -> None:
