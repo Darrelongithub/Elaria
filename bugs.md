@@ -1577,3 +1577,23 @@ running the documented command chain).
 - **Was:** `except Exception: last_capture = None` — indistinguishable from "no capture session ever ran", hiding the failure exactly when capture debugging needs it.
 - **Fix:** `last_capture = {"error": …}`; the aggregator stays up, the hole is labelled. Also in this commit: removed a fully-shadowed dead `is_user` assignment in `GeminiClient._call_once` (every branch below it reassigned before use; quota attribution unchanged, pinned by existing tests) and the unused `_WAKE_BOUNDARY` regex in `hotword.py` (zero references repo-wide).
 
+### BH-K32 — `assist knock accept|decline|…` bypassed the running daemon (recon S10, proven)
+
+- **Severity:** authority/privacy plumbing + fabricated output
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_knock_daemon_first.py`
+- **Expected:** knock actions settle where the state lives: the daemon (WakeGuard authentication, conversation, signal delivery). A wake-knock voice-accept must verify.
+- **Was:** every mutating knock action drove a local `InitiativeService` directly, even with the daemon up. Accept printed "voice · first line: <reason>" while the reason was never appended to the daemon's conversation nor spoken (the local service has no sessions). A wake-knock could be "accepted" with zero WakeGuard involvement while the guard stayed in `wake_knock` holding its pending utterance; decline/ignore never zeroed that RAM-only audio via the deny path; raise/due delivered no knock signal at all.
+- **Fix:** `_knock_command` calls the daemon first for raise/accept/decline/later/ignore/due (refusals surface as exit 2 per BH-K12). The local store remains the fallback for a stopped daemon only, and there a wake-knock *accept* refuses — only the guard can settle it, and its pending audio died with the daemon process.
+
+## SUSPECTS from the 2026-10-21 hunt — unproven, NOT fixed (evidence + settling check in BUGHUNT-2026-10-21.md)
+
+- **S1** Live model ids exist for the owner's key → `assist voice models`.
+- **S2** Final segment vs `turn_complete` ordering after `activityEnd` → `GEMINI_MODE=record` dictate, read `fixtures/seq-live.jsonl` (possible after BH-K4).
+- **S3** `generate_audio` fallback `send_realtime_input(text=…)` may not end the turn → `assist voice say "test"` on hardware.
+- **S4** `ipc.subscribe_events` has no read timeout (a wedged-but-alive daemon freezes Waybar/console feeds silently) → design call; needs an owner decision on feed-liveness semantics.
+- **S5** `no_speech` gate (peak RMS < 0.003) may discard very quiet real speech → quiet dictation + compare `capture.stats`.
+- **S6** Duplex guard may drop a genuine user `final` inside the 400 ms output window → record-mode session with an interjection during her reply.
+- **S7** Hotword scoring/verify run on the event loop (onnx + ECAPA subprocess) → ack-latency measurement on hardware.
+- **S8** `_sdk_transcribe` never deletes the Files-API upload → list files in AI Studio after a batch transcription.
+- **S9** `meeting.stop` awaits `transcribe_dual` with no overall bound; a wedged backend parks mode switches (`_meeting_processing`) indefinitely → stop a meeting with the ASR backend wedged and watch `assist status`. (Proper fix is progress-heartbeat based; a blind timeout would silently discard a finished transcript.)
