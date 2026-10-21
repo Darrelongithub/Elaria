@@ -1523,3 +1523,12 @@ running the documented command chain).
 - **Was:** `play_audio` and Piper `synthesize` both used a flat `timeout=120` — long read-alouds were killed mid-speech and misreported as player failures, while a hung player blocked its thread for two minutes on any clip.
 - **Fix:** playback bound derived from the WAV header (duration × 1.5 + 10 s, floor 15 s, cap 30 min; 120 s only when unreadable); synth bound scales with text length (60 s floor, 600 s cap). Both remain finite.
 
+### BH-K26 — Doctor drift check covered only one of the shipped-and-copied files
+
+- **Severity:** stale-deployment (disease 5; the LimitCORE pattern, generalized)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_doctor_drift.py`
+- **Expected:** every file the install instructions copy elsewhere is drift-checked by doctor.
+- **Was:** only `systemd/assistant.service` was compared. `elaria-overlay.service`, `elaria-console.service`, the installed knock sound (which shadows the repo asset), and the appended Hyprland binds could all go stale invisibly; the UI units' hardcoded `%h/Elaria` quickshell path was never sanity-checked against the actual checkout.
+- **Fix:** `_deployment_drift_checks()` byte-compares all three units + knock.wav (LimitCORE callout retained), verifies each UI unit's `quickshell -p` target exists, and checks the load-bearing bind markers in an existing Hyprland config. Merged files (Waybar module/style) remain unchecked — they are not byte copies.
+
