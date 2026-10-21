@@ -1454,3 +1454,12 @@ running the documented command chain).
 - **Was:** undo fell through to `_journaled_move`, whose no-overwrite rule (correctly) refused the occupied destination; the op reported a raw FileExists problem and could never be undone.
 - **Fix:** when the original location already holds identical content, undo retires the duplicate through the journaled trash path (recoverable — never a bare unlink) and marks the op rolled back.
 
+### BH-K22 — Shared SQLite store had no WAL / busy-timeout posture
+
+- **Severity:** wrong-action (cross-process "database is locked" failures)
+- **Status:** fixed in this pass
+- **Repro:** `tests/test_bughunt_k_store.py`
+- **Expected:** daemon + CLI + doctor share the DB without lock failures under brief contention.
+- **Was:** default rollback journal, implicit timeout — the exact multi-process shape (daemon resident, CLI one-shots writing state/facts/queue rows) that produces locked-database errors.
+- **Fix:** `PRAGMA journal_mode=WAL` + `busy_timeout=5000` at open (with an explicit connect timeout). Companion honesty fix: `forget_facts` by-id now also filters `active = 1`, so double-forget counts 0 instead of recounting.
+
