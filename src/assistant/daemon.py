@@ -185,8 +185,10 @@ class Daemon:
             config, self.store, presence=self.presence, sessions=self.sessions,
             initiative=self.initiative, showoff=self.showoff,
             disclosure=self.disclosure)
-        self._meeting: dict | None = None  # {task, dual, mic_frames, sys_frames}
-        self._meeting_processing = False
+        self._meeting: dict | None = None  # {session_id, task, dual, frames}
+        # A stopped meeting can still be transcribing while the next meeting
+        # is captured; track every in-flight worker rather than one shared bool.
+        self._meeting_processing: set[str] = set()
         self._plan_tasks: dict[int, asyncio.Task] = {}
         # VB-13: early acks wait for the boot warm instead of being silent. The
         # event is set as soon as a warm cycle ends (success, failure, or a
@@ -420,6 +422,13 @@ class Daemon:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
+
+    def _meeting_mode(self) -> str:
+        if self._meeting is not None:
+            return "meeting"
+        if self._meeting_processing:
+            return "processing"
+        return "idle"
 
     def _session_active(self) -> bool:
         return bool((self._dictation_task and not self._dictation_task.done())
@@ -2150,9 +2159,10 @@ class Daemon:
                 frames["mic"].append(mic_frame)
                 frames["sys"].append(sys_frame)
 
+        session_id = uuid.uuid4().hex
         self.mode = "meeting"
         await self.broadcast({"event": "status.changed", "mode": self.mode})
-        self._meeting = {"dual": dual, "frames": frames,
+        self._meeting = {"session_id": session_id, "dual": dual, "frames": frames,
                          "task": asyncio.create_task(collect())}
         return {"state": "meeting"}
 
@@ -2170,14 +2180,16 @@ class Daemon:
 
         from .capture import write_wav
 
+        session_id = str(meeting.get("session_id") or uuid.uuid4().hex)
         stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        raw_stem = f"meeting-{stamp}-{session_id}"
         rate = int(self.config.section("capture").get("sample_rate", 16000))
-        mic_wav = write_wav(self.config.data_dir / "audio" / f"meeting-{stamp}-mic.wav",
+        mic_wav = write_wav(self.config.data_dir / "audio" / f"{raw_stem}-mic.wav",
                             meeting["frames"]["mic"], rate)
-        sys_wav = write_wav(self.config.data_dir / "audio" / f"meeting-{stamp}-system.wav",
+        sys_wav = write_wav(self.config.data_dir / "audio" / f"{raw_stem}-system.wav",
                             meeting["frames"]["sys"], rate)
-        self.mode = "processing"
-        self._meeting_processing = True
+        self._meeting_processing.add(session_id)
+        self.mode = self._meeting_mode()
         await self.broadcast({"event": "status.changed", "mode": self.mode})
         try:
             result = await asyncio.to_thread(
@@ -2185,11 +2197,11 @@ class Daemon:
                 title=params.get("title"),
                 pyannote_refine=bool(self.config.section("meeting").get("pyannote_refine")))
         finally:
-            self._meeting_processing = False
-        self.mode = "idle"
-        await self.broadcast({"event": "status.changed", "mode": self.mode})
-        await self._apply_pending_mode_switch()
-        return {"state": "idle", "note_path": str(result.note_path),
+            self._meeting_processing.discard(session_id)
+            self.mode = self._meeting_mode()
+            await self.broadcast({"event": "status.changed", "mode": self.mode})
+            await self._apply_pending_mode_switch()
+        return {"state": self.mode, "note_path": str(result.note_path),
                 "turns": len(result.turns), "backend": result.backend,
                 "transcript_preview": result.transcript[:400],
                 "connectivity": self.mode_manager.status(refresh=False).as_dict()}

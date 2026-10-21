@@ -1586,6 +1586,16 @@ running the documented command chain).
 - **Was:** every mutating knock action drove a local `InitiativeService` directly, even with the daemon up. Accept printed "voice · first line: <reason>" while the reason was never appended to the daemon's conversation nor spoken (the local service has no sessions). A wake-knock could be "accepted" with zero WakeGuard involvement while the guard stayed in `wake_knock` holding its pending utterance; decline/ignore never zeroed that RAM-only audio via the deny path; raise/due delivered no knock signal at all.
 - **Fix:** `_knock_command` calls the daemon first for raise/accept/decline/later/ignore/due (refusals surface as exit 2 per BH-K12). The local store remains the fallback for a stopped daemon only, and there a wake-knock *accept* refuses — only the guard can settle it, and its pending audio died with the daemon process.
 
+### BH-K33 — Overlapping meeting stops reused raw WAV paths and cleared processing early
+
+- **Severity:** data-loss (silent session substitution) + wrong-action (mode switch unparked early)
+- **Status:** fixed in this pass
+- **Invariant (prose):** each meeting's captured bytes remain bound to that session until archival; processing remains active until every in-flight stop finishes.
+- **Root cause:** `_meeting_stop()` named raw WAVs with only second-resolution timestamps. It also used one shared boolean for concurrent transcriptions, so the later stop could clear it while an earlier worker was still pending. A transcription failure could leave `mode="processing"` because cleanup and mode restoration were not in the same `finally` block.
+- **Repro:** `tests/test_bug_meeting_raw_collision.py::test_bug_meeting_overlapping_stops_keep_each_sessions_raw_wav` freezes the clock, pauses the first real `MeetingService.transcribe_dual()` before its source copy, then stops a second session with distinct bytes. Before the fix, both stops used the same raw path, the first archive contained the second session's bytes, and processing was false while the first stop remained pending. `tests/test_bug_meeting_stop_failure.py::test_bug_meeting_transcription_failure_restores_mode_and_unparks_switch` proves a failed ASR worker also releases the processing gate and applies the parked preference.
+- **Verifier:** `pytest -q tests/test_bug_meeting_raw_collision.py tests/test_bug_meeting_stop_failure.py tests/test_phase6_meeting.py tests/test_bughunt_k_config.py tests/test_bughunt_systems.py -k meeting` — **14 passed, 60 deselected**; Ruff on touched Python files passed.
+- **Fix:** assign a UUID to each meeting at start, include it in the raw WAV names, track processing session IDs in a set, recompute global mode from active capture/processing state, and restore mode/apply parked switches in `finally` on success or failure.
+
 ## SUSPECTS from the 2026-10-21 hunt — unproven, NOT fixed (evidence + settling check in BUGHUNT-2026-10-21.md)
 
 - **S1** Live model ids exist for the owner's key → `assist voice models`.
