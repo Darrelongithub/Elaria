@@ -2205,7 +2205,7 @@ class Daemon:
             if self._meeting is None and self.mode == "meeting":
                 self.mode = self._meeting_mode()
 
-    async def _meeting_stop_impl(self, params: dict) -> dict:
+    async def _meeting_stop_impl(self, request: dict) -> dict:
         if self._meeting is None:
             return {"state": "idle", "note": "no meeting in progress"}
         deadline = time.monotonic() + self._meeting_stop_timeout_s
@@ -2243,7 +2243,7 @@ class Daemon:
         await self.broadcast({"event": "status.changed", "mode": self.mode})
         try:
             try:
-                title = params.get("title")
+                title = request.get("title")
                 pyannote_refine = bool(self.config.section("meeting").get(
                     "pyannote_refine"))
                 if self.client.mode != "mock":
