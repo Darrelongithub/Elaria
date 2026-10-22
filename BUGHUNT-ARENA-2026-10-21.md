@@ -16,6 +16,13 @@ The earlier all-handler hostile sweep exercised all **65** `Daemon._handlers()` 
 
 An earlier `status` harness result was inconclusive because its connectivity stub was incomplete. Freshly calling the real `Daemon.handle("status", {})` with isolated XDG paths returned successfully (`mode=idle`, no status error).
 
+## Post-fix verification on the current tree (2026-10-22)
+
+- Fresh full-suite rerun after BH-K39: **1,545 passed, 6 skipped** (1,551 collected), compared with the user's stated **1,393** baseline and the earlier 1,506-collected initial-checkout result.
+- Ten randomized full-suite passes, seeds **260201–260210**: every seed **1,545 passed, 6 skipped**. Combined coverage: **84.60% statements** (9,468/11,191) and **74.02% branches** (2,610/3,526); total combined cover 82.07%. The loop's trailing report initially used unsupported `coverage report --branch`; the data were retained and the report was successfully generated with `coverage report -m`.
+- The first full-suite run had two failures: an IPC-handler integrity false positive on the extracted `_meeting_stop_impl(params)` helper, and a stale BH-H1 SDK fake that lacked the async method required by the BH-K36 transport. Renamed the helper argument and made the fake satisfy `generate_async`; the next full run and all ten randomized seeds passed.
+- This does **not** close the audit: no mutation run or independent review is complete, and no second fresh reviewer-led pass has established zero new confirmed bugs. Hardware/live provider and offline/pyannote checks remain unverified as listed below.
+
 ### Freshly confirmed findings, ranked by the requested severity order
 
 1. **Data loss — meeting raw-WAV collision (BH-K33, now fixed).** Frozen-clock overlapping stops reused a second-resolution daemon raw path. With the real `MeetingService.transcribe_dual` and ASR replaced only by a local stub, the first session's archive contained the second session's mic bytes. The second stop also cleared the shared processing flag while the first worker was still pending. A separate repro showed a transcription failure left mode processing and a parked preference unapplied. Red/green regressions are `tests/test_bug_meeting_raw_collision.py` and `tests/test_bug_meeting_stop_failure.py`.
@@ -143,4 +150,4 @@ PY
 
 ## Next
 
-Settle S9's unbounded offline faster-whisper and optional pyannote paths without losing completed transcripts. Then resume the fresh full pass, mutation testing, independent fix reviews, and final clean pass; report survivors, entry-point maps, and hardware-only checks precisely.
+S9's offline faster-whisper and optional pyannote paths remain unbounded and require the owner's forced-offline check before any claim or timeout change. Continue the remaining suspect/territory and invariant audits, run mutation testing and genuinely independent fix reviews, then take a second fresh full pass after resulting fixes; do not declare the hunt complete until that pass finds zero new confirmed bugs. Preserve the 10-seed full-suite run and current coverage numbers above; the owner-only hardware/provider checks stay explicitly UNVERIFIED.
