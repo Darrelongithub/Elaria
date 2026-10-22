@@ -1670,6 +1670,15 @@ running the documented command chain).
 - **Verifier:** `.venv/bin/pytest -q tests/test_bug_meeting_stop_deadline.py` — **9 passed** after the close-failure, source-cancellation and async-success/persistence regressions were added; ten current randomized full suites each return **1,548 passed, 6 skipped**. Final unseeded verification is in `BUGHUNT-ARENA-2026-10-21.md`. Mutations that remove `return_exceptions=True` are killed by the blocking-peer regression. Ruff and `git diff --check` pass after generated mutation artifacts are removed.
 - **Hardware check (UNVERIFIED):** no live microphone/PipeWire session was run; use the existing BH-K38 owner check to verify real capture process release.
 
+### BH-K41 — PTT event-stream test left a live IPC client task at loop teardown
+
+- **Severity:** test-integrity / asyncio task leak; not a production behavior claim.
+- **Status:** fixed in `tests/test_phase1_dictation.py`.
+- **Repro:** `.venv/bin/pytest -q tests/test_phase1_dictation.py::test_daemon_ptt_round_trip_and_events` passed but emitted `Task was destroyed but it is pending!` for `serve.<locals>._client()` blocked at `reader.readline()`.
+- **Root cause:** the test's raw subscriber socket and drainer thread were not closed, and its loop was stopped before the IPC server and daemon were awaited through shutdown.
+- **Fix:** shut down/close the client socket, join the drainer, await `server.wait_closed()` and `daemon.aclose()`, stop/join the loop thread, then close the loop.
+- **Verification:** the isolated test passes with empty stderr. The current ten randomized full-suite runs (after BH-K40–K42) each passed **1,548 tests, 6 skipped**; the fresh unseeded post-ledger suite also passed **1,548 tests, 6 skipped**, with no pending-task warnings.
+
 ## SUSPECTS from the 2026-10-21 hunt — unproven, NOT fixed (evidence + settling check in BUGHUNT-2026-10-21.md)
 
 - **S1** Live model ids exist for the owner's key → `assist voice models`.
