@@ -1,4 +1,4 @@
-"""BH-K14 — event subscribers must be removed when their client disconnects.
+"""BH-K14 [I10] — event subscribers must be removed when their client disconnects.
 
 `ipc.serve` never told the daemon a client went away: the StreamWriter
 stayed in `Daemon._subscribers` until some later broadcast happened to
@@ -52,6 +52,7 @@ def test_subscriber_discarded_on_disconnect_without_any_broadcast(config):
         async def _shutdown():
             server.close()
             await daemon.aclose()
+            await asyncio.wait_for(server.wait_closed(), timeout=3)
 
         asyncio.run_coroutine_threadsafe(_shutdown(), loop).result(timeout=5)
         loop.call_soon_threadsafe(loop.stop)

@@ -64,8 +64,17 @@ def running_daemon(config):
     async def _shutdown():
         server.close()
         await daemon.aclose()
+        await asyncio.wait_for(server.wait_closed(), timeout=3)
+        await asyncio.sleep(0)
+        current = asyncio.current_task()
+        clients = [task for task in asyncio.all_tasks()
+                   if task is not current and not task.done()
+                   and task.get_coro().__qualname__ == "serve.<locals>._client"]
+        if clients:
+            await asyncio.wait_for(
+                asyncio.gather(*clients, return_exceptions=True), timeout=3)
 
-    asyncio.run_coroutine_threadsafe(_shutdown(), loop).result(timeout=3)
+    asyncio.run_coroutine_threadsafe(_shutdown(), loop).result(timeout=8)
     loop.call_soon_threadsafe(loop.stop)
     thread.join(timeout=3)
     loop.close()

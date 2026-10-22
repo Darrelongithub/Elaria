@@ -309,6 +309,8 @@ def test_daemon_ptt_round_trip_and_events(config):
     server = loop.run_until_complete(serve(config.socket_path, daemon.handle))
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
+    sock = None
+    drainer = None
     try:
         received: list[dict] = []
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -350,8 +352,24 @@ def test_daemon_ptt_round_trip_and_events(config):
         assert "session.started" in kinds and "transcript.final" in kinds
         assert "session.ended" in kinds
     finally:
-        loop.call_soon_threadsafe(server.close)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        if drainer is not None:
+            drainer.join(timeout=3)
+
+        async def _shutdown():
+            server.close()
+            await server.wait_closed()
+            await daemon.aclose()
+
+        asyncio.run_coroutine_threadsafe(_shutdown(), loop).result(timeout=5)
         loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=3)
+        loop.close()
 
 
 def test_cli_transcribe_file_local_fallback(tmp_path):

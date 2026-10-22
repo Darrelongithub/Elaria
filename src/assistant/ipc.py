@@ -17,9 +17,11 @@ import inspect
 import json
 import os
 import socket
+import struct
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 try:                                  # Linux/Fedora target; tests may run anywhere
@@ -33,6 +35,42 @@ Handler = Callable[[str, dict], Awaitable[dict]]
 # seconds is orders of magnitude above a normal local drain, and the peer is
 # already gone by then.
 REPLY_DRAIN_TIMEOUT_S = 5.0
+
+
+@dataclass(frozen=True)
+class IpcPrincipal:
+    """Kernel-authenticated identity of a connected Unix-socket peer (I5).
+
+    This value is constructed only from SO_PEERCRED, never from request JSON.
+    The daemon decides whether the UID is its local owner before authorizing a
+    state-changing handler.
+    """
+
+    pid: int
+    uid: int
+    gid: int
+
+
+def ipc_peer_principal(writer: asyncio.StreamWriter) -> IpcPrincipal:
+    """Read the connecting process identity from the kernel (I5).
+
+    Linux is the supported runtime. If the transport cannot provide kernel
+    credentials, fail closed rather than treating a caller-supplied identity
+    field or the socket pathname alone as an authenticated principal.
+    """
+    peer_socket = writer.get_extra_info("socket")
+    if peer_socket is None or not hasattr(socket, "SO_PEERCRED"):
+        raise PermissionError("kernel-authenticated IPC credentials are unavailable")
+    try:
+        raw = peer_socket.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, uid, gid = struct.unpack("3i", raw)
+    except (OSError, struct.error) as exc:
+        raise PermissionError(
+            f"could not authenticate the IPC peer: {exc}") from exc
+    if pid <= 0 or uid < 0 or gid < 0:
+        raise PermissionError("kernel returned invalid IPC peer credentials")
+    return IpcPrincipal(pid=pid, uid=uid, gid=gid)
 
 
 def _lock_path(socket_path: Path) -> Path:
@@ -201,18 +239,27 @@ async def serve(socket_path: Path, handler: Handler,
 
 
 class DaemonUnavailable(RuntimeError):
-    pass
+    """The daemon could not be contacted before a request was sent."""
+
+
+class DaemonOutcomeUnknown(RuntimeError):
+    """A request may have been applied, but no authoritative reply arrived.
+
+    Callers must not replay the operation against local state: the daemon may
+    already have committed it before the connection timed out or broke.
+    """
 
 
 class DaemonError(RuntimeError):
     """The daemon ANSWERED and refused (ok: false) — BH-K12.
 
-    Distinct from DaemonUnavailable (no answer at all): a refusal is an
-    authoritative answer. Callers that fall back to local state when the
-    daemon is down must never silently re-run an operation the live
-    daemon just refused; distinguishing the two is what makes that
-    enforceable. Subclasses RuntimeError so generic error printers keep
-    working and see the daemon's real message.
+    Distinct from DaemonUnavailable (the request was never sent) and
+    DaemonOutcomeUnknown (a sent request got no authoritative reply): a refusal
+    is an answer. Callers that fall back to local state when the daemon is
+    unreachable must never silently re-run an operation the live daemon just
+    refused; the three-way distinction makes that enforceable. Subclasses
+    RuntimeError so generic error printers keep working and see the daemon's
+    real message.
     """
 
 
@@ -241,7 +288,7 @@ def subscribe_events(socket_path: Path):
 
 
 def _parse_reply_frame(raw_line: bytes) -> dict:
-    """A reply frame, or a clear `DaemonUnavailable` (never a raw JSON error)."""
+    """A reply frame, or a malformed-frame error for `call()` to classify."""
     try:
         parsed = json.loads(raw_line)
     except ValueError as exc:
@@ -261,7 +308,9 @@ def call(socket_path: Path, method: str, params: dict | None = None, timeout: fl
     daemon streams event frames on the same connection as the reply, and a
     per-recv timeout reset by every frame let `assist dictate` sit inside
     `ptt.result` far past its wait_s budget while events trickled by. One
-    deadline covers connect, send and the entire reply wait.
+    deadline covers connect, send and the entire reply wait. Failures before
+    `sendall` are `DaemonUnavailable`; after send may have begun they are
+    `DaemonOutcomeUnknown`, which must not trigger a local replay.
     """
     if not socket_path.exists():
         raise DaemonUnavailable(
@@ -270,11 +319,13 @@ def call(socket_path: Path, method: str, params: dict | None = None, timeout: fl
         )
     deadline = (time.monotonic() + timeout) if timeout is not None else None
     reply: dict | None = None
+    request_started = False
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
             sock.connect(str(socket_path))
             payload = json.dumps({"id": 1, "method": method, "params": params or {}}) + "\n"
+            request_started = True  # sendall can partially write before raising
             sock.sendall(payload.encode())
             buffer = b""
             while reply is None:
@@ -303,10 +354,24 @@ def call(socket_path: Path, method: str, params: dict | None = None, timeout: fl
                             reply = parsed
                     break
                 buffer += chunk
+    except DaemonUnavailable as exc:
+        if request_started:
+            raise DaemonOutcomeUnknown(
+                f"daemon at {socket_path} may have processed '{method}', but "
+                f"no valid reply arrived: {exc}") from exc
+        raise
     except OSError as exc:
+        if request_started:
+            raise DaemonOutcomeUnknown(
+                f"daemon at {socket_path} may have processed '{method}', but "
+                f"the reply was not confirmed: {exc}") from exc
         raise DaemonUnavailable(f"cannot reach daemon at {socket_path}: {exc}") from exc
     if reply is None:
-        reply = {"ok": False, "error": "empty reply"}
+        if request_started:
+            raise DaemonOutcomeUnknown(
+                f"daemon at {socket_path} closed without replying to '{method}'; "
+                "the operation may already have been applied")
+        raise DaemonUnavailable(f"daemon at {socket_path} returned no reply")
     if not reply.get("ok"):
         raise DaemonError(reply.get("error", "daemon error"))
     return reply["result"]

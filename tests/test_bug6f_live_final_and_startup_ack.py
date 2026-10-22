@@ -1,4 +1,4 @@
-"""BUG 6f: real Live response shapes and the session-start speaker/mic race.
+"""BUG 6f [I1, I2, I4]: real Live response shapes and the session-start speaker/mic race.
 
 No SDK, network, API key, or audio hardware is required. The SDK double keeps
 receive()'s one-model-turn scope and sends the transcription-only model's

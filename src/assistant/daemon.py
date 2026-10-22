@@ -20,12 +20,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 import signal
 import socket as socket_mod
 import sys
 import time
 import uuid
+from contextvars import ContextVar
 
 from . import __version__
 from .asr import local_asr_status
@@ -40,7 +42,7 @@ from .disclosure import (
 )
 from .gemini_client import GeminiClient
 from .initiative import InitiativeError, InitiativeService, KnockSignal
-from .ipc import serve
+from .ipc import IpcPrincipal, ipc_peer_principal, serve
 from .modes import ModeManager
 from .offline_queue import CloudQueue
 from .organiser import OrganiserService
@@ -58,6 +60,8 @@ from .showoff import ShowoffError, ShowoffService
 from .store import Store
 from .transcribe import DictationService
 from .tts import STANDARD_ACKS, SpeechResult, SpeechService
+
+MAX_PTT_WAIT_S = 90.0
 
 
 class ChatTimeout(TimeoutError):
@@ -110,6 +114,13 @@ def _int_param(params: dict, name: str) -> int:
 class Daemon:
     def __init__(self, config: Config):
         self.config = config
+        # Request identity is task-local: concurrent IPC clients must never
+        # inherit one another's principal or method. Peer credentials are
+        # installed by handle() from SO_PEERCRED, not request params (I5).
+        self._ipc_principal: ContextVar[IpcPrincipal | None] = ContextVar(
+            f"elaria_ipc_principal_{id(self)}", default=None)
+        self._ipc_method: ContextVar[str | None] = ContextVar(
+            f"elaria_ipc_method_{id(self)}", default=None)
         config.ensure_dirs()
         self.store = Store(config.db_path)
         self.governor = PersonaGovernor.from_config(config, load_humour_profile(config))
@@ -148,9 +159,10 @@ class Daemon:
         from .embeddings import make_embedder
         from .memory import Memory
         self.memory = Memory(self.store, make_embedder(config))
-        from .meeting import MeetingService
+        from .meeting import MEETING_TRANSCRIPTION_TIMEOUT_S, MeetingService
         self.meetings = MeetingService(
             config, self.store, self.client, mode_manager=self.mode_manager)
+        self._meeting_stop_timeout_s = MEETING_TRANSCRIPTION_TIMEOUT_S
         # Disclosure awareness: memory may be used, secrets/plans never spoken
         # while company is present, and no owner memory to a guest voice.
         self.disclosure = DisclosureService(config, self.store)
@@ -185,8 +197,11 @@ class Daemon:
             config, self.store, presence=self.presence, sessions=self.sessions,
             initiative=self.initiative, showoff=self.showoff,
             disclosure=self.disclosure)
-        self._meeting: dict | None = None  # {task, dual, mic_frames, sys_frames}
-        self._meeting_processing = False
+        self._meeting: dict | None = None  # {session_id, task, dual, frames}
+        # A stopped meeting can still be transcribing while the next meeting
+        # is captured; track every in-flight worker rather than one shared bool.
+        self._meeting_processing: set[str] = set()
+        self._meeting_stop_tasks: set[asyncio.Task] = set()
         self._plan_tasks: dict[int, asyncio.Task] = {}
         # VB-13: early acks wait for the boot warm instead of being silent. The
         # event is set as soon as a warm cycle ends (success, failure, or a
@@ -234,6 +249,10 @@ class Daemon:
         # text-duration estimate). Separate workers survive waiter cancellation:
         # cancelling to_thread cannot stop audio already playing in that thread.
         self._ack_playbacks: set[asyncio.Task] = set()
+        # Local TTS work includes synthesis before sound starts. Keep the duplex
+        # gate closed for the real worker lifetime; a text-duration estimate can
+        # expire while synthesis is still delayed (I4).
+        self._speech_playbacks: set[asyncio.Task] = set()
         # BUG F / Bug 8 (2026-10-20): the single 4 s total-turn bound is gone.
         # Two deadlines from [gemini]: a streaming first-token deadline (a
         # transport with no first token is dead) and a generous total bound (a
@@ -292,11 +311,30 @@ class Daemon:
             self._speaking_until = __import__("time").monotonic() + guard_s
             # Don't clear text immediately; let guard expire
 
+    def _start_speech_task(self, text: str, *, play: bool = True) -> asyncio.Task:
+        """Start one TTS call; a playing call owns the duplex gate through finish (I4)."""
+        if play:
+            self._set_speaking(True, text=text)
+        worker = asyncio.create_task(asyncio.to_thread(
+            self.speech.speak, text, play=play))
+        if play:
+            self._speech_playbacks.add(worker)
+
+            def finished(task: asyncio.Task) -> None:
+                self._speech_playbacks.discard(task)
+                self._set_speaking(False, text=text)
+                self._consume_task_result(task)
+
+            worker.add_done_callback(finished)
+        return worker
+
     def is_speaking(self) -> bool:
-        return bool(self._ack_playbacks) or time.monotonic() < self._speaking_until
+        return bool(self._ack_playbacks or self._speech_playbacks) or (
+            time.monotonic() < self._speaking_until)
 
     def speaking_guard_remaining(self) -> float:
-        return max(0.4 if self._ack_playbacks else 0.0,
+        active_playback = bool(self._ack_playbacks or self._speech_playbacks)
+        return max(0.4 if active_playback else 0.0,
                    self._speaking_until - time.monotonic())
 
     def _queue_ack_playback(self, kind: str) -> asyncio.Task:
@@ -421,6 +459,13 @@ class Daemon:
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    def _meeting_mode(self) -> str:
+        if self._meeting is not None:
+            return "meeting"
+        if self._meeting_processing:
+            return "processing"
+        return "idle"
+
     def _session_active(self) -> bool:
         return bool((self._dictation_task and not self._dictation_task.done())
                     or self._ptt_processing
@@ -483,7 +528,8 @@ class Daemon:
         synthesis of the same text (BH-I4).
         """
         try:
-            result = await asyncio.to_thread(self.speech.speak, text)
+            worker = self._start_speech_task(text, play=True)
+            result = await asyncio.shield(worker)
             if result.error and not route.get("muted"):
                 await self.broadcast({"event": "speech.error", "error": result.error,
                                       **route})
@@ -492,8 +538,6 @@ class Daemon:
             await self.broadcast({"event": "speech.error", "error": str(exc), **route})
             return SpeechResult(text=text.strip(), backend="none", voice_id="none",
                                 muted=True, error=str(exc))
-        finally:
-            self._set_speaking(False, text=text)
 
     async def _maybe_speak_reply(self, text: str, params: dict) -> dict:
         # Hybrid: try blocking with a short timeout so a fast local render can
@@ -613,28 +657,50 @@ class Daemon:
             "ask": self._ask,
         }
 
+    def _require_ipc_owner(self) -> IpcPrincipal:
+        """Return this request's kernel-authenticated local owner principal (I5)."""
+        principal = self._ipc_principal.get()
+        if principal is None or principal.uid != os.getuid():
+            raise PermissionError(
+                "state-changing IPC requires the daemon's authenticated local owner")
+        return principal
+
     async def handle(self, method: str, params: dict, writer=None) -> dict:
-        handlers = self._handlers()
-        if method == "events.subscribe":
-            if writer is not None:
-                self._subscribers.add(writer)
-            return {"subscribed": True,
-                    "events": ["session.started", "transcript.interim",
-                               "session.checkin", "session.offline",
-                               "transcript.final", "session.ended",
-                               "transcript.echo_suppressed",
-                               "live.uplink_gated", "live.output_audio",
-                               "live.output_transcript", "live.duplex",
-                               "ptt.result",
-                               "mode.changed", "offline.drained",
-                               "speech.error", "conversation.message",
-                               "class.changed", "knock.raised",
-                               "knock.accepted", "knock.changed", "error"]}
-        handler = handlers.get(method)
-        if handler is None:
-            raise ValueError(f"unknown method '{method}' — supported: "
-                             f"{', '.join(sorted(handlers))}, events.subscribe")
-        return await handler(params)
+        principal_token = method_token = None
+        if writer is not None:
+            principal = ipc_peer_principal(writer)
+            if principal.uid != os.getuid():
+                raise PermissionError(
+                    "IPC peer UID does not match the daemon's local owner")
+            principal_token = self._ipc_principal.set(principal)
+            method_token = self._ipc_method.set(method)
+        try:
+            handlers = self._handlers()
+            if method == "events.subscribe":
+                if writer is not None:
+                    self._subscribers.add(writer)
+                return {"subscribed": True,
+                        "events": ["session.started", "transcript.interim",
+                                   "session.checkin", "session.offline",
+                                   "transcript.final", "session.ended",
+                                   "transcript.echo_suppressed",
+                                   "live.uplink_gated", "live.output_audio",
+                                   "live.output_transcript", "live.duplex",
+                                   "ptt.result",
+                                   "mode.changed", "offline.drained",
+                                   "speech.error", "conversation.message",
+                                   "class.changed", "knock.raised",
+                                   "knock.accepted", "knock.changed", "error"]}
+            handler = handlers.get(method)
+            if handler is None:
+                raise ValueError(f"unknown method '{method}' — supported: "
+                                 f"{', '.join(sorted(handlers))}, events.subscribe")
+            return await handler(params)
+        finally:
+            if method_token is not None:
+                self._ipc_method.reset(method_token)
+            if principal_token is not None:
+                self._ipc_principal.reset(principal_token)
 
     async def _ping(self, params: dict) -> dict:
         return {"pong": True, "version": __version__}
@@ -924,6 +990,13 @@ class Daemon:
         return {"knock": knock, "signal": signal}
 
     async def _knock_accept(self, params: dict) -> dict:
+        # The request method plus the kernel-authenticated socket peer is the
+        # owner's explicit accept. Serialized channel/score claims are not
+        # authority, on either the wake-knock or initiative path (I5).
+        if "channel" in params or "voiceprint_score" in params:
+            raise ValueError(
+                "refused: knock.accept does not accept caller-supplied "
+                "channel or voiceprint_score; use the authenticated owner action")
         knock_id = _int_param(params, "id")
         knock_row = self.store.get_knock(knock_id)
         if knock_row is not None and knock_row.get("kind") == "wake":
@@ -975,20 +1048,18 @@ class Daemon:
         return payload
 
     async def _wake_knock_accept(self, knock_id: int, params: dict) -> dict:
-        """Wake-knock accept: owner authentication, then listening (or the
-        console in class mode). voice-accept must itself be voiceprint
-        verified; hotkey/console carry the same trust as PTT. The guest door
-        stays show-off's alone."""
+        """Accept a wake-knock only for the authenticated local IPC owner (I5).
+
+        Voice accept is unavailable until fresh accept audio is captured and
+        scored inside the daemon; the request body cannot choose a channel or
+        supply a confidence score. The guest door stays show-off's alone.
+        """
         from .wake_guard import WakeGuardError
 
-        channel = str(params.get("channel") or "console")
-        voiceprint_score = params.get("voiceprint_score")
-        if voiceprint_score is not None:
-            voiceprint_score = float(voiceprint_score)
+        principal = self._require_ipc_owner()
         try:
             gate = self.wake_guard.wake_knock_accepted(
-                knock_id=knock_id, channel=channel,
-                voiceprint_score=voiceprint_score)
+                knock_id=knock_id, principal=principal)
         except WakeGuardError as exc:
             raise ValueError(str(exc)) from exc
         class_now = self.presence.status().enabled
@@ -1221,8 +1292,9 @@ class Daemon:
         text = str(params.get("text") or "").strip()
         if not text:
             raise ValueError("speech.say needs params.text")
-        result = await asyncio.to_thread(
-            self.speech.speak, text, play=bool(params.get("play", True)))
+        play = bool(params.get("play", True))
+        worker = self._start_speech_task(text, play=play)
+        result = await (asyncio.shield(worker) if play else worker)
         return {"speech": result.as_dict()}
 
     async def _speech_warm(self, params: dict) -> dict:
@@ -1461,6 +1533,28 @@ class Daemon:
                                       or "default"),
                 "connectivity": connectivity.as_dict()}
 
+    @staticmethod
+    def _ptt_wait_budget(params: dict) -> float:
+        """Validate the caller's optional PTT wait before allocating a waiter."""
+        raw = params.get("wait_s", 0)
+        if raw is None:
+            return 0.0
+        if isinstance(raw, bool):
+            raise TypeError("parameter 'wait_s' must be a finite number of seconds")
+        try:
+            wait_s = float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "parameter 'wait_s' must be a finite number of seconds") from exc
+        if not math.isfinite(wait_s):
+            raise ValueError("parameter 'wait_s' must be finite")
+        if wait_s < 0:
+            raise ValueError("parameter 'wait_s' must be non-negative")
+        if wait_s > MAX_PTT_WAIT_S:
+            raise ValueError(
+                f"parameter 'wait_s' must not exceed {MAX_PTT_WAIT_S:g} seconds")
+        return wait_s
+
     async def _ptt_stop(self, params: dict) -> dict:
         """Release: acknowledge in-process, finish the session in the background.
 
@@ -1477,6 +1571,7 @@ class Daemon:
         open for a moment, more of her own audio to transcribe. `speak=False`
         also means the reply cannot wait on the boot-time ack cache warm.
         """
+        wait_s = self._ptt_wait_budget(params)
         self._ptt_log("ptt.stop.received", session_id=str(self._ptt_session_id or ""))
         ack = await self._ack({"kind": "on_it", "speak": False})
         task = self._dictation_task
@@ -1523,7 +1618,6 @@ class Daemon:
                     "connectivity": self.mode_manager.status(refresh=False).as_dict()}
         # Explicit opt-in for scripts/tests that want the old one-shot shape.
         # The hotkey path never sets it; nothing here waits by default.
-        wait_s = float(params.get("wait_s") or 0)
         if wait_s > 0:
             # BUG 6c/6d: bounded wait for THIS session's terminal answer —
             # the real result, a fail-fast dead capture, or an explicit
@@ -1914,7 +2008,7 @@ class Daemon:
         requested = params.get("session_id") or None
         if requested is None:
             requested = self._ptt_session_id or self._ptt_last_session_id
-        wait_s = float(params.get("wait_s") or 0)
+        wait_s = self._ptt_wait_budget(params)
         answer = None
         if requested is not None and wait_s > 0:
             answer = await self._ptt_wait_for(requested, wait_s)
@@ -2150,46 +2244,91 @@ class Daemon:
                 frames["mic"].append(mic_frame)
                 frames["sys"].append(sys_frame)
 
+        session_id = uuid.uuid4().hex
         self.mode = "meeting"
         await self.broadcast({"event": "status.changed", "mode": self.mode})
-        self._meeting = {"dual": dual, "frames": frames,
+        self._meeting = {"session_id": session_id, "dual": dual, "frames": frames,
                          "task": asyncio.create_task(collect())}
         return {"state": "meeting"}
 
     async def _meeting_stop(self, params: dict) -> dict:
+        task = asyncio.current_task()
+        if task is not None:
+            self._meeting_stop_tasks.add(task)
+        try:
+            return await self._meeting_stop_impl(params)
+        finally:
+            if task is not None:
+                self._meeting_stop_tasks.discard(task)
+            if self._meeting is None and self.mode == "meeting":
+                self.mode = self._meeting_mode()
+
+    async def _meeting_stop_impl(self, request: dict) -> dict:
         if self._meeting is None:
             return {"state": "idle", "note": "no meeting in progress"}
+        deadline = time.monotonic() + self._meeting_stop_timeout_s
         meeting, self._meeting = self._meeting, None
-        await meeting["dual"].aclose()
-        meeting["task"].cancel()
+        capture_close = asyncio.create_task(meeting["dual"].aclose())
+        capture_error = None
         try:
-            await meeting["task"]
-        except asyncio.CancelledError:
-            pass  # expected: we just cancelled it
+            try:
+                await asyncio.shield(capture_close)
+            except asyncio.CancelledError:
+                close_result, = await asyncio.gather(
+                    capture_close, return_exceptions=True)
+                if isinstance(close_result, BaseException):
+                    print("[assistd] meeting capture cleanup failed during stop "
+                          f"cancellation: {type(close_result).__name__}: {close_result}",
+                          file=sys.stderr, flush=True)
+                raise
+            except Exception as exc:
+                capture_error = exc
+        finally:
+            meeting["task"].cancel()
+            await asyncio.gather(meeting["task"], return_exceptions=True)
         from datetime import datetime
 
         from .capture import write_wav
 
+        session_id = str(meeting.get("session_id") or uuid.uuid4().hex)
         stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        raw_stem = f"meeting-{stamp}-{session_id}"
         rate = int(self.config.section("capture").get("sample_rate", 16000))
-        mic_wav = write_wav(self.config.data_dir / "audio" / f"meeting-{stamp}-mic.wav",
+        mic_wav = write_wav(self.config.data_dir / "audio" / f"{raw_stem}-mic.wav",
                             meeting["frames"]["mic"], rate)
-        sys_wav = write_wav(self.config.data_dir / "audio" / f"meeting-{stamp}-system.wav",
+        sys_wav = write_wav(self.config.data_dir / "audio" / f"{raw_stem}-system.wav",
                             meeting["frames"]["sys"], rate)
-        self.mode = "processing"
-        self._meeting_processing = True
+        self._meeting_processing.add(session_id)
+        self.mode = self._meeting_mode()
         await self.broadcast({"event": "status.changed", "mode": self.mode})
         try:
-            result = await asyncio.to_thread(
-                self.meetings.transcribe_dual, mic_wav, sys_wav,
-                title=params.get("title"),
-                pyannote_refine=bool(self.config.section("meeting").get("pyannote_refine")))
+            if capture_error is not None:
+                raise RuntimeError(
+                    "meeting capture close failed; raw audio retained "
+                    f"at {mic_wav} and {sys_wav}") from capture_error
+            try:
+                title = request.get("title")
+                pyannote_refine = bool(self.config.section("meeting").get(
+                    "pyannote_refine"))
+                if self.client.mode != "mock":
+                    result = await self.meetings.transcribe_dual_async(
+                        mic_wav, sys_wav, title=title,
+                        pyannote_refine=pyannote_refine, deadline=deadline)
+                else:
+                    result = await asyncio.to_thread(
+                        self.meetings.transcribe_dual, mic_wav, sys_wav,
+                        title=title, pyannote_refine=pyannote_refine,
+                        deadline=deadline)
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    "meeting transcription deadline expired; raw audio retained "
+                    f"at {mic_wav} and {sys_wav}") from exc
         finally:
-            self._meeting_processing = False
-        self.mode = "idle"
-        await self.broadcast({"event": "status.changed", "mode": self.mode})
-        await self._apply_pending_mode_switch()
-        return {"state": "idle", "note_path": str(result.note_path),
+            self._meeting_processing.discard(session_id)
+            self.mode = self._meeting_mode()
+            await self.broadcast({"event": "status.changed", "mode": self.mode})
+            await self._apply_pending_mode_switch()
+        return {"state": self.mode, "note_path": str(result.note_path),
                 "turns": len(result.turns), "backend": result.backend,
                 "transcript_preview": result.transcript[:400],
                 "connectivity": self.mode_manager.status(refresh=False).as_dict()}
@@ -2243,36 +2382,20 @@ class Daemon:
         return {"showoff": self.showoff.status()}
 
     async def _showoff_enter(self, params: dict) -> dict:
-        try:
-            result = self.showoff.enter(
-                command=str(params.get("command") or ""),
-                embedding=params.get("embedding"),
-                owner_present=bool(params.get("owner_present", False)),
-                source=str(params.get("source") or "mic"),
-                replayed=bool(params.get("replayed", False)),
-                live_mic=bool(params.get("live_mic", True)),
-                audio_sha256=params.get("audio_sha256"))
-        except ShowoffError as exc:
-            raise ValueError(str(exc)) from exc
-        speech = await self._maybe_speak_reply(
-            result["announcement"], {"speak": params.get("speak", True)})
-        await self.broadcast({"event": "showoff.entered",
-                              "session_id": result["session_id"],
-                              "announcement": result["announcement"]})
-        return {**result, "speech": speech}
+        """Fail closed until entry is wired to daemon-captured live audio (I5)."""
+        self._require_ipc_owner()
+        raise ValueError(
+            "refused: show-off entry has no daemon-side fresh-capture path; "
+            "caller-supplied embedding, presence, source, and live-mic flags "
+            "are not authentication")
 
     async def _showoff_exit(self, params: dict) -> dict:
+        """The authenticated owner IPC action closes show-off; params do not."""
+        self._require_ipc_owner()
         try:
-            if params.get("command") or params.get("reason") == "owner_stop":
-                summary = self.showoff.exit_owner(
-                    command=str(params.get("command") or ""),
-                    embedding=params.get("embedding"))
-            elif params.get("reason") == "owner_hotkey" or not params.get("reason"):
-                summary = self.showoff.exit_hotkey()
-            else:
-                raise ValueError(
-                    "show-off exits only by owner stop command, owner hotkey, "
-                    "timeout, or a never-list attempt")
+            # The CLI/local owner action itself is the authenticated principal.
+            # `reason`, command text, and embeddings are not caller authority.
+            summary = self.showoff.exit_hotkey()
         except ShowoffError as exc:
             raise ValueError(str(exc)) from exc
         await self.broadcast({"event": "showoff.exited", "summary": summary})
@@ -2320,11 +2443,14 @@ class Daemon:
         else:
             reply, via = verdict["reply"], "showoff-refusal"
         leak = self.disclosure.leak_in(reply, guest=True) if verdict.get("allowed") else None
+        withheld = None
         if leak is not None:
             self.disclosure.log("leak_blocked", {
                 "kind": leak["kind"], "why": leak["why"],
                 "fact_id": leak.get("fact_id"), "channel": channel,
                 "speaker": "guest", "context": "showoff"})
+            withheld = {"kind": leak["kind"], "why": leak["why"],
+                        "note": "the show-off reply named owner information"}
             reply, via = self.disclosure.deflection(guest=True), "withheld"
         speech = await self._maybe_speak_reply(reply, params)
         await self.broadcast({"event": "conversation.message",
@@ -2338,7 +2464,7 @@ class Daemon:
             "channel": channel, "conversation_id": None,
             "model": model, "register": "expressive-allowed",
             "showoff": verdict, "memory_closed": True,
-            "speech": speech, "fixture": None,
+            "speech": speech, "fixture": None, "withheld": withheld,
             "serious_gate": None, "mode": self.config.gemini_mode,
         }
 
@@ -2414,14 +2540,15 @@ class Daemon:
 
         BUG F / Bug 8 (2026-10-20): the old single 4 s total bound cancelled
         the `asyncio.to_thread(...)` await — which does NOT stop the worker
-        thread. The generation ran to success, hit the cost ledger, and its
-        text was discarded for a canned reply. Deadlines are split now:
+        thread. Live chat now uses the SDK's native async HTTP stream, which is
+        cancelled at the total deadline; only finite fixture/legacy transports
+        retain the thread-backed compatibility path. Deadlines are split:
 
         * first-token deadline — a transport that has produced NOTHING by
           then is dead (streaming transports signal `on_first_token`; a
           non-streaming double counts only its completion as progress);
-        * generous total bound — a generation that started is awaited to
-          completion and delivered verbatim.
+        * total bound — a generation that finishes in time is delivered
+          verbatim; an unfinished live async request is cancelled at the bound.
 
         BUG 8b (2026-10-20 hardware): the real SDK transport never fires
         mid-generation, so the first-token deadline acted as a hard 5s total
@@ -2437,6 +2564,7 @@ class Daemon:
         first_token_s = min(float(self._chat_first_token_s),
                             float(self._chat_timeout_s))
         total_s = float(self._chat_timeout_s)
+        deadline = time.monotonic() + total_s
         first_token = asyncio.Event()
         signalled = {"done": False}
 
@@ -2464,6 +2592,23 @@ class Daemon:
                         raise
             raise AssertionError("unreachable")  # pragma: no cover
 
+        async_generate = getattr(self.client, "generate_async", None)
+        async_support = getattr(self.client, "supports_cancellable_async", None)
+        use_async = callable(async_generate) and async_support is not False
+
+        async def run_async():
+            # The live SDK path is natively async: cancelling it closes the
+            # request instead of abandoning a synchronous worker thread.
+            attempts = ({**full_kwargs, "deadline": deadline}, full_kwargs,
+                        base_kwargs, {"gen_config": gen_config}, {})
+            for i, kwargs in enumerate(attempts):
+                try:
+                    return await async_generate("chat", prompt, **kwargs)
+                except TypeError as exc:
+                    if "unexpected keyword" not in str(exc) or i == len(attempts) - 1:
+                        raise
+            raise AssertionError("unreachable")  # pragma: no cover
+
         abandoned = {"flag": False, "reason": "first_token"}
 
         def _late_completion(done_task: asyncio.Task) -> None:
@@ -2482,37 +2627,48 @@ class Daemon:
                 original_len=len(text), replacement="",
                 turn=prompt[-60:])
 
-        task = self._track_task(asyncio.ensure_future(asyncio.to_thread(run)))
+        generation = run_async() if use_async else asyncio.to_thread(run)
+        task = self._track_task(asyncio.ensure_future(generation))
         task.add_done_callback(_late_completion)
+
+        async def _await_generation(timeout: float):
+            awaited = task if use_async else asyncio.shield(task)
+            result = await asyncio.wait_for(awaited, timeout=timeout)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("chat total deadline expired")
+            return result
+
         progress = asyncio.ensure_future(first_token.wait())
         try:
             done, _pending = await asyncio.wait(
                 {task, progress}, timeout=first_token_s,
                 return_when=asyncio.FIRST_COMPLETED)
             if task in done:
+                if time.monotonic() >= deadline:
+                    abandoned["flag"] = True
+                    abandoned["reason"] = "total"
+                    raise ChatTimeout("total", total_s)
                 return task.result()      # success: delivered verbatim
             if progress in done:
                 # Streaming: first token arrived within deadline — generous total.
-                remaining = max(0.0, total_s - first_token_s)
+                remaining = max(0.0, deadline - time.monotonic())
                 try:
-                    return await asyncio.wait_for(asyncio.shield(task),
-                                                  timeout=remaining)
+                    return await _await_generation(remaining)
                 except TimeoutError as exc:
                     abandoned["flag"] = True
                     abandoned["reason"] = "total"
                     raise ChatTimeout("total", total_s) from exc
             # Neither completed nor signaled within first-token deadline.
-            # For blocking transports (real SDK on hardware) this is NOT failure:
-            # the generation may still complete within the total bound and must
-            # be DELIVERED (marked late, not substituted) — BUG 8b.
-            remaining = max(0.0, total_s - first_token_s)
+            # A legacy non-streaming transport is not dead just because it
+            # missed the first-token threshold: it may still finish inside the
+            # total bound and must be DELIVERED (marked late, not substituted).
+            remaining = max(0.0, deadline - time.monotonic())
             if remaining <= 0:
                 abandoned["flag"] = True
                 abandoned["reason"] = "first_token"
                 raise ChatTimeout("first_token", first_token_s)
             try:
-                result = await asyncio.wait_for(asyncio.shield(task),
-                                                timeout=remaining)
+                result = await _await_generation(remaining)
                 # Delivered late but within total — mark late, don't substitute.
                 try:
                     text = getattr(result, "text", "") or ""
@@ -2535,6 +2691,11 @@ class Daemon:
             if not progress.done():
                 progress.cancel()
                 await asyncio.gather(progress, return_exceptions=True)
+            if use_async and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            if task.done():
+                self._background_tasks.discard(task)
 
     async def _ask(self, params: dict) -> dict:
         """Conversational turn on the §13.4 ladder: governor (local) →
@@ -2554,23 +2715,27 @@ class Daemon:
         # Mid-sentence mentions never match (match_wake is start-anchored).
         wake = match_wake(text)
         route_text = wake.remainder if wake is not None else text
-        speaker = str(params.get("speaker") or "owner").lower()
-        channel = str(params.get("channel") or "voice")
+        request_method = self._ipc_method.get()
+        # Channel is derived from the registered handler, never from a JSON
+        # claim. A generic `ask` cannot turn itself into a console/owner path.
+        channel = "console" if request_method == "console.say" else "voice"
+        request_params = {"speak": bool(params.get("speak", False)),
+                          "channel": channel}
         showoff_now = self.showoff.status()
-        # Speaker verification, when the caller supplies a verdict, is authority
-        # here too: a voice that is not the owner never sees owner memory.
-        # During show-off mode, the room has guests by definition — any voice
-        # turn claiming to be the owner must pass voiceprint verification.
-        verified = params.get("owner_verified")
-        if verified is None and showoff_now.get("active") and speaker == "owner" and channel == "voice":
-            verdict = self.showoff.verify_owner(params.get("embedding"))
-            verified = bool(verdict.get("verified"))
-        if verified is False:
-            speaker = "guest"
+        # Every turn while the public demo is active is a guest turn, including
+        # console.say. Owner flags, speaker labels, and copied embeddings in the
+        # request are not speaker evidence (I5); show-off only exposes its
+        # explicit demo-safe allowlist.
+        if showoff_now.get("active"):
+            return await self._guest_turn(text, request_params, showoff_now)
+        # The kernel-authenticated local owner is the default principal. A
+        # caller may voluntarily downgrade its own turn to guest, but cannot
+        # promote itself with `speaker=owner` or `owner_verified=True`.
+        speaker_claim = str(params.get("speaker") or "").lower()
+        speaker = ("guest" if speaker_claim in ("guest", "non-owner")
+                   or params.get("owner_verified") is False else "owner")
         if speaker != "owner":
-            if showoff_now.get("active"):
-                return await self._guest_turn(text, params, showoff_now)
-            return await self._guest_turn_normal(text, params)
+            return await self._guest_turn_normal(text, request_params)
 
         # The owner can tell her the room has company. That is awareness, not a
         # mode: nothing about voice, class mode or surfacing changes.
@@ -2584,7 +2749,6 @@ class Daemon:
             json.dumps({"register": decision.register,
                         "serious_gate": decision.serious_gate,
                         "pushback": decision.pushback, "reason": decision.reason}))
-        channel = str(params.get("channel") or "voice")
         conversation_id = self.sessions.active_id(iso_now())
         prior_turns = self.sessions.history(limit=8).get("messages") or []
         self.sessions.append("user", text, channel=channel, ts=iso_now())
@@ -2611,8 +2775,11 @@ class Daemon:
         if reply is None:
             # Rung 5/6: assemble the exact context the cheap model needs.
             hits = await asyncio.to_thread(self.memory.recall, route_text)
-            restricted = self.disclosure.company() or speaker != "owner"
-            kept = self.disclosure.filter_hits(hits, guest=speaker != "owner")
+            public_demo = bool(self.showoff.status().get("active"))
+            restricted = (self.disclosure.company() or public_demo
+                          or speaker != "owner")
+            kept = self.disclosure.filter_hits(
+                hits, guest=(speaker != "owner" or public_demo))
             context = "\n".join(f"- [{h.source} {h.ref}] {h.text}" for h in kept)
             history_lines = ""
             if prior_turns:
@@ -2621,8 +2788,9 @@ class Daemon:
                     if m.get("text") and (
                         not restricted
                         or self.disclosure.leak_in(
-                            str(m["text"]), guest=speaker != "owner",
-                            company=self.disclosure.company()) is None
+                            str(m["text"]),
+                            guest=(speaker != "owner" or public_demo),
+                            company=(self.disclosure.company() or public_demo)) is None
                     )
                 ]
                 if safe_turns:
@@ -2645,8 +2813,9 @@ class Daemon:
                 body = (f"Recent conversation in this session:\n{history_lines}\n\n"
                           f"User: {route_text}")
             # System prompt carries the persona governor: no roleplay, terse, no asterisks
-            disclosure_note = (self.disclosure.prompt_note(guest=speaker != "owner")
-                               if restricted else None)
+            disclosure_note = (self.disclosure.prompt_note(
+                guest=(speaker != "owner" or public_demo))
+                if restricted else None)
             full_prompt, gen_config = build_chat_prompt(
                 body, decision=decision, restricted=restricted,
                 disclosure_note=disclosure_note)
@@ -2707,9 +2876,10 @@ class Daemon:
 
         # The outgoing guard: a model that ignores the prompt still cannot read a
         # stored secret, plan or owner fact back to the room.
+        public_demo = bool(self.showoff.status().get("active"))
         leak = self.disclosure.leak_in(
-            reply, guest=speaker != "owner",
-            company=self.disclosure.company())
+            reply, guest=(speaker != "owner" or public_demo),
+            company=(self.disclosure.company() or public_demo))
         withheld = None
         if leak is not None:
             self.disclosure.log("leak_blocked", {
@@ -2941,15 +3111,32 @@ class Daemon:
     async def aclose(self, *, extra_tasks=()) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
+        meeting, self._meeting = self._meeting, None
+        meeting_task = meeting.get("task") if meeting is not None else None
+        capture_error = None
+        if meeting is not None:
+            if meeting_task is not None:
+                meeting_task.cancel()
+            try:
+                await meeting["dual"].aclose()
+            except Exception as exc:
+                capture_error = exc
         tasks = [
-            t for t in (*extra_tasks, self._dictation_task, *self._background_tasks)
+            t for t in (*extra_tasks, self._dictation_task, meeting_task,
+                        *self._meeting_stop_tasks, *self._background_tasks)
             if t is not None
         ]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if meeting is not None:
+            self.mode = self._meeting_mode()
         self.store.close()
+        if capture_error is not None:
+            print(f"[assistd] meeting capture cleanup failed: "
+                  f"{type(capture_error).__name__}: {capture_error}",
+                  file=sys.stderr, flush=True)
 
 
 def main() -> None:

@@ -1,4 +1,4 @@
-"""BUG 6 consolidated capture regressions (hardware report 2026-10-20).
+"""BUG 6 [I1, I2, I3, I4] consolidated capture regressions (hardware report 2026-10-20).
 
 The proven-working microphone never reached the transcript: `ptt.start` spawned
 pw-record with NO `--target` (params["target"] was never set by `assist

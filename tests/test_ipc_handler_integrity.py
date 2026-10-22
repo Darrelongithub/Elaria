@@ -1,4 +1,4 @@
-"""BUG A class (ADOPT-2): every IPC handler must resolve to a real bound
+"""BUG A [I9] class (ADOPT-2): every IPC handler must resolve to a real bound
 method and be callable BY NAME through the real handlers dict.
 
 The external hotword submission shipped `self._hotword_stop` (an asyncio.Event)
@@ -47,7 +47,7 @@ def test_every_ipc_handler_resolves_to_a_bound_method(running_daemon):
 
 
 def test_handlers_dict_matches_every_async_handler_method(running_daemon):
-    """A method that looks like a handler but is missing from the dict (or
+    """I9: a method that looks like a handler but is missing from the dict (or
     vice versa) is the same bug class one step removed."""
     daemon, _server = running_daemon
     handlers = daemon._handlers()

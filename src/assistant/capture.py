@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import re
 import shutil
 import struct
@@ -24,6 +25,8 @@ from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Protocol
+
+from .config import ensure_private_dir
 
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # s16le mono — what the Live API wants natively (§3.4)
@@ -227,7 +230,12 @@ class WavSink:
     def __init__(self, path: Path, sample_rate: int = SAMPLE_RATE):
         self.path = Path(path)
         self.sample_rate = int(sample_rate)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.path.parent)
+        fd = os.open(self.path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
         self._wav = wave.open(str(self.path), "wb")  # noqa: SIM115 — sink owns lifecycle; close() is the API
         self._wav.setnchannels(1)
         self._wav.setsampwidth(BYTES_PER_SAMPLE)
@@ -434,8 +442,25 @@ class DualCapture:
             yield (mic_frame or silence, sys_frame or silence)
 
     async def aclose(self) -> None:
-        await self.mic.aclose()
-        await self.system.aclose()
+        results = await asyncio.gather(
+            self.mic.aclose(), self.system.aclose(), return_exceptions=True)
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if not failures:
+            return
+        cancelled = next((failure for failure in failures
+                          if isinstance(failure, asyncio.CancelledError)), None)
+        if cancelled is not None:
+            other_failures = [failure for failure in failures if failure is not cancelled]
+            error = RuntimeError("meeting capture source close was cancelled")
+            if other_failures:
+                error.add_note(
+                    "additional capture close failure(s): "
+                    + "; ".join(f"{type(err).__name__}: {err}"
+                                 for err in other_failures))
+            raise error from cancelled
+        if len(failures) == 1:
+            raise failures[0]
+        raise BaseExceptionGroup("meeting capture sources failed to close", failures)
 
 
 async def _next_or_silence(iterator, _silence):

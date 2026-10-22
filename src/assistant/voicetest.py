@@ -39,10 +39,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import statistics
 import struct
 import subprocess
+import tempfile
 import time
 import wave
 from collections import deque
@@ -611,6 +613,34 @@ def corpus_check(embeddings_dir: Path) -> dict:
     }
 
 
+def _write_voiceprint_atomic(out_path: Path, payload: bytes) -> None:
+    """Publish a complete owner template with owner-only mode from creation (I5)."""
+    out_path = Path(out_path)
+    fd = None
+    temporary = None
+    try:
+        fd, name = tempfile.mkstemp(
+            prefix=f".{out_path.name}.", suffix=".tmp", dir=out_path.parent)
+        temporary = Path(name)
+        os.fchmod(fd, BIOMETRIC_FILE_MODE)
+        handle = os.fdopen(fd, "wb")
+        fd = None  # `handle` owns and closes the descriptor from here.
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, out_path)
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
 def enroll(embeddings_dir: Path, out_path: Path, model: str) -> dict:
     """Build voiceprint.json (centroid) from embedding sidecars.
 
@@ -632,10 +662,10 @@ def enroll(embeddings_dir: Path, out_path: Path, model: str) -> dict:
         "file_count": len(vectors),
         "total_speech_seconds": total_speech_s,
     }
-    out_path.write_text(json.dumps(voiceprint, indent=2), encoding="utf-8")
-    # Written 0600 from the first moment: a template that lands world-readable in a
-    # shared /home is a leak the owner cannot take back (VB-9).
-    out_path.chmod(BIOMETRIC_FILE_MODE)
+    payload = json.dumps(voiceprint, indent=2).encode("utf-8")
+    # The private temp inode is complete before this atomic publish. No 0644
+    # final path or half-written template is ever observable (I5 / VB-9).
+    _write_voiceprint_atomic(out_path, payload)
     return {k: v for k, v in voiceprint.items() if k != "centroid"}
 
 

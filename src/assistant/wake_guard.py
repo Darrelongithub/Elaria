@@ -46,6 +46,7 @@ from pathlib import Path
 
 from .capture import frame_rms
 from .cost import iso_now
+from .ipc import IpcPrincipal
 from .transcribe import SilenceLadder
 from .wake_buffers import SAMPLE_RATE, PendingWindow, PreWakeRing, bytes_for
 
@@ -664,35 +665,28 @@ class WakeGuard:
                                                     sort_keys=True))
 
     # -- accept paths ------------------------------------------------------
-    def authorize_accept(self, *, channel: str,
-                         voiceprint_score: float | None = None) -> dict:
-        """Who may open listening for a wake-knock.
+    def authorize_accept(self, *, principal: IpcPrincipal | None) -> dict:
+        """Only the kernel-authenticated local owner may accept a knock (I5).
 
-        voice-accept must ITSELF be voiceprint-verified (high confidence).
-        hotkey/console accept counts as owner authentication — the same
-        trust as PTT. Everything else fails closed.
+        A channel label or confidence number from an IPC payload is not proof.
+        Voice acceptance would require fresh daemon-captured evidence; this
+        package currently exposes only the explicit owner-console action.
         """
-        channel = str(channel or "")
-        if channel in ("hotkey", "console", "voice_unavailable"):
-            return {"authorized": True, "via": channel}
-        if channel == "voice":
-            ok = (voiceprint_score is not None
-                  and self.gate.evaluate(voiceprint_score, verified=True) == CONF_HIGH)
-            return {"authorized": ok,
-                    "via": "voice",
-                    "reason": ("voiceprint verified" if ok else
-                               "refused: voice-accept must itself be "
-                               "voiceprint-verified (fail closed)")}
-        return {"authorized": False, "via": channel,
-                "reason": f"refused: unknown accept channel {channel!r}"}
+        if (not isinstance(principal, IpcPrincipal)
+                or principal.pid <= 0 or principal.uid != os.getuid()):
+            return {
+                "authorized": False,
+                "via": "none",
+                "reason": "refused: wake-knock accept requires a "
+                          "daemon-authenticated local owner (I5)",
+            }
+        return {"authorized": True, "via": "authenticated-local-owner"}
 
     def wake_knock_accepted(self, *, knock_id: int | None = None,
-                            channel: str = "console",
-                            voiceprint_score: float | None = None) -> dict:
+                            principal: IpcPrincipal | None = None) -> dict:
         if self.state != WAKE_KNOCK:
             raise WakeGuardError(f"no wake-knock pending (state {self.state!r})")
-        auth = self.authorize_accept(channel=channel,
-                                     voiceprint_score=voiceprint_score)
+        auth = self.authorize_accept(principal=principal)
         if not auth.get("authorized"):
             raise WakeGuardError(str(auth.get("reason")))
         if self._guest_door_blocked():

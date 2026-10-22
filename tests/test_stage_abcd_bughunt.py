@@ -185,6 +185,12 @@ def test_bh_h1_live_disconnect_during_conversation_emits_speech_error_and_text_f
                 "usage": {"tokens_in": 5, "tokens_out": 5},
             }
 
+        async def generate_async(self, model: str, contents, config: dict,
+                                 on_first_token=None, deadline=None) -> dict:
+            if on_first_token is not None:
+                on_first_token()
+            return self.generate(model, contents, config)
+
         def generate_audio(self, model: str, text: str, voice_name: str) -> dict:
             raise RuntimeError("Live WebSocket closed unexpectedly (1006)")
 
@@ -310,7 +316,7 @@ def test_bh_h3_allowed_voices_widened_then_narrowed_and_case_canonical(tmp_path:
 
 
 def test_bh_h4_deprecated_model_voice_never_shadows_gemini_voice_model(tmp_path: Path):
-    """BH-H4: Setting deprecated `model_voice` alongside default `gemini_voice_model`
+    """BH-H4 [I7]: setting deprecated `model_voice` alongside default `gemini_voice_model`
     must NOT hijack `voice_model(config)` away from `DEFAULT_VOICE_MODEL`.
     """
     cfg = _sandbox_config(

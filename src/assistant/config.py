@@ -50,6 +50,14 @@ def runtime_dir() -> Path:
     return Path(f"/tmp/assistant-{os.getuid()}")
 
 
+def ensure_private_dir(path: Path) -> Path:
+    """Create an application-owned directory with owner-only traversal (I5)."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+    return path
+
+
 def canonical_voices(config) -> tuple[str, ...]:
     """`[gemini] allowed_voices`, defaulting to `("Flare",)`.
 
@@ -449,7 +457,7 @@ DEFAULTS: dict = {
         # Rotate before the ~10min Live connection lifetime (§3.5 table).
         "live_session_max_s": 540,
         "save_audio": True,               # disk is free; re-transcription isn't
-        "inbox_dir": "~/.local/share/assistant/inbox",
+        "inbox_dir": "",
         "copy_to_clipboard": True,        # wl-copy only (Wayland, §3.3)
         # Adaptive endpointing (§13.8 soft check-in): per-mode silence
         # before the single "Is that all?" — narration waits far longer.
@@ -683,6 +691,14 @@ class Config:
         return self.data_dir / "assistant.db"
 
     @property
+    def inbox_dir(self) -> Path:
+        """Configured transcript inbox, defaulting to the XDG data root (I7)."""
+        configured = self.section("transcribe").get("inbox_dir")
+        if configured:
+            return Path(configured).expanduser()
+        return self.data_dir / "inbox"
+
+    @property
     def socket_path(self) -> Path:
         return runtime_dir() / "assistant.sock"
 
@@ -717,8 +733,9 @@ class Config:
         return cwd if cwd.exists() else None
 
     def ensure_dirs(self) -> None:
-        for path in (self.data_dir, self.state_dir, runtime_dir()):
-            path.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.data_dir)
+        ensure_private_dir(self.state_dir)
+        runtime_dir().mkdir(parents=True, exist_ok=True)
 
 
 def _read_env_file(path: Path) -> tuple[str | None, int | None]:
