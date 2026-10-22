@@ -12,12 +12,15 @@ exists in this module — memory is offline by architecture (§16).
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import threading
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import ClassVar
+
+from .config import ensure_private_dir
 
 # FTS5 treats the operand of `MATCH` as a query *language*, so raw user text
 # such as `"`, `NEAR(`, `invoice OR` or `invoice)` is a syntax error and
@@ -270,7 +273,18 @@ CREATE TABLE IF NOT EXISTS state (
 
 class Store:
     def __init__(self, db_path: Path):
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path = Path(db_path)
+        ensure_private_dir(db_path.parent)
+        try:
+            fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            os.chmod(db_path, 0o600)
+        else:
+            os.close(fd)
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                os.chmod(sidecar, 0o600)
         self.db_path = db_path
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False,
                                      timeout=5.0)

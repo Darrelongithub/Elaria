@@ -1,4 +1,4 @@
-"""BUG 7 + the dead-command class: every `assist` subcommand entry point must
+"""BUG 7 [I9] + the dead-command class: every `assist` subcommand entry point must
 be alive.
 
 Owner repro 2026-10-20: `uv run assist meeting setup` crashed with
@@ -173,7 +173,7 @@ def test_every_cli_subcommand_entry_point_is_alive(tmp_path, capsys,
 
 
 def test_every_parser_leaf_has_a_smoke_invocation(tmp_path):
-    """A new subcommand without a smoke argv fails here — the table rots
+    """I9: a new subcommand without a smoke argv fails here — the table rots
     loudly, which is the whole point of the Bug 7 exercise."""
     table = [tuple(argv) for argv in _smoke_table(tmp_path)]
     leaves = [leaf for leaf in _leaf_paths(build_parser()) if leaf]

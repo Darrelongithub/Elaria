@@ -1544,16 +1544,16 @@ running the documented command chain).
 
 ## SUSPECTS from the 2026-10-21 hunt — unproven, NOT fixed (evidence + settling check in BUGHUNT-2026-10-21.md)
 
-- **S1** Live model ids exist for the owner's key → `assist voice models`.
-- **S2** Final segment vs `turn_complete` ordering after `activityEnd` → `GEMINI_MODE=record` dictate, read `fixtures/seq-live.jsonl` (possible after BH-K4).
-- **S3** `generate_audio` fallback `send_realtime_input(text=…)` may not end the turn → `assist voice say "test"` on hardware.
-- **S4** `ipc.subscribe_events` has no read timeout (a wedged-but-alive daemon freezes Waybar/console feeds silently) → design call; needs an owner decision on feed-liveness semantics.
-- **S5** `no_speech` gate (peak RMS < 0.003) may discard very quiet real speech → quiet dictation + compare `capture.stats`.
-- **S6** Duplex guard may drop a genuine user `final` inside the 400 ms output window → record-mode session with an interjection during her reply.
-- **S7** Hotword scoring/verify run on the event loop (onnx + ECAPA subprocess) → ack-latency measurement on hardware.
-- **S8** `_sdk_transcribe` and live `transcribe_batch_async` upload Gemini Files but do not delete the remote file; provider retention/expiry remains unverified. After a sanitized batch transcription, list the owner's Gemini Files via AI Studio/SDK.
-- **S9** offline meeting ASR remains unbounded after BH-K39: `_transcribe_channel_async` runs `LocalWhisperBackend.transcribe()` in `asyncio.to_thread()` without deadline/cancellation, while optional `PyannoteDiarizer.diarize()` runs synchronously without a deadline. A stuck inference/refinement can still park `_meeting_processing` or the event loop. Settle on the owner's forced-offline path with `time assist meeting stop` while another terminal runs `watch -n 1 assist status`; if `pyannote_refine=true`, repeat with refinement enabled. Do not add a blind timeout that discards a completed transcript.
-- **S10** real Google SDK timeout enforcement remains UNVERIFIED: fake SDK tests cancel both upload and generation, and installed SDK source maps the remaining-time configs to HTTP timeouts, but no live provider/network request or forced stall was run. With the owner's key, run `assist meeting start`, record several utterances, then `time assist meeting stop`; confirm a note, `assist cost` ledger rows, and idle `assist status`. This exercises real requests but does not force a stall.
+- **S1 [I7]** Live model ids exist for the owner's key → `assist voice models`.
+- **S2 [I1, I2]** Final segment vs `turn_complete` ordering after `activityEnd` → `GEMINI_MODE=record` dictate, read `fixtures/seq-live.jsonl` (possible after BH-K4).
+- **S3 [I1, I2]** `generate_audio` fallback `send_realtime_input(text=…)` may not end the turn → `assist voice say "test"` on hardware.
+- **S4 [I2, I10]** `ipc.subscribe_events` has no read timeout (a wedged-but-alive daemon freezes Waybar/console feeds silently) → design call; needs an owner decision on feed-liveness semantics.
+- **S5 [I1]** `no_speech` gate (peak RMS < 0.003) may discard very quiet real speech → quiet dictation + compare `capture.stats`.
+- **S6 [I1, I4]** Duplex guard may drop a genuine user `final` inside the 400 ms output window → record-mode session with an interjection during her reply.
+- **S7 [I2, I3]** Hotword scoring/verify run on the event loop (onnx + ECAPA subprocess) → ack-latency measurement on hardware.
+- **S8 [I5]** `_sdk_transcribe` and live `transcribe_batch_async` upload Gemini Files but do not delete the remote file; provider retention/expiry remains unverified. After a sanitized batch transcription, list the owner's Gemini Files via AI Studio/SDK.
+- **S9 [I2, I3, I10]** offline meeting ASR remains unbounded after BH-K39: `_transcribe_channel_async` runs `LocalWhisperBackend.transcribe()` in `asyncio.to_thread()` without deadline/cancellation, while optional `PyannoteDiarizer.diarize()` runs synchronously without a deadline. A stuck inference/refinement can still park `_meeting_processing` or the event loop. Settle on the owner's forced-offline path with `time assist meeting stop` while another terminal runs `watch -n 1 assist status`; if `pyannote_refine=true`, repeat with refinement enabled. Do not add a blind timeout that discards a completed transcript.
+- **S10 [I2, I3]** real Google SDK timeout enforcement remains UNVERIFIED: fake SDK tests cancel both upload and generation, and installed SDK source maps the remaining-time configs to HTTP timeouts, but no live provider/network request or forced stall was run. With the owner's key, run `assist meeting start`, record several utterances, then `time assist meeting stop`; confirm a note, `assist cost` ledger rows, and idle `assist status`. This exercises real requests but does not force a stall.
 
 ### BH-K43 [I5] — Wake-knock accept trusted caller channel and score
 
@@ -1600,3 +1600,30 @@ running the documented command chain).
 - **Root cause:** `speech.say` called `SpeechService.speak()` without acquiring the gate. Reply speech relied on `_speaking_until`, an estimate from text length; slow synthesis could outlast that reservation before playback began, and the playback worker itself was not represented in `is_speaking()`.
 - **Fix:** playing local-TTS calls now use a tracked `_speech_playbacks` worker set. The gate closes before synthesis, remains closed until the actual synthesis/playback task completes, then retains the existing 400 ms tail. `speech.say` and `_speak_once` use the shared helper; play-disabled synthesis does not close the mic gate. Playback workers are shielded from request cancellation because cancelling `to_thread` cannot stop sound already being rendered.
 - **Verification:** I4 regressions were run red before the change and pass after. `.venv/bin/pytest -q tests/test_bug_i4_speech_say_duplex.py tests/test_bug6f_live_final_and_startup_ack.py tests/test_voice_bughunt.py tests/test_stage_b_console_class.py tests/test_hardening_pass2.py` — **127 passed, 1 skipped**. The scoped I4 mutation check killed **5/5** changes (worker registration, gate task check, tail reset, `speech.say` bypass, and owner-reply bypass). Two fresh full-suite runs returned **1,560 passed, 6 skipped** each; `.venv/bin/ruff check .` and `git diff --check` passed. This is 167 more passing tests than the user's 1,393-test baseline. No audio hardware/provider was used. No independent reviewer is available; the fix remains **UNCONFIRMED**.
+
+### BH-K48 [I7] — default transcript inbox ignored `XDG_DATA_HOME`
+
+- **Severity:** user-data path/config mismatch; dictation and meeting notes could land outside the active XDG data tree.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix red repro:** `tests/test_bug_i7_xdg_inbox.py::test_bug_i7_default_transcript_inboxes_follow_xdg_data_home` set a non-default `XDG_DATA_HOME`. `Config.data_dir` followed it, but `DictationService.inbox_dir` (and the parallel `MeetingService` path) still resolved to `~/.local/share/assistant/inbox`; the regression failed. The explicit user-configured inbox override test passed before the fix.
+- **Root cause:** the default `[transcribe].inbox_dir` and both service constructors independently hardcoded the fallback path instead of deriving it from `Config.data_dir`.
+- **Fix:** `Config.inbox_dir` preserves a non-empty explicit override and otherwise resolves to `data_dir / "inbox"`. Dictation and meeting services use that single property; the shipped config default/example now leave it empty to select the XDG-derived location.
+- **Verification:** the two I7 regression tests pass. The focused dictation/meeting/storage suite passed **161 passed, 1 skipped**; two fresh full-suite runs passed **1,565 passed, 6 skipped** each. No hardware/provider check was needed. Independent review is unavailable; the fix remains **UNCONFIRMED**.
+
+### BH-K49 [I5] — local transcript/audio/database artifacts were group/world-readable
+
+- **Severity:** local privacy exposure under the common `umask 0022`; sensitive data paths were traversable and persisted files had mode `0644`.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix reproduction:** `tests/test_bug_i5_private_storage_modes.py` ran under `umask 0022` and failed. A separate executed probe observed `data_dir` and `state_dir` at `0755`, `assistant.db`, `-wal`, `-shm`, a raw WAV, and dictation note at `0644`. The red test also covered meeting audio copies and notes.
+- **Root cause:** ordinary `mkdir`, SQLite, `wave.open`, `Path.write_text`, and meeting-copy opens inherited permissive defaults from the process umask.
+- **Fix:** application data/state/audio/inbox directories are created and normalized to `0700`; SQLite's DB and existing WAL/SHM sidecars are normalized to `0600` before connect, and new DBs are pre-created `0600`; WAV sinks and meeting audio copies use `0600`; dictation/meeting notes use a private descriptor and secure existing files before writing/appending.
+- **Verification:** the I5 mode regression passes and kills relevant mode-removal mutations. Two fresh full-suite runs passed **1,565 passed, 6 skipped** each; Ruff and `git diff --check` passed. Mode-bit behavior was checked, but an actual read attempt by a separate UID was not run; cross-UID behavior remains **UNVERIFIED**. Independent review is unavailable; the fix remains **UNCONFIRMED**.
+
+### BH-K50 [I5] — voiceprint enrollment briefly exposed and could truncate its template
+
+- **Severity:** biometric privacy exposure and non-atomic replacement; a template could be readable during enrollment or left partial after a failed write.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix red repros:** under `umask 0022`, `tests/test_bug_i5_voiceprint_atomic_permissions.py::test_bug_i5_enrollment_is_never_world_readable_even_under_umask_0022` observed mode `0644` at the existing post-write `chmod` boundary (420 decimal) even though the final mode became `0600`. `test_bug_i5_interrupted_atomic_enrollment_preserves_existing_template` injected a publish failure; before the fix no atomic replace occurred, so the injection did not fire and the old template had already been overwritten.
+- **Root cause:** `Path.write_text()` created/truncated the final path using `0666 & ~umask`, and the later `chmod(0600)` left a disclosure window; writing directly to the destination also exposed partial data on interruption.
+- **Fix:** enrollment writes a same-directory temporary inode created `0600`, flushes/fsyncs it, then publishes with `os.replace`. Failures clean up the temporary file and preserve the previous template.
+- **Verification:** both I5 enrollment regressions pass, including an assertion that the inode being published is `0600`; the focused I5/I7/storage suite passed **161 passed, 1 skipped**. The scoped permission/path mutation audit killed **8/8** mutants. Two fresh full-suite runs passed **1,565 passed, 6 skipped** each. No biometric model, microphone, or hardware was used. Independent review is unavailable; the fix remains **UNCONFIRMED**.

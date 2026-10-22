@@ -6,16 +6,42 @@ Local files only; nothing here touches the network."""
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
+
+from .config import ensure_private_dir
+
+
+def write_private_text(path: Path, text: str, *, append: bool = False,
+                       exclusive: bool = False) -> Path:
+    """Write an owner-only note, securing existing files before changing bytes (I5)."""
+    path = Path(path)
+    flags = os.O_WRONLY | os.O_CREAT
+    if append:
+        flags |= os.O_APPEND
+    if exclusive:
+        flags |= os.O_EXCL
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        if not append and not exclusive:
+            os.ftruncate(fd, 0)
+        handle = os.fdopen(fd, "a" if append else "w", encoding="utf-8")
+        fd = None
+        with handle:
+            handle.write(text)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return path
 
 
 def write_inbox_note(inbox_dir: Path, *, when: datetime, raw: str,
                      cleaned: str | None, backend: str, language: str,
                      audio_path: str | None, flagged: bool,
                      session_id: str) -> Path:
-    inbox_dir = Path(inbox_dir).expanduser()
-    inbox_dir.mkdir(parents=True, exist_ok=True)
+    inbox_dir = ensure_private_dir(Path(inbox_dir).expanduser())
     stamp = when.strftime("%Y%m%d-%H%M%S")
     path = inbox_dir / f"{stamp}-dictation-{session_id[:6]}.md"
     body = cleaned if (cleaned and not flagged) else raw
@@ -44,7 +70,7 @@ def write_inbox_note(inbox_dir: Path, *, when: datetime, raw: str,
     if flagged:
         lines.append("> ⚠️ Cleanup was flagged by a safety gate — the text above is the "
                      "raw transcript. See `assist cost`/transcript log for the reason.\n")
-    path.write_text("\n".join(lines), encoding="utf-8")
+    write_private_text(path, "\n".join(lines))
     return path
 
 
@@ -68,6 +94,5 @@ def append_cloud_transcript(path: Path, *, cloud_text: str,
             "</details>",
             "",
         ]
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
+    write_private_text(path, "\n".join(lines), append=True)
     return path

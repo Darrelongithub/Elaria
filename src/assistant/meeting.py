@@ -29,8 +29,10 @@ from pathlib import Path
 
 from . import asr
 from .capture import write_wav
+from .config import ensure_private_dir
 from .cost import iso_now
 from .diarize import Turn, assign_speakers, format_transcript, merge_adjacent
+from .inbox import write_private_text
 
 # `assist meeting stop` has an existing 900 s IPC deadline; keep 60 s for its reply.
 MEETING_TRANSCRIPTION_TIMEOUT_S = 840.0
@@ -103,17 +105,20 @@ class MeetingService:
         self.client = client
         self.mode_manager = mode_manager
         self.local_backend = local_backend
-        self.audio_dir = config.data_dir / "audio"
-        self.inbox_dir = Path(config.section("transcribe").get(
-            "inbox_dir", "~/.local/share/assistant/inbox")).expanduser()
-        self.audio_dir.mkdir(parents=True, exist_ok=True)
-        self.inbox_dir.mkdir(parents=True, exist_ok=True)
+        self.audio_dir = ensure_private_dir(config.data_dir / "audio")
+        self.inbox_dir = ensure_private_dir(config.inbox_dir)
 
     @staticmethod
     def _copy_no_overwrite(src: Path, dest: Path) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with src.open("rb") as source, dest.open("xb") as target:
-            shutil.copyfileobj(source, target)
+        ensure_private_dir(dest.parent)
+        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            with src.open("rb") as source, os.fdopen(fd, "wb") as target:
+                fd = None
+                shutil.copyfileobj(source, target)
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def _unused_meeting_stamp(self) -> str:
         """Meeting names have only minute resolution in their readable
@@ -225,11 +230,11 @@ class MeetingService:
         turns = merge_adjacent(sorted(turns, key=lambda t: t.start_s))
         transcript = format_transcript(turns)
         note_path = self.inbox_dir / f"meeting-{stamp}.md"
-        with note_path.open("x", encoding="utf-8") as note:
-            note.write(
-                f"---\ncreated: {iso_now()}\ntype: meeting\ntitle: {title or 'Untitled call'}\n"
-                f"diarization: {backend}\nmic: {mic_dest}\nsystem: {sys_dest}\n---\n\n"
-                f"# {title or 'Meeting'} — {stamp}\n\n{transcript}\n")
+        note_text = (
+            f"---\ncreated: {iso_now()}\ntype: meeting\ntitle: {title or 'Untitled call'}\n"
+            f"diarization: {backend}\nmic: {mic_dest}\nsystem: {sys_dest}\n---\n\n"
+            f"# {title or 'Meeting'} — {stamp}\n\n{transcript}\n")
+        write_private_text(note_path, note_text, exclusive=True)
         raw = "\n".join(f"{t.speaker}: {t.text}" for t in turns)
         self.store.log_transcript(
             session_id=f"meeting-{stamp}", ts=iso_now(),
@@ -279,11 +284,11 @@ class MeetingService:
         turns = merge_adjacent(sorted(turns, key=lambda t: t.start_s))
         transcript = format_transcript(turns)
         note_path = self.inbox_dir / f"meeting-{stamp}.md"
-        with note_path.open("x", encoding="utf-8") as note:
-            note.write(
-                f"---\ncreated: {iso_now()}\ntype: meeting\ntitle: {title or 'Untitled call'}\n"
-                f"diarization: {backend}\nmic: {mic_dest}\nsystem: {sys_dest}\n---\n\n"
-                f"# {title or 'Meeting'} — {stamp}\n\n{transcript}\n")
+        note_text = (
+            f"---\ncreated: {iso_now()}\ntype: meeting\ntitle: {title or 'Untitled call'}\n"
+            f"diarization: {backend}\nmic: {mic_dest}\nsystem: {sys_dest}\n---\n\n"
+            f"# {title or 'Meeting'} — {stamp}\n\n{transcript}\n")
+        write_private_text(note_path, note_text, exclusive=True)
         raw = "\n".join(f"{t.speaker}: {t.text}" for t in turns)
         self.store.log_transcript(
             session_id=f"meeting-{stamp}", ts=iso_now(),

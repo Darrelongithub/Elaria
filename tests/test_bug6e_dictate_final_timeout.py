@@ -1,4 +1,4 @@
-"""BUG 6e: a Live transport that never finalizes must not swallow the WAV.
+"""BUG 6e [I1, I2, I3]: a Live transport that never finalizes must not swallow the WAV.
 
 The hardware capture is already known to work. These regressions focus on the
 Live receive/finalization path and on keeping capture.stats durable when a

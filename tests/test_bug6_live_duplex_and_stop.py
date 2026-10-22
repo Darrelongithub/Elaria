@@ -1,4 +1,4 @@
-"""BUG 6 regressions — live dictation: ptt.stop must not hang, and the Live
+"""BUG 6 regressions [I1, I2, I4] — live dictation: ptt.stop must not hang, and the Live
 session itself must be half-duplex.
 
 Owner repro 2026-10-20 (after the Bug 1–5 fixes):
@@ -365,7 +365,7 @@ def test_bug6_simulated_live_session_playing_while_hearing_it_yields_zero_user_t
 
 
 def test_bug6_without_the_gate_the_same_transport_does_echo_itself():
-    """Control: the double is faithful, so the test above proves the fix."""
+    """I4 control: the double is faithful, so the test above proves the fix."""
     clock = FakeClock()
     transport = SelfHearingLiveTransport(trigger_after_frames=2, clock=clock)
     events: list[LiveEvent] = []
@@ -468,7 +468,7 @@ def test_bug6_every_ledger_call_site_carries_a_purpose():
 
 
 def test_bug6_a_finished_previous_session_cannot_clobber_the_next_dictation(config):
-    """Async finish must be generation-safe.
+    """I2/I10: async finish must be generation-safe.
 
     The transcript is delivered in the background, so it can land after the
     owner has pressed the hotkey again. The old finisher may not set the mode
@@ -519,7 +519,7 @@ def test_bug6_a_finished_previous_session_cannot_clobber_the_next_dictation(conf
 
 
 def test_bug6_cli_dictate_prints_a_turn_and_never_blocks(config, running_daemon):
-    """The exact owner command: Listening… → Enter → a dictate turn, quickly.
+    """I1/I2: the exact owner command: Listening… → Enter → a dictate turn, quickly.
 
     Previously this blocked in the stop recv for 90 s and then printed nothing.
     Here the release is ack'd, the CLI asks `ptt.result` for the transcript, and

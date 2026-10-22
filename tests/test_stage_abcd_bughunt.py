@@ -316,7 +316,7 @@ def test_bh_h3_allowed_voices_widened_then_narrowed_and_case_canonical(tmp_path:
 
 
 def test_bh_h4_deprecated_model_voice_never_shadows_gemini_voice_model(tmp_path: Path):
-    """BH-H4: Setting deprecated `model_voice` alongside default `gemini_voice_model`
+    """BH-H4 [I7]: setting deprecated `model_voice` alongside default `gemini_voice_model`
     must NOT hijack `voice_model(config)` away from `DEFAULT_VOICE_MODEL`.
     """
     cfg = _sandbox_config(

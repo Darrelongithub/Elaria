@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import re
 import shutil
 import struct
@@ -24,6 +25,8 @@ from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Protocol
+
+from .config import ensure_private_dir
 
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # s16le mono — what the Live API wants natively (§3.4)
@@ -227,7 +230,12 @@ class WavSink:
     def __init__(self, path: Path, sample_rate: int = SAMPLE_RATE):
         self.path = Path(path)
         self.sample_rate = int(sample_rate)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.path.parent)
+        fd = os.open(self.path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
         self._wav = wave.open(str(self.path), "wb")  # noqa: SIM115 — sink owns lifecycle; close() is the API
         self._wav.setnchannels(1)
         self._wav.setsampwidth(BYTES_PER_SAMPLE)

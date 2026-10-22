@@ -1,4 +1,4 @@
-"""A hostile infinite PTT wait must not outlive the caller indefinitely."""
+"""I2/I3/I10: a hostile infinite PTT wait must not outlive its caller."""
 
 from __future__ import annotations
 

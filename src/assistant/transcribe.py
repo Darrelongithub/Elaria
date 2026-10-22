@@ -190,8 +190,7 @@ class DictationService:
         # Phase 8 restates §12.5 as a rule, not a preference: raw audio is
         # the truth that makes offline placeholders recoverable.
         self.save_audio = True
-        self.inbox_dir = Path(settings.get("inbox_dir",
-                                           "~/.local/share/assistant/inbox")).expanduser()
+        self.inbox_dir = config.inbox_dir
         self.copy_clipboard = bool(settings.get("copy_to_clipboard", True))
         self.vad_threshold = float(settings.get("vad_rms_threshold", 0.01))
         self.checkin_after = settings.get("checkin_after_s") or {}

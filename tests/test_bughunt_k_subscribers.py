@@ -1,4 +1,4 @@
-"""BH-K14 — event subscribers must be removed when their client disconnects.
+"""BH-K14 [I10] — event subscribers must be removed when their client disconnects.
 
 `ipc.serve` never told the daemon a client went away: the StreamWriter
 stayed in `Daemon._subscribers` until some later broadcast happened to
