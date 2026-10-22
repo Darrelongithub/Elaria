@@ -544,6 +544,21 @@ DEFAULTS: dict = {
         "system_target": "",          # usually "<your-sink>.monitor"
         "pyannote_refine": False,     # needs extra: diarize + HF_TOKEN
     },
+    "event": {
+        # Event transcriber (Blueprint v2). Defaults = §0 decision-table row 3
+        # (the proven batch engine). `assist event spike` measures the real
+        # row on the owner's account; these keys follow its decision.
+        "route": "batch",             # batch | transcribe-live
+        "segment_minutes": 30.0,      # row 3: 30 · row 1: 10 · row 2: shortened
+        "tokens_per_second": 32.0,    # pacing estimate; replaced by the spike
+        "tpm_ceiling": 20_000.0,      # transcribe-live TPM ceiling ([quota])
+        "daily_call_budget": 25,      # batch route: 25 calls/day (§3)
+        "max_attempts": 3,
+        "deferred_retries": 2,
+        "stop_grace_s": 120.0,
+        "sleep_inhibit": True,
+        "mic_target": "",             # falls back to [meeting]/[capture]
+    },
     "memory": {
         # §10.5: local embeddings. 'hashing' = stdlib lexical baseline;
         # 'sentence-transformers' = real semantics (extra: embeddings).

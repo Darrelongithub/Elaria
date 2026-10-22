@@ -644,6 +644,130 @@ def _meeting_command(args, config) -> int:
     return 0
 
 
+def _event_command(args, config) -> int:
+    """`assist event …` — the field tool (Blueprint v2).
+
+    start/stop/status/speaker go through the daemon (it owns capture). Stop
+    and status degrade to disk assembly with the daemon gone (§5 recovery).
+    """
+    from pathlib import Path
+
+    action = args.event_action
+
+    if action == "spike":
+        from .event_spike import run_spike, write_decision
+
+        result = run_spike(config,
+                           wav_path=Path(args.wav) if args.wav else None,
+                           minutes=args.minutes)
+        out = Path(args.out) if args.out else (
+            config.data_dir / "events" / "event-spike.json")
+        write_decision(result, out)
+        decision = result["decision"]
+        print(f"§0 spike · mode={result['mode']} · model={result['model']}")
+        print(f"  full transcript: {result['full_transcript']} · "
+              f"tokens: {result['tokens']}"
+              f"{'' if result['tokens_measured'] else ' (ESTIMATED — not measured)'}"
+              f" · latency: {result['latency_s']}s")
+        print(f"  Decision: row {decision['row']} → {decision['route']} · "
+              f"{decision['segment_minutes']} min segments · "
+              f"switch flush: {decision['switch_flush']}")
+        print(f"  {decision['reason']}")
+        print(f"  saved: {out}")
+        return 0
+
+    if action == "start":
+        params = {"title": args.title, "speakers": args.speakers,
+                  "segment_minutes": args.segment_minutes,
+                  "source": args.source, "battery_ok": bool(args.battery_ok)}
+        try:
+            out = call(config.socket_path, "event.start", params, timeout=60.0)
+        except DaemonUnavailable as exc:
+            print(f"daemon unavailable (event capture lives there): {exc}",
+                  file=sys.stderr)
+            return 1
+        if out.get("state") == "needs-battery-ok":
+            detail = (out.get("preflight") or {}).get("power", {}).get("detail", "")
+            print(f"on battery ({detail}) — plug in for a 10 h event, or confirm.",
+                  file=sys.stderr)
+            if not sys.stdin.isatty():
+                print("non-interactive: re-run with --battery-ok to confirm.",
+                      file=sys.stderr)
+                return 1
+            if input("Run on battery anyway? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("not started.", file=sys.stderr)
+                return 1
+            params["battery_ok"] = True
+            out = call(config.socket_path, "event.start", params, timeout=60.0)
+        if out.get("state") == "refused":
+            for refusal in (out.get("preflight") or {}).get("refusals", []):
+                print(f"refused: {refusal}", file=sys.stderr)
+            return 1
+        if out.get("state") == "already-event":
+            print(f"Already running: {out.get('title')} · Document: "
+                  f"{out.get('document')}")
+            return 0
+        print("Event capture ON (segments → live document). Stop: assist event stop")
+        print(f"Document: {out.get('document')}")
+        for warning in (out.get("preflight") or {}).get("warnings", []):
+            print(f"  WARN {warning}", file=sys.stderr)
+        return 0
+
+    if action == "stop":
+        try:
+            out = call(config.socket_path, "event.stop", {}, timeout=300.0)
+        except DaemonUnavailable:
+            # §5 recovery: the state file + segments are enough — assemble.
+            from .event import recover_event
+
+            out = recover_event(config)
+        if out.get("state") == "not-running":
+            print("no event running.")
+            return 0
+        print(f"Document: {out.get('document')}")
+        print(f"words: {out.get('word_count')} · segments: {out.get('segments')} · "
+              f"transcribed: {out.get('transcribed')}")
+        for row in out.get("deferred") or []:
+            print(f"  deferred seg {row.get('index', 0):03d} — audio kept: "
+                  f"{row.get('wav')}")
+        return 0
+
+    if action == "status":
+        try:
+            out = call(config.socket_path, "event.status", {}, timeout=10.0)
+        except DaemonUnavailable:
+            from .event import status_from_disk
+
+            out = status_from_disk(config)
+        print(json.dumps(out, indent=2))
+        return 0
+
+    if action == "speaker":
+        if args.name == "next":
+            params = {"next": True}
+        elif args.name:
+            params = {"name": args.name}
+        else:
+            params = {}
+        try:
+            out = call(config.socket_path, "event.speaker", params, timeout=5.0)
+        except DaemonUnavailable as exc:
+            print(f"daemon unavailable (speaker state lives there): {exc}",
+                  file=sys.stderr)
+            return 1
+        if out.get("state") == "not-running":
+            print("no event running.")
+            return 0
+        if not params:
+            print(f"Speaker: {out.get('active_speaker')} · "
+                  f"elapsed {out.get('elapsed_s', 0):.0f}s · "
+                  f"roster: {', '.join(out.get('roster') or [])}")
+        else:
+            print(f"Speaker: {out.get('active_speaker')}")
+        return 0
+    return 2
+
+
 def _class_command(args, config) -> int:
     """`assist class [on|off|toggle|status]` — one toggle, visible everywhere."""
     from .presence import PresenceService
@@ -1613,6 +1737,31 @@ def build_parser() -> argparse.ArgumentParser:
     m_tr.add_argument("--pyannote", action="store_true",
                       help="refine far side with pyannote (extra + HF_TOKEN)")
     meeting_sub.add_parser("setup", help="PipeWire node discovery + loopback plan")
+    event_p = sub.add_parser(
+        "event",
+        help="live event transcription: segmented capture -> one growing "
+             "document (Blueprint v2)")
+    event_sub = event_p.add_subparsers(dest="event_action", required=True)
+    ev_start = event_sub.add_parser("start", help="preflight + begin the event")
+    ev_start.add_argument("--segment-minutes", type=float, default=None,
+                          help="segment length (default: decision-table row)")
+    ev_start.add_argument("--title", help="event title (document name)")
+    ev_start.add_argument("--speakers", help='roster, e.g. "Amina,John"')
+    ev_start.add_argument("--source", help="capture source (e.g. simulated)")
+    ev_start.add_argument("--battery-ok", action="store_true",
+                          help="run on battery (otherwise plug in or confirm)")
+    event_sub.add_parser("stop", help="close the event + assemble the document")
+    event_sub.add_parser("status", help="running state, segments, budget, disk")
+    ev_speaker = event_sub.add_parser(
+        "speaker", help='switch label: name | next | (bare: print active)')
+    ev_speaker.add_argument("name", nargs="?", default=None,
+                            help='speaker name, or "next" to cycle the roster')
+    ev_spike = event_sub.add_parser(
+        "spike", help="§0 Step 0: one closed WAV through the transcribe-live "
+                      "route; writes the decision-table result")
+    ev_spike.add_argument("--wav", help="existing WAV (default: synthesize)")
+    ev_spike.add_argument("--minutes", type=float, default=10.0)
+    ev_spike.add_argument("--out", help="decision JSON path")
     dictate_p = sub.add_parser("dictate", help="terminal push-to-talk: Enter to stop")
     dictate_p.add_argument("--command", dest="command_flag", action="store_true",
                            help="route the final transcript through the local intent ladder")
@@ -1939,6 +2088,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "meeting":
             return _meeting_command(args, config)
+
+        if args.command == "event":
+            return _event_command(args, config)
 
         if args.command == "hotword":
             return _hotword_command(args, config)

@@ -163,6 +163,11 @@ class Daemon:
         self.meetings = MeetingService(
             config, self.store, self.client, mode_manager=self.mode_manager)
         self._meeting_stop_timeout_s = MEETING_TRANSCRIPTION_TIMEOUT_S
+        # Event transcriber (Blueprint v2 P0): sibling of meeting mode, not a
+        # mutation of it. Capture lives here; transcription may fail — capture
+        # may not (see assistant.event).
+        from .event import EventService
+        self.event_service = EventService(config, self.store, client=self.client)
         # Disclosure awareness: memory may be used, secrets/plans never spoken
         # while company is present, and no owner memory to a guest voice.
         self.disclosure = DisclosureService(config, self.store)
@@ -617,6 +622,10 @@ class Daemon:
             "embed.run": self._embed_run,
             "meeting.start": self._meeting_start,
             "meeting.stop": self._meeting_stop,
+            "event.start": self._event_start,
+            "event.stop": self._event_stop,
+            "event.status": self._event_status,
+            "event.speaker": self._event_speaker,
             "mode.status": self._mode_status,
             "mode.set": self._mode_set,
             "mode.refresh": self._mode_refresh,
@@ -2333,6 +2342,30 @@ class Daemon:
                 "transcript_preview": result.transcript[:400],
                 "connectivity": self.mode_manager.status(refresh=False).as_dict()}
 
+    # -- event transcriber (Blueprint v2 P0) --------------------------------
+    async def _event_start(self, params: dict) -> dict:
+        """Segmented live transcription. Sibling of meeting mode (§11): the
+        recording is the truth; transcription may fail, capture may not."""
+        return await self.event_service.start(
+            title=params.get("title"),
+            speakers=params.get("speakers"),
+            segment_minutes=params.get("segment_minutes"),
+            source=params.get("source"),
+            battery_ok=bool(params.get("battery_ok")))
+
+    async def _event_stop(self, params: dict) -> dict:
+        return await self.event_service.stop()
+
+    async def _event_status(self, params: dict) -> dict:
+        return self.event_service.status()
+
+    async def _event_speaker(self, params: dict) -> dict:
+        if params.get("next"):
+            return self.event_service.speaker_next()
+        if params.get("name"):
+            return self.event_service.speaker_switch(str(params["name"]))
+        return self.event_service.speaker_status()
+
     # -- disclosure awareness (owner rule 2026-10-20) ------------------------
     async def _privacy_status(self, params: dict) -> dict:
         return {"company": self.disclosure.status()}
@@ -3111,6 +3144,13 @@ class Daemon:
     async def aclose(self, *, extra_tasks=()) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
+        # Event capture first: bounded best-effort finalize (assembles the
+        # document, releases the sleep-inhibit lock). A kill that skips this
+        # is covered by `event stop` recovery from disk (§5).
+        try:
+            await self.event_service.close()
+        except Exception:  # noqa: S110 - event finalize must never block daemon shutdown
+            pass
         meeting, self._meeting = self._meeting, None
         meeting_task = meeting.get("task") if meeting is not None else None
         capture_error = None

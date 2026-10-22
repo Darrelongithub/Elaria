@@ -1,0 +1,22 @@
+{
+  "when": "2026-10-22T17:26:04",
+  "mode": "mock",
+  "model": "gemini-3.5-transcribe-live",
+  "wav": "/home/user/.local/share/assistant/audio/event-spike.wav",
+  "minutes": 10.0,
+  "duration_s": 600.0,
+  "live_ok": true,
+  "full_transcript": true,
+  "text_sample": "[mock-synthetic 5097ddcb] No recorded fixture for this request. Prompt began: \"{'audio_sha256': 'eb677f320e6539079e9c71b44960b548dc10d43e3d4084012875ef89d0de5d\". Record real behaviour with GEMINI_MODE",
+  "tokens": 94,
+  "tokens_measured": false,
+  "latency_s": 0.029,
+  "error": null,
+  "decision": {
+    "row": 3,
+    "route": "batch",
+    "segment_minutes": 30,
+    "switch_flush": false,
+    "reason": "live route cannot batch a closed WAV, or the spike is ambiguous (no measured token figure) \u2014 defaulting to the third row: the proven batch engine (25 calls/day; speaker switches log inline markers and do NOT flush)"
+  }
+}

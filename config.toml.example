@@ -331,6 +331,24 @@ mic_target = ""                     # pw node name from: assist meeting setup
 system_target = ""                  # usually "<your-sink>.monitor"
 pyannote_refine = false             # extra: diarize + HF_TOKEN
 
+[event]
+# Event transcriber (Blueprint v2). The recording is the truth; the live text
+# is a convenience — transcription may fail, capture may not. Defaults follow
+# the §0 decision table's THIRD row (the proven batch engine): 30-min
+# segments, speaker switches log inline markers and do NOT flush. Run
+# `assist event spike` on the real account — its measured row lands in
+# docs/event-spike.json and these values should follow it.
+route = "batch"                     # batch | transcribe-live (set by the spike's row)
+segment_minutes = 30.0              # row 3: 30 · row 1: 10 · row 2: shortened to fit 20K TPM
+tokens_per_second = 32.0            # pacing estimate; replace with the spike's MEASURED figure
+tpm_ceiling = 20000.0               # transcribe-live TPM ceiling ([quota])
+daily_call_budget = 25              # batch route: 25 calls/day (§3) — switches cost nothing
+max_attempts = 3                    # capped retries with backoff + jitter, then deferred
+deferred_retries = 2                # extra rounds in the retry pool, drained when idle
+stop_grace_s = 120.0                # bounded wait at event stop; leftovers get markers
+sleep_inhibit = true                # systemd-inhibit sleep:idle:handle-lid-switch all event
+mic_target = ""                     # falls back to [meeting] then [capture] mic_target
+
 [privacy]
 tier = "free"                       # free | paid — see §12.2 before changing
 # §10.7 OPEN — decide before any indexing (Phase 3). Placeholder:

@@ -1060,7 +1060,8 @@ class GeminiClient:
     def transcribe_batch(self, audio_path, language: str = "en", *,
                          also_languages: list[str] | None = None,
                          preserve_code_switching: bool = False,
-                         deadline: float | None = None) -> dict:
+                         deadline: float | None = None,
+                         model: str | None = None) -> dict:
         """generateContent on saved audio: accurate pass, same ledger rules.
 
         Mock/record keying uses the audio's SHA-256 (+ language set), so
@@ -1080,7 +1081,10 @@ class GeminiClient:
         path = Path(audio_path)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         duration = wav_duration_s(path)
-        model = self.config.model_for_role("transcribe_batch")
+        # `model` override: the §0 spike pushes a closed WAV through the
+        # transcribe-live route AS a batch call (event_spike.py). Default
+        # stays the dedicated batch STT model.
+        model = model or self.config.model_for_role("transcribe_batch")
         others = [lang for lang in (also_languages or []) if lang != language]
         if others and preserve_code_switching:
             prompt = (
@@ -1112,7 +1116,8 @@ class GeminiClient:
     async def transcribe_batch_async(self, audio_path, language: str = "en", *,
                                      also_languages: list[str] | None = None,
                                      preserve_code_switching: bool = False,
-                                     deadline: float | None = None) -> dict:
+                                     deadline: float | None = None,
+                                     model: str | None = None) -> dict:
         """Transcribe through the SDK's native async HTTP transport.
 
         Live meeting stop uses this path so its absolute deadline cancels the
@@ -1123,7 +1128,7 @@ class GeminiClient:
             return self.transcribe_batch(
                 audio_path, language, also_languages=also_languages,
                 preserve_code_switching=preserve_code_switching,
-                deadline=deadline)
+                deadline=deadline, model=model)
 
         from pathlib import Path
 
@@ -1131,7 +1136,7 @@ class GeminiClient:
 
         path = Path(audio_path)
         duration = wav_duration_s(path)
-        model = self.config.model_for_role("transcribe_batch")
+        model = model or self.config.model_for_role("transcribe_batch")
         others = [lang for lang in (also_languages or []) if lang != language]
         if others and preserve_code_switching:
             prompt = (

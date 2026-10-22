@@ -426,6 +426,15 @@ class Store:
         with self._lock:
             return int(self._conn.execute(query, tuple(params)).fetchone()["n"])
 
+    def recent_llm_calls(self, limit: int = 5) -> list[dict]:
+        """Newest ledger rows first — the §0 spike reads its measured token
+        figure from the row its own call wrote (never an estimate guess)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM llm_calls ORDER BY id DESC LIMIT ?",
+                (max(1, int(limit)),)).fetchall()
+        return [dict(row) for row in rows]
+
     def failure_summary_since(self, since_iso: str) -> list[dict]:
         """Failed calls, grouped by purpose/model/error — the evidence behind
         `assist cost`'s failure count (BUG6 cost note).
