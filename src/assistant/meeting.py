@@ -17,9 +17,11 @@ capture sources are plain PipeWireCapture targets per channel.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import struct
+import time
 import wave
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +31,9 @@ from . import asr
 from .capture import write_wav
 from .cost import iso_now
 from .diarize import Turn, assign_speakers, format_transcript, merge_adjacent
+
+# `assist meeting stop` has an existing 900 s IPC deadline; keep 60 s for its reply.
+MEETING_TRANSCRIPTION_TIMEOUT_S = 840.0
 
 
 def read_pcm(path: Path) -> tuple[bytes, int]:
@@ -126,7 +131,8 @@ class MeetingService:
         return stamp
 
     def _transcribe_channel(self, wav_path: Path, speaker: str,
-                            work_dir: Path) -> list[Turn]:
+                            work_dir: Path, *,
+                            deadline: float | None = None) -> list[Turn]:
         pcm, sample_rate = read_pcm(wav_path)
         segments = segment_utterances(pcm, sample_rate)
         turns: list[Turn] = []
@@ -136,9 +142,44 @@ class MeetingService:
                    if offline else asr.GeminiBatchBackend(self.client, self.config))
         language = asr.primary_language(self.config)
         for idx, (start, end) in enumerate(segments[:400]):  # sane ceiling
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "meeting transcription deadline expired before next utterance")
             piece = slice_wav(pcm, sample_rate, start, end,
                               work_dir / f"{speaker.lower()}-{idx:03d}.wav")
-            transcript = backend.transcribe(str(piece), language)
+            if isinstance(backend, asr.GeminiBatchBackend) and deadline is not None:
+                transcript = backend.transcribe(
+                    str(piece), language, deadline=deadline)
+            else:
+                transcript = backend.transcribe(str(piece), language)
+            if transcript.text:
+                turns.append(Turn(speaker=speaker, start_s=start, end_s=end,
+                                  text=transcript.text))
+        return turns
+
+    async def _transcribe_channel_async(self, wav_path: Path, speaker: str,
+                                        work_dir: Path, *,
+                                        deadline: float | None = None) -> list[Turn]:
+        pcm, sample_rate = read_pcm(wav_path)
+        segments = segment_utterances(pcm, sample_rate)
+        turns: list[Turn] = []
+        offline = bool(self.mode_manager
+                       and self.mode_manager.status(refresh=False).is_offline)
+        backend = (self.local_backend or asr.LocalWhisperBackend(self.config)
+                   if offline else asr.GeminiBatchBackend(self.client, self.config))
+        language = asr.primary_language(self.config)
+        for idx, (start, end) in enumerate(segments[:400]):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "meeting transcription deadline expired before next utterance")
+            piece = slice_wav(pcm, sample_rate, start, end,
+                              work_dir / f"{speaker.lower()}-{idx:03d}.wav")
+            if isinstance(backend, asr.GeminiBatchBackend):
+                transcript = await backend.transcribe_async(
+                    str(piece), language, deadline=deadline)
+            else:
+                transcript = await asyncio.to_thread(
+                    backend.transcribe, str(piece), language)
             if transcript.text:
                 turns.append(Turn(speaker=speaker, start_s=start, end_s=end,
                                   text=transcript.text))
@@ -146,7 +187,8 @@ class MeetingService:
 
     def transcribe_dual(self, mic_wav: Path, system_wav: Path, *,
                         title: str | None = None,
-                        pyannote_refine: bool = False) -> MeetingResult:
+                        pyannote_refine: bool = False,
+                        deadline: float | None = None) -> MeetingResult:
         stamp = self._unused_meeting_stamp()
         mic_dest = self.audio_dir / f"meeting-{stamp}-mic.wav"
         sys_dest = self.audio_dir / f"meeting-{stamp}-system.wav"
@@ -157,11 +199,71 @@ class MeetingService:
         work = self.config.data_dir / "meeting-work" / stamp
         work.mkdir(parents=True, exist_ok=True)
 
-        turns = self._transcribe_channel(mic_dest, "You", work)
-        turns += self._transcribe_channel(sys_dest, "Them", work)
+        if deadline is None:
+            turns = self._transcribe_channel(mic_dest, "You", work)
+            turns += self._transcribe_channel(sys_dest, "Them", work)
+        else:
+            turns = self._transcribe_channel(
+                mic_dest, "You", work, deadline=deadline)
+            turns += self._transcribe_channel(
+                sys_dest, "Them", work, deadline=deadline)
         offline = bool(self.mode_manager
                        and self.mode_manager.status(refresh=False).is_offline)
         backend = "channel-diarization + local ASR (offline)" if offline else "channel-diarization"
+
+        if pyannote_refine:
+            try:  # refine the far side only: the near side is one person
+                from .diarize import PyannoteDiarizer
+
+                speaker_turns = PyannoteDiarizer().diarize(sys_dest)
+                far = [t for t in turns if t.speaker == "Them"]
+                assign_speakers(far, speaker_turns)
+                backend = "channel + pyannote (far side)"
+            except RuntimeError as exc:
+                backend = f"channel-diarization (pyannote unavailable: {exc})"
+
+        turns = merge_adjacent(sorted(turns, key=lambda t: t.start_s))
+        transcript = format_transcript(turns)
+        note_path = self.inbox_dir / f"meeting-{stamp}.md"
+        with note_path.open("x", encoding="utf-8") as note:
+            note.write(
+                f"---\ncreated: {iso_now()}\ntype: meeting\ntitle: {title or 'Untitled call'}\n"
+                f"diarization: {backend}\nmic: {mic_dest}\nsystem: {sys_dest}\n---\n\n"
+                f"# {title or 'Meeting'} — {stamp}\n\n{transcript}\n")
+        raw = "\n".join(f"{t.speaker}: {t.text}" for t in turns)
+        self.store.log_transcript(
+            session_id=f"meeting-{stamp}", ts=iso_now(),
+            language=",".join(self.config.section("asr").get("languages") or ["en"]),
+            raw_text=raw, cleaned_text=raw, flagged=0,
+            backend=f"meeting:{backend}",
+            duration_s=max((t.end_s for t in turns), default=0.0),
+            audio_path=str(mic_dest), inbox_path=str(note_path))
+        return MeetingResult(note_path=note_path, mic_wav=mic_dest, system_wav=sys_dest,
+                             turns=turns, transcript=transcript, backend=backend)
+
+    async def transcribe_dual_async(self, mic_wav: Path, system_wav: Path, *,
+                                    title: str | None = None,
+                                    pyannote_refine: bool = False,
+                                    deadline: float | None = None) -> MeetingResult:
+        """Async live path so a meeting deadline cancels native SDK I/O."""
+        stamp = self._unused_meeting_stamp()
+        mic_dest = self.audio_dir / f"meeting-{stamp}-mic.wav"
+        sys_dest = self.audio_dir / f"meeting-{stamp}-system.wav"
+        if mic_wav.resolve() != mic_dest.resolve():
+            self._copy_no_overwrite(mic_wav, mic_dest)
+        if system_wav.resolve() != sys_dest.resolve():
+            self._copy_no_overwrite(system_wav, sys_dest)
+        work = self.config.data_dir / "meeting-work" / stamp
+        work.mkdir(parents=True, exist_ok=True)
+
+        turns = await self._transcribe_channel_async(
+            mic_dest, "You", work, deadline=deadline)
+        turns += await self._transcribe_channel_async(
+            sys_dest, "Them", work, deadline=deadline)
+        offline = bool(self.mode_manager
+                       and self.mode_manager.status(refresh=False).is_offline)
+        backend = ("channel-diarization + local ASR (offline)"
+                   if offline else "channel-diarization")
 
         if pyannote_refine:
             try:  # refine the far side only: the near side is one person

@@ -19,6 +19,7 @@ Two facts still need the owner's machine:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import platform
@@ -26,6 +27,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
@@ -608,16 +610,17 @@ def _meeting_command(args, config) -> int:
         return 0
     if args.meeting_action == "transcribe":
         from .gemini_client import GeminiClient
-        from .meeting import MeetingService
+        from .meeting import MEETING_TRANSCRIPTION_TIMEOUT_S, MeetingService
         from .modes import ModeManager
         store = _local_store(config)
         manager = ModeManager(config, store)
         manager.refresh()  # one-shot CLI: no resident monitor to snapshot from
-        result = MeetingService(
-            config, store, GeminiClient(config, store),
-            mode_manager=manager).transcribe_dual(
+        service = MeetingService(
+            config, store, GeminiClient(config, store), mode_manager=manager)
+        result = asyncio.run(service.transcribe_dual_async(
             Path(args.mic_wav), Path(args.system_wav), title=args.title,
-            pyannote_refine=args.pyannote)
+            pyannote_refine=args.pyannote,
+            deadline=time.monotonic() + MEETING_TRANSCRIPTION_TIMEOUT_S))
         store.close()
         print(result.transcript)
         print(f"\nNote: {result.note_path} · diarization: {result.backend}", file=sys.stderr)

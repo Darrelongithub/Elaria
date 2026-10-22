@@ -151,9 +151,10 @@ class Daemon:
         from .embeddings import make_embedder
         from .memory import Memory
         self.memory = Memory(self.store, make_embedder(config))
-        from .meeting import MeetingService
+        from .meeting import MEETING_TRANSCRIPTION_TIMEOUT_S, MeetingService
         self.meetings = MeetingService(
             config, self.store, self.client, mode_manager=self.mode_manager)
+        self._meeting_stop_timeout_s = MEETING_TRANSCRIPTION_TIMEOUT_S
         # Disclosure awareness: memory may be used, secrets/plans never spoken
         # while company is present, and no owner memory to a guest voice.
         self.disclosure = DisclosureService(config, self.store)
@@ -192,6 +193,7 @@ class Daemon:
         # A stopped meeting can still be transcribing while the next meeting
         # is captured; track every in-flight worker rather than one shared bool.
         self._meeting_processing: set[str] = set()
+        self._meeting_stop_tasks: set[asyncio.Task] = set()
         self._plan_tasks: dict[int, asyncio.Task] = {}
         # VB-13: early acks wait for the boot warm instead of being silent. The
         # event is set as soon as a warm cycle ends (success, failure, or a
@@ -2192,10 +2194,33 @@ class Daemon:
         return {"state": "meeting"}
 
     async def _meeting_stop(self, params: dict) -> dict:
+        task = asyncio.current_task()
+        if task is not None:
+            self._meeting_stop_tasks.add(task)
+        try:
+            return await self._meeting_stop_impl(params)
+        finally:
+            if task is not None:
+                self._meeting_stop_tasks.discard(task)
+            if self._meeting is None and self.mode == "meeting":
+                self.mode = self._meeting_mode()
+
+    async def _meeting_stop_impl(self, params: dict) -> dict:
         if self._meeting is None:
             return {"state": "idle", "note": "no meeting in progress"}
+        deadline = time.monotonic() + self._meeting_stop_timeout_s
         meeting, self._meeting = self._meeting, None
-        await meeting["dual"].aclose()
+        capture_close = asyncio.create_task(meeting["dual"].aclose())
+        try:
+            await asyncio.shield(capture_close)
+        except asyncio.CancelledError:
+            close_result, = await asyncio.gather(
+                capture_close, return_exceptions=True)
+            if isinstance(close_result, BaseException):
+                print("[assistd] meeting capture cleanup failed during stop "
+                      f"cancellation: {type(close_result).__name__}: {close_result}",
+                      file=sys.stderr, flush=True)
+            raise
         meeting["task"].cancel()
         try:
             await meeting["task"]
@@ -2217,10 +2242,23 @@ class Daemon:
         self.mode = self._meeting_mode()
         await self.broadcast({"event": "status.changed", "mode": self.mode})
         try:
-            result = await asyncio.to_thread(
-                self.meetings.transcribe_dual, mic_wav, sys_wav,
-                title=params.get("title"),
-                pyannote_refine=bool(self.config.section("meeting").get("pyannote_refine")))
+            try:
+                title = params.get("title")
+                pyannote_refine = bool(self.config.section("meeting").get(
+                    "pyannote_refine"))
+                if self.client.mode != "mock":
+                    result = await self.meetings.transcribe_dual_async(
+                        mic_wav, sys_wav, title=title,
+                        pyannote_refine=pyannote_refine, deadline=deadline)
+                else:
+                    result = await asyncio.to_thread(
+                        self.meetings.transcribe_dual, mic_wav, sys_wav,
+                        title=title, pyannote_refine=pyannote_refine,
+                        deadline=deadline)
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    "meeting transcription deadline expired; raw audio retained "
+                    f"at {mic_wav} and {sys_wav}") from exc
         finally:
             self._meeting_processing.discard(session_id)
             self.mode = self._meeting_mode()
@@ -3025,7 +3063,7 @@ class Daemon:
                 capture_error = exc
         tasks = [
             t for t in (*extra_tasks, self._dictation_task, meeting_task,
-                        *self._background_tasks)
+                        *self._meeting_stop_tasks, *self._background_tasks)
             if t is not None
         ]
         for task in tasks:

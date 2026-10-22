@@ -78,15 +78,36 @@ class GeminiBatchBackend:
         self._client = client
         self._config = config
 
-    def transcribe(self, audio_path: str, language: str) -> Transcript:
+    def transcribe(self, audio_path: str, language: str, *,
+                   deadline: float | None = None) -> Transcript:
+        deadline_option = {"deadline": deadline} if deadline is not None else {}
         if self._config is not None:
             languages = configured_languages(self._config)
             result = self._client.transcribe_batch(
                 Path(audio_path), languages[0], also_languages=languages[1:],
-                preserve_code_switching=code_switching_enabled(self._config))
+                preserve_code_switching=code_switching_enabled(self._config),
+                **deadline_option)
             return Transcript(text=result["text"],
                               language=",".join(languages), backend=self.name)
-        result = self._client.transcribe_batch(Path(audio_path), language)
+        result = self._client.transcribe_batch(
+            Path(audio_path), language, **deadline_option)
+        return Transcript(text=result["text"], language=language, backend=self.name)
+
+    async def transcribe_async(self, audio_path: str, language: str, *,
+                               deadline: float | None = None) -> Transcript:
+        transcribe = getattr(self._client, "transcribe_batch_async", None)
+        if not callable(transcribe):
+            return self.transcribe(audio_path, language, deadline=deadline)
+        deadline_option = {"deadline": deadline} if deadline is not None else {}
+        if self._config is not None:
+            languages = configured_languages(self._config)
+            result = await transcribe(
+                Path(audio_path), languages[0], also_languages=languages[1:],
+                preserve_code_switching=code_switching_enabled(self._config),
+                **deadline_option)
+            return Transcript(text=result["text"],
+                              language=",".join(languages), backend=self.name)
+        result = await transcribe(Path(audio_path), language, **deadline_option)
         return Transcript(text=result["text"], language=language, backend=self.name)
 
 

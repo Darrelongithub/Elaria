@@ -1059,7 +1059,8 @@ class GeminiClient:
     # -- batch transcription: second tier (§3.6) + Live fallback (§12.7) ------
     def transcribe_batch(self, audio_path, language: str = "en", *,
                          also_languages: list[str] | None = None,
-                         preserve_code_switching: bool = False) -> dict:
+                         preserve_code_switching: bool = False,
+                         deadline: float | None = None) -> dict:
         """generateContent on saved audio: accurate pass, same ledger rules.
 
         Mock/record keying uses the audio's SHA-256 (+ language set), so
@@ -1096,7 +1097,8 @@ class GeminiClient:
                     "languages": [language, *others], "prompt": prompt}
         correlation_id = uuid.uuid4().hex[:12]
         if isinstance(self._transport, _SdkTransport) and self.mode != "mock":
-            text = self._sdk_transcribe(path, model, prompt, correlation_id, duration)
+            text = self._sdk_transcribe(
+                path, model, prompt, correlation_id, duration, deadline=deadline)
             return {"text": text, "model": model, "duration_s": duration, "backend": "gemini_batch"}
         response = self._call_once(
             "transcribe_batch", model, contents, {},
@@ -1107,15 +1109,129 @@ class GeminiClient:
                 "duration_s": duration, "backend": "gemini_batch",
                 "fixture": response.get("fixture")}
 
-    def _sdk_transcribe(self, path, model, prompt, correlation_id, duration):  # pragma: no cover
+    async def transcribe_batch_async(self, audio_path, language: str = "en", *,
+                                     also_languages: list[str] | None = None,
+                                     preserve_code_switching: bool = False,
+                                     deadline: float | None = None) -> dict:
+        """Transcribe through the SDK's native async HTTP transport.
+
+        Live meeting stop uses this path so its absolute deadline cancels the
+        request coroutine instead of abandoning a synchronous worker thread.
+        Fixture/mock transports remain on the existing deterministic path.
+        """
+        if not isinstance(self._transport, _SdkTransport) or self.mode == "mock":
+            return self.transcribe_batch(
+                audio_path, language, also_languages=also_languages,
+                preserve_code_switching=preserve_code_switching,
+                deadline=deadline)
+
+        from pathlib import Path
+
+        from .capture import wav_duration_s
+
+        path = Path(audio_path)
+        duration = wav_duration_s(path)
+        model = self.config.model_for_role("transcribe_batch")
+        others = [lang for lang in (also_languages or []) if lang != language]
+        if others and preserve_code_switching:
+            prompt = (
+                f"Transcribe this audio verbatim. The speaker's primary language "
+                f"is {language} and they code-switch with {', '.join(others)}. "
+                "Transcribe EVERY passage in the language actually spoken in it. "
+                "Do NOT translate. Do NOT normalise mixed speech into one "
+                "language. Return only the transcript.")
+        else:
+            prompt = (f"Transcribe this audio verbatim. The language is {language}; "
+                      "transcribe in that language exactly as spoken. Do NOT "
+                      "translate. Return only the transcript.")
+        correlation_id = uuid.uuid4().hex[:12]
         started = time.monotonic()
+
+        def request_config():
+            if deadline is None:
+                return None
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise TimeoutError("meeting transcription deadline expired")
+            return {"http_options": {
+                "timeout": max(1, int(remaining_s * 1000))}}
+
+        error_exc = None
+        cancelled_exc = None
         try:
-            uploaded = self._transport._client.files.upload(file=str(path))
-            response = self._transport._client.models.generate_content(
-                model=model, contents=[prompt, uploaded])
+            if deadline is None:
+                uploaded = await self._transport._client.aio.files.upload(
+                    file=str(path))
+                response = await self._transport._client.aio.models.generate_content(
+                    model=model, contents=[prompt, uploaded])
+            else:
+                async with asyncio.timeout_at(deadline):
+                    upload_config = request_config()
+                    uploaded = await self._transport._client.aio.files.upload(
+                        file=str(path), config=upload_config)
+                    generation_config = request_config()
+                    response = await self._transport._client.aio.models.generate_content(
+                        model=model, contents=[prompt, uploaded],
+                        config=generation_config)
+            text = response.text or ""
+            error = None
+        except asyncio.CancelledError as exc:
+            error_exc = cancelled_exc = exc
+            text, error = "", f"{type(exc).__name__}: {exc}"
+        except Exception as exc:
+            error_exc = exc
+            text, error = "", f"{type(exc).__name__}: {exc}"
+        self.store.log_llm_call(
+            ts=iso_now(), correlation_id=correlation_id, role="transcribe_batch",
+            model=model, mode=self.mode, tokens_in=0, tokens_out=estimate_tokens(text),
+            tokens_estimated=1, audio_seconds=duration,
+            cost_usd=shadow_cost_usd(model, 0, estimate_tokens(text), duration),
+            latency_ms=(time.monotonic() - started) * 1000, ok=0 if error else 1,
+            verified=None, attempt=1, fixture_key=None, error=error,
+            purpose="housekeeping:transcribe_batch", is_user_turn=0)
+        if cancelled_exc is not None:
+            raise cancelled_exc
+        if error:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "meeting transcription deadline expired") from error_exc
+            raise RuntimeError(error) from error_exc
+        return {"text": text, "model": model, "duration_s": duration,
+                "backend": "gemini_batch"}
+
+    def _sdk_transcribe(self, path, model, prompt, correlation_id, duration,
+                        *, deadline: float | None = None):  # pragma: no cover
+        started = time.monotonic()
+
+        def request_config():
+            if deadline is None:
+                return None
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise TimeoutError("meeting transcription deadline expired")
+            return {"http_options": {
+                "timeout": max(1, int(remaining_s * 1000))}}
+
+        error_exc = None
+        try:
+            upload_config = request_config()
+            if upload_config is None:
+                uploaded = self._transport._client.files.upload(file=str(path))
+            else:
+                uploaded = self._transport._client.files.upload(
+                    file=str(path), config=upload_config)
+            generation_config = request_config()
+            if generation_config is None:
+                response = self._transport._client.models.generate_content(
+                    model=model, contents=[prompt, uploaded])
+            else:
+                response = self._transport._client.models.generate_content(
+                    model=model, contents=[prompt, uploaded],
+                    config=generation_config)
             text = response.text or ""
             error = None
         except Exception as exc:
+            error_exc = exc
             text, error = "", f"{type(exc).__name__}: {exc}"
         self.store.log_llm_call(
             ts=iso_now(), correlation_id=correlation_id, role="transcribe_batch",
@@ -1126,7 +1242,10 @@ class GeminiClient:
             verified=None, attempt=1, fixture_key=None, error=error,
             purpose="housekeeping:transcribe_batch", is_user_turn=0)
         if error:
-            raise RuntimeError(error)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "meeting transcription deadline expired") from error_exc
+            raise RuntimeError(error) from error_exc
         return text
 
     def list_models(self) -> dict:
