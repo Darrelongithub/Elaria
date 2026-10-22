@@ -1,4 +1,4 @@
-"""Wake-knock package (2026-10-20) — owner-approved spec, behind tests.
+"""I5 — Wake-knock package (2026-10-20), owner-approved spec, behind tests.
 
 Sections covered here (spec §1–§5):
   * wake-knock model: NO straight hit->listening; uncertain raises a `wake`
@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -67,6 +68,13 @@ def pcm(seconds: float, amp: int = 6000) -> bytes:
 
 def silence(seconds: float) -> bytes:
     return pcm(seconds, amp=0)
+
+
+def _local_owner_principal():
+    """I5: synthetic in-process peer identity for WakeGuard unit tests only."""
+    from assistant.ipc import IpcPrincipal
+
+    return IpcPrincipal(pid=os.getpid(), uid=os.getuid(), gid=os.getgid())
 
 
 def make_guard(tmp_path, *, score=0.9, with_knocks=True, **overrides):
@@ -154,8 +162,8 @@ def test_uncertain_discards_pending_untranscribed_and_accept_is_fresh(tmp_path):
 
     # Accept-after-knock starts FRESH capture — the discarded bytes must
     # never resurrect.
-    opened = guard.wake_knock_accepted(knock_id=outcome["knock_id"],
-                                       channel="console")
+    opened = guard.wake_knock_accepted(
+        knock_id=outcome["knock_id"], principal=_local_owner_principal())
     assert opened["open"] == "listening"
     assert opened["fresh_capture"] is True
     assert opened["head_bytes"] == 0
@@ -177,23 +185,28 @@ def test_accept_opens_listening_and_decline_returns_to_sleep(tmp_path):
     outcome2 = guard.verify()
     assert guard.state == wg.WAKE_KNOCK
     assert outcome2["knock_id"] != outcome["knock_id"]
-    opened = guard.wake_knock_accepted(knock_id=outcome2["knock_id"],
-                                       channel="hotkey")
+    opened = guard.wake_knock_accepted(
+        knock_id=outcome2["knock_id"], principal=_local_owner_principal())
     assert opened["open"] == "listening"
 
 
-def test_voice_accept_must_itself_be_voiceprint_verified(tmp_path):
+def test_wake_accept_requires_kernel_authenticated_owner_principal(tmp_path):
+    """I5: WakeGuard accepts identity evidence, not a channel or score claim."""
     guard, _store = make_guard(tmp_path, score=0.55)
     guard.trigger(keyword_score=0.9)
     outcome = guard.verify()
 
-    with pytest.raises(wg.WakeGuardError, match="voiceprint-verified"):
-        guard.wake_knock_accepted(knock_id=outcome["knock_id"], channel="voice")
-    with pytest.raises(wg.WakeGuardError, match="voiceprint-verified"):
-        guard.wake_knock_accepted(knock_id=outcome["knock_id"], channel="voice",
-                                  voiceprint_score=0.2)
-    opened = guard.wake_knock_accepted(knock_id=outcome["knock_id"],
-                                       channel="voice", voiceprint_score=0.9)
+    with pytest.raises(wg.WakeGuardError, match="authenticated local owner"):
+        guard.wake_knock_accepted(knock_id=outcome["knock_id"])
+    from assistant.ipc import IpcPrincipal
+
+    wrong_uid = IpcPrincipal(pid=os.getpid(), uid=os.getuid() + 1,
+                             gid=os.getgid())
+    with pytest.raises(wg.WakeGuardError, match="authenticated local owner"):
+        guard.wake_knock_accepted(knock_id=outcome["knock_id"],
+                                  principal=wrong_uid)
+    opened = guard.wake_knock_accepted(
+        knock_id=outcome["knock_id"], principal=_local_owner_principal())
     assert opened["open"] == "listening"
 
 
@@ -202,8 +215,8 @@ def test_class_mode_accept_opens_console_not_ptt(tmp_path):
                                class_mode=lambda: True)
     guard.trigger(keyword_score=0.9)
     outcome = guard.verify()
-    opened = guard.wake_knock_accepted(knock_id=outcome["knock_id"],
-                                       channel="console")
+    opened = guard.wake_knock_accepted(
+        knock_id=outcome["knock_id"], principal=_local_owner_principal())
     assert opened["open"] == "console"
     assert guard.state != wg.LISTENING
 
@@ -217,8 +230,8 @@ def test_wake_path_never_opens_the_guest_door(tmp_path):
     guard.trigger(keyword_score=0.9)
     outcome = guard.verify()
     with pytest.raises(wg.WakeGuardError, match="guest door is show-off"):
-        guard.wake_knock_accepted(knock_id=outcome["knock_id"],
-                                  channel="console")
+        guard.wake_knock_accepted(
+            knock_id=outcome["knock_id"], principal=_local_owner_principal())
 
 
 # ---------------------------------------------------------------------------
@@ -262,8 +275,8 @@ def test_unsafe_energy_trigger_can_never_open_command_listening(tmp_path):
     outcome2 = guard2.verify()
     assert guard2.state == wg.WAKE_KNOCK
     with pytest.raises(wg.WakeGuardError, match="unsafe energy"):
-        guard2.wake_knock_accepted(knock_id=outcome2["knock_id"],
-                                   channel="console")
+        guard2.wake_knock_accepted(
+            knock_id=outcome2["knock_id"], principal=_local_owner_principal())
 
 
 def test_every_trigger_is_logged_metadata_only(tmp_path):
@@ -542,7 +555,7 @@ def test_socket_accept_opens_listening_on_real_knock_system(
     assert knock_id is not None
 
     result = call(config.socket_path, "knock.accept",
-                  {"id": knock_id, "channel": "console"}, timeout=5.0)
+                  {"id": knock_id}, timeout=5.0)
     assert result["open"] == "listening"
     assert result["wake"]["head_bytes"] == 0
     assert daemon.wake_guard.state == wg.LISTENING
@@ -552,22 +565,25 @@ def test_socket_accept_opens_listening_on_real_knock_system(
     assert status["hotword"]["state"] == wg.LISTENING
 
 
-def test_socket_wake_accept_voice_requires_verification(config, running_daemon):
+def test_socket_wake_accept_rejects_caller_channel_and_score_claims(
+        config, running_daemon):
+    """I5: caller labels and scores are rejected; the local owner action works."""
     daemon, _server = running_daemon
     outcome = _wake_knock_over_socket(config, daemon, score=0.55)
     knock_id = outcome["knock_id"]
 
-    with pytest.raises(RuntimeError, match="voiceprint-verified"):
-        call(config.socket_path, "knock.accept",
-             {"id": knock_id, "channel": "voice"}, timeout=5.0)
-    with pytest.raises(RuntimeError, match="voiceprint-verified"):
-        call(config.socket_path, "knock.accept",
-             {"id": knock_id, "channel": "voice", "voiceprint_score": 0.1},
-             timeout=5.0)
+    for forged in (
+            {"channel": "voice"},
+            {"channel": "voice", "voiceprint_score": 0.1},
+            {"channel": "voice", "voiceprint_score": 0.95},
+            {"channel": "voice_unavailable", "voiceprint_score": 0.01}):
+        with pytest.raises(RuntimeError, match="caller-supplied"):
+            call(config.socket_path, "knock.accept",
+                 {"id": knock_id, **forged}, timeout=5.0)
+        assert daemon.wake_guard.state == wg.WAKE_KNOCK
 
     result = call(config.socket_path, "knock.accept",
-                  {"id": knock_id, "channel": "voice",
-                   "voiceprint_score": 0.95}, timeout=5.0)
+                  {"id": knock_id}, timeout=5.0)
     assert result["open"] == "listening"
 
 
@@ -577,7 +593,7 @@ def test_socket_wake_accept_in_class_mode_opens_console(config, running_daemon):
     # class mode via the real presence service
     call(config.socket_path, "class.set", {"enabled": True}, timeout=5.0)
     result = call(config.socket_path, "knock.accept",
-                  {"id": outcome["knock_id"], "channel": "console"}, timeout=5.0)
+                  {"id": outcome["knock_id"]}, timeout=5.0)
     assert result["open"] == "console"
     assert daemon.wake_guard.state != wg.LISTENING
 

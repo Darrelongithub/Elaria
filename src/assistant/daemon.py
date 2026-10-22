@@ -27,6 +27,7 @@ import socket as socket_mod
 import sys
 import time
 import uuid
+from contextvars import ContextVar
 
 from . import __version__
 from .asr import local_asr_status
@@ -41,7 +42,7 @@ from .disclosure import (
 )
 from .gemini_client import GeminiClient
 from .initiative import InitiativeError, InitiativeService, KnockSignal
-from .ipc import serve
+from .ipc import IpcPrincipal, ipc_peer_principal, serve
 from .modes import ModeManager
 from .offline_queue import CloudQueue
 from .organiser import OrganiserService
@@ -113,6 +114,13 @@ def _int_param(params: dict, name: str) -> int:
 class Daemon:
     def __init__(self, config: Config):
         self.config = config
+        # Request identity is task-local: concurrent IPC clients must never
+        # inherit one another's principal or method. Peer credentials are
+        # installed by handle() from SO_PEERCRED, not request params (I5).
+        self._ipc_principal: ContextVar[IpcPrincipal | None] = ContextVar(
+            f"elaria_ipc_principal_{id(self)}", default=None)
+        self._ipc_method: ContextVar[str | None] = ContextVar(
+            f"elaria_ipc_method_{id(self)}", default=None)
         config.ensure_dirs()
         self.store = Store(config.db_path)
         self.governor = PersonaGovernor.from_config(config, load_humour_profile(config))
@@ -627,28 +635,50 @@ class Daemon:
             "ask": self._ask,
         }
 
+    def _require_ipc_owner(self) -> IpcPrincipal:
+        """Return this request's kernel-authenticated local owner principal (I5)."""
+        principal = self._ipc_principal.get()
+        if principal is None or principal.uid != os.getuid():
+            raise PermissionError(
+                "state-changing IPC requires the daemon's authenticated local owner")
+        return principal
+
     async def handle(self, method: str, params: dict, writer=None) -> dict:
-        handlers = self._handlers()
-        if method == "events.subscribe":
-            if writer is not None:
-                self._subscribers.add(writer)
-            return {"subscribed": True,
-                    "events": ["session.started", "transcript.interim",
-                               "session.checkin", "session.offline",
-                               "transcript.final", "session.ended",
-                               "transcript.echo_suppressed",
-                               "live.uplink_gated", "live.output_audio",
-                               "live.output_transcript", "live.duplex",
-                               "ptt.result",
-                               "mode.changed", "offline.drained",
-                               "speech.error", "conversation.message",
-                               "class.changed", "knock.raised",
-                               "knock.accepted", "knock.changed", "error"]}
-        handler = handlers.get(method)
-        if handler is None:
-            raise ValueError(f"unknown method '{method}' — supported: "
-                             f"{', '.join(sorted(handlers))}, events.subscribe")
-        return await handler(params)
+        principal_token = method_token = None
+        if writer is not None:
+            principal = ipc_peer_principal(writer)
+            if principal.uid != os.getuid():
+                raise PermissionError(
+                    "IPC peer UID does not match the daemon's local owner")
+            principal_token = self._ipc_principal.set(principal)
+            method_token = self._ipc_method.set(method)
+        try:
+            handlers = self._handlers()
+            if method == "events.subscribe":
+                if writer is not None:
+                    self._subscribers.add(writer)
+                return {"subscribed": True,
+                        "events": ["session.started", "transcript.interim",
+                                   "session.checkin", "session.offline",
+                                   "transcript.final", "session.ended",
+                                   "transcript.echo_suppressed",
+                                   "live.uplink_gated", "live.output_audio",
+                                   "live.output_transcript", "live.duplex",
+                                   "ptt.result",
+                                   "mode.changed", "offline.drained",
+                                   "speech.error", "conversation.message",
+                                   "class.changed", "knock.raised",
+                                   "knock.accepted", "knock.changed", "error"]}
+            handler = handlers.get(method)
+            if handler is None:
+                raise ValueError(f"unknown method '{method}' — supported: "
+                                 f"{', '.join(sorted(handlers))}, events.subscribe")
+            return await handler(params)
+        finally:
+            if method_token is not None:
+                self._ipc_method.reset(method_token)
+            if principal_token is not None:
+                self._ipc_principal.reset(principal_token)
 
     async def _ping(self, params: dict) -> dict:
         return {"pong": True, "version": __version__}
@@ -938,6 +968,13 @@ class Daemon:
         return {"knock": knock, "signal": signal}
 
     async def _knock_accept(self, params: dict) -> dict:
+        # The request method plus the kernel-authenticated socket peer is the
+        # owner's explicit accept. Serialized channel/score claims are not
+        # authority, on either the wake-knock or initiative path (I5).
+        if "channel" in params or "voiceprint_score" in params:
+            raise ValueError(
+                "refused: knock.accept does not accept caller-supplied "
+                "channel or voiceprint_score; use the authenticated owner action")
         knock_id = _int_param(params, "id")
         knock_row = self.store.get_knock(knock_id)
         if knock_row is not None and knock_row.get("kind") == "wake":
@@ -989,20 +1026,18 @@ class Daemon:
         return payload
 
     async def _wake_knock_accept(self, knock_id: int, params: dict) -> dict:
-        """Wake-knock accept: owner authentication, then listening (or the
-        console in class mode). voice-accept must itself be voiceprint
-        verified; hotkey/console carry the same trust as PTT. The guest door
-        stays show-off's alone."""
+        """Accept a wake-knock only for the authenticated local IPC owner (I5).
+
+        Voice accept is unavailable until fresh accept audio is captured and
+        scored inside the daemon; the request body cannot choose a channel or
+        supply a confidence score. The guest door stays show-off's alone.
+        """
         from .wake_guard import WakeGuardError
 
-        channel = str(params.get("channel") or "console")
-        voiceprint_score = params.get("voiceprint_score")
-        if voiceprint_score is not None:
-            voiceprint_score = float(voiceprint_score)
+        principal = self._require_ipc_owner()
         try:
             gate = self.wake_guard.wake_knock_accepted(
-                knock_id=knock_id, channel=channel,
-                voiceprint_score=voiceprint_score)
+                knock_id=knock_id, principal=principal)
         except WakeGuardError as exc:
             raise ValueError(str(exc)) from exc
         class_now = self.presence.status().enabled
@@ -2324,36 +2359,20 @@ class Daemon:
         return {"showoff": self.showoff.status()}
 
     async def _showoff_enter(self, params: dict) -> dict:
-        try:
-            result = self.showoff.enter(
-                command=str(params.get("command") or ""),
-                embedding=params.get("embedding"),
-                owner_present=bool(params.get("owner_present", False)),
-                source=str(params.get("source") or "mic"),
-                replayed=bool(params.get("replayed", False)),
-                live_mic=bool(params.get("live_mic", True)),
-                audio_sha256=params.get("audio_sha256"))
-        except ShowoffError as exc:
-            raise ValueError(str(exc)) from exc
-        speech = await self._maybe_speak_reply(
-            result["announcement"], {"speak": params.get("speak", True)})
-        await self.broadcast({"event": "showoff.entered",
-                              "session_id": result["session_id"],
-                              "announcement": result["announcement"]})
-        return {**result, "speech": speech}
+        """Fail closed until entry is wired to daemon-captured live audio (I5)."""
+        self._require_ipc_owner()
+        raise ValueError(
+            "refused: show-off entry has no daemon-side fresh-capture path; "
+            "caller-supplied embedding, presence, source, and live-mic flags "
+            "are not authentication")
 
     async def _showoff_exit(self, params: dict) -> dict:
+        """The authenticated owner IPC action closes show-off; params do not."""
+        self._require_ipc_owner()
         try:
-            if params.get("command") or params.get("reason") == "owner_stop":
-                summary = self.showoff.exit_owner(
-                    command=str(params.get("command") or ""),
-                    embedding=params.get("embedding"))
-            elif params.get("reason") == "owner_hotkey" or not params.get("reason"):
-                summary = self.showoff.exit_hotkey()
-            else:
-                raise ValueError(
-                    "show-off exits only by owner stop command, owner hotkey, "
-                    "timeout, or a never-list attempt")
+            # The CLI/local owner action itself is the authenticated principal.
+            # `reason`, command text, and embeddings are not caller authority.
+            summary = self.showoff.exit_hotkey()
         except ShowoffError as exc:
             raise ValueError(str(exc)) from exc
         await self.broadcast({"event": "showoff.exited", "summary": summary})
@@ -2401,11 +2420,14 @@ class Daemon:
         else:
             reply, via = verdict["reply"], "showoff-refusal"
         leak = self.disclosure.leak_in(reply, guest=True) if verdict.get("allowed") else None
+        withheld = None
         if leak is not None:
             self.disclosure.log("leak_blocked", {
                 "kind": leak["kind"], "why": leak["why"],
                 "fact_id": leak.get("fact_id"), "channel": channel,
                 "speaker": "guest", "context": "showoff"})
+            withheld = {"kind": leak["kind"], "why": leak["why"],
+                        "note": "the show-off reply named owner information"}
             reply, via = self.disclosure.deflection(guest=True), "withheld"
         speech = await self._maybe_speak_reply(reply, params)
         await self.broadcast({"event": "conversation.message",
@@ -2419,7 +2441,7 @@ class Daemon:
             "channel": channel, "conversation_id": None,
             "model": model, "register": "expressive-allowed",
             "showoff": verdict, "memory_closed": True,
-            "speech": speech, "fixture": None,
+            "speech": speech, "fixture": None, "withheld": withheld,
             "serious_gate": None, "mode": self.config.gemini_mode,
         }
 
@@ -2670,23 +2692,27 @@ class Daemon:
         # Mid-sentence mentions never match (match_wake is start-anchored).
         wake = match_wake(text)
         route_text = wake.remainder if wake is not None else text
-        speaker = str(params.get("speaker") or "owner").lower()
-        channel = str(params.get("channel") or "voice")
+        request_method = self._ipc_method.get()
+        # Channel is derived from the registered handler, never from a JSON
+        # claim. A generic `ask` cannot turn itself into a console/owner path.
+        channel = "console" if request_method == "console.say" else "voice"
+        request_params = {"speak": bool(params.get("speak", False)),
+                          "channel": channel}
         showoff_now = self.showoff.status()
-        # Speaker verification, when the caller supplies a verdict, is authority
-        # here too: a voice that is not the owner never sees owner memory.
-        # During show-off mode, the room has guests by definition — any voice
-        # turn claiming to be the owner must pass voiceprint verification.
-        verified = params.get("owner_verified")
-        if verified is None and showoff_now.get("active") and speaker == "owner" and channel == "voice":
-            verdict = self.showoff.verify_owner(params.get("embedding"))
-            verified = bool(verdict.get("verified"))
-        if verified is False:
-            speaker = "guest"
+        # Every turn while the public demo is active is a guest turn, including
+        # console.say. Owner flags, speaker labels, and copied embeddings in the
+        # request are not speaker evidence (I5); show-off only exposes its
+        # explicit demo-safe allowlist.
+        if showoff_now.get("active"):
+            return await self._guest_turn(text, request_params, showoff_now)
+        # The kernel-authenticated local owner is the default principal. A
+        # caller may voluntarily downgrade its own turn to guest, but cannot
+        # promote itself with `speaker=owner` or `owner_verified=True`.
+        speaker_claim = str(params.get("speaker") or "").lower()
+        speaker = ("guest" if speaker_claim in ("guest", "non-owner")
+                   or params.get("owner_verified") is False else "owner")
         if speaker != "owner":
-            if showoff_now.get("active"):
-                return await self._guest_turn(text, params, showoff_now)
-            return await self._guest_turn_normal(text, params)
+            return await self._guest_turn_normal(text, request_params)
 
         # The owner can tell her the room has company. That is awareness, not a
         # mode: nothing about voice, class mode or surfacing changes.
@@ -2700,7 +2726,6 @@ class Daemon:
             json.dumps({"register": decision.register,
                         "serious_gate": decision.serious_gate,
                         "pushback": decision.pushback, "reason": decision.reason}))
-        channel = str(params.get("channel") or "voice")
         conversation_id = self.sessions.active_id(iso_now())
         prior_turns = self.sessions.history(limit=8).get("messages") or []
         self.sessions.append("user", text, channel=channel, ts=iso_now())
@@ -2727,8 +2752,11 @@ class Daemon:
         if reply is None:
             # Rung 5/6: assemble the exact context the cheap model needs.
             hits = await asyncio.to_thread(self.memory.recall, route_text)
-            restricted = self.disclosure.company() or speaker != "owner"
-            kept = self.disclosure.filter_hits(hits, guest=speaker != "owner")
+            public_demo = bool(self.showoff.status().get("active"))
+            restricted = (self.disclosure.company() or public_demo
+                          or speaker != "owner")
+            kept = self.disclosure.filter_hits(
+                hits, guest=(speaker != "owner" or public_demo))
             context = "\n".join(f"- [{h.source} {h.ref}] {h.text}" for h in kept)
             history_lines = ""
             if prior_turns:
@@ -2737,8 +2765,9 @@ class Daemon:
                     if m.get("text") and (
                         not restricted
                         or self.disclosure.leak_in(
-                            str(m["text"]), guest=speaker != "owner",
-                            company=self.disclosure.company()) is None
+                            str(m["text"]),
+                            guest=(speaker != "owner" or public_demo),
+                            company=(self.disclosure.company() or public_demo)) is None
                     )
                 ]
                 if safe_turns:
@@ -2761,8 +2790,9 @@ class Daemon:
                 body = (f"Recent conversation in this session:\n{history_lines}\n\n"
                           f"User: {route_text}")
             # System prompt carries the persona governor: no roleplay, terse, no asterisks
-            disclosure_note = (self.disclosure.prompt_note(guest=speaker != "owner")
-                               if restricted else None)
+            disclosure_note = (self.disclosure.prompt_note(
+                guest=(speaker != "owner" or public_demo))
+                if restricted else None)
             full_prompt, gen_config = build_chat_prompt(
                 body, decision=decision, restricted=restricted,
                 disclosure_note=disclosure_note)
@@ -2823,9 +2853,10 @@ class Daemon:
 
         # The outgoing guard: a model that ignores the prompt still cannot read a
         # stored secret, plan or owner fact back to the room.
+        public_demo = bool(self.showoff.status().get("active"))
         leak = self.disclosure.leak_in(
-            reply, guest=speaker != "owner",
-            company=self.disclosure.company())
+            reply, guest=(speaker != "owner" or public_demo),
+            company=(self.disclosure.company() or public_demo))
         withheld = None
         if leak is not None:
             self.disclosure.log("leak_blocked", {

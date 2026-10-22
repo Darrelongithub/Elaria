@@ -1,4 +1,4 @@
-"""Stage D — show-off mode (§19.3).
+"""I5 — Stage D show-off mode (§19.3), with owner authority at the daemon boundary.
 
 Entry is the owner's voice, not the words. Everything below is asserted
 offline and keyless, against the same service and daemon the room would use:
@@ -57,6 +57,12 @@ def enter(service, **overrides):
     kwargs = {"command": "Elaria, show off", "embedding": "owner-voice",
               "owner_present": True, **overrides}
     return service.enter(**kwargs)
+
+
+def enter_daemon_showoff_for_test(daemon):
+    """I5 test setup: trusted in-process setup, not the unauthenticated IPC path."""
+    return daemon.showoff.enter(command="Elaria, show off",
+                                embedding="owner-voice", owner_present=True)
 
 
 # -- entry is the owner's --------------------------------------------------------
@@ -294,9 +300,7 @@ def test_daemon_guest_flow_declines_logs_and_exits(config, running_daemon,
     monkeypatch.setattr(daemon.showoff, "verify_owner",
                         lambda embedding: {"verified": embedding == "owner-voice",
                                            "score": 0.99, "reason": "test"})
-    entered = call(config.socket_path, "showoff.enter", {
-        "command": "Elaria, show off", "embedding": "owner-voice",
-        "owner_present": True, "speak": False})
+    entered = enter_daemon_showoff_for_test(daemon)
     assert entered["entered"] is True
     assert call(config.socket_path, "status")["showoff"]["active"] is True
     assert call(config.socket_path, "console.state")["showoff"]["active"] is True
@@ -323,9 +327,7 @@ def test_daemon_guest_turn_is_conversation_only(config, running_daemon,
     monkeypatch.setattr(daemon.showoff, "verify_owner",
                         lambda embedding: {"verified": True, "score": 0.99,
                                            "reason": "test"})
-    call(config.socket_path, "showoff.enter", {
-        "command": "talk to them", "embedding": "owner-voice",
-        "owner_present": True, "speak": False})
+    enter_daemon_showoff_for_test(daemon)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("guest turns must not reach tools or memory")
@@ -348,11 +350,13 @@ def test_daemon_guest_turn_is_conversation_only(config, running_daemon,
     assert "who he is" in probe["reply"]
     assert call(config.socket_path, "status")["showoff"]["active"] is True
 
-    # Owner turns are unaffected.
+    # An ambiguous `ask` is still public/guest-scope while show-off is active;
+    # a missing speaker label cannot silently promote it to owner.
     monkeypatch.setattr(daemon, "_run_intent", real_intent)
     monkeypatch.setattr(daemon.memory, "recall", real_recall)
-    owner = call(config.socket_path, "ask", {"text": "hello"})
-    assert owner.get("speaker") == "owner"
+    public_turn = call(config.socket_path, "ask", {"text": "hello"})
+    assert public_turn.get("speaker") == "guest"
+    assert public_turn["memory_closed"] is True
     assert call(config.socket_path, "status")["showoff"]["active"] is True
 
 
@@ -362,9 +366,7 @@ def test_daemon_status_reports_showoff_off_after_exit(config, running_daemon,
     monkeypatch.setattr(daemon.showoff, "verify_owner",
                         lambda embedding: {"verified": True, "score": 0.99,
                                            "reason": "test"})
-    call(config.socket_path, "showoff.enter", {
-        "command": "Elaria, show off", "embedding": "owner-voice",
-        "owner_present": True, "speak": False})
+    enter_daemon_showoff_for_test(daemon)
     out = call(config.socket_path, "showoff.exit", {"reason": "owner_hotkey"})
     assert out["summary"]["exit_reason"] == "owner_hotkey"
     status = call(config.socket_path, "status")

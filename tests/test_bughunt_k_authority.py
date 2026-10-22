@@ -1,4 +1,4 @@
-"""BH-K10/K11 — posture checks fail closed; stored posture is the truth.
+"""I5 — BH-K10/K11: posture checks fail closed; stored posture is the truth.
 
 K10: WakeGuard._in_class_mode()/_guest_door_blocked() returned False on
     ANY exception from the wired presence/showoff probe — fail OPEN. A

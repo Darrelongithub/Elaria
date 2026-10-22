@@ -17,9 +17,11 @@ import inspect
 import json
 import os
 import socket
+import struct
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 try:                                  # Linux/Fedora target; tests may run anywhere
@@ -33,6 +35,42 @@ Handler = Callable[[str, dict], Awaitable[dict]]
 # seconds is orders of magnitude above a normal local drain, and the peer is
 # already gone by then.
 REPLY_DRAIN_TIMEOUT_S = 5.0
+
+
+@dataclass(frozen=True)
+class IpcPrincipal:
+    """Kernel-authenticated identity of a connected Unix-socket peer (I5).
+
+    This value is constructed only from SO_PEERCRED, never from request JSON.
+    The daemon decides whether the UID is its local owner before authorizing a
+    state-changing handler.
+    """
+
+    pid: int
+    uid: int
+    gid: int
+
+
+def ipc_peer_principal(writer: asyncio.StreamWriter) -> IpcPrincipal:
+    """Read the connecting process identity from the kernel (I5).
+
+    Linux is the supported runtime. If the transport cannot provide kernel
+    credentials, fail closed rather than treating a caller-supplied identity
+    field or the socket pathname alone as an authenticated principal.
+    """
+    peer_socket = writer.get_extra_info("socket")
+    if peer_socket is None or not hasattr(socket, "SO_PEERCRED"):
+        raise PermissionError("kernel-authenticated IPC credentials are unavailable")
+    try:
+        raw = peer_socket.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, uid, gid = struct.unpack("3i", raw)
+    except (OSError, struct.error) as exc:
+        raise PermissionError(
+            f"could not authenticate the IPC peer: {exc}") from exc
+    if pid <= 0 or uid < 0 or gid < 0:
+        raise PermissionError("kernel returned invalid IPC peer credentials")
+    return IpcPrincipal(pid=pid, uid=uid, gid=gid)
 
 
 def _lock_path(socket_path: Path) -> Path:

@@ -6,7 +6,7 @@ Starting commit: `9151984` (working tree was clean)
 Bug entries: [`bugs.md`](bugs.md)  
 Prior notes retained as leads only: [`BUGHUNT-2026-10-21.md`](BUGHUNT-2026-10-21.md)
 
-This ledger records evidence gathered independently in the current checkout. The prior bughunt files are not accepted as proof by themselves. Invariant labels use prose where the condensed task context omitted exact I1–I10 definitions; only I1, I3, and I4 are used when their meanings are clear from the available context.
+This ledger records evidence gathered in the current checkout; prior notes are leads, not proof. Invariant tags use the exact I1–I10 definitions in `INVARIANTS.md`.
 
 ## Phase 0 — recon only (closed before fixes)
 
@@ -48,14 +48,14 @@ An earlier `status` harness result was inconclusive because its connectivity stu
 
 ## Fix checkpoints
 
-### BH-K33 — meeting raw WAVs and concurrent processing state
+### BH-K33 [I1, I6, I10] — meeting raw WAVs and concurrent processing state
 
 - **Before fix:** `tests/test_bug_meeting_raw_collision.py` failed with all three observations: same raw mic path for both stops; first archive held later-session bytes; processing was false while the first stop remained pending.
 - **Change:** UUID-scoped raw WAV names; processing-session set instead of a shared bool; mode is recomputed from active capture/workers; `finally` restores mode and applies parked connectivity preferences even when transcription fails.
 - **Verification:** `pytest -q tests/test_bug_meeting_raw_collision.py tests/test_bug_meeting_stop_failure.py tests/test_phase6_meeting.py tests/test_bughunt_k_config.py tests/test_bughunt_systems.py -k meeting` — **14 passed, 60 deselected**. Ruff passed on all touched Python files.
 - **Commit/push:** committed as `a72f4e8` and pushed to `arena/ef0e665f-elaria`.
 
-### BH-K34 — sample capture and frozen eval data integrity
+### BH-K34 [I1, I6] — sample capture and frozen eval data integrity
 
 - **Before fix:** first red run of `tests/test_bug_record_elaria_samples.py` reported **5 failures**: fraction 0 moved a file; an existing eval take was replaced; `--bucket ../../escaped` reached the recorder; manifest paths remained under `train/`; and a symlinked train bucket was followed. A second red run reported **7 failures** for bucket escape, same-second WAV replacement, and invalid takes/durations. The independent Phase 0 probe also observed fraction 2 moving every take.
 - **Invariants (prose):** recorded samples remain under the selected sample root and bucket; an existing sample/eval file is never replaced; frozen split paths and manifest entries agree; eval is split exactly once; invalid capture requests do not report success or reach capture.
@@ -63,18 +63,20 @@ An earlier `status` harness result was inconclusive because its connectivity stu
 - **Repros:** `tests/test_bug_record_elaria_samples.py` covers unsafe bucket, same-second collision, invalid capture arguments, manifest symlinks, symlinked train/eval buckets, existing eval collision, zero/out-of-range/non-finite fractions, stale manifest, repeat freeze, partial-move rollback, manifest-write rollback, and an incomplete-move marker. Existing sample-capture tests remain in `tests/test_wake_knock_package.py`.
 - **Fix:** bucket-component validation and root/symlink checks; UUID filenames and no-overwrite capture guard; finite positive duration and positive take count; fraction validation; no-overwrite same-filesystem moves; one-shot `.frozen` marker; atomic manifest-path update; rollback on pre-commit failures, with an in-progress marker retained when recovery is uncertain. Cross-filesystem split moves fail safely rather than copy/overwrite.
 - **Verification:** `.venv/bin/pytest -q tests/test_bug_record_elaria_samples.py tests/test_wake_knock_package.py` — **50 passed**. `.venv/bin/ruff check scripts/record_elaria_samples.py tests/test_bug_record_elaria_samples.py` and `git diff --check` passed. No real `pw-record`/PipeWire capture was run.
+- **Independent verification:** **UNCONFIRMED**; no separate reviewer was available in this continuation.
 - **Commit/push:** committed as `1c145b8` and pushed to `arena/ef0e665f-elaria`.
 
-### BH-K35 — ambiguous IPC timeout replayed an external queue enqueue
+### BH-K35 [I2, I9] — ambiguous IPC timeout replayed an external queue enqueue
 
 - **Before fix:** a real Unix-socket `Daemon` committed `queue.enqueue_external`, then an injected 300 ms response delay exceeded the client’s 50 ms total deadline. `assist queue add-external` treated the response timeout as daemon-down, retried against the same SQLite database locally, returned success, and left **2** matching durable jobs. Red repro: `tests/test_bug_queue_timeout_duplicate.py::test_bug_queue_timeout_after_commit_does_not_enqueue_again`.
 - **Invariant (prose / I1):** one request causes at most one durable side effect; local fallback is allowed only if no request was sent.
 - **Root cause:** `ipc.call()` collapsed post-`sendall` timeouts, malformed replies, and empty replies into `DaemonUnavailable`, which mutating CLI fallbacks interpreted as safe-to-replay.
 - **Fix:** distinguish pre-send `DaemonUnavailable` from post-send `DaemonOutcomeUnknown`; ambiguous outcomes do not inherit the fallback exception type. Queue and knock commands surface the uncertainty and do not retry. Authoritative `DaemonError` refusals remain distinct. Definite missing-socket offline fallback remains supported.
 - **Verification:** `.venv/bin/pytest -q tests/test_bug_queue_timeout_duplicate.py tests/test_hardening_pass2.py tests/test_bughunt_k_error_surfacing.py tests/test_bug6d_ptt_result_orphans.py tests/test_phase8_offline_voice.py` — **70 passed**. This includes malformed/empty reply classification, missing-socket fallback, and the total-deadline regression. Full Ruff and `git diff --check` passed.
+- **Independent verification:** **UNCONFIRMED**; no separate reviewer was available in this continuation.
 - **Commit/push:** committed as the BH-K35 checkpoint and pushed to `arena/ef0e665f-elaria` after this ledger update.
 
-### BH-K36 — Live chat total timeout left generation work running
+### BH-K36 [I2, I3, I10] — Live chat total timeout left generation work running
 
 - **Severity:** unbounded work / I3 total-deadline and cancellation violation.
 - **Invariant (prose / I3):** when the total chat deadline expires, the live request must be cancelled; no blocked SDK worker or tracked generation task remains after `_generate` returns `ChatTimeout`. Do not extend the deadline to hide a hang.
@@ -82,6 +84,7 @@ An earlier `status` harness result was inconclusive because its connectivity stu
 - **Before-fix red repro:** the first run of `tests/test_bug_generate_worker_cancellation.py` blocked a synchronous fake backend on a threading event (20 ms first-token / 80 ms total). It failed because `_generate()` raised `ChatTimeout` while **one `to_thread` task remained pending and the worker was still blocked**; the test released the event in cleanup.
 - **Fix:** live `_SdkTransport.generate_async()` streams using google-genai's native async HTTP client, receives the caller's absolute deadline and applies the remaining time as the SDK request timeout. `GeminiClient.generate_async()` preserves quota checks, async/cancellable RPM waiting, retry/backoff, verification and cost-ledger behavior. `_generate()` cancels (rather than shields) this async task on the unchanged total deadline. The live extra and runtime guard require `google-genai>=2.0.0`; sync fixture/legacy transports retain their compatibility path.
 - **Verification:** `.venv/bin/pytest -q tests/test_bug_generate_worker_cancellation.py tests/test_hotword_and_reply_delivery.py tests/test_disclosure.py tests/test_fixtures_and_harness.py tests/test_bughunt_k_quota.py` — **75 passed**. The new `test_bug*` regressions verify cancellation/no retained task, async quota-deadline handling, successful reply + verified ledger row, and cancellation through the `_SdkTransport` stream seam. Full `.venv/bin/ruff check .` and `git diff --check` passed. Installed `google-genai==2.0.0` locally and verified its stream method is a coroutine; no key/network request was made.
+- **Independent verification:** **UNCONFIRMED**; no separate reviewer was available in this continuation.
 - **Hardware check (UNVERIFIED):** with a valid owner key, run the forced-deadline probe below after `uv sync --extra live`. It sends one small live request; check that the script reports a deadline and zero retained tasks. If the response finishes before 0.25 s, repeat with a smaller bound.
 
 ```bash
@@ -119,7 +122,7 @@ finally:
 PY
 ```
 
-### BH-K37 — Infinite PTT wait budget orphaned a daemon handler
+### BH-K37 [I2, I3, I10] — Infinite PTT wait budget orphaned a daemon handler
 
 - **Severity:** unbounded wait / handler leak; prose invariant I3 (total deadline and cancellation).
 - **Invariant:** a client-supplied `wait_s` is finite, non-negative, and bounded. Invalid waits must be refused before they create a server-side waiter; `ptt.stop` must validate before changing session state.
@@ -127,8 +130,9 @@ PY
 - **Before-fix red repro:** `tests/test_bug_ptt_infinite_wait.py` sent `ptt.result(wait_s=Infinity)` through the real Unix socket with a 1 s client deadline. It failed expecting an authoritative `DaemonError`; instead `call()` raised `DaemonOutcomeUnknown` after the client timed out while the instrumented server waiter stayed pending. The final regression also covers `ptt.stop`.
 - **Fix:** `_ptt_wait_budget()` rejects booleans, parse errors, non-finite, negative, and values above 90 seconds. Both `ptt.result` and `ptt.stop` use the validator; `ptt.stop` validates before ack/state mutation. Ninety seconds is the existing CLI's largest explicit wait, not a timeout increase.
 - **Verification:** `.venv/bin/pytest -q tests/test_bug_ptt_infinite_wait.py tests/test_bug6d_ptt_result_orphans.py tests/test_phase2_surfaces.py tests/test_phase1_dictation.py tests/test_phase8_offline_voice.py tests/test_bug6_live_duplex_and_stop.py` — **90 passed**. The regression matrix exercises Infinity, NaN, negative, and over-90-second waits through both PTT IPC entry points. No audio device, Gemini key, or network was used.
+- **Independent verification:** **UNCONFIRMED**; no separate reviewer was available in this continuation.
 
-### BH-K38 — `Daemon.aclose()` left an active meeting's capture sources running
+### BH-K38 [I10] — `Daemon.aclose()` left an active meeting's capture sources running
 
 - **Severity:** privacy/capture-lifetime leak; prose invariant that daemon shutdown releases all audio sources and stops their collectors.
 - **Invariant:** no microphone/system capture process or collector survives shutdown of the daemon that owns it.
@@ -136,9 +140,10 @@ PY
 - **Before-fix red repro:** `tests/test_bug_daemon_aclose_meeting_capture.py` constructs an active meeting and pending collector, calls `Daemon.aclose()`, then fails all three assertions: `DualCapture.aclose()` was not called, the collector remained pending, and `_meeting` remained attached.
 - **Fix:** `aclose()` detaches the active meeting, cancels and gathers its collector, calls the capture's async close, resets mode if a meeting was active, and logs capture-close errors only after remaining shutdown cleanup.
 - **Verification:** `.venv/bin/pytest -q tests/test_bug_daemon_aclose_meeting_capture.py tests/test_bug_meeting_stop_failure.py tests/test_bug_meeting_raw_collision.py tests/test_phase6_meeting.py` — **10 passed**. No microphone, PipeWire, or Gemini key/network was used.
+- **Independent verification:** **UNCONFIRMED**; no separate reviewer was available in this continuation.
 - **Hardware check (UNVERIFIED):** on Fedora with live PipeWire sources, run `assist meeting start`; record the `pw-record` child PIDs using `pgrep -af '[p]w-record'`; then run `systemctl --user stop assistant`. Confirm those exact PIDs exit and the mic/system nodes are released. Restart with `systemctl --user start assistant`.
 
-### BH-K39 — Live meeting transcription could outlive stop and shutdown
+### BH-K39 [I1, I2, I3, I10] — Live meeting transcription could outlive stop and shutdown
 
 - **Severity:** unbounded wait / abandoned request; prose invariant I3 (total deadline and cancellation).
 - **Invariant:** upload and generation share one absolute end-to-end budget; expiry cancels the live request, preserves both raw WAVs, and starts no later utterance. A fully completed transcript must not be discarded because later bookkeeping crossed the budget. Daemon shutdown must cancel an in-flight stop request without abandoning capture close or losing its failure ledger entry.
@@ -146,36 +151,95 @@ PY
 - **Before-fix red repros:** `tests/test_bug_meeting_stop_deadline.py::test_bug_meeting_stop_bounds_live_request_and_retains_raw_audio` uses the real Unix socket and controlled SDK seams for both upload and generation; the pre-fix blocked upload returned `DaemonOutcomeUnknown` while its worker remained pending. `test_bug_daemon_aclose_cancels_pending_live_meeting_stop` failed when stop tasks were omitted from the shutdown worklist. `test_bug_meeting_stop_shutdown_finishes_both_capture_closes` failed when shutdown cancelled a sequential dual-capture close. The shutdown regressions verify handler/task and ledger cleanup, both capture closes, and idle mode.
 - **Fix:** `MEETING_TRANSCRIPTION_TIMEOUT_S=840` leaves 60 s inside the existing 900 s IPC limit. Live daemon and direct CLI paths use the SDK's native async upload/generation methods, `asyncio.timeout_at(deadline)`, and remaining-time `http_options.timeout` values; they do not leave a synchronous Gemini worker in `to_thread`. `meeting.stop` tracks its handler so `Daemon.aclose()` cancels and gathers it; capture close is shielded through completion, cancellation restores stale meeting mode, and the failed provider attempt is recorded. Raw WAVs are retained on timeout. Completed transcript persistence has no post-completion time rejection.
 - **Verification:** focused meeting/deadline/PTT/shutdown command — **69 passed**; `.venv/bin/ruff check .` and `git diff --check` passed. The first full-suite run returned **1,543 passed, 2 failed, 6 skipped**: the handler-integrity audit classified `_meeting_stop_impl(params)` as an unregistered handler, and the BH-H1 fake `_SdkTransport` implemented only sync methods after BH-K36 moved live calls to `generate_async`. Renamed the helper parameter to `request` and updated that fake to implement the async transport interface; fresh `.venv/bin/pytest -q` returned **1,545 passed, 6 skipped** (**1,551 collected**) versus the user's stated **1,393** baseline. Ten randomized full-suite seeds 260201–260210 each returned **1,545 passed, 6 skipped**; combined coverage was **84.60% statements** and **74.02% branches** (82.07% combined). Installed SDK 2.0.0 async methods/config types were inspected locally; no live key or network request was used. These counts precede the BH-K40 tests/fix below and are not current-tree final verification.
+- **Independent verification:** **UNCONFIRMED**; no separate reviewer was available in this continuation.
 - **Hardware check (UNVERIFIED):** with the owner's live key on Fedora, run `assist meeting start`, record several utterances, then `time assist meeting stop`; verify the note, `assist cost` batch ledger rows, and idle `assist status`. This exercises real request success but does not force a provider stall. A forced live stall/timeout remains UNVERIFIED.
 
-### BH-K40 — Capture-close failure short-circuited peer cleanup and raw archival
+### BH-K40 [I1, I10] — Capture-close failure short-circuited peer cleanup and raw archival
 
 - **Severity:** data-loss / capture-lifetime leak when either meeting source fails to close.
 - **Reproduction:** `tests/test_bug_meeting_stop_deadline.py::test_bug_meeting_stop_capture_close_failure_closes_peer_and_keeps_raw` first failed on the assertion that system capture closed after a controlled mic-close `RuntimeError`. Its strengthened version blocks the peer close and proves stop cannot return before it finishes; it then checks collector cancellation, both raw WAVs, and idle mode. The independent `test_bug_meeting_stop_capture_source_cancel_keeps_raw_audio` reproduced a second failure mode: a source-local `CancelledError` was misclassified as cancellation of `meeting.stop`, so WAV persistence never ran.
 - **Root cause:** sequential `DualCapture.aclose()` made the first close error skip the peer. `_meeting_stop_impl()` awaited close before collector cancellation and raw-WAV persistence, with no error path to those steps.
 - **Fix:** close both sources concurrently with `asyncio.gather(..., return_exceptions=True)`, preserve/aggregate source failures, and wrap a source-local cancellation as an ordinary close error. The stop handler now cancels/gathers the collector in `finally`, writes both raw WAVs, then reports close failure with their paths and uses the existing processing/mode-finally cleanup.
 - **Verification:** `.venv/bin/pytest -q tests/test_bug_meeting_stop_deadline.py` — **9 passed**; the current ten randomized full-suite seeds 260501–260510 each pass **1,548 passed, 6 skipped**, and the fresh unseeded post-ledger suite passes **1,548 passed, 6 skipped**. This test file covers the close-failure, source-cancellation, remaining-time, async-success/persistence and completion-after-budget regressions. The capture path was not exercised on real hardware.
+- **Independent verification:** **UNCONFIRMED**; no separate reviewer was available in this continuation.
 
-### BH-K41 — PTT event-stream test leaked an IPC client at event-loop teardown
+### BH-K41 [I10] — PTT event-stream test leaked an IPC client at event-loop teardown
 
 - **Severity:** test-integrity leak only; no production failure is claimed.
 - **Reproduction:** `.venv/bin/pytest -q tests/test_phase1_dictation.py::test_daemon_ptt_round_trip_and_events` passed but emitted `Task was destroyed but it is pending!` for `serve.<locals>._client()` awaiting `reader.readline()`.
 - **Root cause:** the raw event subscriber socket and drainer thread were not closed, and the test stopped its event loop before awaiting the IPC server and daemon shutdown.
 - **Fix:** shut down/close the subscriber socket, join its drainer, await `server.wait_closed()` and `daemon.aclose()`, stop/join the loop thread, and close the loop.
 - **Verification:** the isolated test passes with empty stderr. The ten randomized full-suite runs after BH-K40–K42 and the fresh unseeded post-ledger suite each returned **1,548 passed, 6 skipped**, with no pending-task warnings.
+- **Independent verification:** **UNCONFIRMED**; no separate reviewer was available in this continuation.
 
-### BH-K42 — UI event-stream tests abandoned subscriber threads
+### BH-K42 [I10] — UI event-stream tests abandoned subscriber threads
 
 - **Severity:** test-integrity / pending IPC-client tasks; not a production UI behavior claim.
 - **Reproduction:** full randomized seed 260303 passed tests but emitted two `Task was destroyed but it is pending!` warnings for `serve.<locals>._client()` blocked at `reader.readline()`. Adding stricter fixture teardown made the leak explicit as teardown timeouts in `test_waybar_follow_reacts_to_status_changed` and `test_overlay_stream_over_real_daemon`: their consumer threads waited indefinitely for >12/>40 output records and were never stopped or joined.
 - **Fix:** the consumers now stop once the state required by each assertion arrives, close their stream generators in `finally`, and join their threads. The shared `running_daemon` fixture and manually created serve tests await connection/client cleanup instead of stopping their event loops immediately.
 - **Verification:** the two stream tests pass (**2 passed**); seed 260303 rerun after the fix passed **1,548 passed, 6 skipped**, empty stderr. The ten current randomized seeds 260501–260510 also passed without pending-task warnings.
+- **Independent verification:** **UNCONFIRMED**; no separate reviewer was available in this continuation.
+
+### BH-K43 [I5] — Wake-knock accept trusted caller channel and score
+
+- **Severity:** authority / privacy boundary; a caller could open command listening without daemon-verified accept evidence.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix red repros:** `tests/test_bug_i5_authority_ipc.py::test_bug_i5_knock_accept_rejects_forged_high_voiceprint_score` sent `channel="voice", voiceprint_score=0.99` over the real Unix socket and observed listening open. `test_bug_i5_knock_accept_rejects_voice_unavailable_bypass` sent `channel="voice_unavailable", voiceprint_score=0.01` and also observed listening open. Both failed their refusal assertions before the fix; the existing `tests/test_wake_knock_package.py` socket test also explicitly expected forged 0.95 to open listening.
+- **Root cause:** `_wake_knock_accept` forwarded both values from JSON to `WakeGuard.authorize_accept()`. That guard trusted the caller's `channel`; `voice_unavailable` bypassed the threshold entirely, and `voice` trusted the caller's score.
+- **Handler sweep / principal:** `Daemon.handle` is the sole production dispatcher for every registered `_handlers()` method and `events.subscribe`. It now obtains an `IpcPrincipal` from kernel `SO_PEERCRED`, checks the UID against the daemon owner, and stores principal + method in task-local context. JSON `principal`, `uid`, `role`, `speaker`, and similar fields cannot construct that identity. This dispatcher gate covers all state-changing RPC families (PTT/capture, file plans/review/undo, memory, meetings, mode, speech, queue, knocks, hotword, privacy, show-off, class mode, and ask), not only the wake path. A real-socket test verifies the principal equals the connected process and a foreign-UID principal is refused before a class-state change.
+- **Fix:** `knock.accept` refuses any caller-supplied `channel` or `voiceprint_score`; the authenticated local owner action is the only currently supported wake-knock accept. `WakeGuard` now requires an `IpcPrincipal` with the daemon's UID and accepts no channel/score arguments. Voice acceptance remains closed until fresh accept audio is captured and scored inside the daemon; the CLI's ordinary `assist knock accept ID` sends only the knock ID.
+- **Verification:** `.venv/bin/pytest -q tests/test_bug_i5_authority_ipc.py tests/test_wake_knock_package.py tests/test_stage_d_showoff.py tests/test_disclosure.py tests/test_stage_c_initiative.py tests/test_stage_b_console_class.py` — **146 passed**. Ruff passed on the touched Python files. Real-socket regressions cover forged channel/score fields; no mic, voiceprint scorer, or provider was used. Independent reviewer agents are unavailable, so the fix remains **UNCONFIRMED**.
+
+### BH-K44 [I5] — Show-off entry and owner turns trusted caller assertions
+
+- **Severity:** authority / privacy boundary; copied owner data and booleans could manufacture show-off permission or promote a guest turn.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix red repros:** `tests/test_bug_i5_authority_ipc.py::test_bug_i5_showoff_entry_rejects_copied_centroid_and_capture_flags` created a real enrolled centroid, copied it into `showoff.enter`, and sent `owner_present=true`, `source="mic"`, `live_mic=true`, and `replayed=false`; the real socket entered show-off without any capture. `test_bug_i5_owner_verified_ipc_flag_cannot_bypass_showoff_guest_gate` sent `speaker="owner", owner_verified=true` and a copied embedding during active show-off; the response was classified as owner before the fix.
+- **Root cause:** `_showoff_enter` forwarded caller-controlled embedding/presence/source/replay/live-mic assertions to the service. `_ask` treated caller `owner_verified` as authority and, if true, skipped server verification; `channel` and `speaker` were also read from the payload.
+- **Fix:** the IPC `showoff.enter` endpoint now fails closed because no daemon-side fresh-capture entry flow exists; it explicitly refuses embeddings and capture flags as evidence. `ask` derives its channel from the registered RPC method, ignores caller embeddings and owner-verification claims, and allows a caller to downgrade to guest but not promote itself. Every request while show-off is active is routed as guest-scope, regardless of a supplied owner label. `showoff.exit` also requires the authenticated local owner and no longer uses caller reason/command/embedding fields to select its authority path.
+- **Verification:** the same 146-test command listed under BH-K43 passed, including real-socket regressions and concurrent request-method context isolation. Existing direct `ShowoffService` unit tests still exercise service policy; no socket caller can reach entry through forged values. Independent review is unavailable; the fix is **UNCONFIRMED**. Show-off IPC entry is intentionally unavailable until a daemon-captured live-audio path exists.
+
+### BH-K45 [I1, I5] — Show-off outgoing guard leaked a model secret to the owner path
+
+- **Severity:** confirmed information disclosure; model-returned credential reached the reply with `withheld=None`.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix red repro:** `tests/test_bug_i5_authority_ipc.py::test_bug_i1_i5_showoff_owner_reply_still_runs_outgoing_secret_guard` made the model return a stored `The password is hunter2.` during an active show-off console turn. Before the fix, the real socket response contained `hunter2` and `withheld` was `None`.
+- **Root cause:** active show-off did not itself make the ordinary owner `_ask` path restricted. `DisclosureService.leak_in()` therefore received `guest=false, company=false` and intentionally allowed owner-alone secrets.
+- **Fix:** every active show-off conversation now enters the guest/demo-safe path before owner memory; that path keeps the explicit demo-safe allowlist, runs the outgoing guest leak guard, and returns a `withheld` descriptor when it substitutes a reply. The ordinary owner path also treats an active show-off observed at generation/guard time as restricted, covering a session that becomes active after prompt construction.
+- **Verification:** the same 146-test command listed under BH-K43 passed. Controlled model returns exercise both a stored credential and an ordinary owner fact without network or audio; the post-fix socket replies withhold them and include a `withheld` descriptor. A show-off activation-during-generation regression covers the final race guard. Independent review is unavailable; the fix is **UNCONFIRMED**.
+
+### BH-K46 [I5] — Show-off race kept the owner/company prompt after activation
+
+- **Severity:** confirmed information disclosure; a paraphrase of a stored owner fact reached the active demo reply.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix red repro:** `tests/test_bug_i5_authority_ipc.py::test_bug_i5_showoff_activated_during_owner_turn_uses_guest_prompt` activated show-off during the awaited memory-recall stage of a real-socket `console.say`. A prompt-sensitive controlled model returned a paraphrase of a stored ordinary owner fact under the company prompt. The final exact-quote guard did not catch it; the response contained “bicycle” and had `withheld=None`. Test failed before the fix.
+- **Root cause:** the in-flight owner path noticed `public_demo` when building restricted context and the final guard, but selected its disclosure note with `guest=(speaker != "owner")` only. It therefore sent `COMPANY_NOTE`, not `GUEST_NOTE`; a paraphrase was outside the exact-match guard.
+- **Fix:** include `public_demo` in the guest predicate passed to `DisclosureService.prompt_note()`, so a show-off session that starts during an owner turn changes the prompt to guest scope as well as filtering context and applying the outgoing guard.
+- **Verification:** the real-socket test fails red before this one-line change and passes after; it asserts the guest note is present and no owner-fact paraphrase reaches the response. The focused I5 suite (the six-file command listed under BH-K43) is **146 passed**. Provider, audio, and hardware were not used. Independent review is unavailable; the fix remains **UNCONFIRMED**.
 
 ### Mutation-test addendum (incomplete triage)
 
 - The earlier four-file focused run generated **1,284 mutants**: **525 killed, 737 survived, 22 with no tests**. In `GeminiClient.transcribe_batch_async`, the deadline conversion mutant `remaining_s * 1000` → `remaining_s / 1000` survived because the test had only a loose upper bound. After delaying fake upload and asserting `20,000 <= generation_timeout < upload_timeout <= 30,000`, that mutant was killed; targeted counters became **526 killed, 736 survived, 22 no tests**.
-- A fresh capture-only pass on the current close-failure tests generated **89 mutants**: **59 killed, 19 survived, 11 with no tests** (limited to `tests/test_bug_meeting_stop_deadline.py`). Of the **31** mutants in `DualCapture.aclose`, **24 were killed** and **7 survived**; the seven are changes to exception/note wording, not surviving close-order or source-cancellation behavior. The blocking-peer regression kills mutants that remove/omit `return_exceptions=True`; the source-cancellation red/green test verifies raw retention and secondary error notes. The earlier four-file run remains at 1,284 generated, 526 killed after the timeout test was strengthened, 736 survivors and 22 no-tests; those survivors have not been fully reviewed. Mutation audit is **not complete**. Temporary `setup.cfg`, `mutants/`, and generated cache artifacts were removed.
+- A fresh capture-only pass on the current close-failure tests generated **89 mutants**: **59 killed, 19 survived, 11 with no tests** (limited to `tests/test_bug_meeting_stop_deadline.py`). Of the **31** mutants in `DualCapture.aclose`, **24 were killed** and **7 survived**; the seven are changes to exception/note wording, not surviving close-order or source-cancellation behavior. The blocking-peer regression kills mutants that remove/omit `return_exceptions=True`; the source-cancellation red/green test verifies raw retention and secondary error notes. The earlier four-file run remains at 1,284 generated, 526 killed after the timeout test was strengthened, 736 survivors and 22 no-tests; those survivors have not been fully reviewed. This historical broad mutation audit remains incomplete. Temporary `setup.cfg`, `mutants/`, and generated cache artifacts from that run were removed.
+
+### Focused I5/I1 mutation audit [I1, I5]
+
+- `mutmut 3.8.0` could not collect node-id-selected tests in its copied worktree (`no collectors`); the same command passed when run directly there. Stopped rather than spend more time polishing the mutation harness. The temporary `setup.cfg` and `mutants/` tree were removed.
+- Temporarily mutated the actual changed source decision points, restored each file in `finally`, and ran the regression owning that branch. The initial **11/11** mutants were killed as listed below; after BH-K46, the added disclosure-note mutation was also killed (**12/12 scoped mutants total; no scoped survivor**): (1) dispatcher peer-UID rejection disabled — `test_bug_i5_nonowner_peer_cannot_change_state_even_with_owner_json`; (2) principal ContextVar installation removed — `test_bug_i5_principal_is_kernel_peer_not_request_json`; (3) method ContextVar installation removed — `test_bug_i5_ipc_method_context_stays_task_local_under_concurrent_sockets`; (4) `knock.accept` forged channel/score rejection disabled — the two forged-score/`voice_unavailable` socket tests; (5) WakeGuard foreign-UID rejection removed — `test_wake_accept_requires_kernel_authenticated_owner_principal`; (6) show-off entry's fail-closed capture refusal removed — `test_bug_i5_showoff_entry_rejects_copied_centroid_and_capture_flags`; (7) active-show-off guest routing disabled; (8) caller channel trusted again; (9) guest outgoing owner-fact guard downgraded to owner scope; and (10) guest `withheld` descriptor removed — each killed by `test_bug_i5_owner_verified_ipc_flag_cannot_bypass_showoff_guest_gate`; (11) final outgoing guard's show-off race bit disabled — `test_bug_i1_i5_showoff_activated_during_generation_hits_final_guard`; (12) prompt note stopped treating a late-starting demo as guest — `test_bug_i5_showoff_activated_during_owner_turn_uses_guest_prompt`.
+- This scoped result covers the current I5/I1 changes and their principal disclosure decisions only. It does not resolve the historical 736-survivor mutation run above. The I5/I1 fixes remain **UNCONFIRMED** because no independent reviewer is available.
+
+## Clean-pass log after BH-K46 [I1, I5]
+
+- Focused I5/show-off suite: `.venv/bin/pytest -q tests/test_bug_i5_authority_ipc.py tests/test_wake_knock_package.py tests/test_stage_d_showoff.py tests/test_disclosure.py tests/test_stage_c_initiative.py tests/test_stage_b_console_class.py` — **146 passed**.
+- Fresh full suite, unseeded: `.venv/bin/pytest -q` — **1,558 passed, 6 skipped in 75.31s**.
+- Second fresh full suite: `.venv/bin/pytest -q --randomly-seed=260601` — **1,558 passed, 6 skipped in 74.15s**.
+- `.venv/bin/ruff check .` and `git diff --check` — passed. This is **165 more passing tests** than the user's stated 1,393-test baseline. Six tests remain skipped.
+- These are clean test runs, not independent review or hardware/provider proof. BH-K43–K46 remain **UNCONFIRMED**; no independent reviewer is available.
 
 ## Next
 
-The ten randomized/branch-coverage passes and the second fresh unseeded suite after BH-K40–K42 are complete. Continue a genuinely independent review and mutation-survivor triage; do not declare the hunt complete until the second reviewer-led pass finds zero new confirmed bugs. S9's offline faster-whisper and optional pyannote paths, live provider timeout behavior, PipeWire capture behavior, and other hardware-dependent conclusions remain SUSPECT/UNVERIFIED. Owner-only checks are listed above; do not claim them as run.
+1. Finish I4 playback: `speech.say` into open-mic behavior and the delayed-synthesis case where the estimated playback gate expires before playback begins.
+2. Reproduce and fix XDG_DATA_HOME transcript placement and 0644 note/DB/WAL/enrollment permissions; enrollment creation must be atomic with mode 0600.
+3. Produce the requested Part 2 status table for Live final, ack into open mic, dictate captured nothing, orphaned `ptt.result`, leaked subscribers, shadowing, and CLI ImportError audit. Live final remains SUSPECT until the protocol-level SDK-source root cause is proven; do not substitute a timeout.
+4. Resolve I1 suspects with exact owner hardware commands: late Live final under playback guard; non-empty transcript below 0.003 RMS. No hardware/provider checks have run in this sandbox.
+5. Run the required fresh bughunt pass and seek independent review. K34–K42 and BH-K43–K46 remain unconfirmed where no separate reviewer is available; do not declare completion while confirmed bugs are unfixed or fixes unconfirmed. Historical broad mutation survivors remain untriaged; the current scoped I5/I1 decision-point audit is 12/12 killed.

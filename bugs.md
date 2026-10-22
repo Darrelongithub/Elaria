@@ -17,12 +17,12 @@ Severity vocabulary:
 
 Status vocabulary: **fixed**, **open-xfail** (a strict-xfail regression test is
 the repro), **open-reproduced** (minimal repro exists and is being converted
-into a regular hunt test).
+into a regular hunt test), and **UNCONFIRMED** (local fix lacks independent
+review). Entry headings carry their applicable invariant IDs from `INVARIANTS.md`.
 
 ## Fixed during the hunt
 
-### BH-A1 — Destination created after policy check could be overwritten
-
+### BH-A1 [I6] — Destination created after policy check could be overwritten
 - **Severity:** data-loss
 - **Status:** fixed in `6733f17`
 - **Repro:** `test_destination_appearing_after_policy_check_is_never_overwritten`
@@ -31,8 +31,7 @@ into a regular hunt test).
 - **Was:** `shutil.move()` could replace the raced destination.
 - **Fix:** atomic no-overwrite destination creation in the executor.
 
-### BH-A2 — Model/plan `new_name` could escape the root
-
+### BH-A2 [I5, I6] — Model/plan `new_name` could escape the root
 - **Severity:** data-loss
 - **Status:** fixed in `6733f17`
 - **Repro:** `test_schema_valid_llm_output_cannot_escape_with_new_name`, with
@@ -43,8 +42,7 @@ into a regular hunt test).
 - **Fix:** `is_safe_filename()` in planner verification and again in the
   executor, plus executor destination/root containment checks.
 
-### BH-A3 — Taxonomy symlink could smuggle a file outside the root
-
+### BH-A3 [I5, I6] — Taxonomy symlink could smuggle a file outside the root
 - **Severity:** data-loss
 - **Status:** fixed in `6733f17`
 - **Repro:** `test_taxonomy_symlink_cannot_smuggle_file_outside_root`
@@ -56,8 +54,7 @@ into a regular hunt test).
 
 ## Fixed in the full-repo hardening pass (`arena/86517426-elaria`)
 
-### BH-A4 — Protected paths ignore `$VAR` spelling
-
+### BH-A4 [I5, I6] — Protected paths ignore `$VAR` spelling
 - **Severity:** wrong-action
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_protected_path_env_var_spelling_is_honoured`
@@ -65,8 +62,7 @@ into a regular hunt test).
 - **Actual:** only `~` expansion is honoured; `$HOME/...` is treated as a
   literal relative path.
 
-### BH-B1 — Move completed before journal commit is not undoable
-
+### BH-B1 [I6] — Move completed before journal commit is not undoable
 - **Severity:** wrong-action
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_kill_after_move_before_commit_can_be_undone`
@@ -75,8 +71,7 @@ into a regular hunt test).
 - **Actual:** undo only considers `committed` operations, so the moved file is
   stranded outside the normal undo path.
 
-### BH-B2 — Partial cross-device copy is left at the destination
-
+### BH-B2 [I1, I6] — Partial cross-device copy is left at the destination
 - **Severity:** wrong-action
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_disk_full_mid_move_leaves_no_partial_destination`
@@ -86,8 +81,7 @@ into a regular hunt test).
   inspection. This follows the never-delete bias, but is not yet reconciled
   into a named partial/quarantine state.
 
-### BH-B3 — Executor-level bare undo unwinds all committed history
-
+### BH-B3 [I6] — Executor-level bare undo unwinds all committed history
 - **Severity:** wrong-action
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_bare_undo_refuses_without_scope`
@@ -95,8 +89,7 @@ into a regular hunt test).
 - **Actual:** it unwinds every committed operation. The CLI guards this, but
   daemon/intent paths can still reach the executor surface.
 
-### BH-B4 — Broken symlink crashes indexing
-
+### BH-B4 [I1, I9] — Broken symlink crashes indexing
 - **Severity:** crash-with-safe-state
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_broken_symlink_is_skipped_not_fatal`
@@ -104,16 +97,14 @@ into a regular hunt test).
   still index.
 - **Actual:** `Path.stat()` raises and aborts the root indexing pass.
 
-### BH-B5 — FIFO/special file can hang the indexer
-
+### BH-B5 [I2, I3] — FIFO/special file can hang the indexer
 - **Severity:** crash-with-safe-state
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_fifo_is_skipped_instead_of_blocking_indexer`
 - **Expected:** non-regular files are skipped by type before any read.
 - **Actual:** the indexer attempts to read the FIFO and blocks.
 
-### BH-B6 — Later `never_send` policy does not reflag unchanged files
-
+### BH-B6 [I5, I7] — Later `never_send` policy does not reflag unchanged files
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_never_send_added_later_reflags_unchanged_documents`
@@ -122,8 +113,7 @@ into a regular hunt test).
 - **Actual:** unchanged size/mtime short-circuits before the privacy flag is
   refreshed.
 
-### BH-C1 — Halt landing after policy check does not stop the imminent move
-
+### BH-C1 [I5, I6] — Halt landing after policy check does not stop the imminent move
 - **Severity:** wrong-action
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_halt_landing_after_policy_check_prevents_the_move`
@@ -131,8 +121,7 @@ into a regular hunt test).
 - **Actual:** halt is checked between plan items, but a halt landing after an
   item's policy check can still allow that item to move.
 
-### BH-C2 — `trash()` bypasses protected-path and halt policy
-
+### BH-C2 [I5, I6] — `trash()` bypasses protected-path and halt policy
 - **Severity:** data-loss
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_trash_refuses_protected_paths_and_halt`
@@ -144,8 +133,7 @@ into a regular hunt test).
 
 ## Fixed in the wider Areas D–G pass
 
-### BH-E1 — `forget %` / `forget _` deactivated unintended memories
-
+### BH-E1 [I6] — `forget %` / `forget _` deactivated unintended memories
 - **Severity:** data-loss
 - **Status:** fixed in the working tree during this continuation
 - **Repros:** `test_forget_percent_is_a_literal_topic_not_a_wildcard`,
@@ -158,8 +146,7 @@ into a regular hunt test).
 - **Fix:** escape `\`, `%`, and `_` and use `ESCAPE '\'` in
   `Store.forget_facts()`.
 
-### BH-F4 — Two meetings in one minute overwrote each other's records
-
+### BH-F4 [I1] — Two meetings in one minute overwrote each other's records
 - **Severity:** data-loss
 - **Status:** fixed in the working tree during this continuation
 - **Repro:** `test_same_minute_meetings_never_overwrite_raw_audio_or_notes`
@@ -171,8 +158,7 @@ into a regular hunt test).
 - **Fix:** allocate a collision suffix across the complete artifact set and
   copy/write with exclusive-create semantics.
 
-### BH-F5 — Meeting system channel copy depended on the mic path
-
+### BH-F5 [I1] — Meeting system channel copy depended on the mic path
 - **Severity:** wrong-action
 - **Status:** fixed in the working tree during this continuation
 - **Repro:**
@@ -190,8 +176,7 @@ Found by running the keyless suite on Fedora/Python 3.14 after PR #1 merged:
 crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 `XPASS(strict)` because they passed *for the wrong reason* on that build.
 
-### BH-G4 — One unescaped `%` in a help string broke the entire CLI on Python 3.14
-
+### BH-G4 [I9] — One unescaped `%` in a help string broke the entire CLI on Python 3.14
 - **Severity:** crash-with-safe-state
 - **Status:** fixed
 - **Repros:** `test_cli_every_help_string_renders`,
@@ -223,8 +208,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
   moved out of `main()` into `build_parser()` so the whole command tree can
   be rendered in-process on every supported Python.
 
-### BH-E2 — Raw user search text is interpreted as FTS5 syntax
-
+### BH-E2 [I9] — Raw user search text is interpreted as FTS5 syntax
 - **Severity:** crash-with-safe-state
 - **Status:** fixed (was open-xfail)
 - **Repros:** `test_search_documents_treats_user_text_as_text_not_fts_syntax`,
@@ -257,8 +241,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
     (same class as BH-E1) so a literal wildcard cannot widen a match, and
     degrades to LIKE rather than crashing if FTS5 ever rejects a query.
 
-### BH-C3 — Concurrent queue drains can process the same job twice
-
+### BH-C3 [I5, I6] — Concurrent queue drains can process the same job twice
 - **Severity:** wrong-action
 - **Status:** fixed (was open-xfail)
 - **Repros:** `test_concurrent_queue_drains_claim_a_job_once`,
@@ -286,8 +269,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 
 ## Fixed in the full-repo hardening pass: executor/organiser & Areas D–G
 
-### BH-A5 — Executor does not verify plan root against root spec
-
+### BH-A5 [I6] — Executor does not verify plan root against root spec
 - **Severity:** wrong-action
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_plan_for_one_root_cannot_be_applied_with_another_root_spec`
@@ -297,8 +279,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
   files into A. Daemon/CLI callers pair them correctly today, but the sole
   file-moving authority does not enforce its own boundary.
 
-### BH-A6 — Executor accepts a source outside the organise root
-
+### BH-A6 [I6] — Executor accepts a source outside the organise root
 - **Severity:** wrong-action
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_plan_item_source_outside_root_is_refused`
@@ -306,8 +287,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** if the outside file is indexed under another root/spec, the
   executor moves it into the current root.
 
-### BH-A7 — Executor accepts invented destinations outside frozen taxonomy
-
+### BH-A7 [I6] — Executor accepts invented destinations outside frozen taxonomy
 - **Severity:** wrong-action
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_plan_item_invented_destination_is_refused`
@@ -316,8 +296,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** syntax/root-containment checks pass and the executor creates
   and files into `Invented/`.
 
-### BH-A8 — Nested already-filed files are flattened
-
+### BH-A8 [I6] — Nested already-filed files are flattened
 - **Severity:** wrong-action
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_nested_already_filed_file_is_not_flattened`
@@ -326,8 +305,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** organiser marks it already-filed with destination `Finance`
   and basename only; executor therefore moves it to `Finance/invoice.txt`.
 
-### BH-A9 — Destination occupied by a directory crashes the apply
-
+### BH-A9 [I6] — Destination occupied by a directory crashes the apply
 - **Severity:** crash-with-safe-state
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_destination_occupied_by_directory_is_refused_not_raised`
@@ -335,16 +313,14 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** `check_operation()` tries to hash the directory and raises
   `IsADirectoryError`, aborting the apply loop.
 
-### BH-A10 — `ApplyReport.op_ids` is always empty
-
+### BH-A10 [I6] — `ApplyReport.op_ids` is always empty
 - **Severity:** cosmetic
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_apply_report_names_the_journal_operations_it_committed`
 - **Expected:** the report names committed journal operation IDs.
 - **Actual:** files move and journal rows commit, but `op_ids == []`.
 
-### BH-B7 — Watcher debounce does not restart on later writes
-
+### BH-B7 [I1, I2] — Watcher debounce does not restart on later writes
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_watcher_debounce_restarts_when_a_file_changes_again`
@@ -353,8 +329,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** the pending timestamp keeps the first change time; only the
   scan that directly observes the second modification suppresses settling.
 
-### BH-B8 — Unreadable directory is indexed as empty and docs go missing
-
+### BH-B8 [I1, I9] — Unreadable directory is indexed as empty and docs go missing
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_unreadable_directory_does_not_mark_known_files_missing`
@@ -363,8 +338,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** `os.walk` silently yields no files below the unreadable
   directory and reconciliation marks known documents `missing`.
 
-### BH-B9 — `build_plan` ignores a missing-root index error
-
+### BH-B9 [I1, I9] — `build_plan` ignores a missing-root index error
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_build_plan_for_missing_root_does_not_finish_ready`
@@ -374,8 +348,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 
 ## Fixed in the full-repo hardening pass: Area D — planner, intents, config
 
-### BH-D1 — LLM batch verifier does not require an exact path set
-
+### BH-D1 [I1, I6] — LLM batch verifier does not require an exact path set
 - **Severity:** wrong-action
 - **Status:** fixed in `0176d8d`
 - **Repros:** `test_llm_batch_with_duplicate_path_and_missing_file_is_invalid`,
@@ -386,8 +359,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
   and uniqueness are not; `True` also passes as numeric confidence because
   Python `bool` is an `int`.
 
-### BH-D2 — API-cost intent overmatches ordinary English
-
+### BH-D2 [I5, I9] — API-cost intent overmatches ordinary English
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_ordinary_cost_words_are_not_the_api_cost_intent`
@@ -395,8 +367,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
   “quota for fishing boats” go up the conversational ladder.
 - **Actual:** all route locally to the Gemini cost report.
 
-### BH-D3 — Natural emergency halt variants are misses
-
+### BH-D3 [I5] — Natural emergency halt variants are misses
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_natural_halt_variants_route_to_halt`
@@ -404,8 +375,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
   set the halt.
 - **Actual:** only exact canned forms match; these fall through.
 
-### BH-D4 — A string where a config sequence belongs becomes characters
-
+### BH-D4 [I7] — A string where a config sequence belongs becomes characters
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_string_taxonomy_and_languages_are_rejected_or_wrapped`
@@ -414,8 +384,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** taxonomy becomes `['F','i','n','a','n','c','e', ...]` and
   languages becomes `['s','w']`.
 
-### BH-D5 — Loaded configs share nested `DEFAULTS` objects
-
+### BH-D5 [I7] — Loaded configs share nested `DEFAULTS` objects
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_mutating_loaded_config_does_not_pollute_next_load`
@@ -424,8 +393,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** `_deep_merge(DEFAULTS, {})` shallow-copies the outer dict, so
   nested section dicts/lists remain shared.
 
-### BH-D6 — Malformed humour TOML crashes instead of degrading
-
+### BH-D6 [I7, I9] — Malformed humour TOML crashes instead of degrading
 - **Severity:** crash-with-safe-state
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_malformed_humour_profile_degrades_to_empty_profile`
@@ -437,8 +405,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 
 (BH-E2 moved to *Fixed* above.)
 
-### BH-E3 — Every `OSError` is classified as a network failure
-
+### BH-E3 [I9] — Every `OSError` is classified as a network failure
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_local_filesystem_errors_are_not_network_failures`
@@ -448,8 +415,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
   `OSError`; in the queue this can requeue forever and mark connectivity
   unhealthy—for example when saved dictation audio is missing.
 
-### BH-E4 — First 500 historical queue jobs starve newer pending jobs
-
+### BH-E4 [I2] — First 500 historical queue jobs starve newer pending jobs
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_queue_drain_reaches_pending_job_after_500_finished_jobs`
@@ -458,8 +424,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** drain loads the first 500 rows by ID across all statuses,
   filters afterward, and never reaches pending job #501.
 
-### BH-E5 — A cloud job left `running` by a crash is never recovered
-
+### BH-E5 [I2, I10] — A cloud job left `running` by a crash is never recovered
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_queue_recovers_a_job_left_running_by_a_crash`
@@ -467,8 +432,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** candidates are only `pending`/`approved`; `running` remains
   forever while duplicate-suppression treats it as active.
 
-### BH-E6 — `ModeManager` without a store cannot remember a switch
-
+### BH-E6 [I7] — `ModeManager` without a store cannot remember a switch
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_mode_manager_without_store_remembers_requested_preference`
@@ -477,8 +441,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** preference writes are no-ops and status re-reads config's old
   `auto` preference.
 
-### BH-E7 — Harness verification outcomes are never ledgered
-
+### BH-E7 [I9] — Harness verification outcomes are never ledgered
 - **Severity:** cosmetic
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_verified_outcome_is_recorded_in_the_ledger`
@@ -491,8 +454,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 
 ## Fixed in the full-repo hardening pass: Area F — audio, dictation, meeting, TTS
 
-### BH-F1 — Empty ASR output stops the fallback chain
-
+### BH-F1 [I1] — Empty ASR output stops the fallback chain
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_asr_fallback_chain_continues_after_empty_text`
@@ -500,8 +462,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** a backend returning `Transcript("")` is treated as success
   and later backends are never tried.
 
-### BH-F2 — `WavSink.close()` reports duration at the wrong sample rate
-
+### BH-F2 [I1] — `WavSink.close()` reports duration at the wrong sample rate
 - **Severity:** cosmetic
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_wav_sink_reports_duration_at_its_configured_sample_rate`
@@ -509,8 +470,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** the WAV is written at 8kHz but duration divides by the global
   16kHz constant and reports 0.5s.
 
-### BH-F3 — PCM-stream PipeWire command bypasses the object.id trap guard
-
+### BH-F3 [I1, I5] — PCM-stream PipeWire command bypasses the object.id trap guard
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_pw_record_stream_rejects_short_numeric_object_id_targets`
@@ -520,8 +480,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
   used by live capture accepts it and can silently capture the default
   device on Fedora.
 
-### BH-F6 — Live age rotation reconnects on every later frame
-
+### BH-F6 [I2, I3] — Live age rotation reconnects on every later frame
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_live_age_rotation_does_not_reconnect_on_every_frame`
@@ -531,8 +490,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
   crossed, each subsequent frame raises rotation, reconnects, and replays
   the buffered tail again.
 
-### BH-F7 — Cleanup failure prevents raw dictation persistence
-
+### BH-F7 [I1] — Cleanup failure prevents raw dictation persistence
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_cleanup_failure_still_persists_raw_transcript`
@@ -541,8 +499,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** cleanup is called before either persistence step; an
   exception propagates and only the raw WAV remains.
 
-### BH-F8 — Piper availability ignores a missing voice JSON config
-
+### BH-F8 [I7, I9] — Piper availability ignores a missing voice JSON config
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_piper_availability_requires_the_json_config`
@@ -551,8 +508,7 @@ crash (BH-G4), five were BH-E2 and one was BH-C3 — the latter two surfacing as
 - **Actual:** model + executable presence is reported available; synthesis
   is the first place the missing config can fail.
 
-### BH-F9 — Explicit TTS destination is reused as cache for different text
-
+### BH-F9 [I1] — Explicit TTS destination is reused as cache for different text
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_tts_explicit_destination_is_not_reused_for_different_text`
@@ -569,8 +525,7 @@ Same ledger rules as the sections above; `VB-*` ids are the ones used in
 severity vocabulary because the owner marked wrong-voice and offline-speaking as
 their own CRITICAL class.
 
-### VB-1 — Online cache key ignored the voice, so a voice change replayed Flare
-
+### VB-1 [I1] — Online cache key ignored the voice, so a voice change replayed Flare
 - **Severity:** wrong-action (hunt class: CRITICAL — wrong voice)
 - **Status:** fixed in `3d2b9e5`
 - **Repro:** `test_b7_voice_change_invalidates_the_online_cache`
@@ -580,8 +535,7 @@ their own CRITICAL class.
   `speech-<hash>.wav` answered for a different voice while `status` reported the
   new one. The key is now the route's own audio identity.
 
-### VB-2 — A dormant-path setting made every cached ack a permanent silence
-
+### VB-2 [I1] — A dormant-path setting made every cached ack a permanent silence
 - **Severity:** wrong-action (hunt class: HIGH — silent hotkey)
 - **Status:** fixed in `3d2b9e5` (key) and `d63f0de` (re-warm)
 - **Repro:** `test_b5b_dormant_config_change_must_not_silence_the_hotkey_path`,
@@ -593,8 +547,7 @@ their own CRITICAL class.
   online ack forever; 1.286 ms audible became 0.063 ms silence, and only a manual
   `assist voice warm` healed it.
 
-### VB-3 — A dormant Piper render answered an online ack
-
+### VB-3 [I1] — A dormant Piper render answered an online ack
 - **Severity:** wrong-action (hunt class: CRITICAL — a voice that must never speak
   spoke)
 - **Status:** fixed in `3d2b9e5`
@@ -605,8 +558,7 @@ their own CRITICAL class.
   — introduced with the interim online-voice commit and reachable on any box that
   had ever run the local voice. The fallback and its comment are deleted.
 
-### VB-4 — Any string in `[gemini] voice` silently became her voice
-
+### VB-4 [I7] — Any string in `[gemini] voice` silently became her voice
 - **Severity:** wrong-action (hunt class: CRITICAL — config poisoning)
 - **Status:** fixed in `3d2b9e5`
 - **Repro:** `test_a3_voice_is_pinned_and_the_precedence_is_documented`,
@@ -617,8 +569,7 @@ their own CRITICAL class.
 - **Actual (before):** `voice_name = voice or "Flare"` with no validation, doctor
   green, and two config sources disagreeing about who speaks.
 
-### VB-5 — One thought, two check-ins
-
+### VB-5 [I2] — One thought, two check-ins
 - **Severity:** wrong-action (hunt class: MED — she speaks when she should not)
 - **Status:** fixed in `c1469cc`
 - **Repro:** `test_c9_blip_speech_does_not_rearm_the_ladder_for_a_second_nag`
@@ -626,8 +577,7 @@ their own CRITICAL class.
 - **Actual (before):** any frame ≥ the RMS gate cleared `_asked`, so a 30 ms breath
   or click inside one long pause earned a second nag.
 
-### VB-6 — Asked, then the mic never released
-
+### VB-6 [I10] — Asked, then the mic never released
 - **Severity:** crash-with-safe-state (hunt class: MED — resource hold)
 - **Status:** fixed in `c1469cc`
 - **Repro:** `test_c9b_after_the_checkin_the_session_closes_after_grace`
@@ -636,8 +586,7 @@ their own CRITICAL class.
 - **Actual (before):** the user's hotkey was the only exit; a headless repro held
   the source for ~50 minutes.
 
-### VB-7 — Rotation dropped the head of a long dictation
-
+### VB-7 [I1] — Rotation dropped the head of a long dictation
 - **Severity:** data-loss
 - **Status:** fixed in `c1469cc`
 - **Repro:** `test_d11b_rotation_on_a_long_utterance_keeps_every_word`
@@ -647,8 +596,7 @@ their own CRITICAL class.
   older than the ≤30 s replay buffer vanished from the transcript while
   `assist events` had already shown it.
 
-### VB-8 — Transcribed words reached the intent ladder with no confidence gate
-
+### VB-8 [I1, I5] — Transcribed words reached the intent ladder with no confidence gate
 - **Severity:** wrong-action (hunt class: HIGH)
 - **Status:** fixed in `c1469cc`
 - **Repro:** `test_d13b_low_confidence_command_words_never_execute`
@@ -658,8 +606,7 @@ their own CRITICAL class.
 - **Actual (before):** `route(text)` ran whatever the mic heard: a TV saying
   "undo." reversed files. `Daemon._command_gate` now vetoes and says why.
 
-### VB-9 — The doctor green-lit a broken biometric template
-
+### VB-9 [I5, I9] — The doctor green-lit a broken biometric template
 - **Severity:** cosmetic (hunt class: MED — misleading reporting about a real
   failure)
 - **Status:** fixed in `b058ea2`
@@ -670,8 +617,7 @@ their own CRITICAL class.
 - **Actual (before):** `voiceprint.exists()` only — `ok — present (path only…)` for
   a 0-byte or 0644 template.
 
-### VB-10 — SIGKILL of the daemon orphaned its audio child
-
+### VB-10 [I10] — SIGKILL of the daemon orphaned its audio child
 - **Severity:** crash-with-safe-state (hunt class: MED)
 - **Status:** fixed in `b058ea2`
 - **Repro:** `test_g18_kill_daemon_mid_playback_leaves_no_player_running`,
@@ -683,8 +629,7 @@ their own CRITICAL class.
   plus a real supervisor sweep now cover it — the sandbox kernel proved pdeathsig
   alone is not a promise to rely on.
 
-### VB-11 — A rejected second hotkey press spoke its own ack
-
+### VB-11 [I4] — A rejected second hotkey press spoke its own ack
 - **Severity:** cosmetic (hunt class: LOW)
 - **Status:** fixed in `c1469cc`
 - **Repro:** `test_g19_double_hotkey_acks_once`
@@ -692,8 +637,7 @@ their own CRITICAL class.
 - **Actual (before):** the loser got `note: "already listening"` *and* an "On it."
   clip: one double-press, two answers.
 
-### VB-12 — 0-byte audio blamed on a missing package
-
+### VB-12 [I1, I9] — 0-byte audio blamed on a missing package
 - **Severity:** cosmetic (hunt class: LOW)
 - **Status:** open-reproduced, deliberately unpinned — it fails safe
 - **Repro:** `test_d13_empty_or_silent_audio_is_never_a_confident_transcript`
@@ -701,8 +645,7 @@ their own CRITICAL class.
   `faster-whisper` absent, so it is recorded, not tested.
 - **Expected:** "the recording is empty", not "install faster-whisper".
 
-### VB-13 — The socket opened before the ack cache existed
-
+### VB-13 [I2, I9] — The socket opened before the ack cache existed
 - **Severity:** wrong-action (hunt class: HIGH — silent at boot)
 - **Status:** fixed in `d63f0de`
 - **Repro:** `test_b5c_boot_warm_starts_before_the_socket_serves`,
@@ -713,8 +656,7 @@ their own CRITICAL class.
   task afterwards, so the first press after boot was silent — online, one
   rate-limited render per ack.
 
-### VB-14 — The Waybar pill called cloud audio "local"
-
+### VB-14 [I9] — The Waybar pill called cloud audio "local"
 - **Severity:** cosmetic (hunt class: LOW)
 - **Status:** fixed in `b058ea2`
 - **Repro:** `test_a4c_waybar_line_is_truthful_in_every_mode`
@@ -722,8 +664,7 @@ their own CRITICAL class.
 - **Actual (before):** `voice: local gemini-native-audio / Flare` online and
   `voice: local none / none` offline.
 
-### VB-15 — "do it anyway" / "approve" are not voice-reachable (gap, not a bug)
-
+### VB-15 [I5] — "do it anyway" / "approve" are not voice-reachable (gap, not a bug)
 - **Severity:** cosmetic (a missing capability, recorded so it is not mistaken for
   a broken gate)
 - **Status:** open — deliberately not implemented while fixing bugs
@@ -736,8 +677,7 @@ their own CRITICAL class.
 
 ## Fixed in the full-repo hardening pass: Area G — IPC, daemon, voice-test
 
-### BH-G1 — Speaker-threshold suggestion tie-breaks dangerously low
-
+### BH-G1 [I5] — Speaker-threshold suggestion tie-breaks dangerously low
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_suggested_speaker_threshold_uses_the_separation_gap_midpoint`
@@ -746,8 +686,7 @@ their own CRITICAL class.
 - **Actual:** the sweep keeps the first zero-error threshold, 0.101,
   maximizing unseen-impostor false-accept risk.
 
-### BH-G2 — `review.decide` reports success for a nonexistent item
-
+### BH-G2 [I9] — `review.decide` reports success for a nonexistent item
 - **Severity:** cosmetic
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_review_decide_rejects_a_nonexistent_item`
@@ -755,8 +694,7 @@ their own CRITICAL class.
 - **Actual:** the SQL update affects zero rows but the daemon returns a
   successful approve/reject response.
 
-### BH-G3 — IPC client mistakes a pushed event for its reply
-
+### BH-G3 [I2, I9] — IPC client mistakes a pushed event for its reply
 - **Severity:** crash-with-safe-state
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_ipc_call_skips_event_lines_until_the_matching_reply`
@@ -767,8 +705,7 @@ their own CRITICAL class.
 
 ## Fixed in the full-repo hardening pass: Area H — Stages A–D & cross-cutting (`tests/test_stage_abcd_bughunt.py`)
 
-### BH-H1 — Live session failure mid-ack or mid-conversation leaves truncated WAV or ignores connectivity loss
-
+### BH-H1 [I1, I2, I3] — Live session failure mid-ack or mid-conversation leaves truncated WAV or ignores connectivity loss
 - **Severity:** crash-with-safe-state / wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_bh_h1_live_session_failure_mid_ack_leaves_no_partial_wav_and_falls_back_to_text`
@@ -780,8 +717,7 @@ their own CRITICAL class.
   mid-stream Live disconnects were not distinguished from completed turns, and
   conversation speech failures did not update `mode_manager`.
 
-### BH-H2 — Voice catalogue cache never expires and `voice_route()` ignores upstream voice removal
-
+### BH-H2 [I7, I9] — Voice catalogue cache never expires and `voice_route()` ignores upstream voice removal
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_bh_h2_catalogue_cache_ttl_and_upstream_voice_removal`
@@ -792,8 +728,7 @@ their own CRITICAL class.
   and `voice_route()` only checked local `voice_identity()` without consulting
   the verified cached catalogue.
 
-### BH-H3 — Narrowing `allowed_voices` leaks the unapproved voice into `cloud_cache_identity()` and `status()`
-
+### BH-H3 [I7] — Narrowing `allowed_voices` leaks the unapproved voice into `cloud_cache_identity()` and `status()`
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_bh_h3_allowed_voices_widened_then_narrowed_and_case_canonical`
@@ -804,8 +739,7 @@ their own CRITICAL class.
   `self.configured_voice()` (`"Kore"`) via `or`, and `resolve_voice()` returned
   raw lowercase `"flare"`.
 
-### BH-H4 — Removed legacy `model_voice = "gemini-2.5-flash-preview-tts"` shadows `gemini_voice_model`
-
+### BH-H4 [I7] — Removed legacy `model_voice = "gemini-2.5-flash-preview-tts"` shadows `gemini_voice_model`
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_bh_h4_deprecated_model_voice_never_shadows_gemini_voice_model`
@@ -814,8 +748,7 @@ their own CRITICAL class.
 - **Actual (before):** `voice_model()` let any non-empty `model_voice` shadow
   `gemini_voice_model` whenever `gemini_voice_model == DEFAULT_VOICE_MODEL`.
 
-### BH-H5 — Daemon restart mid-conversation omits prior SQLite turns from `ask` prompt
-
+### BH-H5 [I1, I6] — Daemon restart mid-conversation omits prior SQLite turns from `ask` prompt
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_bh_h5_session_continuity_under_daemon_restart_includes_history_in_prompt`
@@ -826,8 +759,7 @@ their own CRITICAL class.
   built the prompt from `memory.recall(text)` alone and never included the
   active conversation's recent messages.
 
-### BH-H6 — Console follow-mode stalls forever on dead socket and leaks dead subscriber writers
-
+### BH-H6 [I2, I10] — Console follow-mode stalls forever on dead socket and leaks dead subscriber writers
 - **Severity:** crash-with-safe-state
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_bh_h6_console_follow_mode_disconnect_timeout_and_dead_subscriber_pruning`
@@ -838,8 +770,7 @@ their own CRITICAL class.
   `None` after connecting, and `Daemon.broadcast()` only called `w.write()`
   without `await w.drain()`.
 
-### BH-H7 — Class-mode toggle racing in-flight speech synthesis allows audio playback after class mode is enabled
-
+### BH-H7 [I4, I5] — Class-mode toggle racing in-flight speech synthesis allows audio playback after class mode is enabled
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_bh_h7_class_mode_toggle_racing_spoken_ack_or_say_speech_loses`
@@ -849,8 +780,7 @@ their own CRITICAL class.
 - **Actual (before):** `voice_route()` was checked only before synthesis; if
   class mode turned on while synthesis was in flight, `play_audio()` still ran.
 
-### BH-H8 — Overnight schedule windows fail across midnight and boolean `days` match Tuesday/Monday
-
+### BH-H8 [I7] — Overnight schedule windows fail across midnight and boolean `days` match Tuesday/Monday
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_bh_h8_schedule_suggestion_overnight_and_malformed_days_never_self_activate`
@@ -862,8 +792,7 @@ their own CRITICAL class.
   when `start > end`), `isinstance(True, int)` matched weekday `1`, and
   `bool("false")` in `_class_set` evaluated to `True`.
 
-### BH-H9 — `KnockSignal.emit()` ignores `knock["silent"]` and `raise_knock()` ignores `urgent_in_class_mode`
-
+### BH-H9 [I4, I5] — `KnockSignal.emit()` ignores `knock["silent"]` and `raise_knock()` ignores `urgent_in_class_mode`
 - **Severity:** wrong-action
 - **Status:** fixed in `810bab4` / `e4108b5`
 - **Repro:** `test_bh_h9_knock_during_class_mode_silent_pulse_and_urgent_config_respected`
@@ -874,8 +803,7 @@ their own CRITICAL class.
   `raise_knock()` read `class_mode_urgent_only` while `DEFAULTS` and
   `config.toml.example` defined `urgent_in_class_mode`.
 
-### BH-H10 — Accepting a knock while voice is muted opens `"voice"`, and crash before `sessions.append` loses the opener
-
+### BH-H10 [I1, I5, I6] — Accepting a knock while voice is muted opens `"voice"`, and crash before `sessions.append` loses the opener
 - **Severity:** wrong-action / data-loss
 - **Status:** fixed in `810bab4`
 - **Repro:** `test_bh_h10_knock_accept_respects_mute_and_survives_daemon_restart`
@@ -886,8 +814,7 @@ their own CRITICAL class.
   (always `True`), and `sessions.append` only ran in `Daemon._knock_accept`
   after `initiative.accept()` returned.
 
-### BH-H11 — Declining a snoozed or proposal-backed knock leaves its commitment active in `facts`
-
+### BH-H11 [I6] — Declining a snoozed or proposal-backed knock leaves its commitment active in `facts`
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_bh_h11_commitment_created_by_accepted_proposal_then_declined_is_deactivated`
@@ -897,8 +824,7 @@ their own CRITICAL class.
 - **Actual (before):** `decline()` rejected `"snoozed"` knocks and never
   deactivated the underlying commitment row in `facts`.
 
-### BH-H12 — Topic retirement can be bypassed by punctuation variants or calling `ignore()` on resolved knocks
-
+### BH-H12 [I5, I6] — Topic retirement can be bypassed by punctuation variants or calling `ignore()` on resolved knocks
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_bh_h12_topic_retire_counter_manipulation_and_punctuation_normalisation`
@@ -909,8 +835,7 @@ their own CRITICAL class.
   mutated already-accepted/declined knocks, and retirement only checked a
   single knock row's `ignore_count`.
 
-### BH-H13 — AST boundary test for knock sound and signal emit paths
-
+### BH-H13 [I4] — AST boundary test for knock sound and signal emit paths
 - **Severity:** cosmetic (guard)
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_bh_h13_ast_knock_signal_and_sound_only_called_from_knock_handlers`
@@ -918,8 +843,7 @@ their own CRITICAL class.
   only referenced in `initiative.py`, `config.py`, and `Daemon._knock_*`
   handlers.
 
-### BH-H14 — Needy-framing paraphrases slip past `NEEDY_PATTERNS`
-
+### BH-H14 [I5] — Needy-framing paraphrases slip past `NEEDY_PATTERNS`
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_bh_h14_needy_framing_fuzz_catches_subtle_paraphrases`
@@ -928,8 +852,7 @@ their own CRITICAL class.
   `"Are you ignoring me?"` are rejected by `InitiativeService._validate_reason()`.
 - **Actual (before):** `NEEDY_PATTERNS` missed these paraphrases.
 
-### BH-H15 — Show-off entry accepts a replayed recording of the owner's voice
-
+### BH-H15 [I5] — Show-off entry accepts a replayed recording of the owner's voice
 - **Severity:** wrong-action (security boundary)
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_bh_h15_showoff_entry_rejects_recorded_or_replayed_owner_audio`
@@ -938,8 +861,7 @@ their own CRITICAL class.
 - **Actual (before):** `enter()` only checked cosine similarity against the
   owner's voiceprint and had no replay or live-mic provenance check.
 
-### BH-H16 — Unverified turn during show-off falls through to owner path if `speaker` is omitted
-
+### BH-H16 [I5] — Unverified turn during show-off falls through to owner path if `speaker` is omitted
 - **Severity:** wrong-action (security boundary)
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_bh_h16_guest_audio_during_showoff_without_speaker_tag_is_treated_as_guest`
@@ -949,8 +871,7 @@ their own CRITICAL class.
 - **Actual (before):** `_ask` defaulted `speaker = "owner"` whenever `speaker`
   was omitted and no `embedding` was supplied, even during active show-off mode.
 
-### BH-H17 — Show-off timeout racing `exit_owner()` raises `ShowoffError` instead of returning the expired session summary
-
+### BH-H17 [I2] — Show-off timeout racing `exit_owner()` raises `ShowoffError` instead of returning the expired session summary
 - **Severity:** crash-with-safe-state
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_bh_h17_showoff_timeout_racing_owner_stop_returns_clean_summary`
@@ -960,8 +881,7 @@ their own CRITICAL class.
 - **Actual (before):** `self.status()` auto-closed the timed-out session first,
   causing `exit_owner()` to see `current is None` and raise `ShowoffError`.
 
-### BH-H18 — `demo_write()` follows a symlink inside the demo sandbox to overwrite an outside file
-
+### BH-H18 [I6] — `demo_write()` follows a symlink inside the demo sandbox to overwrite an outside file
 - **Severity:** data-loss (security boundary)
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_bh_h18_demo_action_via_symlink_inside_sandbox_is_refused`
@@ -970,8 +890,7 @@ their own CRITICAL class.
 - **Actual (before):** `demo_target()` checked lexical `Path(name).parts` only,
   allowing a symlink inside the sandbox to point outside.
 
-### BH-H19 — Outgoing leak guard misses colon-delimited and paraphrased owner secrets
-
+### BH-H19 [I1, I5] — Outgoing leak guard misses colon-delimited and paraphrased owner secrets
 - **Severity:** data-loss (privacy boundary)
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_bh_h19_allowlist_fact_leaking_via_paraphrase_or_colon_value_is_blocked`
@@ -981,8 +900,7 @@ their own CRITICAL class.
 - **Actual (before):** `_VALUE_AFTER_IS` only matched `is|are|was|equals`, so
   `"My bank vault code: EmeraldFalcon"` had `sensitive_values() == []`.
 
-### BH-H20 — `kill -9` mid-showoff leaves guest audio in sandbox and `guests_heard=0` on restart
-
+### BH-H20 [I5, I10] — `kill -9` mid-showoff leaves guest audio in sandbox and `guests_heard=0` on restart
 - **Severity:** data-loss (privacy boundary)
 - **Status:** fixed in `0176d8d`
 - **Repro:** `test_bh_h20_crash_exit_mid_showoff_cleans_audio_residue_and_persists_guest_count`
@@ -992,8 +910,7 @@ their own CRITICAL class.
 - **Actual (before):** `guests_heard` was only written on clean `_close()`, and
   `recover_unclosed()` did not sweep audio files from the demo sandbox.
 
-### BH-H21 — Second daemon unlinks a live daemon's socket, and non-dict JSON frame crashes IPC handler
-
+### BH-H21 [I2, I9, I10] — Second daemon unlinks a live daemon's socket, and non-dict JSON frame crashes IPC handler
 - **Severity:** crash-with-safe-state / wrong-action
 - **Status:** fixed in `810bab4` / `e4108b5`
 - **Repro:** `test_bh_h21_second_daemon_refuses_to_steal_active_socket_and_ipc_handles_non_dict`
@@ -1005,8 +922,7 @@ their own CRITICAL class.
   unhandled `AttributeError` before `req_id` was initialized when `json.loads`
   returned a list.
 
-### BH-H22 — `config.toml.example` table scoping bug (`[quota.models.transcribe-batch]`) and config schema drift
-
+### BH-H22 [I7] — `config.toml.example` table scoping bug (`[quota.models.transcribe-batch]`) and config schema drift
 - **Severity:** wrong-action
 - **Status:** fixed in `e4108b5`
 - **Repro:** `test_bh_h22_config_example_parity_and_validation`
@@ -1027,8 +943,7 @@ their own CRITICAL class.
 All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
 (written first; 24 of its 28 cases failed before any fix).
 
-### BH-I1 — Deprecated `gemini.model_voice` still beat an explicit `gemini_voice_model`
-
+### BH-I1 [I7] — Deprecated `gemini.model_voice` still beat an explicit `gemini_voice_model`
 - **Severity:** wrong-behaviour (voice identity)
 - **Status:** fixed in this pass
 - **Repro:** `test_voice_model_explicit_new_key_wins_over_legacy_alias`
@@ -1041,8 +956,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   `gemini-2.5-flash-preview-tts`, so a file carrying both keys still spoke the
   legacy model while doctor reported the new key as authoritative.
 
-### BH-I2 — Config poisoning passed validation and crashed the readers
-
+### BH-I2 [I7, I9] — Config poisoning passed validation and crashed the readers
 - **Severity:** crash-with-safe-state / wrong-action
 - **Status:** fixed in this pass
 - **Repro:** `test_validate_config_names_poisoned_keys`,
@@ -1059,8 +973,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   `KeyError: 'path'`, and unknown keys were silently accepted (the
   accept-and-ignore bug class the task forbids).
 
-### BH-I3 — `[console] history_limit` was documented but ignored
-
+### BH-I3 [I7] — `[console] history_limit` was documented but ignored
 - **Severity:** wrong-behaviour
 - **Status:** fixed in this pass
 - **Repro:** `test_daemon_uses_console_history_limit`
@@ -1070,8 +983,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   `console.history` honoured the config, so follow-mode and print-mode
   disagreed about the same conversation.
 
-### BH-I4 — A timed-out reply was synthesised and played twice
-
+### BH-I4 [I2, I4] — A timed-out reply was synthesised and played twice
 - **Severity:** wrong-behaviour (double audio, owner-visible)
 - **Status:** fixed in this pass
 - **Repro:** `test_timed_out_reply_is_spoken_once`
@@ -1081,8 +993,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   `_speak_reply_async`; the original `to_thread` call was never cancelled, so a
   1.9 s utterance was spoken twice, overlapping.
 
-### BH-I5 — Post-guard echo check suppressed legitimate short replies
-
+### BH-I5 [I1, I9] — Post-guard echo check suppressed legitimate short replies
 - **Severity:** wrong-behaviour
 - **Status:** fixed in this pass
 - **Repro:** `test_short_user_reply_is_not_echo_after_guard`
@@ -1093,8 +1004,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   utterance was discarded as echo. Reproduced with
   `_speaking_until = 0` and `"No. Not at this hour."`.
 
-### BH-I6 — Show-off crash recovery deleted EVERY dictation and meeting recording
-
+### BH-I6 [I1, I10] — Show-off crash recovery deleted EVERY dictation and meeting recording
 - **Severity:** data-loss
 - **Status:** fixed in this pass
 - **Repro:** `test_showoff_crash_recovery_never_deletes_dictation_or_meeting_audio`
@@ -1106,8 +1016,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   The `BH-H20` test had encoded that deletion as the contract; it was corrected,
   not deleted (see `change.md`).
 
-### BH-I7 — `initiative.status()["latest"]` reported the OLDEST pending knock
-
+### BH-I7 [I9] — `initiative.status()["latest"]` reported the OLDEST pending knock
 - **Severity:** wrong-behaviour
 - **Status:** fixed in this pass
 - **Repro:** `test_initiative_latest_is_newest_pending`
@@ -1115,8 +1024,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
 - **Actual (before):** `pending[-1]` returned the oldest, so Waybar and the
   console announced a stale knock while a newer one was waiting.
 
-### BH-I7b — A due knock refused every cycle was silent
-
+### BH-I7b [I1, I9] — A due knock refused every cycle was silent
 - **Severity:** wrong-behaviour (observability)
 - **Status:** fixed in this pass
 - **Repro:** `test_due_loop_refusal_is_logged_not_swallowed`
@@ -1127,8 +1035,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   could never be raised vanished from all evidence surfaces while `pending`
   stayed non-zero.
 
-### BH-I8 — Two daemons could still race the check-unlink-bind window
-
+### BH-I8 [I5, I10] — Two daemons could still race the check-unlink-bind window
 - **Severity:** crash-with-safe-state (socket loss)
 - **Status:** fixed in this pass
 - **Repro:** `test_ipc_serve_refuses_when_daemon_lock_is_held`,
@@ -1140,8 +1047,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   unlink and bind; one could delete the other's freshly bound socket (the
   `BH-H21` probe only narrowed the window, it did not close it).
 
-### BH-I9 — Malformed IPC frames escaped as raw JSON errors; reply drain was unbounded
-
+### BH-I9 [I2, I9] — Malformed IPC frames escaped as raw JSON errors; reply drain was unbounded
 - **Severity:** crash-with-safe-state / hang
 - **Status:** fixed in this pass
 - **Repro:** `test_ipc_call_malformed_reply_is_daemon_unavailable`,
@@ -1156,8 +1062,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   line, `writer.drain()` had no bound, and `play_audio()` swallowed
   `TimeoutExpired` into a bare `False`.
 
-### BH-I10 — A failed catalogue refresh downgraded a verified cache; timestamp-less cache was trusted
-
+### BH-I10 [I7, I9] — A failed catalogue refresh downgraded a verified cache; timestamp-less cache was trusted
 - **Severity:** wrong-action (voice selection)
 - **Status:** fixed in this pass
 - **Repro:** `test_catalogue_refresh_falls_back_to_verified_cache`,
@@ -1168,8 +1073,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   committed baseline (never checked against the API), and `load_cached()` with
   `max_age_s=None` accepted a cache row with no timestamp.
 
-### BH-I11 — Needy framing survived paraphrases
-
+### BH-I11 [I5] — Needy framing survived paraphrases
 - **Severity:** wrong-behaviour (persona boundary)
 - **Status:** fixed in this pass
 - **Repro:** `test_needy_paraphrases_rejected` (7 parametrised openers, e.g.
@@ -1179,8 +1083,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
 - **Actual (before):** the `NEEDY_PATTERNS` list missed all seven; two of the
   seven were already caught by earlier patterns and stayed as regression pins.
 
-### BH-I12 — A guest turn had no network timeout at all
-
+### BH-I12 [I2, I3] — A guest turn had no network timeout at all
 - **Severity:** crash-unsafe (hung demo)
 - **Status:** fixed in this pass
 - **Repro:** `test_guest_turn_is_time_bounded`
@@ -1191,8 +1094,7 @@ All thirteen were reproduced on `25179c8` by `tests/test_hardening_pass2.py`
   process was killed. The `TypeError`-as-feature-detect retry around it could
   also only fire after awaiting.
 
-### BH-I13 — Waybar/console streams died on one malformed event line
-
+### BH-I13 [I2, I9] — Waybar/console streams died on one malformed event line
 - **Severity:** crash-with-safe-state (display only)
 - **Status:** fixed in this pass
 - **Repro:** `test_waybar_stream_survives_malformed_event_line`
@@ -1209,8 +1111,7 @@ Reproduced with `tests/test_hardening_pass2b.py` (5 cases; J1, J2 and J3 were
 red before their fixes, J4/J5 were missing helpers, J6 was reproduced by
 running the documented command chain).
 
-### BH-J1 — Guest speech was written into the OWNER's conversation record
-
+### BH-J1 [I1, I5] — Guest speech was written into the OWNER's conversation record
 - **Severity:** privacy boundary / record contamination
 - **Status:** fixed in this pass
 - **Repro:** `test_non_owner_voice_never_enters_owner_conversation`,
@@ -1225,8 +1126,7 @@ running the documented command chain).
   owner's conversation. In show-off, guest turns also had no
   `disclosure.log_guest` row at all.
 
-### BH-J2 — One connectivity probe error killed the posture loop
-
+### BH-J2 [I2, I10] — One connectivity probe error killed the posture loop
 - **Severity:** crash-unsafe (frozen state)
 - **Status:** fixed in this pass
 - **Repro:** `test_connectivity_loop_survives_a_failing_tick`
@@ -1238,8 +1138,7 @@ running the documented command chain).
   or from `OFFLINE`/`FORCED_OFFLINE` again, so queue drain and voice routing
   stayed stale until restart.
 
-### BH-J3 — A second `assistd` printed a traceback instead of one line
-
+### BH-J3 [I9, I10] — A second `assistd` printed a traceback instead of one line
 - **Severity:** cosmetic (diagnosability)
 - **Status:** fixed in this pass
 - **Repro:** `test_second_daemon_exits_cleanly_with_one_line`
@@ -1249,8 +1148,7 @@ running the documented command chain).
   catches a missing `import sys` (NameError inside the handler), which is why
   the assertion is on stderr text, not just the exit code.
 
-### BH-J4 — `assist forget <topic>` claimed "No argument, as designed."
-
+### BH-J4 [I9] — `assist forget <topic>` claimed "No argument, as designed."
 - **Severity:** cosmetic (misleading output)
 - **Status:** fixed in this pass
 - **Repro:** `test_forget_message_names_the_topic_it_searched`
@@ -1259,8 +1157,7 @@ running the documented command chain).
   optional; with the now-required argument every miss printed the stale
   no-argument sentence. The parser help also still said "no argument".
 
-### BH-J5 — Daemon refusals printed "refused: refused: …"
-
+### BH-J5 [I9] — Daemon refusals printed "refused: refused: …"
 - **Severity:** cosmetic
 - **Status:** fixed in this pass
 - **Repro:** `test_refusal_text_does_not_double_the_prefix`
@@ -1268,8 +1165,7 @@ running the documented command chain).
 - **Actual (before):** `raise_knock` already raises `InitiativeError("refused: …")`
   and the CLI wrapped every exception in `refused: {exc}`.
 
-### BH-J6 — README's `assist status && assist cost` chain stops when the daemon is down
-
+### BH-J6 [I9] — README's `assist status && assist cost` chain stops when the daemon is down
 - **Severity:** documentation (stale command)
 - **Status:** fixed in this pass (README changed to `assist status; assist cost`)
 - **Repro:** run both commands with no daemon: `assist status` correctly prints a
@@ -1301,8 +1197,7 @@ running the documented command chain).
 
 ## BUG HUNT 2026-10-21 — BH-K series (see BUGHUNT-2026-10-21.md)
 
-### BH-K1 — Dictated text containing a filler phrase was silently discarded
-
+### BH-K1 [I1] — Dictated text containing a filler phrase was silently discarded
 - **Severity:** data-loss
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_transcript_integrity.py::test_dictated_email_with_filler_signoff_is_kept` (fails pre-fix)
@@ -1310,8 +1205,7 @@ running the documented command chain).
 - **Was:** a post-persist "BUG5 echo filter" in `DictationService.dictate` matched the final text against persona `FILLER_PHRASES` substrings ("let me know how i can", "how can i help", …) and, on any hit, replaced the already-persisted `SessionResult` with a fabricated empty one — raw/cleaned text, inbox path, clipboard and transcript_id all falsified while the store row kept the real words. The user got nothing; the record lied about it.
 - **Fix:** block removed. Echo defence is upstream and evidence-based (frames during playback never reach uplink/WAV; duplex refuses self-audio finals; the daemon strips by exact spoken-text comparison, BH-K2). Resemblance to her filler is not evidence about user speech.
 
-### BH-K2 — Daemon echo check wiped real dictation on timing alone
-
+### BH-K2 [I1] — Daemon echo check wiped real dictation on timing alone
 - **Severity:** data-loss
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_transcript_integrity.py` (`test_echo_requires_textual_match_not_timing`, `test_finish_dictation_keeps_text_that_lands_during_ack`, …)
@@ -1319,8 +1213,7 @@ running the documented command chain).
 - **Was:** `Daemon._is_echo` returned True whenever a transcript merely *finished* while an ack was playing (or inside the guard), with no textual comparison — `_speaking_text` is never cleared, so the timing branch was armed forever — and also on any `FILLER_PHRASES` substring. `_finish_dictation` then emptied `text`/`raw_text` in `ptt.result`. In command mode the general check ran *after* `_ask` had spoken its reply, so a routed command's own text was reported back as "" with "echo suppressed".
 - **Fix:** `Daemon._strip_self_echo` compares normalised word sequences against `_speaking_text`: exact match or a ≥2-word contiguous run of her sentence is hers (the ≥2 floor preserves BH-I5's one-word "No."); her sentence as a prefix is stripped and the user's words kept. Applied once, before routing; `raw_text` remains the ASR record. Two assertions in `test_bugs_1_to_5_regressions.py` encoded the old rule and were updated with justification inline — the BUG5 incident line is still caught when she actually spoke it.
 
-### BH-K3 — Committed Live finals were overwritten by the saved-WAV batch redo
-
+### BH-K3 [I1, I6] — Committed Live finals were overwritten by the saved-WAV batch redo
 - **Severity:** data-loss (silent substitution) + wrong-action (double transcription cost)
 - **Status:** fixed in this pass; hardware sequence still to confirm (BH-K4/S2)
 - **Repro:** `tests/test_bughunt_k_transcript_integrity.py` (`test_pause_then_release_silence_after_end_keeps_live`, `test_turn_complete_only_with_uncommitted_tail_recovers_via_batch`)
@@ -1328,8 +1221,7 @@ running the documented command chain).
 - **Was:** `needs_fallback = live_failed or live_terminal_missing or not final_text`. Any post-`activity_end` wait timeout — including the benign case where every segment committed during speech and the user simply paused before releasing — re-transcribed the WAV and assigned `final_text = fallback_text`, silently swapping the Live transcript (the one interims had shown) for a different batch transcription. Contributing cause: `GenaiLiveTransport` swallowed the server's `turn_complete` for the transcription-only model, so the boundary was invisible to collector, diagnostics and fixtures alike.
 - **Fix:** (a) the parser surfaces `turn_complete` for both model shapes (finals in the same message are queued first); for the transcription-only model `events()` does not end there and the collector does not treat it as a terminal, because a committed segment can arrive *after* the boundary (test_bug6f) — it is evidence for diagnostics, not a completeness proof. (b) `dictate` now accounts in audio time: seconds of speech-level audio sent vs. sent at the moment the last final arrived. Batch runs only when no text was committed, or speech followed the last final *and* no clean post-release terminal arrived; every branch is stated in `notes`. The 6f guarantee is preserved: an unconfirmed tail is still recovered from the WAV, never truncated.
 
-### BH-K4 — `GEMINI_MODE=record` never recorded Live session sequences
-
+### BH-K4 [I1, I9] — `GEMINI_MODE=record` never recorded Live session sequences
 - **Severity:** wrong-action (broken debugging contract)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_record_mode.py`
@@ -1337,8 +1229,7 @@ running the documented command chain).
 - **Was:** `asr.make_live_transport` returned the bare `GenaiLiveTransport` for record mode; `RecordingTransport` existed and was tested in isolation but was wired into no production path. The documented way to capture evidence for the hardware "no final after activity_end" bug produced nothing.
 - **Fix:** the factory wraps the real transport in `RecordingTransport(..., "live")` when `gemini_mode == "record"` (audio is logged as hash+size only, sequence written on close).
 
-### BH-K5 — Voice render could hang a worker thread forever
-
+### BH-K5 [I2, I3, I10] — Voice render could hang a worker thread forever
 - **Severity:** wrong-action (unbounded wait / thread-pool starvation)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_waits.py::test_run_coroutine_sync_*`
@@ -1346,8 +1237,7 @@ running the documented command chain).
 - **Was:** `gemini_client._run_coroutine_sync` ran the render with no timeout in both branches (`asyncio.run` and `thread.join()`), and `render()`'s `async for message in session.receive()` can wait forever. TTS runs on the shared `to_thread` executor, so each hang permanently consumed a daemon worker thread.
 - **Fix:** `_run_coroutine_sync(factory, timeout_s=60)` wraps the coroutine in `asyncio.wait_for`; the thread branch joins with a margin and raises `TimeoutError` (thread is daemonized). Voice render passes 30s.
 
-### BH-K6 — Capture close could hang or leave pw-record running
-
+### BH-K6 [I2, I10] — Capture close could hang or leave pw-record running
 - **Severity:** wrong-action / privacy (unbounded wait, orphaned microphone)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_waits.py::test_aclose_*`
@@ -1355,8 +1245,7 @@ running the documented command chain).
 - **Was:** `terminate()` then `await proc.wait()` with no bound and no SIGKILL escalation; if the caller's lifecycle timeout cancelled the wait, the process was simply abandoned.
 - **Fix:** bounded wait (`TERMINATE_TIMEOUT_S = 2.0`) then `kill()` + reap; on `CancelledError`, `kill()` before re-raising. The process handle is detached first so a second close is a no-op.
 
-### BH-K7 — Hotword capture path: factory TypeError, leaked pw-record, silent stall
-
+### BH-K7 [I1, I2, I10] — Hotword capture path: factory TypeError, leaked pw-record, silent stall
 - **Severity:** crash-with-safe-state (factory) + privacy (orphaned live mic) + wrong-action (false "armed")
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_hotword_knock.py::test_hotword_*`
@@ -1364,8 +1253,7 @@ running the documented command chain).
 - **Was:** three root causes, all invisible to tests that replace the factory: (1) `_hotword_capture_factory` passed `chunk_ms=` to `PipeWireCapture(frame_ms=...)` → TypeError on every production start; (2) `_hotword_loop`'s finally called a sync `close()` that does not exist on `PipeWireCapture` (only `aclose()`), so a running capture was never closed; (3) a capture stall ends `frames()`, but the loop then exited without disarming or broadcasting — `hotword status` claimed armed over a dead stream. The `[hotword] stall_timeout_s` (2s) was also never passed, silently using the 8s capture default.
 - **Fix:** factory maps `[capture] chunk_ms` → `frame_ms` and passes the hotword stall timeout; the loop treats stream-end-while-armed as the stall (disarm + `hotword.stalled` broadcast); the finally awaits a shielded `aclose()` (with sync-`close()` fallback for test doubles) so cancellation by `hotword.stop` still reaps the process.
 
-### BH-K8 — `assist plan build` polled a stuck "building" plan forever
-
+### BH-K8 [I2, I3] — `assist plan build` polled a stuck "building" plan forever
 - **Severity:** wrong-action (unbounded wait)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_waits.py::test_plan_build_poll_gives_up_on_a_stuck_building_plan`
@@ -1373,8 +1261,7 @@ running the documented command chain).
 - **Was:** `while True` poll with no deadline. A daemon restart mid-build orphans the plan row in `building` (its build task died with the old process), so the CLI spun forever.
 - **Fix:** total deadline `_PLAN_BUILD_POLL_DEADLINE_S = 600` in cli.py; on expiry it prints that the daemon may have restarted mid-build, points at `assist plan show`, and exits 1. Nothing was moved (build is shadow-only).
 
-### BH-K9 — Knock delivery blocked the daemon event loop and bypassed the speaking gate
-
+### BH-K9 [I2, I4] — Knock delivery blocked the daemon event loop and bypassed the speaking gate
 - **Severity:** wrong-action (loop stall) + duplex hole
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_hotword_knock.py::test_knock_emit_does_not_block_the_event_loop_and_is_gated`
@@ -1382,8 +1269,7 @@ running the documented command chain).
 - **Was:** `KnockSignal.emit` (two `subprocess.run(timeout=5)` calls) was invoked synchronously inside the async `_knock_raise`/`_knock_due` handlers — up to ~10s where every IPC call, including `ptt.stop`, waited — and the sound played with no speaking-gate marks, straight into any open microphone.
 - **Fix:** both handlers now run emit via `asyncio.to_thread` with `_set_speaking` held (class mode short-circuits: silent pulse, no thread, no gate). `_set_speaking(True, text=None)` no longer clobbers `_speaking_text` (the BH-K2 echo reference). The code is inlined at both handlers so the BH-H13 boundary (knock emit reachable only from `_knock_raise`/`_knock_due`) is preserved unchanged.
 
-### BH-K10 — Wake-guard posture probes failed OPEN
-
+### BH-K10 [I5] — Wake-guard posture probes failed OPEN
 - **Severity:** wrong-action (authority/privacy leak)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_authority.py::test_*_probe_failure_fails_closed`
@@ -1391,8 +1277,7 @@ running the documented command chain).
 - **Was:** `WakeGuard._in_class_mode()` and `_guest_door_blocked()` returned `False` on any exception from the wired probe, so a broken presence/showoff read let an accepted wake-knock open voice listening in class mode or during show-off — despite `WakeGuardError`'s own "fail closed" contract.
 - **Fix:** exceptions now fail closed (`True`) and are recorded as `posture_error`, surfaced in `status()` so the restriction is diagnosable. Unwired probes (`None`, headless/tests) keep meaning "no such concept" and are unchanged.
 
-### BH-K11 — Daemon's company posture was cached forever per-process
-
+### BH-K11 [I5, I7] — Daemon's company posture was cached forever per-process
 - **Severity:** wrong-action (privacy: disclosure on stale posture)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_authority.py::test_company_state_is_read_fresh_from_the_store`
@@ -1400,8 +1285,7 @@ running the documented command chain).
 - **Was:** the first read was cached in `_company` for the process lifetime. The CLI's local path writes company state directly to the same SQLite store; the daemon never observed it — it could keep treating the room as private with company present (or stay restricted after they left). `PresenceService` already read fresh; disclosure did not.
 - **Fix:** `company()` reads the store on every call; the cache field is removed. `set_company` is unchanged apart from dropping the cache write.
 
-### BH-K12 — CLI treated daemon refusals as "daemon unavailable" and re-ran them locally
-
+### BH-K12 [I9] — CLI treated daemon refusals as "daemon unavailable" and re-ran them locally
 - **Severity:** wrong-action (silent substitution / split-brain writes; refusals reported as success)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_error_surfacing.py` — with the daemon UP, `assist review approve 999` printed "item 999: approved" and exited 0.
@@ -1409,8 +1293,7 @@ running the documented command chain).
 - **Was:** `ipc.call` raised plain `RuntimeError` for `ok:false`, and 37 CLI sites caught `(DaemonUnavailable, RuntimeError, OSError)` around the call and silently re-ran the operation against the local store/services. Refusals were masked (and sometimes converted to printed success: the local review path ignored `set_item_decision`'s rowcount and printed "approved" for nonexistent items); writes could also split-brain against a live daemon (see BH-K11 for the posture instance).
 - **Fix:** `ipc.DaemonError(RuntimeError)` is raised for `ok:false`. CLI fallback sites now catch `DaemonUnavailable` only (print-and-continue surfaces — the console REPL and the ptt.result wait — catch both and print the real message). `main` gains a `DaemonError` net: `_refusal_text` + exit 2. Special cases kept honest: doctor distinguishes down vs erroring; `assist halt` still sets the flag file when the daemon errors (a kill switch must land) but now says so. The local review path checks the rowcount and exits 1 on a missing item.
 
-### BH-K13 — wpctl parser offered the camera as a microphone
-
+### BH-K13 [I1, I5] — wpctl parser offered the camera as a microphone
 - **Severity:** wrong-action (mock-fidelity: green tests, dead hardware path)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_wpctl.py` with a full real-shape `wpctl status` (Audio + Video groups, Devices, Streams, Settings)
@@ -1418,8 +1301,7 @@ running the documented command chain).
 - **Was:** sections were keyed by name alone and `current` was never reset on unknown headers — the Video group's `Sources:` (the camera) merged into audio Sources, `Streams:` entries (Firefox, pw-record) became "Source endpoints", and `Default Configured Devices:` entries polluted the last section. `meeting setup`/doctor thus offered cameras and streams as mic/system nodes. The existing fixture had an Audio group only, so this was invisible.
 - **Fix:** track the top-level group (Audio/Video/Settings) and collect only under Audio; any other header line ends the current section.
 
-### BH-K14 — Disconnected event subscribers were never removed
-
+### BH-K14 [I10] — Disconnected event subscribers were never removed
 - **Severity:** wrong-action (slow leak; false status)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_subscribers.py`
@@ -1427,8 +1309,7 @@ running the documented command chain).
 - **Was:** `ipc.serve` closed the writer in the connection's finally but never told the daemon; pruning happened only when a later broadcast failed writing to the corpse. Owner observed 2 leaked subscribers in `status`.
 - **Fix:** `ipc.serve(..., on_disconnect=...)` is invoked in the connection finally (before close, teardown-safe); the daemon passes `self._subscribers.discard`. The broadcast-time prune remains as backstop.
 
-### BH-K15 — Executor operations raced across processes (cap double-spend)
-
+### BH-K15 [I5, I6] — Executor operations raced across processes (cap double-spend)
 - **Severity:** wrong-action
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_executor.py::test_executor_refuses_to_race_another_process`
@@ -1436,8 +1317,7 @@ running the documented command chain).
 - **Was:** no serialisation at all. The daemon applies in a thread while a CLI invocation can apply/undo in its own process; both read the hourly budget (`ops_since`) before either journaled — double-spending `max_ops_per_hour` — and could move the same files concurrently.
 - **Fix:** `Executor._operation_gate()` wraps apply/undo/trash: a non-blocking process lock plus an `flock` on `<db>.executor.lock`. Contention raises a clear `RuntimeError` (surfaced via IPC/CLI, BH-K12). Re-entrant on the holding thread (undo retires duplicates via trash). `verify()` is read-only and deliberately ungated.
 
-### BH-K16 — trash() claimed success for moves that had failed
-
+### BH-K16 [I9] — trash() claimed success for moves that had failed
 - **Severity:** wrong-action (false report; file believed trashed)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_executor.py::test_trash_same_name_twice_both_land_and_report_truly`
@@ -1445,8 +1325,7 @@ running the documented command chain).
 - **Was:** the destination name had second resolution, so two same-name files trashed within one second collided; the journaled move failed, yet the manifest and the return value still claimed `trashed_as=<dest>`.
 - **Fix:** destination uniquified (`name (2)`, `(3)`, … — same style as `_Conflicts`); `trashed_as` in both the manifest and the return is set only when the move actually applied.
 
-### BH-K17 — Undo of a `copied` op failed with a misleading FileExists
-
+### BH-K17 [I6, I9] — Undo of a `copied` op failed with a misleading FileExists
 - **Severity:** wrong-action (undo unavailable precisely for crash-interrupted ops)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_executor.py::test_undo_of_copied_op_reconciles_identical_duplicate`
@@ -1454,8 +1333,7 @@ running the documented command chain).
 - **Was:** undo fell through to `_journaled_move`, whose no-overwrite rule (correctly) refused the occupied destination; the op reported a raw FileExists problem and could never be undone.
 - **Fix:** when the original location already holds identical content, undo retires the duplicate through the journaled trash path (recoverable — never a bare unlink) and marks the op rolled back.
 
-### BH-K22 — Shared SQLite store had no WAL / busy-timeout posture
-
+### BH-K22 [I2, I10] — Shared SQLite store had no WAL / busy-timeout posture
 - **Severity:** wrong-action (cross-process "database is locked" failures)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_store.py`
@@ -1463,32 +1341,28 @@ running the documented command chain).
 - **Was:** default rollback journal, implicit timeout — the exact multi-process shape (daemon resident, CLI one-shots writing state/facts/queue rows) that produces locked-database errors.
 - **Fix:** `PRAGMA journal_mode=WAL` + `busy_timeout=5000` at open (with an explicit connect timeout). Companion honesty fix: `forget_facts` by-id now also filters `active = 1`, so double-forget counts 0 instead of recounting.
 
-### BH-K20 — Config keys the code read were undeclared and undocumented
-
+### BH-K20 [I7] — Config keys the code read were undeclared and undocumented
 - **Severity:** cosmetic (doctor false "unknown key"; undiscoverable knobs)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_config.py::test_keys_the_code_reads_are_declared_and_documented`
 - **Was:** `[organise] tier1_batch_size`/`tier2_batch_size` (planner_llm), `[hotword] sample_rate` (daemon) and `[hotword] unit_path` (wake_guard) were read with in-code defaults but absent from DEFAULTS and config.toml.example.
 - **Fix:** declared in DEFAULTS with the code's defaults (50/10/16000/"") and documented in the example.
 
-### BH-K21 — meeting.start ignored the documented [capture] mic_target
-
+### BH-K21 [I1, I7] — meeting.start ignored the documented [capture] mic_target
 - **Severity:** wrong-action (meetings recorded the PipeWire default mic)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_config.py::test_meeting_mic_*`
 - **Was:** dictate/hotword resolve `param → [capture] → [meeting]`, but `_meeting_start` read `[meeting] mic_target` only — an owner who set their mic under `[capture]` (as the example documents) got the default source in meetings.
 - **Fix:** meeting resolves `[meeting] mic_target → [capture] mic_target → default` (its own section wins, the documented capture mic is the fallback).
 
-### BH-K24 — Malformed config.toml crashed every command with a traceback
-
+### BH-K24 [I7, I9] — Malformed config.toml crashed every command with a traceback
 - **Severity:** crash-with-safe-state (every invocation, until fixed by hand)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_config.py::test_malformed_config_is_a_one_line_error_exit_2`
 - **Was:** `load_config()` ran before `main()`'s try and the raw `TOMLDecodeError` (no filename in the message) propagated as a traceback; same in `assistd`.
 - **Fix:** `load_config` wraps parse/IO errors as `ValueError("cannot parse config <path>: …")`; both entry points print one line and exit 2.
 
-### BH-K18 — Per-model quota (RPD) was configured but never enforced
-
+### BH-K18 [I7, I9] — Per-model quota (RPD) was configured but never enforced
 - **Severity:** wrong-action (quota burned into opaque 429s; two drifting sources of truth)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_quota.py`
@@ -1496,8 +1370,7 @@ running the documented command chain).
 - **Was:** only the flat `flash_rpm`/`flash_lite_rpm` fed the limiter and only a global 1200/day cap existed. The 21st flash call of the day went out, earned a 429, and burned backoff time before failing opaquely. Also latent: `PerModelLimiter` clamped rpm to `max(1, …)`, so a configured `0` ("not rate-limited", per the config comments) meant 1/minute.
 - **Fix:** `quota_family()` maps model ids to quota rows; `rpm_for` takes the stricter of structured vs flat (0/unlimited in a row disables the limiter for that model, which now honours ≤0); `_check_daily_cap(model)` additionally enforces the family's RPD from the ledger with a clear `QuotaExhausted`; `validate_config` warns when flat and structured values disagree.
 
-### BH-K23 — Keyword spotter scored a single 30 ms frame, not a window
-
+### BH-K23 [I1] — Keyword spotter scored a single 30 ms frame, not a window
 - **Severity:** dead-hardware-path (acoustic arming could never fire with a real model)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_keyword_window.py`
@@ -1505,8 +1378,7 @@ running the documented command chain).
 - **Was:** `WakeGuard.feed()` passed the single 30 ms frame just received. No keyword model recognises a phrase in 30 ms; the energy test model masked it because RMS works on any length.
 - **Fix:** `feed()` scores the trailing `[hotword] keyword_window_s` (default 1.0 s, validated 0.1–2.0) slice of the pre-wake ring, ending with the frame just fed.
 
-### BH-K19 — `[asr] assert_output_language` was never called
-
+### BH-K19 [I1] — `[asr] assert_output_language` was never called
 - **Severity:** dead promise (silent-translation guard, §12.4)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_language_assert.py`
@@ -1514,8 +1386,7 @@ running the documented command chain).
 - **Was:** the helper `asr.assert_output_language` and the config key both existed; zero call sites in `src/` (only a unit test of the helper itself). The content-level marker gate in cleanup was wired; the tag gate was not.
 - **Fix:** enforced at the one seam every batch transcript crosses (`asr.transcribe_file`): an out-of-set result is passed over for the next backend; if the chain exhausts it returns degraded-but-marked (`Transcript.language_ok=False`), and both `Transcriber` batch call sites surface a loud session note. Flag off restores first-result-wins.
 
-### BH-K25 — Flat 120 s timeouts on audio playback and Piper synthesis
-
+### BH-K25 [I2, I3, I4] — Flat 120 s timeouts on audio playback and Piper synthesis
 - **Severity:** wrong-output / bounded-wait (long speech truncated; hung player stalls)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_tts_timeout.py`
@@ -1523,8 +1394,7 @@ running the documented command chain).
 - **Was:** `play_audio` and Piper `synthesize` both used a flat `timeout=120` — long read-alouds were killed mid-speech and misreported as player failures, while a hung player blocked its thread for two minutes on any clip.
 - **Fix:** playback bound derived from the WAV header (duration × 1.5 + 10 s, floor 15 s, cap 30 min; 120 s only when unreadable); synth bound scales with text length (60 s floor, 600 s cap). Both remain finite.
 
-### BH-K26 — Doctor drift check covered only one of the shipped-and-copied files
-
+### BH-K26 [I8] — Doctor drift check covered only one of the shipped-and-copied files
 - **Severity:** stale-deployment (disease 5; the LimitCORE pattern, generalized)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_doctor_drift.py`
@@ -1532,8 +1402,7 @@ running the documented command chain).
 - **Was:** only `systemd/assistant.service` was compared. `elaria-overlay.service`, `elaria-console.service`, the installed knock sound (which shadows the repo asset), and the appended Hyprland binds could all go stale invisibly; the UI units' hardcoded `%h/Elaria` quickshell path was never sanity-checked against the actual checkout.
 - **Fix:** `_deployment_drift_checks()` byte-compares all three units + knock.wav (LimitCORE callout retained), verifies each UI unit's `quickshell -p` target exists, and checks the load-bearing bind markers in an existing Hyprland config. Merged files (Waybar module/style) remain unchecked — they are not byte copies.
 
-### BH-K27 — ECAPA scoring wrote the wake clip to /tmp
-
+### BH-K27 [I1, I10] — ECAPA scoring wrote the wake clip to /tmp
 - **Severity:** privacy (wake audio on a persistent filesystem, contradicting the RAM-only design)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_ecapa_memfd.py`
@@ -1541,8 +1410,7 @@ running the documented command chain).
 - **Was:** `EcapaCommandScorer.score_owner` used `NamedTemporaryFile(delete=False)` in the default temp dir and unlinked after the run; a SIGKILL in between (or a non-tmpfs /tmp) left the wake utterance on disk.
 - **Fix:** the clip travels in an anonymous memfd inherited by the child (`/proc/self/fd/N`, `pass_fds`); a `/dev/shm` file remains only as the non-Linux fallback.
 
-### BH-K28 — Dangling symlinks / unhashable paths crashed executor operations
-
+### BH-K28 [I6, I9] — Dangling symlinks / unhashable paths crashed executor operations
 - **Severity:** crash (batch operations die on ordinary folder contents)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_symlink_hash.py`
@@ -1550,8 +1418,7 @@ running the documented command chain).
 - **Was:** `trash()` and `verify()` (and the apply/undo hash comparisons) called `sha256_file` unguarded; a dangling symlink raised FileNotFoundError and a symlink-to-directory raised IsADirectoryError, escaping as a raw daemon error mid-batch.
 - **Fix:** `safety.try_sha256_file` returns None on OSError; comparison/refusal sites use it (None never equals an expected hash, so existing refusal branches fire). `trash` returns its standard refusal dict ("unreadable…"); strict `sha256_file` remains for post-move verification, where raising is correct and journaled.
 
-### BH-K29 — Missing/mistyped IPC ids surfaced as TypeError/KeyError gibberish
-
+### BH-K29 [I9] — Missing/mistyped IPC ids surfaced as TypeError/KeyError gibberish
 - **Severity:** error-surfacing (traceback-flavoured text to users of the IPC surface)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_param_coercion.py`
@@ -1559,8 +1426,7 @@ running the documented command chain).
 - **Was:** `int(params.get("id"))` / `int(params["item_id"])` / `int(params["job_id"])` raised TypeError/KeyError, which the IPC layer stringified verbatim ("TypeError: int() argument must be…").
 - **Fix:** `daemon._int_param()` coerces with a named ValueError at the knock, review, queue-approve and knock-raise commitment sites.
 
-### BH-K30 — Plan-build tasks leaked; early build failures stranded plans at 'building'
-
+### BH-K30 [I2, I10] — Plan-build tasks leaked; early build failures stranded plans at 'building'
 - **Severity:** wrong-output + unbounded growth (minor)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_plan_tasks.py`
@@ -1568,8 +1434,7 @@ running the documented command chain).
 - **Was:** `_plan_tasks` only ever grew. And while `Organiser.build_plan` marks its own failures, a failure before its try (invalid root mode) or after it (tier enqueue) left the daemon-reserved row at 'building' forever — `plan.show` reported a build that would never end.
 - **Fix:** done-callback prunes the task; `_run`'s failure path marks a still-'building' plan failed via `finish_plan(error=…)`.
 
-### BH-K31 — `status` silently swallowed its last-capture diagnostics failure
-
+### BH-K31 [I9] — `status` silently swallowed its last-capture diagnostics failure
 - **Severity:** cosmetic/diagnostics (silent discard)
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_status_surface.py`
@@ -1577,8 +1442,7 @@ running the documented command chain).
 - **Was:** `except Exception: last_capture = None` — indistinguishable from "no capture session ever ran", hiding the failure exactly when capture debugging needs it.
 - **Fix:** `last_capture = {"error": …}`; the aggregator stays up, the hole is labelled. Also in this commit: removed a fully-shadowed dead `is_user` assignment in `GeminiClient._call_once` (every branch below it reassigned before use; quota attribution unchanged, pinned by existing tests) and the unused `_WAKE_BOUNDARY` regex in `hotword.py` (zero references repo-wide).
 
-### BH-K32 — `assist knock accept|decline|…` bypassed the running daemon (recon S10, proven)
-
+### BH-K32 [I5, I9] — `assist knock accept|decline|…` bypassed the running daemon (recon S10, proven)
 - **Severity:** authority/privacy plumbing + fabricated output
 - **Status:** fixed in this pass
 - **Repro:** `tests/test_bughunt_k_knock_daemon_first.py`
@@ -1586,8 +1450,7 @@ running the documented command chain).
 - **Was:** every mutating knock action drove a local `InitiativeService` directly, even with the daemon up. Accept printed "voice · first line: <reason>" while the reason was never appended to the daemon's conversation nor spoken (the local service has no sessions). A wake-knock could be "accepted" with zero WakeGuard involvement while the guard stayed in `wake_knock` holding its pending utterance; decline/ignore never zeroed that RAM-only audio via the deny path; raise/due delivered no knock signal at all.
 - **Fix:** `_knock_command` calls the daemon first for raise/accept/decline/later/ignore/due (refusals surface as exit 2 per BH-K12). The local store remains the fallback for a stopped daemon only, and there a wake-knock *accept* refuses — only the guard can settle it, and its pending audio died with the daemon process.
 
-### BH-K33 — Overlapping meeting stops reused raw WAV paths and cleared processing early
-
+### BH-K33 [I1, I6, I10] — Overlapping meeting stops reused raw WAV paths and cleared processing early
 - **Severity:** data-loss (silent session substitution) + wrong-action (mode switch unparked early)
 - **Status:** fixed in this pass
 - **Invariant (prose):** each meeting's captured bytes remain bound to that session until archival; processing remains active until every in-flight stop finishes.
@@ -1596,30 +1459,27 @@ running the documented command chain).
 - **Verifier:** `pytest -q tests/test_bug_meeting_raw_collision.py tests/test_bug_meeting_stop_failure.py tests/test_phase6_meeting.py tests/test_bughunt_k_config.py tests/test_bughunt_systems.py -k meeting` — **14 passed, 60 deselected**; Ruff on touched Python files passed.
 - **Fix:** assign a UUID to each meeting at start, include it in the raw WAV names, track processing session IDs in a set, recompute global mode from active capture/processing state, and restore mode/apply parked switches in `finally` on success or failure.
 
-### BH-K34 — Sample capture and eval splitting could escape or corrupt the dataset
-
+### BH-K34 [I1, I6] — Sample capture and eval splitting could escape or corrupt the dataset
 - **Severity:** data-loss (out-of-root writes, take replacement, or a changed/stale eval split); wrong-action for invalid capture arguments reported as success
-- **Status:** fixed in this pass
+- **Status:** fixed in this pass; **UNCONFIRMED** pending independent review
 - **Invariant (prose):** captured WAVs stay beneath the selected sample root; existing samples are never replaced; a frozen eval split, its files, and manifest paths agree and cannot silently change; invalid recording requests do not reach capture or report success.
 - **Root cause:** bucket text was inserted into filesystem paths without component validation; second-resolution filenames plus per-invocation indices collided across commands; `Path.rename()` could replace an existing eval file; bucket/manifest symlinks were followed; `freeze_eval()` clamped fractions, allowed repeated runs, and did not update manifest paths; `takes` and `seconds` were not validated.
 - **Repros:** `tests/test_bug_record_elaria_samples.py` covers bucket traversal, same-second replacement, invalid counts/durations, manifest symlink refusal, symlinked train/eval buckets, destination collision, zero/out-of-range/non-finite fractions, stale manifest paths, repeat freeze, partial-move rollback, manifest-write rollback, and retention of an in-progress marker when recovery is uncertain. The first red run failed on bucket escape, symlink traversal, eval overwrite, fraction-zero movement, and stale manifest; the second red run failed on bucket escape, same-second replacement, and invalid capture arguments. The Phase 0 fraction-2 probe moved every take. Existing coverage is in `tests/test_wake_knock_package.py`.
 - **Verifier:** `.venv/bin/pytest -q tests/test_bug_record_elaria_samples.py tests/test_wake_knock_package.py` — **50 passed**; `.venv/bin/ruff check scripts/record_elaria_samples.py tests/test_bug_record_elaria_samples.py` and `git diff --check` passed. Real `pw-record`/PipeWire behavior was not tested.
 - **Fix:** validate bucket names and root containment; refuse symlinks; use UUID filenames and reject existing capture destinations; validate positive finite recording parameters and a finite `[0, 1]` eval fraction; move with a no-overwrite same-filesystem link/unlink; enforce the one-shot `.frozen` marker; update the manifest atomically; roll back pre-commit failures and keep an in-progress marker if recovery may be incomplete. Cross-filesystem splits fail safely instead of falling back to an overwriting move.
 
-### BH-K35 — IPC timeout after dispatch triggered a duplicate local enqueue
-
+### BH-K35 [I2, I9] — IPC timeout after dispatch triggered a duplicate local enqueue
 - **Severity:** wrong-action (a duplicate external job can be approved and executed twice)
-- **Status:** fixed in this pass
+- **Status:** fixed in this pass; **UNCONFIRMED** pending independent review
 - **Invariant (prose / I1):** each CLI request causes at most one durable side effect; local fallback is allowed only when the daemon request was never sent.
 - **Root cause:** `ipc.call()` translated all socket `OSError`s and malformed/empty replies into `DaemonUnavailable`, even after `sendall()`. `_queue_command()` interpreted that as safe daemon absence and enqueued the same external action in the local SQLite store although the daemon had already committed it.
 - **Repro:** `tests/test_bug_queue_timeout_duplicate.py::test_bug_queue_timeout_after_commit_does_not_enqueue_again` uses the real Unix-socket server and real `CloudQueue`: the daemon commits the job, delays the reply 300 ms, and the client deadline is 50 ms. Before the fix the CLI returned success with **two** matching durable `external_action` rows. After the fix it returns 1, explains that the result is unknown and not retried, and leaves exactly one row. `tests/test_hardening_pass2.py` also proves malformed and empty replies after send are outcome-unknown; the missing-socket and offline-queue tests prove definite pre-send unavailability still uses the local fallback.
 - **Verifier:** `.venv/bin/pytest -q tests/test_bug_queue_timeout_duplicate.py tests/test_hardening_pass2.py tests/test_bughunt_k_error_surfacing.py tests/test_bug6d_ptt_result_orphans.py tests/test_phase8_offline_voice.py` — **70 passed**. Full Ruff and `git diff --check` passed.
 - **Fix:** `DaemonUnavailable` now means the request was not sent; `DaemonOutcomeUnknown` means sending may have begun but no authoritative reply arrived. The latter is not caught by local fallback handlers. Queue and knock commands report the ambiguity without replaying. A valid `ok: false` still remains an authoritative `DaemonError`.
 
-### BH-K36 — Total chat timeout left live generation work running
-
+### BH-K36 [I2, I3, I10] — Total chat timeout left live generation work running
 - **Severity:** unbounded work / I3 total-deadline and cancellation violation
-- **Status:** fixed in this pass; real Gemini network cancellation remains UNVERIFIED on hardware
+- **Status:** fixed in this pass; **UNCONFIRMED** pending independent review; real Gemini network cancellation remains UNVERIFIED on hardware
 - **Invariant (prose / I3):** once a chat's total deadline expires, no live generation request or worker may continue running in the background; cancellation must not be replaced by a larger timeout.
 - **Root cause:** `Daemon._generate()` used `asyncio.to_thread()` and shielded its task. Raising `ChatTimeout` stopped waiting but could not stop the synchronous SDK call, leaving its task tracked and its worker blocked. The Google SDK 1.x `aio` facade also delegated HTTP requests to `asyncio.to_thread`, so switching method names alone would not cancel the request.
 - **Red repro:** before the fix, `tests/test_bug_generate_worker_cancellation.py` blocked a synchronous backend on a threading event and set first-token/total deadlines to 20/80 ms. The caller raised `ChatTimeout` at the total bound with **one pending `to_thread` task** still blocked until the test released the worker.
@@ -1627,20 +1487,18 @@ running the documented command chain).
 - **Verifier:** `.venv/bin/pytest -q tests/test_bug_generate_worker_cancellation.py tests/test_hotword_and_reply_delivery.py tests/test_disclosure.py tests/test_fixtures_and_harness.py tests/test_bughunt_k_quota.py` — **75 passed**; full `.venv/bin/ruff check .` and `git diff --check` passed. Installed `google-genai==2.0.0` locally and verified `_SdkTransport`'s SDK streaming method is a coroutine; no Gemini key/network call was made.
 - **Hardware check (UNVERIFIED):** after installing the live extra and restarting the owner daemon, run the forced-deadline probe recorded in `BUGHUNT-ARENA-2026-10-21.md`; it requires the owner's valid key and checks the real SDK stream cancels with no remaining `_background_tasks`.
 
-### BH-K37 — `ptt.result` accepted infinite wait budgets and orphaned handlers
-
+### BH-K37 [I2, I3, I10] — `ptt.result` accepted infinite wait budgets and orphaned handlers
 - **Severity:** unbounded wait / daemon handler leak (I3 total-deadline violation)
-- **Status:** fixed in this pass
+- **Status:** fixed in this pass; **UNCONFIRMED** pending independent review
 - **Invariant (prose / I3):** a request-supplied PTT wait budget is finite and bounded; untrusted `Infinity`, NaN, negative, or oversized values cannot create a handler that outlives its deadline.
 - **Root cause:** `float(params.get("wait_s") or 0)` accepted `Infinity`; `_ptt_wait_for()` then built an infinite deadline and awaited an event with no expiry. The IPC server awaits each handler inline and does not notice a client disconnect until the handler returns.
 - **Red repro:** `tests/test_bug_ptt_infinite_wait.py` sends `ptt.result` over a real Unix socket with `wait_s=float("inf")` and a 1 s client deadline. Before the fix, the request ended as `DaemonOutcomeUnknown` rather than an immediate refusal, and the instrumented daemon-side waiter remained pending after the client timed out. The same regression now covers `ptt.stop`.
 - **Fix:** `_ptt_wait_budget()` rejects booleans, parse failures, non-finite, negative, and greater-than-90-second budgets. Both `ptt.result` and `ptt.stop` use it; `ptt.stop` validates before emitting an ack or changing session state. The 90-second cap matches the existing CLI's largest explicit wait and does not widen it.
 - **Verifier:** `.venv/bin/pytest -q tests/test_bug_ptt_infinite_wait.py tests/test_bug6d_ptt_result_orphans.py tests/test_phase2_surfaces.py tests/test_phase1_dictation.py tests/test_phase8_offline_voice.py tests/test_bug6_live_duplex_and_stop.py` — **90 passed**. No audio hardware or Gemini key/network was involved.
 
-### BH-K38 — daemon shutdown left active meeting capture running
-
+### BH-K38 [I10] — daemon shutdown left active meeting capture running
 - **Severity:** privacy/capture-lifetime leak (microphone/system capture survives owner-daemon shutdown)
-- **Status:** fixed in this pass
+- **Status:** fixed in this pass; **UNCONFIRMED** pending independent review
 - **Invariant (prose):** daemon shutdown releases every active audio source and stops the collector that owns it.
 - **Root cause:** `Daemon.aclose()` cancelled dictation/background tasks but omitted `_meeting`, whose `DualCapture` and collector task are stored separately.
 - **Red repro:** `tests/test_bug_daemon_aclose_meeting_capture.py` creates an active meeting plus a pending collector, calls `Daemon.aclose()`, and checks capture closure, collector completion, and detachment. Before the fix, all three assertions failed. It uses a device-free capture double.
@@ -1648,10 +1506,9 @@ running the documented command chain).
 - **Verifier:** `.venv/bin/pytest -q tests/test_bug_daemon_aclose_meeting_capture.py tests/test_bug_meeting_stop_failure.py tests/test_bug_meeting_raw_collision.py tests/test_phase6_meeting.py` — **10 passed**. No microphone, PipeWire, or Gemini key/network was used.
 - **Hardware check (UNVERIFIED):** on Fedora with live PipeWire sources, run `assist meeting start`, record the `pw-record` child PIDs with `pgrep -af '[p]w-record'`, then run `systemctl --user stop assistant`. Confirm those exact PIDs exit and the mic/system nodes are released; restart with `systemctl --user start assistant`.
 
-### BH-K39 — live meeting transcription could outlive stop and shutdown
-
+### BH-K39 [I1, I2, I3, I10] — live meeting transcription could outlive stop and shutdown
 - **Severity:** unbounded wait / abandoned request (prose invariant / I3 total deadline and cancellation)
-- **Status:** fixed for the live Gemini batch-ASR path and daemon shutdown during `meeting.stop`; offline/native-ASR limits remain SUSPECT
+- **Status:** fixed for live Gemini batch-ASR and daemon shutdown during meeting.stop; **UNCONFIRMED** pending independent review; offline/native-ASR limits remain SUSPECT
 - **Invariant:** live upload and generation share one absolute meeting budget; expiry cancels the request, preserves both raw WAVs, and starts no later utterance. Completed transcripts are not rejected by a stale post-completion deadline check. Daemon shutdown cancels an active stop request only after protecting dual-capture close, and a cancelled provider attempt is ledgered.
 - **Root cause:** `_meeting_stop()` awaited synchronous `MeetingService.transcribe_dual()` in `asyncio.to_thread()` without a deadline. SDK `HttpOptions.timeout` defaults to `None`; synchronous HTTP timeouts alone cannot guarantee coroutine-level cancellation. Separately, `Daemon.aclose()` omitted in-flight `meeting.stop` handler tasks, and cancellation during the handler's sequential `DualCapture.aclose()` could leave a capture channel open and skip the failed-request ledger write.
 - **Before-fix red repros:** `tests/test_bug_meeting_stop_deadline.py::test_bug_meeting_stop_bounds_live_request_and_retains_raw_audio` uses the real Unix socket and controlled SDK seams for upload and generation; the pre-fix blocked upload produced `DaemonOutcomeUnknown` with a pending worker. `test_bug_daemon_aclose_cancels_pending_live_meeting_stop` failed with the stop handler still pending when it was omitted from the shutdown task set. `test_bug_meeting_stop_shutdown_finishes_both_capture_closes` failed when shutdown interrupted sequential dual-capture close. Shutdown tests also assert task/ledger cleanup, both capture closes, and idle mode.
@@ -1659,10 +1516,9 @@ running the documented command chain).
 - **Verifier:** focused meeting/deadline/PTT/shutdown command — **69 passed**; `.venv/bin/ruff check .` and `git diff --check` passed. The first full-suite run had **1,543 passed, 2 failed, 6 skipped**: the handler-integrity audit misclassified `_meeting_stop_impl(params)` as a dispatch handler, and the BH-H1 `_SdkTransport` test double implemented only sync methods after BH-K36 introduced the native async interface. Renamed the helper parameter to `request` and updated that fake to implement `generate_async`. Fresh `.venv/bin/pytest -q` — **1,545 passed, 6 skipped** (**1,551 collected**) versus the user's stated **1,393** baseline. SDK 2.0.0 async methods/config types were inspected locally; no live key or network request was made. Current-tree randomized full suite, seeds 260201–260210: each **1,545 passed, 6 skipped**; combined coverage is **84.60% statements** and **74.02% branches**. The 1,551 collected are 158 above the user's stated 1,393 baseline.
 - **Hardware check (UNVERIFIED):** with the owner's key on Fedora, run `assist meeting start`, record several utterances, then `time assist meeting stop`; verify `assist status`, the resulting note, and `assist cost` batch rows. This exercises successful live upload/generation but not a forced provider stall; timeout behavior under real networking remains unverified.
 
-### BH-K40 — meeting capture-close failures skipped peer release and raw archival
-
+### BH-K40 [I1, I10] — meeting capture-close failures skipped peer release and raw archival
 - **Severity:** data-loss / capture-lifetime leak during `meeting.stop` when one source's close fails.
-- **Status:** fixed in this pass.
+- **Status:** fixed in this pass; **UNCONFIRMED** pending independent review
 - **Invariant (prose):** stop attempts both capture-source closes; it always cancels/gathers the collector, retains captured WAVs, and restores mode even when a source close fails or self-cancels.
 - **Root cause:** `DualCapture.aclose()` awaited mic then system sequentially, so the first exception skipped the second close. `_meeting_stop_impl()` only cancelled the collector and wrote WAVs after a successful close; an exception exited before either cleanup.
 - **Before-fix repros:** `test_bug_meeting_stop_capture_close_failure_closes_peer_and_keeps_raw` first failed because the system close was never attempted after a controlled mic `RuntimeError`. The strengthened test blocks the peer close and verifies stop cannot return early, then checks both closes, collector completion, retained raw files and idle mode. `test_bug_meeting_stop_capture_source_cancel_keeps_raw_audio` separately failed when a source-raised `CancelledError` was mistaken for cancellation of the stop task and raw archival was skipped.
@@ -1670,19 +1526,17 @@ running the documented command chain).
 - **Verifier:** `.venv/bin/pytest -q tests/test_bug_meeting_stop_deadline.py` — **9 passed** after the close-failure, source-cancellation and async-success/persistence regressions were added; ten current randomized full suites each return **1,548 passed, 6 skipped**. Final unseeded verification is in `BUGHUNT-ARENA-2026-10-21.md`. Mutations that remove `return_exceptions=True` are killed by the blocking-peer regression. Ruff and `git diff --check` pass after generated mutation artifacts are removed.
 - **Hardware check (UNVERIFIED):** no live microphone/PipeWire session was run; use the existing BH-K38 owner check to verify real capture process release.
 
-### BH-K41 — PTT event-stream test left a live IPC client task at loop teardown
-
+### BH-K41 [I10] — PTT event-stream test left a live IPC client task at loop teardown
 - **Severity:** test-integrity / asyncio task leak; not a production behavior claim.
-- **Status:** fixed in `tests/test_phase1_dictation.py`.
+- **Status:** fixed in `tests/test_phase1_dictation.py`; **UNCONFIRMED** pending independent review
 - **Repro:** `.venv/bin/pytest -q tests/test_phase1_dictation.py::test_daemon_ptt_round_trip_and_events` passed but emitted `Task was destroyed but it is pending!` for `serve.<locals>._client()` blocked at `reader.readline()`.
 - **Root cause:** the test's raw subscriber socket and drainer thread were not closed, and its loop was stopped before the IPC server and daemon were awaited through shutdown.
 - **Fix:** shut down/close the client socket, join the drainer, await `server.wait_closed()` and `daemon.aclose()`, stop/join the loop thread, then close the loop.
 - **Verification:** the isolated test passes with empty stderr. The current ten randomized full-suite runs (after BH-K40–K42) each passed **1,548 tests, 6 skipped**; the fresh unseeded post-ledger suite also passed **1,548 tests, 6 skipped**, with no pending-task warnings.
 
-### BH-K42 — UI stream integration tests abandoned IPC subscriber threads
-
+### BH-K42 [I10] — UI stream integration tests abandoned IPC subscriber threads
 - **Severity:** test-integrity / pending IPC-client tasks; not a production feature failure.
-- **Status:** fixed in `tests/test_phase2_surfaces.py` and test-server teardown helpers.
+- **Status:** fixed in `tests/test_phase2_surfaces.py` and test-server teardown helpers; **UNCONFIRMED** pending independent review
 - **Reproduction:** randomized seed 260303 passed but emitted two `Task was destroyed but it is pending!` warnings for IPC `_client()` tasks waiting on `reader.readline()`. With stricter `running_daemon` teardown, the leaked subscriptions reproduced as teardown timeouts specifically in `test_waybar_follow_reacts_to_status_changed` and `test_overlay_stream_over_real_daemon`.
 - **Root cause:** both UI tests started daemon consumer threads that only returned after >12 or >40 stream records, yet the assertions needed only the listening/final states. The threads/generators were not joined/closed, leaving open subscriber sockets.
 - **Fix:** stop each consumer after its asserted state(s), close the stream generator in `finally`, join the thread, and have the daemon fixture/server helpers await closed IPC clients before stopping their event loops.
@@ -1700,3 +1554,40 @@ running the documented command chain).
 - **S8** `_sdk_transcribe` and live `transcribe_batch_async` upload Gemini Files but do not delete the remote file; provider retention/expiry remains unverified. After a sanitized batch transcription, list the owner's Gemini Files via AI Studio/SDK.
 - **S9** offline meeting ASR remains unbounded after BH-K39: `_transcribe_channel_async` runs `LocalWhisperBackend.transcribe()` in `asyncio.to_thread()` without deadline/cancellation, while optional `PyannoteDiarizer.diarize()` runs synchronously without a deadline. A stuck inference/refinement can still park `_meeting_processing` or the event loop. Settle on the owner's forced-offline path with `time assist meeting stop` while another terminal runs `watch -n 1 assist status`; if `pyannote_refine=true`, repeat with refinement enabled. Do not add a blind timeout that discards a completed transcript.
 - **S10** real Google SDK timeout enforcement remains UNVERIFIED: fake SDK tests cancel both upload and generation, and installed SDK source maps the remaining-time configs to HTTP timeouts, but no live provider/network request or forced stall was run. With the owner's key, run `assist meeting start`, record several utterances, then `time assist meeting stop`; confirm a note, `assist cost` ledger rows, and idle `assist status`. This exercises real requests but does not force a stall.
+
+### BH-K43 [I5] — Wake-knock accept trusted caller channel and score
+
+- **Severity:** authority / privacy boundary; a caller could open command listening without daemon-verified accept evidence.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix red repros:** `tests/test_bug_i5_authority_ipc.py::test_bug_i5_knock_accept_rejects_forged_high_voiceprint_score` sent `channel="voice", voiceprint_score=0.99` over the real Unix socket and observed listening open. `test_bug_i5_knock_accept_rejects_voice_unavailable_bypass` sent `channel="voice_unavailable", voiceprint_score=0.01` and also observed listening open. Both failed their refusal assertions before the fix; the existing `tests/test_wake_knock_package.py` socket test also explicitly expected forged 0.95 to open listening.
+- **Root cause:** `_wake_knock_accept` forwarded both values from JSON to `WakeGuard.authorize_accept()`. That guard trusted the caller's `channel`; `voice_unavailable` bypassed the threshold entirely, and `voice` trusted the caller's score.
+- **Handler sweep / principal:** `Daemon.handle` is the sole production dispatcher for every registered `_handlers()` method and `events.subscribe`. It now obtains an `IpcPrincipal` from kernel `SO_PEERCRED`, checks the UID against the daemon owner, and stores principal + method in task-local context. JSON `principal`, `uid`, `role`, `speaker`, and similar fields cannot construct that identity. This dispatcher gate covers all state-changing RPC families (PTT/capture, file plans/review/undo, memory, meetings, mode, speech, queue, knocks, hotword, privacy, show-off, class mode, and ask), not only the wake path. A real-socket test verifies the principal equals the connected process and a foreign-UID principal is refused before a class-state change.
+- **Fix:** `knock.accept` refuses any caller-supplied `channel` or `voiceprint_score`; the authenticated local owner action is the only currently supported wake-knock accept. `WakeGuard` now requires an `IpcPrincipal` with the daemon's UID and accepts no channel/score arguments. Voice acceptance remains closed until fresh accept audio is captured and scored inside the daemon; the CLI's ordinary `assist knock accept ID` sends only the knock ID.
+- **Verification:** `.venv/bin/pytest -q tests/test_bug_i5_authority_ipc.py tests/test_wake_knock_package.py tests/test_stage_d_showoff.py tests/test_disclosure.py tests/test_stage_c_initiative.py tests/test_stage_b_console_class.py` — **146 passed**. Ruff passed on the touched Python files. Real-socket regressions cover forged channel/score fields; no mic, voiceprint scorer, or provider was used. Independent reviewer agents are unavailable, so the fix remains **UNCONFIRMED**.
+
+### BH-K44 [I5] — Show-off entry and owner turns trusted caller assertions
+
+- **Severity:** authority / privacy boundary; copied owner data and booleans could manufacture show-off permission or promote a guest turn.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix red repros:** `tests/test_bug_i5_authority_ipc.py::test_bug_i5_showoff_entry_rejects_copied_centroid_and_capture_flags` created a real enrolled centroid, copied it into `showoff.enter`, and sent `owner_present=true`, `source="mic"`, `live_mic=true`, and `replayed=false`; the real socket entered show-off without any capture. `test_bug_i5_owner_verified_ipc_flag_cannot_bypass_showoff_guest_gate` sent `speaker="owner", owner_verified=true` and a copied embedding during active show-off; the response was classified as owner before the fix.
+- **Root cause:** `_showoff_enter` forwarded caller-controlled embedding/presence/source/replay/live-mic assertions to the service. `_ask` treated caller `owner_verified` as authority and, if true, skipped server verification; `channel` and `speaker` were also read from the payload.
+- **Fix:** the IPC `showoff.enter` endpoint now fails closed because no daemon-side fresh-capture entry flow exists; it explicitly refuses embeddings and capture flags as evidence. `ask` derives its channel from the registered RPC method, ignores caller embeddings and owner-verification claims, and allows a caller to downgrade to guest but not promote itself. Every request while show-off is active is routed as guest-scope, regardless of a supplied owner label. `showoff.exit` also requires the authenticated local owner and no longer uses caller reason/command/embedding fields to select its authority path.
+- **Verification:** the same 146-test command listed under BH-K43 passed, including real-socket regressions and concurrent request-method context isolation. Existing direct `ShowoffService` unit tests still exercise service policy; no socket caller can reach entry through forged values. Independent review is unavailable; the fix is **UNCONFIRMED**. Show-off IPC entry is intentionally unavailable until a daemon-captured live-audio path exists.
+
+### BH-K45 [I1, I5] — Show-off outgoing guard leaked a model secret to the owner path
+
+- **Severity:** confirmed information disclosure; model-returned credential reached the reply with `withheld=None`.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix red repro:** `tests/test_bug_i5_authority_ipc.py::test_bug_i1_i5_showoff_owner_reply_still_runs_outgoing_secret_guard` made the model return a stored `The password is hunter2.` during an active show-off console turn. Before the fix, the real socket response contained `hunter2` and `withheld` was `None`.
+- **Root cause:** active show-off did not itself make the ordinary owner `_ask` path restricted. `DisclosureService.leak_in()` therefore received `guest=false, company=false` and intentionally allowed owner-alone secrets.
+- **Fix:** every active show-off conversation now enters the guest/demo-safe path before owner memory; that path keeps the explicit demo-safe allowlist, runs the outgoing guest leak guard, and returns a `withheld` descriptor when it substitutes a reply. The ordinary owner path also treats an active show-off observed at generation/guard time as restricted, covering a session that becomes active after prompt construction.
+- **Verification:** the same 146-test command listed under BH-K43 passed. Controlled model returns exercise both a stored credential and an ordinary owner fact without network or audio; the post-fix socket replies withhold them and include a `withheld` descriptor. A show-off activation-during-generation regression covers the final race guard. Independent review is unavailable; the fix is **UNCONFIRMED**.
+
+### BH-K46 [I5] — Show-off race kept the owner/company prompt after activation
+
+- **Severity:** confirmed information disclosure; a paraphrase of a stored owner fact reached the active demo reply.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix red repro:** `tests/test_bug_i5_authority_ipc.py::test_bug_i5_showoff_activated_during_owner_turn_uses_guest_prompt` activated show-off during the awaited memory-recall stage of a real-socket `console.say`. A prompt-sensitive controlled model returned a paraphrase of a stored ordinary owner fact under the company prompt. The final exact-quote guard did not catch it; the response contained “bicycle” and had `withheld=None`. Test failed before the fix.
+- **Root cause:** the in-flight owner path noticed `public_demo` when building restricted context and the final guard, but selected its disclosure note with `guest=(speaker != "owner")` only. It therefore sent `COMPANY_NOTE`, not `GUEST_NOTE`; a paraphrase was outside the exact-match guard.
+- **Fix:** include `public_demo` in the guest predicate passed to `DisclosureService.prompt_note()`, so a show-off session that starts during an owner turn changes the prompt to guest scope as well as filtering context and applying the outgoing guard.
+- **Verification:** the real-socket test fails red before this one-line change and passes after; it asserts the guest note is present and no owner-fact paraphrase reaches the response. The focused I5 suite (the six-file command listed under BH-K43) is **146 passed**. Provider, audio, and hardware were not used. Independent review is unavailable; the fix remains **UNCONFIRMED**.
