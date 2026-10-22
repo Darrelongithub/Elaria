@@ -43,6 +43,25 @@ def config():
     return load_config()
 
 
+def pytest_pyfunc_call(pyfuncitem):
+    """Run `async def` test functions via asyncio.run — no plugin dependency.
+
+    The suite is deliberately stdlib-only (pyproject dev extras are pytest +
+    ruff). Sync tests are untouched; coroutine tests simply await inside the
+    loop asyncio.run provides.
+    """
+    import asyncio
+    import inspect
+
+    testfunction = pyfuncitem.obj
+    if inspect.iscoroutinefunction(testfunction):
+        kwargs = {name: pyfuncitem.funcargs[name]
+                  for name in pyfuncitem._fixtureinfo.argnames}
+        asyncio.run(testfunction(**kwargs))
+        return True
+    return None
+
+
 @pytest.fixture
 def running_daemon(config):
     """Real daemon on a real Unix socket, event loop in a thread."""
