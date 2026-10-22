@@ -434,8 +434,25 @@ class DualCapture:
             yield (mic_frame or silence, sys_frame or silence)
 
     async def aclose(self) -> None:
-        await self.mic.aclose()
-        await self.system.aclose()
+        results = await asyncio.gather(
+            self.mic.aclose(), self.system.aclose(), return_exceptions=True)
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if not failures:
+            return
+        cancelled = next((failure for failure in failures
+                          if isinstance(failure, asyncio.CancelledError)), None)
+        if cancelled is not None:
+            other_failures = [failure for failure in failures if failure is not cancelled]
+            error = RuntimeError("meeting capture source close was cancelled")
+            if other_failures:
+                error.add_note(
+                    "additional capture close failure(s): "
+                    + "; ".join(f"{type(err).__name__}: {err}"
+                                 for err in other_failures))
+            raise error from cancelled
+        if len(failures) == 1:
+            raise failures[0]
+        raise BaseExceptionGroup("meeting capture sources failed to close", failures)
 
 
 async def _next_or_silence(iterator, _silence):

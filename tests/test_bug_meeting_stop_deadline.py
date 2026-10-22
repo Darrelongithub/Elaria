@@ -141,6 +141,7 @@ def test_bug_meeting_sdk_requests_receive_remaining_deadline(
     class Files:
         async def upload(self, *, file, config=None):
             upload_configs.append(config)
+            await asyncio.sleep(0.05)
             return object()
 
     class Models:
@@ -162,7 +163,55 @@ def test_bug_meeting_sdk_requests_receive_remaining_deadline(
     assert len(upload_configs) == len(generation_configs) == 1
     upload_timeout = upload_configs[0]["http_options"]["timeout"]
     generation_timeout = generation_configs[0]["http_options"]["timeout"]
-    assert 0 < generation_timeout <= upload_timeout <= 30_000
+    assert 20_000 <= generation_timeout < upload_timeout <= 30_000
+
+
+def test_bug_meeting_live_async_success_persists_note_and_ledger(
+        config, running_daemon, tmp_path):
+    from assistant.capture import write_wav
+
+    daemon, _server = running_daemon
+    uploads = []
+    generations = []
+
+    class Files:
+        async def upload(self, *, file, config=None):
+            uploads.append((file, config))
+            return object()
+
+    class Models:
+        async def generate_content(self, *, model, contents, config=None):
+            generations.append((model, config))
+            return SimpleNamespace(text=f"async transcript {len(generations)}")
+
+    transport = _SdkTransport.__new__(_SdkTransport)
+    transport._client = SimpleNamespace(
+        aio=SimpleNamespace(files=Files(), models=Models()))
+    daemon.client.mode = "live"
+    daemon.client._transport = transport
+    daemon.meetings.mode_manager = SimpleNamespace(
+        status=lambda refresh=False: SimpleNamespace(is_offline=False))
+    frame = b"\x70\x17" * 480
+    mic = write_wav(tmp_path / "live-mic.wav", [frame] * 20, 16000)
+    system = write_wav(tmp_path / "live-system.wav", [frame] * 20, 16000)
+
+    result = asyncio.run(daemon.meetings.transcribe_dual_async(
+        mic, system, title="live async success",
+        deadline=time.monotonic() + 30.0))
+
+    assert len(uploads) == len(generations) == 2
+    assert len(result.turns) == 2
+    assert "You: async transcript 1" in result.transcript
+    assert "Them: async transcript 2" in result.transcript
+    assert result.mic_wav.is_file() and result.system_wav.is_file()
+    note = result.note_path.read_text(encoding="utf-8")
+    assert "title: live async success" in note
+    assert "You: async transcript 1" in note
+    row = next(item for item in daemon.store.recent_transcripts(limit=10)
+               if item["session_id"] == f"meeting-{result.note_path.stem.removeprefix('meeting-')}" )
+    assert row["audio_path"] == str(result.mic_wav)
+    assert row["inbox_path"] == str(result.note_path)
+    assert "Them: async transcript 2" in row["raw_text"]
 
 
 def test_bug_daemon_aclose_cancels_pending_live_meeting_stop(config):
@@ -226,6 +275,132 @@ def test_bug_daemon_aclose_cancels_pending_live_meeting_stop(config):
                 await asyncio.gather(stop_task, return_exceptions=True)
             if daemon._background_tasks:
                 await asyncio.gather(*daemon._background_tasks, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_bug_meeting_stop_capture_close_failure_closes_peer_and_keeps_raw(config):
+    from assistant.capture import DualCapture
+    from assistant.daemon import Daemon
+
+    daemon = Daemon(config)
+    mic_attempted = asyncio.Event()
+    system_started = asyncio.Event()
+    release_system_close = asyncio.Event()
+    system_closed = asyncio.Event()
+    collector_cancelled = asyncio.Event()
+    session_id = f"close-failure-{uuid.uuid4().hex}"
+
+    class Mic:
+        async def aclose(self):
+            mic_attempted.set()
+            raise RuntimeError("controlled mic close failure")
+
+    class System:
+        async def aclose(self):
+            system_started.set()
+            await release_system_close.wait()
+            system_closed.set()
+
+    async def collect():
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            collector_cancelled.set()
+
+    async def run():
+        frame = b"\x70\x17" * 480
+        collector = asyncio.create_task(collect())
+        daemon._meeting = {
+            "session_id": session_id,
+            "dual": DualCapture(Mic(), System()),
+            "frames": {"mic": [frame] * 20, "sys": [frame] * 20},
+            "task": collector,
+        }
+        daemon.mode = "meeting"
+        stop_task = asyncio.create_task(daemon._meeting_stop({}))
+        try:
+            await asyncio.wait_for(system_started.wait(), timeout=1)
+            await asyncio.sleep(0.02)
+            assert not stop_task.done(), "stop returned before peer capture close finished"
+            release_system_close.set()
+            with pytest.raises(RuntimeError, match="meeting capture close failed") as caught:
+                await stop_task
+            assert isinstance(caught.value.__cause__, RuntimeError)
+            assert "controlled mic close failure" in str(caught.value.__cause__)
+            assert mic_attempted.is_set()
+            assert system_closed.is_set()
+            assert collector.done() and collector_cancelled.is_set()
+            raw = list((config.data_dir / "audio").glob(
+                f"meeting-*-{session_id}-*.wav"))
+            assert len(raw) == 2 and all(path.is_file() for path in raw)
+            assert daemon.mode == "idle"
+        finally:
+            release_system_close.set()
+            if not collector.done():
+                collector.cancel()
+                await asyncio.gather(collector, return_exceptions=True)
+            if not stop_task.done():
+                stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
+            await daemon.aclose()
+
+    asyncio.run(run())
+
+
+def test_bug_meeting_stop_capture_source_cancel_keeps_raw_audio(config):
+    from assistant.capture import DualCapture
+    from assistant.daemon import Daemon
+
+    daemon = Daemon(config)
+    system_closed = asyncio.Event()
+    collector_cancelled = asyncio.Event()
+    session_id = f"source-cancel-{uuid.uuid4().hex}"
+
+    class Mic:
+        async def aclose(self):
+            raise asyncio.CancelledError
+
+    class System:
+        async def aclose(self):
+            system_closed.set()
+            raise RuntimeError("controlled system close failure")
+
+    async def collect():
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            collector_cancelled.set()
+
+    async def run():
+        frame = b"\x70\x17" * 480
+        collector = asyncio.create_task(collect())
+        daemon._meeting = {
+            "session_id": session_id,
+            "dual": DualCapture(Mic(), System()),
+            "frames": {"mic": [frame] * 20, "sys": [frame] * 20},
+            "task": collector,
+        }
+        daemon.mode = "meeting"
+        try:
+            with pytest.raises(RuntimeError, match="meeting capture close failed") as caught:
+                await daemon._meeting_stop({})
+            capture_error = caught.value.__cause__
+            assert isinstance(capture_error, RuntimeError)
+            assert isinstance(capture_error.__cause__, asyncio.CancelledError)
+            assert "controlled system close failure" in " ".join(
+                getattr(capture_error, "__notes__", []))
+            assert system_closed.is_set()
+            assert collector.done() and collector_cancelled.is_set()
+            raw = list((config.data_dir / "audio").glob(
+                f"meeting-*-{session_id}-*.wav"))
+            assert len(raw) == 2 and all(path.is_file() for path in raw)
+            assert daemon.mode == "idle"
+        finally:
+            if not collector.done():
+                collector.cancel()
+                await asyncio.gather(collector, return_exceptions=True)
+            await daemon.aclose()
 
     asyncio.run(run())
 

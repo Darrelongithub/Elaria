@@ -2211,21 +2211,23 @@ class Daemon:
         deadline = time.monotonic() + self._meeting_stop_timeout_s
         meeting, self._meeting = self._meeting, None
         capture_close = asyncio.create_task(meeting["dual"].aclose())
+        capture_error = None
         try:
-            await asyncio.shield(capture_close)
-        except asyncio.CancelledError:
-            close_result, = await asyncio.gather(
-                capture_close, return_exceptions=True)
-            if isinstance(close_result, BaseException):
-                print("[assistd] meeting capture cleanup failed during stop "
-                      f"cancellation: {type(close_result).__name__}: {close_result}",
-                      file=sys.stderr, flush=True)
-            raise
-        meeting["task"].cancel()
-        try:
-            await meeting["task"]
-        except asyncio.CancelledError:
-            pass  # expected: we just cancelled it
+            try:
+                await asyncio.shield(capture_close)
+            except asyncio.CancelledError:
+                close_result, = await asyncio.gather(
+                    capture_close, return_exceptions=True)
+                if isinstance(close_result, BaseException):
+                    print("[assistd] meeting capture cleanup failed during stop "
+                          f"cancellation: {type(close_result).__name__}: {close_result}",
+                          file=sys.stderr, flush=True)
+                raise
+            except Exception as exc:
+                capture_error = exc
+        finally:
+            meeting["task"].cancel()
+            await asyncio.gather(meeting["task"], return_exceptions=True)
         from datetime import datetime
 
         from .capture import write_wav
@@ -2242,6 +2244,10 @@ class Daemon:
         self.mode = self._meeting_mode()
         await self.broadcast({"event": "status.changed", "mode": self.mode})
         try:
+            if capture_error is not None:
+                raise RuntimeError(
+                    "meeting capture close failed; raw audio retained "
+                    f"at {mic_wav} and {sys_wav}") from capture_error
             try:
                 title = request.get("title")
                 pyannote_refine = bool(self.config.section("meeting").get(
