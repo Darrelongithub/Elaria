@@ -217,6 +217,15 @@ PY
 - **Fix:** include `public_demo` in the guest predicate passed to `DisclosureService.prompt_note()`, so a show-off session that starts during an owner turn changes the prompt to guest scope as well as filtering context and applying the outgoing guard.
 - **Verification:** the real-socket test fails red before this one-line change and passes after; it asserts the guest note is present and no owner-fact paraphrase reaches the response. The focused I5 suite (the six-file command listed under BH-K43) is **146 passed**. Provider, audio, and hardware were not used. Independent review is unavailable; the fix remains **UNCONFIRMED**.
 
+### BH-K47 [I4] — `speech.say` and delayed synthesis escaped the duplex gate
+
+- **Severity:** open-mic playback hazard; local TTS could synthesize/play while the duplex gate reported capture as safe.
+- **Status:** fixed locally; **UNCONFIRMED** pending independent review.
+- **Before-fix red repros:** `tests/test_bug_i4_speech_say_duplex.py::test_bug_i4_speech_say_gate_survives_synthesis_and_delayed_playback` drove `speech.say` over a real Unix socket with synthesis and playback blocked by events. After the test explicitly forced the text-duration estimate to an expired value, `daemon.is_speaking()` was false during synthesis and playback. `test_bug_i4_reply_playback_gate_survives_synthesis_longer_than_estimate` reproduced gate expiry in the owner-reply path. Both tests failed before the fix.
+- **Root cause:** `speech.say` called `SpeechService.speak()` without acquiring the gate. Reply speech relied on `_speaking_until`, an estimate from text length; slow synthesis could outlast that reservation before playback began, and the playback worker itself was not represented in `is_speaking()`.
+- **Fix:** playing local-TTS calls use a tracked `_speech_playbacks` worker set. The gate closes before synthesis, remains closed through synthesis/playback, then retains the existing 400 ms tail after the real worker ends. `speech.say` and `_speak_once` use the helper; play-disabled synthesis does not close the mic gate. Playing workers are shielded from request cancellation because cancelling `to_thread` cannot stop audio already being rendered.
+- **Verification:** I4 regressions were run red before the change and pass after. `.venv/bin/pytest -q tests/test_bug_i4_speech_say_duplex.py tests/test_bug6f_live_final_and_startup_ack.py tests/test_voice_bughunt.py tests/test_stage_b_console_class.py tests/test_hardening_pass2.py` — **127 passed, 1 skipped**. The scoped I4 mutation audit killed **5/5** changes (worker registration, gate task check, tail reset, `speech.say` bypass, and owner-reply bypass). No audio hardware/provider was used. Independent review is unavailable; the fix remains **UNCONFIRMED**.
+
 ### Mutation-test addendum (incomplete triage)
 
 - The earlier four-file focused run generated **1,284 mutants**: **525 killed, 737 survived, 22 with no tests**. In `GeminiClient.transcribe_batch_async`, the deadline conversion mutant `remaining_s * 1000` → `remaining_s / 1000` survived because the test had only a loose upper bound. After delaying fake upload and asserting `20,000 <= generation_timeout < upload_timeout <= 30,000`, that mutant was killed; targeted counters became **526 killed, 736 survived, 22 no tests**.
@@ -236,10 +245,17 @@ PY
 - `.venv/bin/ruff check .` and `git diff --check` — passed. This is **165 more passing tests** than the user's stated 1,393-test baseline. Six tests remain skipped.
 - These are clean test runs, not independent review or hardware/provider proof. BH-K43–K46 remain **UNCONFIRMED**; no independent reviewer is available.
 
+## Clean-pass log after BH-K47 [I1, I4, I5]
+
+- Focused I4 and adjacent suite: `.venv/bin/pytest -q tests/test_bug_i4_speech_say_duplex.py tests/test_bug6f_live_final_and_startup_ack.py tests/test_voice_bughunt.py tests/test_stage_b_console_class.py tests/test_hardening_pass2.py` — **127 passed, 1 skipped**.
+- Fresh full suite, unseeded: `.venv/bin/pytest -q` — **1,560 passed, 6 skipped in 70.51s**.
+- Second fresh full-suite pass: `.venv/bin/pytest -q --randomly-seed=260622` — **1,560 passed, 6 skipped in 68.78s**.
+- `.venv/bin/ruff check .` and `git diff --check` — passed. This is **167 more passing tests** than the user's stated 1,393-test baseline. Six tests remain skipped.
+- The focused I4 source-mutation audit killed **5/5** scoped mutants. These are test passes, not independent review or hardware/provider proof. BH-K34–K47 remain **UNCONFIRMED** where no separate reviewer is available; no hardware/provider checks ran.
+
 ## Next
 
-1. Finish I4 playback: `speech.say` into open-mic behavior and the delayed-synthesis case where the estimated playback gate expires before playback begins.
-2. Reproduce and fix XDG_DATA_HOME transcript placement and 0644 note/DB/WAL/enrollment permissions; enrollment creation must be atomic with mode 0600.
-3. Produce the requested Part 2 status table for Live final, ack into open mic, dictate captured nothing, orphaned `ptt.result`, leaked subscribers, shadowing, and CLI ImportError audit. Live final remains SUSPECT until the protocol-level SDK-source root cause is proven; do not substitute a timeout.
-4. Resolve I1 suspects with exact owner hardware commands: late Live final under playback guard; non-empty transcript below 0.003 RMS. No hardware/provider checks have run in this sandbox.
-5. Run the required fresh bughunt pass and seek independent review. K34–K42 and BH-K43–K46 remain unconfirmed where no separate reviewer is available; do not declare completion while confirmed bugs are unfixed or fixes unconfirmed. Historical broad mutation survivors remain untriaged; the current scoped I5/I1 decision-point audit is 12/12 killed.
+1. Reproduce XDG_DATA_HOME transcript placement and 0644 note/DB/WAL/enrollment permissions before any fix; if confirmed, ensure enrollment creation is atomic with mode 0600.
+2. Produce the requested Part 2 status table for Live final, ack into open mic, dictate captured nothing, orphaned `ptt.result`, leaked subscribers, shadowing, and CLI ImportError audit. Live final remains SUSPECT until the protocol-level SDK-source root cause is proven; do not substitute a timeout.
+3. Resolve I1 suspects with exact owner hardware commands: late Live final under playback guard; non-empty transcript below 0.003 RMS. No hardware/provider checks have run in this sandbox.
+4. Run the required fresh bughunt pass and seek independent review. K34–K47 remain unconfirmed where no separate reviewer is available; do not declare completion while confirmed bugs are unfixed or fixes unconfirmed. Historical broad mutation survivors remain untriaged; the scoped I5/I1 decision-point audit is 12/12 killed and the scoped I4 audit is 5/5 killed.

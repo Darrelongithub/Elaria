@@ -249,6 +249,10 @@ class Daemon:
         # text-duration estimate). Separate workers survive waiter cancellation:
         # cancelling to_thread cannot stop audio already playing in that thread.
         self._ack_playbacks: set[asyncio.Task] = set()
+        # Local TTS work includes synthesis before sound starts. Keep the duplex
+        # gate closed for the real worker lifetime; a text-duration estimate can
+        # expire while synthesis is still delayed (I4).
+        self._speech_playbacks: set[asyncio.Task] = set()
         # BUG F / Bug 8 (2026-10-20): the single 4 s total-turn bound is gone.
         # Two deadlines from [gemini]: a streaming first-token deadline (a
         # transport with no first token is dead) and a generous total bound (a
@@ -307,11 +311,30 @@ class Daemon:
             self._speaking_until = __import__("time").monotonic() + guard_s
             # Don't clear text immediately; let guard expire
 
+    def _start_speech_task(self, text: str, *, play: bool = True) -> asyncio.Task:
+        """Start one TTS call; a playing call owns the duplex gate through finish (I4)."""
+        if play:
+            self._set_speaking(True, text=text)
+        worker = asyncio.create_task(asyncio.to_thread(
+            self.speech.speak, text, play=play))
+        if play:
+            self._speech_playbacks.add(worker)
+
+            def finished(task: asyncio.Task) -> None:
+                self._speech_playbacks.discard(task)
+                self._set_speaking(False, text=text)
+                self._consume_task_result(task)
+
+            worker.add_done_callback(finished)
+        return worker
+
     def is_speaking(self) -> bool:
-        return bool(self._ack_playbacks) or time.monotonic() < self._speaking_until
+        return bool(self._ack_playbacks or self._speech_playbacks) or (
+            time.monotonic() < self._speaking_until)
 
     def speaking_guard_remaining(self) -> float:
-        return max(0.4 if self._ack_playbacks else 0.0,
+        active_playback = bool(self._ack_playbacks or self._speech_playbacks)
+        return max(0.4 if active_playback else 0.0,
                    self._speaking_until - time.monotonic())
 
     def _queue_ack_playback(self, kind: str) -> asyncio.Task:
@@ -505,7 +528,8 @@ class Daemon:
         synthesis of the same text (BH-I4).
         """
         try:
-            result = await asyncio.to_thread(self.speech.speak, text)
+            worker = self._start_speech_task(text, play=True)
+            result = await asyncio.shield(worker)
             if result.error and not route.get("muted"):
                 await self.broadcast({"event": "speech.error", "error": result.error,
                                       **route})
@@ -514,8 +538,6 @@ class Daemon:
             await self.broadcast({"event": "speech.error", "error": str(exc), **route})
             return SpeechResult(text=text.strip(), backend="none", voice_id="none",
                                 muted=True, error=str(exc))
-        finally:
-            self._set_speaking(False, text=text)
 
     async def _maybe_speak_reply(self, text: str, params: dict) -> dict:
         # Hybrid: try blocking with a short timeout so a fast local render can
@@ -1270,8 +1292,9 @@ class Daemon:
         text = str(params.get("text") or "").strip()
         if not text:
             raise ValueError("speech.say needs params.text")
-        result = await asyncio.to_thread(
-            self.speech.speak, text, play=bool(params.get("play", True)))
+        play = bool(params.get("play", True))
+        worker = self._start_speech_task(text, play=play)
+        result = await (asyncio.shield(worker) if play else worker)
         return {"speech": result.as_dict()}
 
     async def _speech_warm(self, params: dict) -> dict:
