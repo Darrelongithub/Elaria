@@ -1679,6 +1679,15 @@ running the documented command chain).
 - **Fix:** shut down/close the client socket, join the drainer, await `server.wait_closed()` and `daemon.aclose()`, stop/join the loop thread, then close the loop.
 - **Verification:** the isolated test passes with empty stderr. The current ten randomized full-suite runs (after BH-K40–K42) each passed **1,548 tests, 6 skipped**; the fresh unseeded post-ledger suite also passed **1,548 tests, 6 skipped**, with no pending-task warnings.
 
+### BH-K42 — UI stream integration tests abandoned IPC subscriber threads
+
+- **Severity:** test-integrity / pending IPC-client tasks; not a production feature failure.
+- **Status:** fixed in `tests/test_phase2_surfaces.py` and test-server teardown helpers.
+- **Reproduction:** randomized seed 260303 passed but emitted two `Task was destroyed but it is pending!` warnings for IPC `_client()` tasks waiting on `reader.readline()`. With stricter `running_daemon` teardown, the leaked subscriptions reproduced as teardown timeouts specifically in `test_waybar_follow_reacts_to_status_changed` and `test_overlay_stream_over_real_daemon`.
+- **Root cause:** both UI tests started daemon consumer threads that only returned after >12 or >40 stream records, yet the assertions needed only the listening/final states. The threads/generators were not joined/closed, leaving open subscriber sockets.
+- **Fix:** stop each consumer after its asserted state(s), close the stream generator in `finally`, join the thread, and have the daemon fixture/server helpers await closed IPC clients before stopping their event loops.
+- **Verification:** the two affected tests — **2 passed**; seed 260303 — **1,548 passed, 6 skipped**, no teardown warnings. The current ten-seed branch-coverage set also passed; exact results are in `BUGHUNT-ARENA-2026-10-21.md`.
+
 ## SUSPECTS from the 2026-10-21 hunt — unproven, NOT fixed (evidence + settling check in BUGHUNT-2026-10-21.md)
 
 - **S1** Live model ids exist for the owner's key → `assist voice models`.

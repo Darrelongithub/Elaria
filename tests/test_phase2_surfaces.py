@@ -136,10 +136,15 @@ def test_overlay_stream_over_real_daemon(config, running_daemon):
     states: list[dict] = []
 
     def consume():
-        for state in stream_overlay_states(config.socket_path):
-            states.append(state)
-            if len(states) > 40:
-                return
+        stream = stream_overlay_states(config.socket_path)
+        try:
+            for state in stream:
+                states.append(state)
+                kinds = {item.get("kind") for item in states}
+                if {"listening", "final"}.issubset(kinds):
+                    break
+        finally:
+            stream.close()
 
     thread = threading.Thread(target=consume, daemon=True)
     thread.start()
@@ -147,7 +152,8 @@ def test_overlay_stream_over_real_daemon(config, running_daemon):
     call(config.socket_path, "ptt.start", {"source": "simulated"})
     time.sleep(0.4)
     call(config.socket_path, "ptt.stop", {"wait_s": 30.0}, timeout=30.0)
-    time.sleep(0.5)
+    thread.join(timeout=3)
+    assert not thread.is_alive(), "overlay event consumer did not finish after final state"
     kinds = [s["kind"] for s in states]
     assert "listening" in kinds and "final" in kinds
 
@@ -162,17 +168,23 @@ def test_waybar_follow_reacts_to_status_changed(config, running_daemon):
     lines: list[dict] = []
 
     def consume():
-        for line in stream_waybar(config.socket_path, interval_s=30):
-            lines.append(line)
-            if len(lines) > 12:
-                return
+        stream = stream_waybar(config.socket_path, interval_s=30)
+        try:
+            for line in stream:
+                lines.append(line)
+                if line.get("alt") == "listening":
+                    break
+        finally:
+            stream.close()
 
-    threading.Thread(target=consume, daemon=True).start()
+    thread = threading.Thread(target=consume, daemon=True)
+    thread.start()
     time.sleep(0.3)
     call(config.socket_path, "ptt.start", {"source": "simulated"})
     time.sleep(0.5)
     call(config.socket_path, "ptt.stop", {"wait_s": 30.0}, timeout=30.0)
-    time.sleep(0.5)
+    thread.join(timeout=3)
+    assert not thread.is_alive(), "Waybar event consumer did not finish after listening"
     alts = [line.get("alt") for line in lines]
     assert "listening" in alts  # event-driven: no 30s poll could produce this
 

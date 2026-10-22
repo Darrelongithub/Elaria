@@ -52,6 +52,7 @@ def test_subscriber_discarded_on_disconnect_without_any_broadcast(config):
         async def _shutdown():
             server.close()
             await daemon.aclose()
+            await asyncio.wait_for(server.wait_closed(), timeout=3)
 
         asyncio.run_coroutine_threadsafe(_shutdown(), loop).result(timeout=5)
         loop.call_soon_threadsafe(loop.stop)

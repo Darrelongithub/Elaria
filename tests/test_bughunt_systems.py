@@ -529,9 +529,14 @@ def test_ipc_call_skips_event_lines_until_the_matching_reply(tmp_path):
     try:
         assert ipc_call(socket_path, "ask", timeout=3) == {"answer": 42}
     finally:
-        loop.call_soon_threadsafe(server.close)
+        async def _shutdown():
+            server.close()
+            await asyncio.wait_for(server.wait_closed(), timeout=3)
+
+        asyncio.run_coroutine_threadsafe(_shutdown(), loop).result(timeout=5)
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=3)
+        loop.close()
 
 
 # -- G: watcher / voice-test / daemon review ----------------------------------
