@@ -301,6 +301,12 @@ PY
 
 No provider, microphone, PipeWire, separate-UID, or independent-review check was run in this sandbox. All fixed items in the table remain **UNCONFIRMED** absent a separate reviewer.
 
+### Post-table revalidation [I1, I2, I3, I4, I5, I7, I9, I10]
+
+- `.venv/bin/pytest -q` — fresh full regression suite: **1,565 passed, 6 skipped** in 69.56 s, with no failures (172 more passing tests than the user's 1,393-test baseline).
+- The status-table focused command — **53 passed**; `.venv/bin/ruff check .` and `git diff --check` passed.
+- This is test-suite evidence only, not a fresh hardware/provider bughunt; it does not resolve the Live-final or quiet-speech suspects, and it is not an independent review.
+
 ## Clean-pass log after BH-K50 [I1, I4, I5, I7]
 
 - Focused XDG, privacy, enrollment, dictation, meeting, offline voice, and adjacent suites — **161 passed, 1 skipped**.
