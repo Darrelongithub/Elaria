@@ -13,16 +13,24 @@ start/stop` captures the day; batch-transcribe the saved WAVs afterwards.
 cd ~/Elaria
 uv sync --extra live --extra offline          # google-genai + faster-whisper
 assist doctor                                 # mic + pw-record + inhibit lines green
-assist event spike --minutes 10 --out docs/event-spike.json   # §0 — writes the decision row
-cat docs/event-spike.json                     # note the row; set [event] route/segment_minutes if row 1/2
+assist event status                           # verify calls used today / 25 and next reset
 ```
 
 Make sure `~/.config/assistant/gemini.env` (0600) has the key and
-`assist doctor` shows **voice routing / connectivity** sane.
+`assist doctor` shows **voice routing / connectivity** sane. The required
+30-minute batch spike must be performed once with a real key/account; this
+sandbox has no API key, so no result is claimed and no mock spike is a
+substitute.
 
 ## 1. Gate 2 — end-to-end on real mic (§8, verbatim)
 
-> **Gate 2, end-to-end on real mic** with `--segment-minutes 2`: speak, switch speakers once, confirm the document fills in order.
+**Zero-cost capture soak:** first run `assist event start --no-transcribe
+--segment-minutes 2 --title "Gate 2 capture soak" --battery-ok`. Verify WAV
+rotation, durable audio-kept markers, battery warning, and inhibit lock.
+**Soak on `--no-transcribe` costs 0 calls.** Then stop and run the real-mic
+transcription/edit rehearsal below; that run uses the persisted quota counter.
+
+> **Gate 2, end-to-end on real mic** with `--segment-minutes 2`: start from the console, speak, switch speakers from the console, edit a landed word IN THE CONSOLE, watch the next segment land beneath it, then stop from the console. Confirm the document and edits are intact.
 
 ```bash
 assist event start --segment-minutes 2 --title "Gate 2 rehearsal" --speakers "Me,Other"
@@ -48,8 +56,9 @@ Confirm, in the printed document path:
 
 ```bash
 # start it UNPLUGGED so the battery warning fires at you:
-assist event start --segment-minutes 2 --title "Gate 3 soak" --battery-ok
-#   ^ confirm the WARN power: ON BATTERY line is in the output
+assist event start --no-transcribe --segment-minutes 2 --title "Gate 3 soak" --battery-ok
+#   ^ confirm WARN power: ON BATTERY and transport: fake — no calls will be made
+#   Soak on --no-transcribe costs 0 calls.
 # now plug in, close the lid / walk away for one hour. Do NOT touch it.
 ```
 
@@ -66,9 +75,9 @@ Confirm:
       must abut)
 - [ ] `capture.stats` peaks are sane the whole way (a flat near-zero run = dead
       mic hour — that is exactly what the log is for)
-- [ ] queue did not grow: `event status` during the soak showed
-      `queued` + `deferred` near 0
-- [ ] no deferred segments you cannot explain
+- [ ] fake-transport status shows calls used unchanged at 0; every captured WAV
+      has a durable `audio kept:` marker (deferred markers are expected here)
+- [ ] `event status` shows `transport: fake — no calls will be made`
 - [ ] the laptop did **not** suspend (inhibit lock held — status/`doctor`)
 
 ## 3. Gate 4 — far-field (§8, verbatim)

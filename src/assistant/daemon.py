@@ -625,6 +625,9 @@ class Daemon:
             "event.start": self._event_start,
             "event.stop": self._event_stop,
             "event.status": self._event_status,
+            "event.edit": self._event_edit,
+            "event.rename": self._event_rename,
+            "event.export": self._event_export,
             "event.speaker": self._event_speaker,
             "mode.status": self._mode_status,
             "mode.set": self._mode_set,
@@ -2351,13 +2354,25 @@ class Daemon:
             speakers=params.get("speakers"),
             segment_minutes=params.get("segment_minutes"),
             source=params.get("source"),
-            battery_ok=bool(params.get("battery_ok")))
+            battery_ok=bool(params.get("battery_ok")),
+            no_transcribe=bool(params.get("no_transcribe")))
 
     async def _event_stop(self, params: dict) -> dict:
         return await self.event_service.stop()
 
     async def _event_status(self, params: dict) -> dict:
         return self.event_service.status()
+
+    async def _event_edit(self, params: dict) -> dict:
+        return self.event_service.edit_segment(
+            int(params["segment"]), str(params["base_text"]), str(params["text"]))
+
+    async def _event_rename(self, params: dict) -> dict:
+        return self.event_service.rename_speaker(
+            str(params["selector"]), str(params["new_name"]))
+
+    async def _event_export(self, params: dict) -> dict:
+        return self.event_service.export_document(str(params.get("format", "md")))
 
     async def _event_speaker(self, params: dict) -> dict:
         if params.get("next"):

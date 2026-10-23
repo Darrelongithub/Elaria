@@ -679,7 +679,8 @@ def _event_command(args, config) -> int:
     if action == "start":
         params = {"title": args.title, "speakers": args.speakers,
                   "segment_minutes": args.segment_minutes,
-                  "source": args.source, "battery_ok": bool(args.battery_ok)}
+                  "source": args.source, "battery_ok": bool(args.battery_ok),
+                  "no_transcribe": bool(args.no_transcribe)}
         try:
             out = call(config.socket_path, "event.start", params, timeout=60.0)
         except DaemonUnavailable as exc:
@@ -708,14 +709,22 @@ def _event_command(args, config) -> int:
                   f"{out.get('document')}")
             return 0
         print("Event capture ON (segments → live document). Stop: assist event stop")
+        if args.no_transcribe:
+            print("transport: fake — no calls will be made")
+        else:
+            print(f"transport: {out.get('transport', 'real transcription')}")
         print(f"Document: {out.get('document')}")
+        if out.get("txt_document"):
+            print(f"Live text: {out.get('txt_document')}")
+        print("Open the .txt in your editor; edit freely above the tail; "
+              "new text arrives at the bottom.")
         for warning in (out.get("preflight") or {}).get("warnings", []):
             print(f"  WARN {warning}", file=sys.stderr)
         return 0
 
     if action == "stop":
         try:
-            out = call(config.socket_path, "event.stop", {}, timeout=300.0)
+            out = call(config.socket_path, "event.stop", {}, timeout=15.0)
         except DaemonUnavailable:
             # §5 recovery: the state file + segments are enough — assemble.
             from .event import recover_event
@@ -726,7 +735,8 @@ def _event_command(args, config) -> int:
             return 0
         print(f"Document: {out.get('document')}")
         print(f"words: {out.get('word_count')} · segments: {out.get('segments')} · "
-              f"transcribed: {out.get('transcribed')}")
+              f"done: {out.get('transcribed')} · queued/deferred: "
+              f"{out.get('queued', len(out.get('deferred') or []))}")
         for row in out.get("deferred") or []:
             print(f"  deferred seg {row.get('index', 0):03d} — audio kept: "
                   f"{row.get('wav')}")
@@ -739,7 +749,60 @@ def _event_command(args, config) -> int:
             from .event import status_from_disk
 
             out = status_from_disk(config)
-        print(json.dumps(out, indent=2))
+        print(json.dumps(out, separators=(",", ":")))
+        return 0
+
+    if action == "edit":
+        try:
+            out = call(config.socket_path, "event.edit", {
+                "segment": args.segment, "base_text": args.base_text,
+                "text": args.text}, timeout=15.0)
+        except DaemonUnavailable as exc:
+            print(f"daemon unavailable (event document edit): {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(out, separators=(",", ":")))
+        return 0 if out.get("state") in ("edited", "conflict-appended") else 1
+
+    if action == "rename":
+        try:
+            out = call(config.socket_path, "event.rename", {
+                "selector": args.selector, "new_name": args.new_name}, timeout=15.0)
+        except DaemonUnavailable:
+            from .event import (
+                events_root,
+                export_event_document,
+                latest_event_dir,
+                rename_event_speaker,
+            )
+            event_dir = latest_event_dir(events_root(config))
+            if event_dir is None:
+                print("no event found.", file=sys.stderr)
+                return 1
+            out = rename_event_speaker(event_dir, args.selector, args.new_name)
+            out["export"] = str(export_event_document(event_dir, "md"))
+        if out.get("state") == "not-running":
+            print("no event found.", file=sys.stderr)
+            return 1
+        print(f"Renamed {out.get('old_name')} to {out.get('new_name')} in labels; "
+              f"copy: {out.get('export')}")
+        return 0
+
+    if action == "export":
+        try:
+            out = call(config.socket_path, "event.export", {"format": args.format},
+                       timeout=15.0)
+        except DaemonUnavailable:
+            from .event import events_root, export_event_document, latest_event_dir
+            event_dir = latest_event_dir(events_root(config))
+            if event_dir is None:
+                print("no event found.", file=sys.stderr)
+                return 1
+            out = {"state": "exported", "format": args.format,
+                   "path": str(export_event_document(event_dir, args.format))}
+        if out.get("state") != "exported":
+            print("no event found.", file=sys.stderr)
+            return 1
+        print(out.get("path"))
         return 0
 
     if action == "speaker":
@@ -1750,8 +1813,20 @@ def build_parser() -> argparse.ArgumentParser:
     ev_start.add_argument("--source", help="capture source (e.g. simulated)")
     ev_start.add_argument("--battery-ok", action="store_true",
                           help="run on battery (otherwise plug in or confirm)")
+    ev_start.add_argument("--no-transcribe", action="store_true",
+                          help="fake transport for zero-call capture/rotation rehearsal")
     event_sub.add_parser("stop", help="close the event + assemble the document")
     event_sub.add_parser("status", help="running state, segments, budget, disk")
+    ev_edit = event_sub.add_parser("edit", help="autosave one segment's owner edit")
+    ev_edit.add_argument("--segment", type=int, required=True)
+    ev_edit.add_argument("--base-text", required=True,
+                         help="text displayed when this edit began")
+    ev_edit.add_argument("--text", required=True, help="owner-edited segment text")
+    ev_rename = event_sub.add_parser("rename", help="rename a roster speaker in exported copies")
+    ev_rename.add_argument("selector", help='speaker name or roster index such as "S2"')
+    ev_rename.add_argument("new_name")
+    ev_export = event_sub.add_parser("export", help="export a renamed transcript copy")
+    ev_export.add_argument("--format", choices=("md", "txt"), default="md")
     ev_speaker = event_sub.add_parser(
         "speaker", help='switch label: name | next | (bare: print active)')
     ev_speaker.add_argument("name", nargs="?", default=None,

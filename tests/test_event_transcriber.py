@@ -501,7 +501,7 @@ async def test_queue_failure_retries_then_defers_with_marker():
     await worker
 
 
-async def test_queue_retry_pool_drains_when_idle():
+async def test_queue_retries_are_limited_to_two_per_segment():
     from assistant.event import SegmentQueue
 
     clock = FakeClock()
@@ -523,15 +523,15 @@ async def test_queue_retry_pool_drains_when_idle():
         on_resolved=lambda seg, text: resolved.append((seg["index"], text)),
         on_deferred=lambda seg, err: deferred.append(seg["index"]),
         tokens_per_second=10.0, tpm_ceiling=100_000.0,
-        daily_call_budget=25, max_attempts=1,       # defer after 1 try…
-        deferred_retries=2,                          # …then the pool takes over
+        daily_call_budget=25, max_attempts=3,       # first call plus max two retries
+        deferred_retries=0,
         clock=clock, sleep=fake_sleep)
     worker = asyncio.create_task(queue.run())
     queue.submit({"index": 1, "wav": Path("/tmp/seg-001.wav"), "duration_s": 3.0})
     await asyncio.wait_for(queue.drain(), timeout=5)
 
-    assert deferred == [1]                           # marker landed…
-    assert resolved and resolved[0][0] == 1          # …then the pool recovered it
+    assert deferred == []
+    assert resolved and resolved[0][0] == 1          # recovered on retry two
     assert resolved[0][1] == "recovered text"
     await queue.stop()
     await worker
