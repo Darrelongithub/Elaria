@@ -35,6 +35,8 @@ Handler = Callable[[str, dict], Awaitable[dict]]
 # seconds is orders of magnitude above a normal local drain, and the peer is
 # already gone by then.
 REPLY_DRAIN_TIMEOUT_S = 5.0
+# Event segment edits travel as one local JSON request (base + edited text).
+IPC_STREAM_LIMIT = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -229,7 +231,8 @@ async def serve(socket_path: Path, handler: Handler,
                 pass
 
     try:
-        server = await asyncio.start_unix_server(_client, path=str(socket_path))
+        server = await asyncio.start_unix_server(
+            _client, path=str(socket_path), limit=IPC_STREAM_LIMIT)
     except BaseException:
         _release_daemon_lock(lock_handle)
         raise
