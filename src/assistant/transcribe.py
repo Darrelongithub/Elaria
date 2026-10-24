@@ -15,6 +15,12 @@ Failure handling is the design, not an afterthought:
   event per segment at a per-mode threshold; PTT release is the user's
   own ending. Endpointing thresholds adapt to session mode because the
   owner's narration pauses (17/min) are not conversation pauses.
+- Silence never SPEAKS (silence hotfix, hardware 2026-10-24): a check-in
+  is earned only by a landed utterance, a session whose measured input
+  peak stays below `[voice] silence_floor` is silence whatever the
+  transcriber hallucinated, and a silence-verdict session closes with no
+  voice reply, no TTS call, no ladder line — one plain line in the
+  journal and on console status: "she heard nothing".
 
 Events (dicts) emitted to the caller's sink: session.started,
 transcript.interim, session.checkin, session.reconnecting,
@@ -45,9 +51,11 @@ from .capture import (
     RollingAudioBuffer,
     WavSink,
     frame_rms,
+    pcm_peak,
 )
 from .cleanup import CleanupPass
 from .clipboard import copy_text
+from .config import DEFAULTS
 from .cost import iso_now, shadow_cost_usd
 from .inbox import write_inbox_note
 from .live_client import (
@@ -59,12 +67,17 @@ from .live_client import (
 
 EventSink = Callable[[dict], Awaitable[None]]
 
+# SILENCE HOTFIX rule 1 (hardware 2026-10-24): the ONE plain-language line a
+# silence-verdict session leaves behind — session journal, session notes,
+# console status. Never a popup, never a voice reply, never a code.
+HEARD_NOTHING = "she heard nothing"
+
 
 class SilenceLadder:
     """Adaptive endpointing (§13.8): listen → ONE soft 'Is that all?' → grace →
     close.
 
-    Two rules the owner stated, both enforced here rather than hoped for:
+    Three rules the owner stated, all enforced here rather than hoped for:
 
     * ONE check-in per thought (VB-5). "Speech resumed" used to mean *any* frame at
       or over the RMS gate, so a breath, a key click or a mic pop between two
@@ -74,32 +87,67 @@ class SilenceLadder:
       `grace_s`, the thought is finished for them and the session ends — the
       microphone used to stay open until the user's hotkey, ~50 minutes in one
       headless repro.
+    * SILENCE AT SESSION START EARNS NOTHING (silence hotfix, hardware
+      2026-10-24): the check-in is a mid-conversation nudge, so it may fire
+      only after the ladder has actually HEARD a landed utterance — sustained
+      speech at or over the RMS gate and, when `floor_peak` is set, at or over
+      the `[voice] silence_floor` energy floor (room/call noise below the
+      floor counts as silence, not speech). A session that was never spoken
+      into closes on the same bounded schedule (window + grace) WITHOUT any
+      ladder line: she must never speak to silence.
     """
 
     def __init__(self, checkin_after_s: float, speech_rms: float = 0.01, *,
-                 resume_s: float = 0.4, grace_s: float = 8.0):
+                 resume_s: float = 0.4, grace_s: float = 8.0,
+                 floor_peak: float = 0.0):
         self.checkin_after_s = checkin_after_s
         self.speech_rms = speech_rms
         self.resume_s = resume_s
         self.grace_s = grace_s
+        self.floor_peak = float(floor_peak)
         self._silent_s = 0.0
         self._speech_s = 0.0
+        self._floor_speech_s = 0.0
+        self._heard_speech = False
         self._asked = False
         self._asked_at_s: float | None = None
 
+    @property
+    def heard_speech(self) -> bool:
+        """Whether at least one sustained, above-floor utterance ever landed.
+
+        The session-level fact behind rule 3: with it, a close is a grace
+        close after a check-in; without it, a close is silent.
+        """
+        return self._heard_speech
+
     def observe(self, frame: bytes, frame_s: float) -> bool:
         """True exactly once per segment: time for the soft check-in."""
-        if frame_rms(frame) >= self.speech_rms:
+        over_gate = frame_rms(frame) >= self.speech_rms
+        # Below the energy floor the frame is NOT speech, even over the RMS
+        # gate: it is room noise, a call on speaker, a fan (rule 2/3). With
+        # floor_peak <= 0 the ladder keeps its exact pre-hotfix semantics.
+        is_speech = over_gate and (self.floor_peak <= 0.0
+                                   or pcm_peak(frame) >= self.floor_peak)
+        if is_speech:
             self._silent_s = 0.0
             self._speech_s += frame_s
-            if self._speech_s >= self.resume_s:
-                # Actual speech resumed: a new segment, and a new check-in is
-                # earned. One frame above the gate is not a resumption.
+            self._floor_speech_s += frame_s
+            if self._floor_speech_s >= self.resume_s:
+                # A real utterance landed: from here the session may earn
+                # check-ins, and this sustained run is a resumption — a new
+                # segment, and a new check-in is earned. One frame above the
+                # gate is not a resumption.
+                self._heard_speech = True
                 self._asked = False
                 self._asked_at_s = None
             return False
         self._speech_s = 0.0
+        self._floor_speech_s = 0.0
         self._silent_s += frame_s
+        if not self._heard_speech:
+            # Silence at session start can never produce a ladder line.
+            return False
         if not self._asked and self._silent_s >= self.checkin_after_s:
             self._asked = True
             self._asked_at_s = self._silent_s
@@ -107,9 +155,17 @@ class SilenceLadder:
         return False
 
     def close_due(self) -> bool:
-        """True once the grace period after the check-in has also run out."""
-        return (self._asked and self._asked_at_s is not None
-                and self._silent_s - self._asked_at_s >= self.grace_s)
+        """True once the session should close itself.
+
+        Two schedules, one bound: after a check-in, the grace period running
+        out ends the thought (VB-6). With NO utterance ever heard, the same
+        window + grace closes the session SILENTLY (silence hotfix rule 1) —
+        the microphone stays exactly as bounded as before, minus the voice.
+        """
+        if self._asked and self._asked_at_s is not None:
+            return self._silent_s - self._asked_at_s >= self.grace_s
+        return (not self._heard_speech
+                and self._silent_s >= self.checkin_after_s + self.grace_s)
 
 
 @dataclass
@@ -157,6 +213,27 @@ def _final_texts(events) -> list[str]:
     return out
 
 
+def _has_real_word(text: str) -> bool:
+    """At least one real word: a token carrying an alphanumeric character.
+
+    Silence-hotfix rule 3 — a punctuation-only or empty transcript is still
+    silence, so it can never earn the soft check-in.
+    """
+    return any(any(ch.isalnum() for ch in token)
+               for token in (text or "").split())
+
+
+def _landed_real_words(events) -> bool:
+    """Whether the Live stream has landed at least one real user word.
+
+    The transcript-layer evidence for the check-in gate. Only INPUT
+    interims/finals count: her own output transcription and echo-suppressed
+    segments are not user utterances and are never in `collected` (BUG 6).
+    """
+    return any(event.type in ("interim", "final") and _has_real_word(event.text)
+               for event in events)
+
+
 class DictationService:
     # The Live path must have a terminal state even when the server omits
     # turn_complete/final after activity_end. Keep all shutdown/post-close
@@ -193,6 +270,13 @@ class DictationService:
         self.inbox_dir = config.inbox_dir
         self.copy_clipboard = bool(settings.get("copy_to_clipboard", True))
         self.vad_threshold = float(settings.get("vad_rms_threshold", 0.01))
+        # SILENCE HOTFIX rule 2: the audio-energy floor on measured input
+        # peak ([voice] silence_floor). A session below it is silence
+        # whatever the transcriber hallucinated — garbage-from-room-noise
+        # transcripts included.
+        self.silence_floor = float(
+            config.section("voice").get(
+                "silence_floor", DEFAULTS["voice"]["silence_floor"]))
         self.checkin_after = settings.get("checkin_after_s") or {}
         # How long speech must last before the ladder treats it as a resumption,
         # and how much silence after the one check-in closes the session (VB-5/6).
@@ -361,7 +445,8 @@ class DictationService:
         gate = FrameGate(rms_threshold=self.vad_threshold)
         ladder = SilenceLadder(
             float(self.checkin_after.get(mode, 20)), speech_rms=self.vad_threshold,
-            resume_s=self.resume_s, grace_s=self.grace_s)
+            resume_s=self.resume_s, grace_s=self.grace_s,
+            floor_peak=self.silence_floor)
         notes: list[str] = []
 
         async def emit_lifecycle_event(step: str, event: dict) -> None:
@@ -409,8 +494,13 @@ class DictationService:
         speech_s_at_last_final: float | None = None
         # BUG 6 capture diagnostics: what the mic actually delivered this
         # session (before any gate) — node, bytes, peak. Logged + reported.
+        # SILENCE HOTFIX rule 2: `session_peak` is the measured INPUT PEAK
+        # (capture.pcm_peak — the capture.stats/doctor-peak mechanism) that
+        # the [voice] silence_floor verdict reads; `peak_rms` (the loudest
+        # frame RMS) stays for the existing §8 near-zero-audio rule.
         captured_bytes = 0
         peak_rms = 0.0
+        session_peak = 0.0
         frames_seen = 0
         capture_label = str(getattr(source, "target", None) or "default")
 
@@ -568,6 +658,7 @@ class DictationService:
                 captured_bytes += len(frame)
                 level = frame_rms(frame)
                 peak_rms = max(peak_rms, level)
+                session_peak = max(session_peak, pcm_peak(frame))
                 frame_s = len(frame) / 2 / 16000
                 # BUG6: half-duplex inside the Live session. While her output
                 # is playing (or inside the ~400 ms guard), a frame is her own
@@ -599,16 +690,36 @@ class DictationService:
                     wav_sink.write(frame)
                 buffer.push(frame)
                 if ladder.observe(frame, frame_s):
-                    await emit({"event": "session.checkin", "prompt": "Is that all?",
-                                "session_id": session_id})
+                    # SILENCE HOTFIX rule 3 — transcript layer: with a Live
+                    # session running, the check-in is earned only once at
+                    # least one real word has landed. (The ladder itself
+                    # holds the audio layer: sustained speech at or over the
+                    # energy floor.) Offline / Live-down sessions have no
+                    # mid-session word source, so the ladder's audio
+                    # evidence is the gate there.
+                    if transport is None or _landed_real_words(collected):
+                        await emit({"event": "session.checkin", "prompt": "Is that all?",
+                                    "session_id": session_id})
+                    else:
+                        notes.append(
+                            "check-in withheld: no word had landed to ask about")
                 elif ladder.close_due():
-                    # VB-6: the thought ended. Release the microphone instead of
-                    # holding it open until the hotkey; the words already heard
-                    # are kept, which is exactly what the check-in was for.
-                    notes.append(f"closed after the check-in grace ({ladder.grace_s:g}s "
-                                 f"of continued silence)")
-                    await emit({"event": "session.grace_close", "session_id": session_id,
-                                "silence_after_checkin_s": round(ladder.grace_s, 3)})
+                    if ladder.heard_speech:
+                        # VB-6: the thought ended. Release the microphone instead of
+                        # holding it open until the hotkey; the words already heard
+                        # are kept, which is exactly what the check-in was for.
+                        notes.append(f"closed after the check-in grace ({ladder.grace_s:g}s "
+                                     f"of continued silence)")
+                        await emit({"event": "session.grace_close", "session_id": session_id,
+                                    "silence_after_checkin_s": round(ladder.grace_s, 3)})
+                    else:
+                        # SILENCE HOTFIX rule 1: a session nobody spoke into
+                        # closes on the same bounded schedule (window +
+                        # grace) — silently. No ladder line, no voice; the
+                        # plain-language verdict lands with the capture
+                        # stats below ("she heard nothing").
+                        notes.append("closed by the endpointing window — "
+                                     "no speech ever landed")
                     break
                 if transport is None or not gate.allows(frame):
                     continue
@@ -788,11 +899,22 @@ class DictationService:
                 stalled = bool(getattr(source, "stalled", False))
             except Exception:
                 stalled = False
-            no_speech = captured_bytes == 0 or peak_rms < 0.003
+            # SILENCE HOTFIX rule 2: the audio-energy floor. `session_peak`
+            # is the measured input peak (capture.pcm_peak — the same
+            # mechanism capture.stats and the doctor level check report;
+            # owner speech proven at 0.8624). Below [voice] silence_floor
+            # the session IS silence, whatever the transcriber hallucinated
+            # from room noise — garbage transcripts included. The §8
+            # near-zero-RMS rule stays: it catches peaky ticks that clear
+            # the floor but carry no audible speech.
+            no_speech = (captured_bytes == 0 or peak_rms < 0.003
+                         or session_peak < self.silence_floor)
             capture_stats = {
                 "session_id": session_id,
                 "node": capture_label, "bytes": captured_bytes,
                 "peak_rms": round(peak_rms, 4), "frames": frames_seen,
+                "peak": round(session_peak, 4),
+                "silence_floor": round(self.silence_floor, 4),
                 "duration_s": round(duration_s, 3), "gated_frames": gated_frames,
                 "stalled": stalled, "no_speech": no_speech,
             }
@@ -808,6 +930,8 @@ class DictationService:
                 notes.append(
                     f"no speech captured (node={capture_label}, bytes={captured_bytes}, "
                     f"peak={peak_rms:.4f})")
+                # Rule 1: the plain-language line, in the session's own words.
+                notes.append(HEARD_NOTHING)
             try:
                 self.store.log_persona_event(
                     iso_now(), "capture.stats", json.dumps(capture_stats))
@@ -815,6 +939,26 @@ class DictationService:
             except Exception as exc:
                 self._log("dictate.capture_stats_log_failed", session_id=session_id,
                           error=f"{type(exc).__name__}: {exc}"[:200])
+            if no_speech:
+                # Rule 1: the session journal carries the same plain line.
+                # Durable before any close await, like capture.stats — a
+                # wedged transport close cannot lose it. No popup, no voice.
+                silent_close = {
+                    "message": HEARD_NOTHING,
+                    "session_id": session_id,
+                    "node": capture_label,
+                    "bytes": captured_bytes,
+                    "peak": round(session_peak, 4),
+                    "peak_rms": round(peak_rms, 4),
+                    "silence_floor": round(self.silence_floor, 4),
+                }
+                try:
+                    self.store.log_persona_event(
+                        iso_now(), "session.silent_close", json.dumps(silent_close))
+                    self._log("dictate.silent_close_logged", session_id=session_id)
+                except Exception as exc:
+                    self._log("dictate.silent_close_log_failed", session_id=session_id,
+                              error=f"{type(exc).__name__}: {exc}"[:200])
 
             if collector is not None and not collector.done():
                 self._log("dictate.collector_cancel_start", session_id=session_id)
@@ -865,6 +1009,17 @@ class DictationService:
             except Exception as exc:
                 self._log("dictate.capture_stats_emit_failed", session_id=session_id,
                           error=f"{type(exc).__name__}: {exc}"[:200])
+            if no_speech:
+                # Rule 1: the verdict is also an event, so the daemon carries
+                # the plain line into console status live. The overlay
+                # ignores unknown events and session.ended hides the pill:
+                # a silent close makes no popup and no sound.
+                await emit_lifecycle_event(
+                    "dictate.silent_close_emit",
+                    {"event": "session.silent_close", "message": HEARD_NOTHING,
+                     "session_id": session_id,
+                     "peak": round(session_peak, 4),
+                     "silence_floor": round(self.silence_floor, 4)})
 
         use_offline_chain = offline_at_start or network_drop
         # BH-K3: when may the saved-WAV batch result replace Live text?

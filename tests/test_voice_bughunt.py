@@ -700,14 +700,24 @@ def ladder(mode: str = "narration", threshold: float | None = None) -> SilenceLa
                          speech_rms=DEFAULTS["transcribe"]["vad_rms_threshold"])
 
 
+def land_an_utterance(state: SilenceLadder, seconds: float = 0.6) -> None:
+    """SILENCE HOTFIX rule 3: the soft check-in is earned by a landed
+    utterance. A mid-conversation pause needs a conversation first — feed
+    sustained loud speech so the ladder has actually heard the user."""
+    for _ in range(int(seconds / 0.03)):
+        state.observe(SPEECH, 0.03)
+
+
 @pytest.mark.parametrize("pause_frames", [20, 50, 100])       # 0.6s, 1.5s, 3s
 def test_c8_narration_survives_mid_thought_pauses(pause_frames):
     ladder_state = ladder("narration")
+    land_an_utterance(ladder_state)     # "mid-thought" = after speech (rule 3)
     fired = [ladder_state.observe(SILENCE, 0.03) for _ in range(pause_frames)]
     assert not any(fired), f"a {pause_frames * 30}ms pause cut a narration thought"
     # ...and the same pause in the snappier modes still doesn't fire below their cap.
     for mode in ("command", "conversation"):
         state = ladder(mode)
+        land_an_utterance(state)
         assert not any(state.observe(SILENCE, 0.03) for _ in range(pause_frames)) or \
             pause_frames * 30 >= DEFAULTS["transcribe"]["checkin_after_s"][mode] * 1000
 
@@ -716,6 +726,7 @@ def test_c8_narration_survives_mid_thought_pauses(pause_frames):
 def test_c8b_checkin_timing_is_per_mode_and_fires_once(mode):
     limit = DEFAULTS["transcribe"]["checkin_after_s"][mode]
     state = ladder(mode)
+    land_an_utterance(state)            # the ask is earned by speech (rule 3)
     total = int(limit / 0.03) + 5
     fired = [i for i in range(total) if state.observe(SILENCE, 0.03)]
     assert len(fired) == 1, f"{mode}: asked {len(fired)} times"
@@ -748,9 +759,13 @@ def test_c9_blip_speech_does_not_rearm_the_ladder_for_a_second_nag(tmp_path):
     click, a chair, or her own playback bleed — so the same silence run re-armed
     and re-asked. Re-arming now needs sustained speech; a real resumption still
     earns a new check-in for the new segment.
+
+    SILENCE HOTFIX rule 3 addendum: the first check-in is itself earned only
+    by a landed utterance — silence at session start never produces one.
     """
     state = ladder("narration", threshold=1.0)
     assert state.resume_s > 0, "the ladder has no sustained-resume rule"
+    land_an_utterance(state)            # a real utterance lands first (rule 3)
     fired = 0
     fired += sum(1 for _ in range(40) if state.observe(SILENCE, 0.03))    # 1.2s → asked
     fired += 1 if state.observe(SPEECH, 0.03) else 0                       # one 30ms blip
@@ -780,6 +795,7 @@ def test_c9b_after_the_checkin_the_session_closes_after_grace(tmp_path):
     """
     state = ladder("command", threshold=4.0)
     assert state.grace_s > 0, "SilenceLadder had no post-prompt grace close"
+    land_an_utterance(state)            # the ask is earned by speech (rule 3)
     silence_run = int(300 / 0.03)            # 5 minutes of walking-away silence
     events = [state.observe(SILENCE, 0.03) for _ in range(silence_run)]
     assert sum(events) == 1, "she must still ask exactly once"
@@ -970,13 +986,18 @@ def indexed_frames(count: int, *, speech=True) -> list[bytes]:
     A stateless ASR double can then be re-fed the same frames and produce the
     same words, which is what makes a replay verifiable: anything not in the
     tail must be re-hearable, and anything lost is genuinely lost.
+
+    The amplitude base keeps every frame ABOVE the [voice] silence_floor
+    (default 0.05 ≈ 1638 LSB): test speech must resemble real speech, which
+    the owner proves at peak 0.8624 — a session below the floor is silence by
+    rule 2, and these sessions are utterances.
     """
     out = []
     for i in range(count):
         if not speech:
             out.append(SILENCE)
             continue
-        out.append(struct.pack(f"<{FRAME_SAMPLES}h", *([1000 + i] * FRAME_SAMPLES)))
+        out.append(struct.pack(f"<{FRAME_SAMPLES}h", *([6000 + i] * FRAME_SAMPLES)))
     return out
 
 
@@ -995,7 +1016,7 @@ def test_d11b_rotation_on_a_long_utterance_keeps_every_word(tmp_path):
         """Stateless per session: emits a word per 3 speech frames IT receives."""
 
         async def send_audio(self, pcm):
-            index = struct.unpack("<h", pcm[:2])[0] - 1000
+            index = struct.unpack("<h", pcm[:2])[0] - 6000
             self.frames += 1
             self.shared["heard"] = sorted({*self.shared.get("heard", set()), index})
             if index % 3 == 0:
@@ -1577,6 +1598,7 @@ def test_g20_clock_jump_does_not_fire_and_the_rotation_cap_holds(tmp_path):
     check-in — and a 25h session must not misfire its rotation cap."""
     real_time = time.time
     state = ladder("narration")
+    land_an_utterance(state)            # the one ask is earned by speech (rule 3)
     fired = 0
     for i in range(800):
         if i == 400:

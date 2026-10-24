@@ -801,3 +801,142 @@ expect `dictate.live_receive_summary.event_counts.final >= 1`, a nonzero
 response. Keep checking `last_capture` for the real mic node/bytes/peak. If Live
 still stalls, the summary now distinguishes "no input envelope received" from
 "input received but no commit", and reports the exact SDK/model in use.
+
+## 2026-10-24 — SILENCE HOTFIX: she never answers an empty room (`arena/e57b6d8f-elaria`)
+
+Two hardware observations (2026-10-24 ~01:20 EAT): (i) a wake-key dictate
+session with no speech at all still spoke the endpointing ladder line ("that's
+everything for now, is there something I can assist with") into an empty room;
+(ii) a brushed F2 during a phone call answered canned filler ("Understood, how
+may I help you?") out loud. Both are the same class of failure: the voice
+reply path treated silence and room noise as something to answer. Five rules,
+voice reply path only — event capture/transcription behaviour and markers are
+untouched (regression-pinned below).
+
+### Rule 1 — silent close on silence
+
+Empty normalized transcript at session end ⇒ no voice reply, no TTS call, no
+ladder. Instead a plain-language line `she heard nothing` is written to the
+session journal (persona event `session.silent_close`, `transcribe.py`
+`HEARD_NOTHING`) and surfaces on the console status line the next time it
+opens (`daemon.py`: `_last_session_line` set by the dictation sink from the
+`session.silent_close` event, reconciled in `_finish_dictation`'s finally,
+exposed as `status.last_session_line` and `console.state.status_line`). No
+notification popup.
+
+Marker scope: silence-verdict sessions only. A session that captured speech
+but whose transcript never arrived (`no_final`) keeps its existing honest
+notes — "she heard nothing" would be factually wrong there, and the pinned
+`no_final` wording in `test_bug6e` stays.
+
+### Rule 2 — audio-energy floor
+
+New config `[voice] silence_floor = 0.05` (`config.py` DEFAULTS +
+`config.toml.example`, BH-H22 parity preserved). `DictationService.dictate()`
+tracks a per-frame session peak with the same `pcm_peak` mechanism as
+`capture.stats`/the doctor peak (owner's speech proven at peak 0.8624). A
+session whose peak stays below the floor is treated as silence regardless of
+what the transcript says — this is what catches hallucinated garbage from
+room noise during a call. `capture.stats` gains `peak` and `silence_floor`
+keys; the silence verdict is `captured_bytes == 0 or peak_rms < 0.003 or
+session_peak < silence_floor`, then the rule-1 silent close applies.
+`wake_guard.py` reads the same floor into its `SilenceLadder`
+(`silence_floor` dataclass field, default from DEFAULTS) so the wake path
+cannot nag at sub-floor rooms either; the observed failure flowed through
+PTT/dictate, but both paths now share the gate.
+
+### Rule 3 — ladder gating
+
+The soft ladder ("Is that all?" / check-in acks) may fire only after at least
+one landed user utterance with at least one real word. Two layers:
+
+- **Audio layer (primary)**: `SilenceLadder` grows `floor_peak` and a sticky
+  `heard_speech` flag. Frames below the energy floor count as silence for the
+  ladder even when their RMS clears the speech gate; `_heard_speech` latches
+  only after `resume_s` of sustained above-floor speech — the same
+  accumulator that re-arms VB-5's "at most once per segment" rule, so
+  existing behaviour is preserved exactly (`floor_peak=0` ⇒ legacy RMS
+  semantics). Silence at session start can therefore never produce a ladder
+  line: `close_due()` splits into grace-close (speech was heard ⇒ ask, then
+  close after grace) and silent-close (nothing was heard ⇒ close quietly
+  after window+grace).
+- **Word layer (secondary, transport sessions only)**: the check-in event is
+  emitted only when `transport is None or _landed_real_words(collected)` —
+  `_has_real_word`/`_landed_real_words` in `transcribe.py` accept only
+  interim/final transcript events containing a token with an alphanumeric
+  character. Audio-only (offline/no-transport) sessions fall back to the
+  audio layer. When withheld, a note records "check-in withheld: no word had
+  landed to ask about".
+
+### Rule 4 — no canned filler as reply fallback
+
+Generic acks/greetings are never spoken when the transcript is empty, below
+the confidence gate, or below the energy floor. Enforced upstream rather than
+by extending `FILLER_PHRASES`: empty transcript ⇒ `_ask` is never reached;
+low confidence ⇒ existing veto; below floor ⇒ text discarded before routing;
+command-mode routing in `_finish_dictation` additionally requires
+`result["text"].strip() and not no_speech`. Real short speech still works: a
+one-word transcript with a healthy peak ("Four.") goes through the normal
+reply path (test (c)/(c2)).
+
+### Rule 5 — quota hygiene
+
+A silent close costs zero Flash-Lite/TTS calls. Asserted with mock-transport
+call counters and daemon spies in `tests/test_silence_hotfix.py`: no `speak`,
+no `_ask`, no ack playback, no check-in broadcast; the day's quota counters
+are unchanged across a silent session. Note for future daemon tests: under
+`GEMINI_MODE=mock` `GeminiClient.can_speak()` is False ⇒ `voice_route()` is
+permanently `"silent"` ⇒ the ack cache can never be seeded, so daemon-level
+red signals are the wrapped-broadcast recorder plus speak/_ask/play-ack
+spies, never `cached_ack()`.
+
+### Journal/lifecycle surface (additive)
+
+Silence-verdict sessions additionally emit persona event
+`session.silent_close` {message, session_id, node, bytes, peak, peak_rms,
+silence_floor} and lifecycle event `dictate.silent_close_emit` (ordered after
+`capture.stats`, before `session.ended`). All existing `list_persona_events`
+consumers are kind-filtered; no key-set equality pins exist on notes,
+`_status`, or `console.state`, so the new fields are purely additive.
+
+### Tests
+
+New `tests/test_silence_hotfix.py` — 16 cases, written red first (14 failed /
+2 passed pre-fix; the 2 pre-existing passes are the VB-5 regression pins):
+config surface ×2; ladder units ×3 (silence-from-start never fires and closes
+silently; below-floor noise counts as silence; loud run fires once, blip does
+not re-arm, sustained speech re-arms); (a) service silence ⇒ no TTS, no
+ladder string, `she heard nothing` in notes + journal + lifecycle, stats
+peak/floor; (a2) daemon silence ⇒ no check-in broadcast, spies empty,
+silent-close broadcast + journal, console line set, quota zero, and a real
+session afterwards clears the line; (b) low-peak noise + garbage transcript
+⇒ silent close, garbage discarded, peak_rms ≥ speech gate proves the floor
+decided (not zero-capture); (b2) configurable floor 0.5 swallows loud frames;
+(b3) daemon noise + command speak=True ⇒ asks/speaks empty; (c)/(c2) "Four."
+one word + healthy peak ⇒ normal reply path intact (service transcript and
+daemon `_ask`); (d) mid-session silence after landed words ⇒ ladder fires
+exactly once + `session.grace_close`; (d2) no word ever landed ⇒ check-in
+withheld; (e) two consecutive mid-session silences ⇒ ladder at most once;
+(f) event path untouched: `EventService` with floor 0.9 still writes its own
+`[seg 001: no signal detected]` markers with identical call counts.
+
+Existing pins updated for the new rule-3 semantics (each with a comment
+citing the rule): `test_voice_bughunt.py` c8, c8b, c9 (first block), c9b
+(unit part), g20 now land a sustained utterance (`land_an_utterance` helper)
+before their silence runs — a mid-conversation pause needs a conversation;
+d11b's `indexed_frames` base amplitude moved 1000 → 6000 (peak ≈0.031 was
+honest sub-floor silence under rule 2 — test speech must resemble real
+speech); `test_phase1_dictation.py::test_silence_ladder_asks_once_per_segment`
+prepends the sustained-speech run and now also asserts silence-from-start
+produces no ask; `test_phase8_offline_voice.py` forced-offline ladder case
+uses 20 loud frames instead of a 5-frame blip.
+
+### Verification
+
+- Full suite: **1,646 passed, 6 skipped** (baseline before this round:
+  1,630 passed, 6 skipped; target ≥1,635).
+- `ruff check .`: All checks passed. `shellcheck` (scripts/
+  event-console-fallback.sh, untouched): clean. `git diff --check`: clean.
+- Hardware definition-of-done (owner to report): silent room ⇒ she stays
+  silent, journal shows `she heard nothing`, quota unchanged; one sentence ⇒
+  normal reply.

@@ -86,6 +86,14 @@ def test_vad_gate_never_streams_silence():
 
 def test_silence_ladder_asks_once_per_segment():
     ladder = SilenceLadder(checkin_after_s=0.09)  # 3 silent frames
+    # SILENCE HOTFIX rule 3: the check-in is a mid-conversation nudge — the
+    # FIRST ask is earned by a landed utterance (sustained speech), never by
+    # silence at session start. Silence-from-start closes silently instead
+    # (pinned in tests/test_silence_hotfix.py).
+    assert not any(ladder.observe(SILENCE, 0.03) for _ in range(10)), \
+        "silence at session start produced a ladder line"
+    for _ in range(int(ladder.resume_s / 0.03) + 1):   # a real utterance lands
+        assert ladder.observe(SPEECH, 0.03) is False
     asks = [ladder.observe(SILENCE, 0.03) for _ in range(10)]
     assert asks.count(True) == 1  # never nagged twice (§13.8)
     # VB-5 (voice hunt): re-arming takes SUSTAINED speech, not one frame over the
