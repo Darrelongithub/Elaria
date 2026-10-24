@@ -385,6 +385,18 @@ DEFAULTS: dict = {
             },
         ],
     },
+    # SILENCE HOTFIX (hardware 2026-10-24): she must never speak to silence.
+    # A dictate/PTT/wake session whose measured INPUT PEAK stays below this
+    # floor is silence, whatever the transcriber hallucinated from room noise
+    # — silent close, no voice reply, no ladder, and one plain line in the
+    # journal ("she heard nothing"). Same mechanism as capture.stats / the
+    # doctor level check (capture.pcm_peak); the owner's speech is proven at
+    # peak 0.8624, so real words clear the floor by an order of magnitude.
+    # Voice reply path ONLY: event transcription keeps its own NO_SIGNAL_PEAK
+    # marker and never consults this floor.
+    "voice": {
+        "silence_floor": 0.05,
+    },
     "capture": {
         "source": "mic",
         # BUG 6 (2026-10-20): dictate/meeting capture resolves its pw-record

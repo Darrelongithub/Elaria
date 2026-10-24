@@ -232,7 +232,10 @@ def test_forced_offline_dictation_never_builds_live_transport(config, tmp_path):
         events.append(event["event"])
 
     result = asyncio.run(service.dictate(
-        SimulatedCapture(speech_frames=5, silent_frames=150),
+        # SILENCE HOTFIX rule 3: the ladder asks only after a real utterance
+        # landed — 20 loud frames (0.6 s ≥ resume_s) are one; the old 5-frame
+        # blip (0.15 s) was never speech, and silence-from-start earns no ask.
+        SimulatedCapture(speech_frames=20, silent_frames=150),
         transport_factory=forbidden_factory, mode="command", sink=sink))
     assert result.backend == "local"
     assert result.connectivity_mode == FORCED_OFFLINE
