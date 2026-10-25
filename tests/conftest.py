@@ -36,6 +36,23 @@ def isolated_env(tmp_path, monkeypatch):
     assert "GEMINI_API_KEY" not in os.environ
 
 
+@pytest.fixture(autouse=True)
+def journal_stream(monkeypatch):
+    """Schema lines (§4.8) go to a per-test buffer, never pytest's stdout.
+
+    Keeps `assist` CLI JSON assertions safe from daemon log interleaving and
+    hands tests the captured lines directly.
+    """
+    import io
+
+    from assistant import journal_log
+
+    buffer = io.StringIO()
+    journal_log.bind(buffer)
+    yield buffer
+    journal_log.reset()
+
+
 @pytest.fixture
 def config():
     from assistant.config import load_config

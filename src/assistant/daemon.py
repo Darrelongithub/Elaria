@@ -43,6 +43,7 @@ from .disclosure import (
 from .gemini_client import GeminiClient
 from .initiative import InitiativeError, InitiativeService, KnockSignal
 from .ipc import IpcPrincipal, ipc_peer_principal, serve
+from .journal_log import log_event
 from .modes import ModeManager
 from .offline_queue import CloudQueue
 from .organiser import OrganiserService
@@ -246,6 +247,10 @@ class Daemon:
         self._ptt_started_at: float | None = None
         self._ptt_released_at: float | None = None
         self._ptt_capture_target: str | None = None
+        # WP0 watchdog (§4.2): the last auto-close marker, or None. Status
+        # carries it so "why did the mic drop" is answerable without a journal
+        # dive (the schema line + persona event remain the durable record).
+        self._last_watchdog_close: dict | None = None
         # SILENCE HOTFIX rule 1: the plain-language line the last voice
         # session left for the console ("she heard nothing"), or None. The
         # durable record is the session journal (session.silent_close);
@@ -768,6 +773,11 @@ class Daemon:
             "dictation_active": bool(self._dictation_task and not self._dictation_task.done()),
             "dictation_processing": self._ptt_processing,
             "ptt_session_id": self._ptt_session_id,
+            # §4.2: the honest enumeration of mic/Live holders (free tier: 3
+            # concurrent Live sessions). The ladder's wake chain reads this.
+            "session_holders": self._session_holders(),
+            "session_ceiling_s": self._session_ceiling_s(),
+            "last_watchdog_close": self._last_watchdog_close,
             "capture": capture,
             "capture_target": capture_target,
             "last_capture": last_capture,
@@ -900,6 +910,13 @@ class Daemon:
                            f"{threshold:.2f}")
         if unknown and mutating:
             reasons.append("confidence is unknown and the intent would change files")
+        # §4.8: a rejected transcription is a visible marker line — the text
+        # is kept (it is in the journal), nothing ran, and the reason is plain.
+        log_event("transcription.rejected", level="warn",
+                  session_id=str(result.get("session_id") or ""),
+                  verdict="rejected",
+                  detail=("nothing executed — " + "; ".join(reasons)
+                          + f"; transcript kept: {text[:60]!r}"))
         return {
             "via": "refused",
             "executed": False,
@@ -1403,6 +1420,111 @@ class Daemon:
         except Exception:
             return
 
+    # -- WP0 watchdog (§4.2): the 5-minute session ceiling -------------------
+    def _session_ceiling_s(self) -> float:
+        try:
+            return float(self.config.section("transcribe").get(
+                "ptt_session_ceiling_s",
+                DEFAULTS["transcribe"]["ptt_session_ceiling_s"]))
+        except (TypeError, ValueError):
+            return float(DEFAULTS["transcribe"]["ptt_session_ceiling_s"])
+
+    def _session_holders(self) -> list[dict]:
+        """Every session currently holding a mic / a Live slot (§4.2).
+
+        The free tier allows 3 concurrent Live sessions; this is the honest
+        enumeration `assist status` and the ladder's wake chain read. A row
+        exists exactly while a holder exists — no caching, no guessing.
+        """
+        holders: list[dict] = []
+        now = time.monotonic()
+        sid = self._ptt_session_id
+        if sid is not None and (self._dictation_task is not None
+                                or sid in self._ptt_finishing):
+            age = (round(now - self._ptt_started_at, 1)
+                   if self._ptt_started_at is not None else None)
+            holders.append({
+                "kind": "ptt" if self._dictation_task is not None else "ptt-finishing",
+                "session_id": sid,
+                "age_s": age,
+                "live": True,
+                "capture_target": self._ptt_capture_target,
+            })
+        meeting = self._meeting
+        if meeting is not None:
+            started = meeting.get("started_mono")
+            holders.append({
+                "kind": "meeting",
+                "session_id": meeting.get("session_id"),
+                "age_s": (round(now - started, 1)
+                          if isinstance(started, (int, float)) else None),
+                "live": False,
+            })
+        try:
+            state = getattr(self.event_service, "_state", None)
+            if isinstance(state, dict) and state.get("status") == "running":
+                holders.append({
+                    "kind": "event",
+                    "session_id": state.get("session_id") or state.get("event_id"),
+                    "age_s": None,
+                    "live": False,
+                })
+        except Exception:  # noqa: S110 - a broken read is one fewer holder row
+            pass
+        return holders
+
+    async def _watchdog_tick(self, *, now: float | None = None) -> bool:
+        """Auto-close a PTT/live session past the ceiling. True iff closed.
+
+        The close is the graceful release path (finisher, terminal result,
+        broadcasts) — never a hard cancel — and it leaves a visible marker in
+        three places: the stdout schema line, the store's journal, and
+        `assist status` (`last_watchdog_close`). The recording is kept by the
+        session itself and its path lands in the session's own close line.
+        """
+        ceiling = self._session_ceiling_s()
+        sid = self._ptt_session_id
+        if (sid is None or self._ptt_started_at is None
+                or self._ptt_released_at is not None
+                or sid in self._ptt_finishing
+                or self._dictation_task is None or self._dictation_task.done()):
+            return False
+        age = (now if now is not None else time.monotonic()) - self._ptt_started_at
+        if age < ceiling:
+            return False
+        marker = {
+            "session_id": sid,
+            "age_s": round(age, 1),
+            "ceiling_s": ceiling,
+            "capture_target": self._ptt_capture_target,
+            "message": (f"watchdog closed session {sid} after "
+                        f"{round(age, 1)} s — the mic was still held past the "
+                        f"{ceiling:g} s ceiling; the recording is kept"),
+        }
+        try:
+            self.store.log_persona_event(
+                iso_now(), "watchdog.close", json.dumps(marker))
+        except Exception:  # noqa: S110 - the schema line below is the marker
+            pass
+        log_event("watchdog.close", level="warn", session_id=sid,
+                  verdict="closed", detail=marker["message"])
+        self._last_watchdog_close = {**marker, "ts": iso_now()}
+        try:
+            await self._ptt_stop({"wait_s": 0, "watchdog": True})
+        except Exception as exc:
+            self._ptt_log("ptt.watchdog_close_failed", session_id=sid,
+                          error=f"{type(exc).__name__}: {exc}"[:200])
+        return True
+
+    async def _session_watchdog_loop(self) -> None:
+        """Periodic ceiling sweep. Cheap when nothing is holding."""
+        while True:
+            await asyncio.sleep(15.0)
+            try:
+                await self._watchdog_tick()
+            except Exception as exc:      # never die: the watchdog is a sensor
+                print(f"[assistd] session watchdog tick failed: {exc}", flush=True)
+
     @staticmethod
     def _consume_task_result(task: asyncio.Future) -> None:
         if task.cancelled():
@@ -1559,6 +1681,11 @@ class Daemon:
                 self._ptt_unfinished_payload(old_session_id,
                                              superseded_by=session_id))
         self._ptt_log("ptt.start.session_create", session_id=session_id, capture_target=self._ptt_capture_target, mode=self._dictation_session_mode)
+        # §4.8 schema line: session.open — the live sensor for "is a session
+        # holding the mic right now" (the ladder's wake chain reads these).
+        log_event("session.open", session_id=session_id, verdict="listening",
+                  detail=(f"{self._dictation_session_mode} session open — "
+                          f"capture target {self._ptt_capture_target}"))
         try:
             self._dictation_task = self._track_task(asyncio.create_task(
                 self.dictation.dictate(
@@ -2004,6 +2131,29 @@ class Daemon:
                 # _ptt_processing). The result is already retrievable by
                 # session id; the terminal event comes after the switch.
                 self._ptt_finishing.discard(session_id)
+                # §4.8 schema lines: session.close (+ a quota counter line so
+                # every session end carries today's spend on stdout).
+                capture = (result or {}).get("capture") or {}
+                log_event("session.close", session_id=session_id,
+                          peak=capture.get("peak"),
+                          verdict=("silence" if (result or {}).get("no_speech")
+                                   else "closed"),
+                          detail=(f"{self._dictation_session_mode or 'narration'} "
+                                  f"session closed — "
+                                  f"{len(str((result or {}).get('text') or (result or {}).get('narration') or ''))} "
+                                  "chars"
+                                  + (f"; audio kept at {(result or {}).get('audio_path')}"
+                                     if (result or {}).get("audio_path") else "")))
+                try:
+                    day = day_start_iso()
+                    log_event("quota.counter", session_id=session_id,
+                              verdict="counted",
+                              detail=(f"today: {self.store.user_turn_calls_since(day)} "
+                                      f"user-turn call(s), "
+                                      f"{self.store.housekeeping_calls_since(day)} "
+                                      "housekeeping call(s) on the ledger"))
+                except Exception:  # noqa: S110 - a counter read never breaks close
+                    pass
             # SILENCE HOTFIX rule 1: console status carries the last
             # finished session's plain line — a silence verdict leaves
             # "she heard nothing"; a session with a real transcript clears
@@ -2315,7 +2465,9 @@ class Daemon:
         self.mode = "meeting"
         await self.broadcast({"event": "status.changed", "mode": self.mode})
         self._meeting = {"session_id": session_id, "dual": dual, "frames": frames,
-                         "task": asyncio.create_task(collect())}
+                         "task": asyncio.create_task(collect()),
+                         "started_mono": time.monotonic(),
+                         "started_at": iso_now()}
         return {"state": "meeting"}
 
     async def _meeting_stop(self, params: dict) -> dict:
@@ -3214,6 +3366,9 @@ class Daemon:
                              on_disconnect=self._subscribers.discard)
         connectivity_task = asyncio.create_task(self._connectivity_loop())
         knock_task = asyncio.create_task(self._knock_due_loop())
+        # WP0 watchdog (§4.2): auto-close a PTT/live session past the ceiling
+        # with a visible marker (a missed release once held the mic ~9 min).
+        watchdog_task = asyncio.create_task(self._session_watchdog_loop())
         _sd_notify("READY=1")
         print(f"[assistd] Elaria up · mode={self.config.gemini_mode} "
               f"· socket={self.config.socket_path}", flush=True)
@@ -3228,7 +3383,8 @@ class Daemon:
             async with server:
                 await stop.wait()
         finally:
-            await self.aclose(extra_tasks=(connectivity_task, warm_task, knock_task))
+            await self.aclose(extra_tasks=(connectivity_task, warm_task, knock_task,
+                                           watchdog_task))
 
     async def aclose(self, *, extra_tasks=()) -> None:
         if self._stop_event is not None:

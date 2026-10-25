@@ -33,6 +33,8 @@ from .config import quota_rows
 from .config import voice_model as configured_voice_model
 from .cost import estimate_tokens, iso_now, shadow_cost_usd
 from .fixtures import FixtureStore, fixture_key
+from .journal_log import log_event
+from .model_registry import assert_model_permitted
 from .voice_catalogue import (
     live_catalogue,
     resolve_catalogue,
@@ -500,6 +502,8 @@ class GeminiClient:
                    correlation_id: str, attempt: int, audio_seconds: float = 0.0,
                    purpose: str | None = None, is_user_turn: bool | None = None,
                    on_first_token: Callable[[], None] | None = None) -> dict:
+        # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
+        assert_model_permitted(model)
         key = fixture_key(model, contents, gen_config)
         request = {"model": model, "contents": contents, "config": gen_config}
         started = time.monotonic()
@@ -564,6 +568,8 @@ class GeminiClient:
                                is_user_turn: bool | None = None,
                                on_first_token: Callable[[], None] | None = None,
                                deadline: float | None = None) -> dict:
+        # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
+        assert_model_permitted(model)
         key = fixture_key(model, contents, gen_config)
         request = {"model": model, "contents": contents, "config": gen_config}
         started = time.monotonic()
@@ -767,6 +773,8 @@ class GeminiClient:
                 "spoken (the local voice is dormant by amendment 2026-10-20)"
             )
         model = request["model"]
+        # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
+        assert_model_permitted(model)
         # Validate before the transport sees a request. A wrong voice is a
         # refusal naming the allowed list, not a 400 halfway through a sentence.
         catalogue = self.voice_catalogue()
@@ -905,6 +913,10 @@ class GeminiClient:
 
         used = self.store.calls_since(day_start_iso())
         if used >= self._daily_cap:
+            log_event("quota.counter", level="warn", verdict="rejected",
+                      detail=(f"daily soft cap reached ({used}/{self._daily_cap} "
+                              "live calls) — refused locally, queued for the "
+                              "midnight Pacific reset"))
             raise QuotaExhausted(
                 f"daily soft cap reached ({used}/{self._daily_cap} live calls). "
                 "Queue and wait for the reset (midnight Pacific) — cascade "
@@ -919,13 +931,27 @@ class GeminiClient:
             row = self._quota_by_family.get(family or "")
             if row and not row.get("unlimited_rpd"):
                 rpd = row.get("rpd")
-                if isinstance(rpd, (int, float)) and rpd > 0:
+                # §4.1 config cap (`rpd_cap`): deliberately below the free
+                # ceiling (chat/intent cap 400 under ~500 free). Enforcement
+                # takes the stricter of the measured RPD and the config cap;
+                # a cap still applies when the free row is unlimited.
+                cap = row.get("rpd_cap")
+                limits = [int(x) for x in (rpd, cap)
+                          if isinstance(x, (int, float)) and x > 0]
+                if limits:
+                    allowed = min(limits)
                     used_model = self.store.calls_since(day_start_iso(), model=model)
-                    if used_model >= int(rpd):
+                    if used_model >= allowed:
+                        source = ("[quota.models.{}.{}]".format(
+                            family, "rpd_cap" if allowed == cap and cap else "rpd"))
+                        log_event("quota.counter", level="warn", verdict="rejected",
+                                  detail=(f"per-model daily quota reached for "
+                                          f"{model} ({used_model}/{allowed} today — "
+                                          f"{source}) — refused locally"))
                         raise QuotaExhausted(
                             f"per-model daily quota reached for {model} "
-                            f"({used_model}/{int(rpd)} today — "
-                            f"[quota.models.{family}] rpd). Resets midnight "
+                            f"({used_model}/{allowed} today — "
+                            f"{source}). Resets midnight "
                             "Pacific; use another model or wait (§12.8).")
 
     # -- the harness (§17): cheapest first, escalate on verified failure -------
@@ -1085,6 +1111,8 @@ class GeminiClient:
         # transcribe-live route AS a batch call (event_spike.py). Default
         # stays the dedicated batch STT model.
         model = model or self.config.model_for_role("transcribe_batch")
+        # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
+        assert_model_permitted(model)
         others = [lang for lang in (also_languages or []) if lang != language]
         if others and preserve_code_switching:
             prompt = (
@@ -1137,6 +1165,8 @@ class GeminiClient:
         path = Path(audio_path)
         duration = wav_duration_s(path)
         model = model or self.config.model_for_role("transcribe_batch")
+        # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
+        assert_model_permitted(model)
         others = [lang for lang in (also_languages or []) if lang != language]
         if others and preserve_code_switching:
             prompt = (

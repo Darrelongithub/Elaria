@@ -324,6 +324,46 @@ def run_doctor(config) -> dict:
          "Flare is not supported'."),
         warn_only=False))
 
+    # §4.1 model registry + forbidden-ID scan (Phase 0 pin fix, owner decision
+    # 2026-10-25): a forbidden id that is CONFIGURED (on its way to being
+    # invoked) is a hard FAIL; guard constants, catalogue history and prose
+    # mentions are never scanned here — the scan list names the enemy to
+    # reject it. An id outside the pinned registry is a DEFECT: reported,
+    # never silently accepted.
+    from .model_registry import registry_report
+
+    reg = registry_report(config)
+    if reg["forbidden"]:
+        checks.append(_check(
+            "forbidden model ids", False,
+            "FORBIDDEN ID CONFIGURED: "
+            + "; ".join(f"[{f['section']}] {f['key']} = {f['id']}"
+                        for f in reg["forbidden"])
+            + " — retired or rejected model (§4.1); replace with the pinned "
+              "ids from src/assistant/model_registry.py (audit: "
+              "docs/phase-reports/2026-10-25-phase0-model-id-audit.md)",
+            warn_only=False))
+    else:
+        checks.append(_check(
+            "forbidden model ids", True,
+            "none configured — every string in the config file was scanned "
+            "(the guard constants and test fixtures are exempt by design)"))
+    drift = ([f"[{f['section']}] {f['key']} = {f['id']}"
+              for f in reg["unregistered"]]
+             + [f"[gemini] escalation_ladder = {m}"
+                for m in reg["ladder_unregistered"]])
+    if drift:
+        checks.append(_check(
+            "model registry", False,
+            "DEFECT — not in the §4.1 pinned registry: " + "; ".join(drift)
+            + " — aliases (-latest) are only for non-identity chat "
+              "experimentation; pin the id (§4.1)"))
+    else:
+        checks.append(_check(
+            "model registry", True,
+            "every configured id is in the §4.1 pinned registry "
+            "(pinned ids live in src/assistant/model_registry.py)"))
+
     hypr = hyprland_info()
     checks.append(_check(
         "hyprland", hypr["present"],
@@ -373,6 +413,60 @@ def run_doctor(config) -> dict:
         "mic level",
         bool(level.get("available") and level.get("bytes", 0) > 0),
         level_detail))
+
+    # §4.2 capture policy: Mic1 is the working microphone; Mic2 is silent and
+    # must never be the default. The node is matched by node.name.
+    mic_pin = str(config.section("capture").get("mic_target")
+                   or config.section("meeting").get("mic_target") or "").strip()
+    mic2_named = "mic2" in mic_pin.lower().replace(" ", "")
+    checks.append(_check(
+        "capture node (Mic1)",
+        not mic2_named and bool(mic_pin or level.get("available")),
+        ("MIC2 CONFIGURED — Mic2 is silent; set [capture] mic_target to the "
+         "Mic1 node.name (wpctl status + wpctl inspect)" if mic2_named else
+         (f"mic_target={mic_pin!r} (matched by node.name)"
+          if mic_pin else
+          "mic_target empty — the PipeWire default source is used; pin "
+          "node.name Mic1 explicitly ([capture] mic_target) so a silent node "
+          "can never become the default"))))
+
+    # §4.8: the quickshell binary (the console/overlay are quickshell panels).
+    checks.append(_check(
+        "quickshell", shutil.which("quickshell") is not None,
+        f"{shutil.which('quickshell') or 'missing'} — Fedora package "
+        "quickshell 0.2.1 (frozen snapshot; do NOT upgrade — it links Qt "
+        "private APIs)"))
+
+    # §4.4 unit hardening, assertable: the SHIPPED units must carry the
+    # values the wiring spec names (the drift checks above compare the
+    # installed copies against these).
+    repo_root = Path(__file__).resolve().parents[2]
+    want_assistant = {
+        "Restart": "on-failure", "RestartSec": "5",
+        "StartLimitIntervalSec": "60", "StartLimitBurst": "3",
+        "StandardOutput": "journal",
+    }
+    for unit_name, want in (("assistant.service", want_assistant),
+                            ("elaria-console.service", want_assistant)):
+        unit_path = repo_root / "systemd" / unit_name
+        try:
+            unit_text = unit_path.read_text() if unit_path.exists() else ""
+        except OSError:
+            unit_text = ""
+        missing = [f"{k}={v}" for k, v in want.items()
+                   if not re.search(rf"^{k}\s*=\s*{re.escape(v)}\s*$",
+                                    unit_text, re.MULTILINE)]
+        after_ok = ("After=network-online.target pipewire.service" in unit_text
+                    if unit_name == "assistant.service" else True)
+        hard_ok = not missing and after_ok
+        checks.append(_check(
+            f"unit hardening ({unit_name})", hard_ok,
+            (f"{unit_path} carries §4.4 hardening"
+             if hard_ok else
+             f"{unit_path} missing: {', '.join(missing)}"
+             + ("" if after_ok else
+                "; After=network-online.target pipewire.service absent"))
+            if unit_text else f"{unit_path} not found"))
 
     # Wake-knock package §4: "crash leaves nothing" must be CHECKABLE.
     from .wake_guard import crash_safety_report
@@ -444,8 +538,29 @@ def run_doctor(config) -> dict:
         connectivity = ModeManager(config, doctor_store).status(refresh=False)
         voice = SpeechService(config, doctor_store).status()
         queue_counts = doctor_store.cloud_job_counts()
+        # §4.8: quota counters on the doctor surface — today's real ledger
+        # spend against the configured caps, never a guess.
+        from .cost import day_start_iso as _day_start
+
+        day = _day_start()
+        quota_counts = {
+            "user_turn": doctor_store.user_turn_calls_since(day),
+            "housekeeping": doctor_store.housekeeping_calls_since(day),
+            "all": doctor_store.calls_since(day),
+            "by_purpose": doctor_store.calls_by_purpose_since(day),
+        }
     finally:
         doctor_store.close()
+    checks.append(_check(
+        "quota counters", True,
+        f"today: {quota_counts['user_turn']} user-turn call(s), "
+        f"{quota_counts['housekeeping']} housekeeping, "
+        f"{quota_counts['all']} total on the ledger"
+        + (f"; by purpose: {quota_counts['by_purpose']}"
+           if quota_counts["by_purpose"] else "")
+        + " — soft cap "
+        f"{config.section('quota').get('max_requests_per_day', 1200)}/day, "
+        "per-model RPD enforced locally ([quota.models.*])"))
     checks.append(_check(
         "connectivity mode", True,
         f"preference={connectivity.preference}, effective={connectivity.effective_mode} "
@@ -1817,6 +1932,13 @@ def build_parser() -> argparse.ArgumentParser:
     queue_ext.add_argument("description")
     sub.add_parser("halt", help="panic switch (§4.4)")
     sub.add_parser("resume", help="clear the halt flag")
+    ladder_p = sub.add_parser(
+        "ladder",
+        help="hardware truth ladder — chains console/wake/voice/event (§4.8)")
+    ladder_p.add_argument(
+        "chain", nargs="?", default="all",
+        choices=("console", "wake", "voice", "event", "all"),
+        help="one chain, or all four")
     ptt_p = sub.add_parser("ptt", help="push-to-talk (bind press/release in Hyprland)")
     hotword_p = sub.add_parser(
         "hotword", help="wake-knock model (armed state, buffers, clips, watchdog)")
@@ -1997,6 +2119,13 @@ def main(argv: list[str] | None = None) -> int:
             if not args.json:
                 _print_doctor(report)
             return 0 if report["blockers"] == 0 else 2
+
+        if args.command == "ladder":
+            from .ladder import Ladder, render
+
+            text, ok = render(Ladder(config).run(args.chain))
+            print(text)
+            return 0 if ok else 1
 
         if args.command == "status":
             if args.waybar and args.follow:

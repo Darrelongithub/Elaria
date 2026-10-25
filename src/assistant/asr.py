@@ -36,6 +36,7 @@ from .live_client import (
     RecordingTransport,
     ScriptedLiveTransport,
 )
+from .model_registry import assert_model_permitted
 
 
 @dataclass
@@ -326,9 +327,12 @@ def make_live_transport(config, *, fixture_name: str | None = None) -> LiveTrans
     """Factory for the streaming path, by effective GEMINI_MODE."""
     if fixture_name:
         return FixtureLiveTransport(FixtureStore(config.fixtures_dir), fixture_name)
+    model = config.model_for_role("transcribe_live")
+    # §4.1: a forbidden model id never reaches the wire — and a forbidden
+    # config refuses the factory itself, even in mock (configured OR invoked).
+    assert_model_permitted(model)
     if config.gemini_mode == "mock":
         return ScriptedLiveTransport()
-    model = config.model_for_role("transcribe_live")
     transport = GenaiLiveTransport(config.api_key, model, primary_language(config))
     if config.gemini_mode == "record":
         # §12.9: record = real API + fixtures saved, streaming included.

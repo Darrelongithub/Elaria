@@ -1,12 +1,30 @@
 #!/usr/bin/env bash
 # Event capture belongs to assistant.service, never to this UI process.
 # If Quickshell fails while an event is active, point the owner at its live file.
+#
+# §4.4 (WP0): on a start-limit hit the console unit stops quietly and this
+# script emits ONE fallback notification — at most 1 per 10 minutes. Never a
+# restart storm, never a notification storm.
 set -u
 
 [[ "${SERVICE_RESULT:-success}" != "success" ]] || exit 0
 command -v assist >/dev/null 2>&1 || exit 0
-status=$(assist event status 2>/dev/null) || exit 0
-readarray -t fields < <(python3 -c '
+
+# Rate limit: one notification per 600 s, enforced before any work that could
+# notify (the stamp is per-user, under the runtime dir).
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
+stamp="$runtime_dir/elaria-event-console-fallback-$UID"
+now=$(date +%s)
+last=$(cat "$stamp" 2>/dev/null || printf '0')
+if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < 600 )); then
+    exit 0
+fi
+
+message=""
+txt_path=""
+status=$(assist event status 2>/dev/null) || status=""
+if [[ -n "$status" ]]; then
+    readarray -t fields < <(python3 -c '
 import json, sys
 try:
     value = json.load(sys.stdin)
@@ -14,24 +32,32 @@ except (ValueError, TypeError):
     raise SystemExit(1)
 print("1" if value.get("running") else "0")
 print(value.get("document", ""))
-' <<<"$status") || exit 0
-[[ "${fields[0]:-0}" == "1" ]] || exit 0
-runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
-stamp="$runtime_dir/elaria-event-console-fallback-$UID"
-now=$(date +%s)
-last=$(cat "$stamp" 2>/dev/null || printf '0')
-if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < 60 )); then
-    exit 0
+' <<<"$status" 2>/dev/null) || fields=()
+    if [[ "${fields[0]:-0}" == "1" ]]; then
+        md_path="${fields[1]:-}"
+        if [[ -n "$md_path" ]]; then
+            txt_path="${md_path%.md}.txt"
+            message="The console is unavailable. Elaria is still listening; open the live text file."
+        fi
+    fi
 fi
+if [[ -z "$message" ]]; then
+    message="The console is unavailable. Elaria is still answering from the daemon."
+fi
+
 printf '%s\n' "$now" > "$stamp"
-md_path="${fields[1]:-}"
-[[ -n "$md_path" ]] || exit 0
-txt_path="${md_path%.md}.txt"
-message="The console is unavailable. Elaria is still listening; open the live text file."
-printf '%s Live document: %s\n' "$message" "$txt_path" >&2
+{
+    printf '%s' "$message"
+    [[ -n "$txt_path" ]] && printf ' Live document: %s' "$txt_path"
+    printf '\n'
+} >&2
 if command -v notify-send >/dev/null 2>&1; then
-    notify-send "Elaria · event notebook" "$message"$'\n'"$txt_path" || true
+    if [[ -n "$txt_path" ]]; then
+        notify-send "Elaria · event notebook" "$message"$'\n'"$txt_path" || true
+    else
+        notify-send "Elaria · console" "$message" || true
+    fi
 fi
-if command -v xdg-open >/dev/null 2>&1 && [[ -f "$txt_path" ]]; then
+if command -v xdg-open >/dev/null 2>&1 && [[ -n "$txt_path" && -f "$txt_path" ]]; then
     xdg-open "$txt_path" >/dev/null 2>&1 &
 fi

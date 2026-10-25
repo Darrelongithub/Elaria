@@ -172,6 +172,7 @@ def quota_rows(quota: dict) -> list[dict]:
                 "rpm": row.get("rpm"),
                 "tpm": row.get("tpm"),
                 "rpd": row.get("rpd"),
+                "rpd_cap": row.get("rpd_cap"),
                 "unlimited_rpm": bool(row.get("rpm") in (0, "unlimited")),
                 "unlimited_rpd": bool(row.get("rpd") in (0, "unlimited")),
             })
@@ -187,10 +188,12 @@ def quota_rows(quota: dict) -> list[dict]:
         rpm = quota.get(f"{prefix}_rpm")
         tpm = quota.get(f"{prefix}_tpm")
         rpd = quota.get(f"{prefix}_rpd")
-        if rpm is None and tpm is None and rpd is None:
+        cap = quota.get(f"{prefix}_rpd_cap")
+        if rpm is None and tpm is None and rpd is None and cap is None:
             continue
         rows.append({
             "model": label, "rpm": rpm, "tpm": tpm, "rpd": rpd,
+            "rpd_cap": cap,
             "unlimited_rpm": rpm in (0, "unlimited"),
             "unlimited_rpd": rpd in (0, "unlimited"),
         })
@@ -215,10 +218,19 @@ def _deep_merge(base: dict, override: dict) -> dict:
 # silently settle later-phase decisions.
 DEFAULTS: dict = {
     "gemini": {
-        "model_default": "gemini-flash-lite-latest",
-        "model_organise": "gemini-flash-lite-latest",
-        "model_cleanup": "gemini-flash-lite-latest",
-        "model_chat": "gemini-flash-latest",
+        # §4.1 PIN FIX (owner-approved 2026-10-25, Phase 0 audit): these were
+        # `-latest` aliases, which can resolve server-side to a retired model
+        # (gemini-2.5-flash-lite was retired 2026-10-20) — the reply-regression
+        # root-cause candidate. Everything is now a pinned registry id; the
+        # alias policy allows `-latest` only for non-identity chat
+        # experimentation, never for these roles. Registry: model_registry.py.
+        "model_default": "gemini-3.5-flash-lite",
+        "model_organise": "gemini-3.5-flash-lite",
+        "model_cleanup": "gemini-3.5-flash-lite",
+        "model_chat": "gemini-3.5-flash-lite",
+        # §4.1 file fallback: used only when the transcription primary is
+        # unavailable (wired into the event/file paths in WP5).
+        "model_file_fallback": "gemini-3.5-flash-lite",
         "model_transcribe_live": "gemini-3.5-transcribe-live",
         # Batch/pre-recorded transcription is a dedicated model, not a chat
         # Flash-Lite. Gemini 3.5 Transcribe (2026-08-26) is the real batch model;
@@ -239,7 +251,9 @@ DEFAULTS: dict = {
         # this list is the ONLY way to change her voice — no code edit, and no
         # silent adoption of whatever string is in `voice`.
         "allowed_voices": ["Flare"],
-        "escalation_ladder": ["gemini-flash-lite-latest", "gemini-flash-latest"],
+        # §4.1: escalation is gemini-3.8-flash (free ~20 RPD), escalation-only
+        # by doctrine. Start at chat/intent, climb one tier on verified failure.
+        "escalation_ladder": ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
         "escalate_after_failures": 2,
         "max_scaffold_calls": 6,
         # BUG F / Bug 8 (2026-10-20): the old single 4 s total-turn bound
@@ -265,7 +279,12 @@ DEFAULTS: dict = {
         "verified_source": "owner's AI Studio rate-limit page",
         "models": {
             "flash": {"rpm": 5, "tpm": 250_000, "rpd": 20},
-            "flash-lite": {"rpm": 15, "tpm": 250_000, "rpd": 500},
+            # §4.1: chat/intent free tier is ~500 RPD; the CONFIG cap is 400
+            # (`rpd_cap`) so housekeeping + file fallback share deliberate
+            # headroom under the free ceiling. `rpd` stays the owner-measured
+            # figure; enforcement takes the stricter of the two.
+            "flash-lite": {"rpm": 15, "tpm": 250_000, "rpd": 500,
+                           "rpd_cap": 400},
             "transcribe-live": {"rpm": 0, "tpm": 20_000, "rpd": 0},
             "transcribe-batch": {"rpm": None, "tpm": None, "rpd": 25},
         },
@@ -281,6 +300,7 @@ DEFAULTS: dict = {
         "transcribe_live_tpm": 20_000,
         "transcribe_live_rpd": 0,
         "transcribe_batch_rpd": 25,
+        "flash_lite_rpd_cap": 400,   # §4.1 chat/intent config cap (under the 500 free)
         "max_requests_per_day": 1200,
         "max_requests_per_minute": 12,
     },
@@ -468,6 +488,11 @@ DEFAULTS: dict = {
         "reconnect_replay_s": 30,
         # Rotate before the ~10min Live connection lifetime (§3.5 table).
         "live_session_max_s": 540,
+        # WP0 watchdog (§4.2): any PTT/live session still holding the mic at
+        # this ceiling is auto-closed with a visible marker — a missed release
+        # bind once held the mic ~9 minutes. Five minutes, by spec; a config
+        # key so the ceiling is checkable, never guessable.
+        "ptt_session_ceiling_s": 300.0,
         "save_audio": True,               # disk is free; re-transcription isn't
         "inbox_dir": "",
         "copy_to_clipboard": True,        # wl-copy only (Wayland, §3.3)
@@ -1103,6 +1128,7 @@ def validate_config(config: Config) -> dict:
     for qkey in ("max_requests_per_day", "max_requests_per_minute",
                  "flash_rpm", "flash_tpm", "flash_rpd",
                  "flash_lite_rpm", "flash_lite_tpm", "flash_lite_rpd",
+                 "flash_lite_rpd_cap",
                  "transcribe_live_rpm", "transcribe_live_tpm", "transcribe_live_rpd",
                  "transcribe_batch_rpd"):
         _number_error(errors, f"[quota] {qkey}", quota.get(qkey), minimum=0)
@@ -1115,9 +1141,9 @@ def validate_config(config: Config) -> dict:
                 errors.append(f"[quota.models.{mname}] must be a table")
                 continue
             for key in mrow:
-                if key not in ("rpm", "tpm", "rpd"):
+                if key not in ("rpm", "tpm", "rpd", "rpd_cap"):
                     warnings.append(f"unknown key [quota.models.{mname}] {key}")
-            for rkey in ("rpm", "tpm", "rpd"):
+            for rkey in ("rpm", "tpm", "rpd", "rpd_cap"):
                 rval = mrow.get(rkey)
                 if rval in (None, "unlimited"):
                     continue
@@ -1136,7 +1162,7 @@ def validate_config(config: Config) -> dict:
             prefix = _FLAT_FOR.get(str(mname).lower().replace("_", "-"))
             if not prefix or not isinstance(mrow, dict):
                 continue
-            for rkey in ("rpm", "tpm", "rpd"):
+            for rkey in ("rpm", "tpm", "rpd", "rpd_cap"):
                 rval, fval = mrow.get(rkey), quota.get(f"{prefix}_{rkey}")
                 if _is_number(rval) and _is_number(fval) and rval != fval:
                     warnings.append(

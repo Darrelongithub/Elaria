@@ -2,6 +2,11 @@
 Description=Elaria console panel (Quickshell, one shared conversation)
 After=graphical-session.target assistant.service
 PartOf=graphical-session.target
+# §4.4: same hardening as assistant.service — a start-limit hit stops the unit
+# quietly (never a restart storm) and the fallback script emits ONE
+# rate-limited notification (at most 1 per 10 minutes).
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -9,7 +14,8 @@ Type=simple
 ExecStart=/usr/bin/quickshell -p %h/Elaria/ui/quickshell/console
 ExecStopPost=%h/Elaria/scripts/event-console-fallback.sh
 Restart=on-failure
-RestartSec=3
+RestartSec=5
+StandardOutput=journal
 
 [Install]
 WantedBy=graphical-session.target

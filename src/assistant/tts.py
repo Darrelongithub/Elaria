@@ -41,6 +41,7 @@ from typing import Protocol
 
 from .config import canonical_voices, resolve_voice
 from .config import voice_model as config_voice_model
+from .journal_log import log_event
 from .proc import child_kwargs
 
 # The ack strings are load-bearing for audibility, not style. This voice cannot
@@ -625,11 +626,19 @@ class SpeechService:
             audio = client.generate_voice(text, correlation_id="voice")
         except Exception as exc:
             self.last_voice_error = f"gemini native audio failed: {exc}"
+            # §4.8: a synthesis failure is a visible marker — reported silence,
+            # never a covered-over local voice. The text is kept in the journal.
+            log_event("tts.failed", level="error", verdict="failed",
+                      detail=(f"gemini native audio failed: {exc} — reported "
+                              "silence; the local voice stays dormant"))
             raise TtsUnavailable(f"no speech for this turn: {exc}. The local voice is "
                                  "dormant by amendment 2026-10-20 and will not cover a "
                                  "cloud failure") from exc
         self.last_voice_error = None
         self.write_wav(path, audio["pcm"], audio.get("sample_rate", 24000))
+        log_event("tts.synthesised", verdict="synthesised",
+                  detail=(f"gemini-native-audio wrote {path} "
+                          f"({len(audio.get('pcm', b'')) // 2} samples)"))
         return SpeechResult(text=text, backend="gemini-native-audio",
                             voice_id=str(request["voice_name"]), audio_path=str(path),
                             cached=False, local=False, cloud_voice=True)
@@ -659,6 +668,10 @@ class SpeechService:
         if cached:
             # A cached Flare render is still a cloud voice, not a local one: the
             # flags follow the route, never the dataclass default.
+            # §4.8: cache hits are their own event (WP1 splits the hit ratio
+            # boilerplate vs generated text; WP0 logs the hit).
+            log_event("tts.cached", verdict="cached",
+                      detail=f"{key_name} cache hit at {path}")
             return SpeechResult(text=text, backend=key_name,
                                 voice_id=(self.voice_identity()["effective"]
                                           if route == "gemini" else backend.voice_id),
@@ -666,7 +679,15 @@ class SpeechService:
                                 local=route != "gemini", cloud_voice=route == "gemini")
         if route == "gemini":
             return self._speak_with_gemini(text, path)
-        backend.synthesize(text, path)
+        try:
+            backend.synthesize(text, path)
+        except Exception as exc:
+            log_event("tts.failed", level="error", verdict="failed",
+                      detail=(f"{backend.name} synthesis failed: {exc} — "
+                              "reported silence; no substitution"))
+            raise
+        log_event("tts.synthesised", verdict="synthesised",
+                  detail=f"{backend.name} wrote {path}")
         return SpeechResult(text=text, backend=backend.name, voice_id=backend.voice_id,
                             audio_path=str(path), cached=False)
 

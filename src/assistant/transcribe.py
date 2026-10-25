@@ -58,6 +58,7 @@ from .clipboard import copy_text
 from .config import DEFAULTS
 from .cost import iso_now, shadow_cost_usd
 from .inbox import write_inbox_note
+from .journal_log import log_event
 from .live_client import (
     DuplexLiveTransport,
     LiveEvent,
@@ -313,11 +314,21 @@ class DictationService:
             result.queued_job_ids.append(job_id)
             result.notes.append(
                 f"low-confidence offline transcript queued for Gemini redo (job #{job_id})")
+            # §4.8: deferred work is visible, not silent — the audio path
+            # ends in a queue row, and the marker names the job.
+            log_event("transcription.deferred", session_id=result.session_id,
+                      verdict="deferred",
+                      detail=(f"low-confidence transcript queued for cloud "
+                              f"redo (job #{job_id}); audio kept at "
+                              f"{result.audio_path}"))
         if (offline and skip_cleanup and self.queue_cleanup_offline
                 and result.raw_text.strip()):
             job_id = self.offline_queue.enqueue_cleanup(result.transcript_id)
             result.queued_job_ids.append(job_id)
             result.notes.append(f"transcript cleanup queued for reconnect (job #{job_id})")
+            log_event("transcription.deferred", session_id=result.session_id,
+                      verdict="deferred",
+                      detail=f"cleanup queued for reconnect (job #{job_id})")
         return result
 
     # -- public entry points ---------------------------------------------------
@@ -735,6 +746,14 @@ class DictationService:
                         # spin the rotation); duplicates from the replayed tail are
                         # folded when the finals are joined.
                         collected[:] = [e for e in collected if e.type != "go_away"]
+                        # §4.8: GoAway is a graceful close plus a visible marker,
+                        # never a silent drop. The session rotates; captured audio
+                        # is kept (prime directive).
+                        log_event("goaway.close", level="warn",
+                                  session_id=str(session_id or ""),
+                                  verdict="closed",
+                                  detail=("server GoAway — graceful close, session "
+                                          "rotating; captured audio kept"))
                         raise LiveUnavailable("server GoAway — rotating session")
                     await transport.send_audio(frame)
                     if level >= self.vad_threshold:
@@ -959,6 +978,15 @@ class DictationService:
                 except Exception as exc:
                     self._log("dictate.silent_close_log_failed", session_id=session_id,
                               error=f"{type(exc).__name__}: {exc}"[:200])
+                # §4.8 schema line: the silence verdict with the measured peak
+                # — the sensor for "she heard nothing" (kept audio: none needed,
+                # but the transcript journal still holds the empty session).
+                log_event("silence.verdict", session_id=session_id,
+                          peak=round(session_peak, 4), verdict="silence",
+                          detail=(f"{HEARD_NOTHING} — node {capture_label}, "
+                                  f"{captured_bytes} bytes, peak "
+                                  f"{round(session_peak, 4)} under floor "
+                                  f"{round(self.silence_floor, 4)}"))
 
             if collector is not None and not collector.done():
                 self._log("dictate.collector_cancel_start", session_id=session_id)
@@ -1173,11 +1201,24 @@ class DictationService:
                              "is retained for retry."),
                  "audio_path": str(audio_path) if audio_path else None,
                  "session_id": session_id})
+            # §4.8: a failure in the audio path is a visible marker line that
+            # keeps the recording, referenced by path (prime directive).
+            log_event("transcription.deferred", level="warn",
+                      session_id=session_id, verdict="no_final",
+                      detail=("no final transcript returned — audio kept at "
+                              f"{audio_path if audio_path else '(memory only)'}, "
+                              "retained for retry"))
         else:
             await emit_lifecycle_event(
                 "dictate.transcript_final_emit",
                 {"event": "transcript.final", "text": shown,
                  "inbox_path": result.inbox_path, "session_id": session_id})
+            # §4.8: the transcription landed — text committed, audio kept.
+            log_event("transcription.landed", session_id=session_id,
+                      verdict="landed",
+                      detail=(f"{len(shown)} chars committed"
+                              + (f"; audio kept at {audio_path}" if audio_path
+                                 else "")))
         await emit_lifecycle_event(
             "dictate.session_ended_emit",
             {"event": "session.ended", "session_id": session_id,
