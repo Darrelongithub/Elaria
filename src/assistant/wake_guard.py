@@ -113,18 +113,19 @@ class OnnxKeywordModel:
         path = str(path or "").strip()
         if not path:
             raise KeywordModelUnavailable(
-                "refused: no keyword model configured ([hotword] keyword_model). "
+                "wake word paused: no keyword model configured ([hotword] keyword_model). "
                 "Acoustic arming needs a real .onnx keyword model.")
         if not Path(path).is_file():
             raise KeywordModelUnavailable(
-                f"refused: no keyword model (.onnx) at {path!r} — acoustic "
+                f"wake word paused: no keyword model (.onnx) at {path!r} — acoustic "
                 "arming will not run on an energy/loudness fallback.")
         try:
             import onnxruntime  # noqa: F401  # hardware-side extra
-        except ImportError as exc:
+        except (ImportError, OSError) as exc:
             raise KeywordModelUnavailable(
-                "refused: onnxruntime is not installed — cannot run the "
-                "keyword model; energy fallback is not a wake path") from exc
+                "wake word paused: onnxruntime is unavailable — "
+                "run `uv sync --extra voice` before loading the .onnx keyword "
+                "model; energy fallback is not a wake path") from exc
         return cls(path)
 
     def score_window(self, pcm: bytes) -> float:

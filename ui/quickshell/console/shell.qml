@@ -33,11 +33,12 @@
 // posture and typography only.
 //
 // REFERENCE BUILD (owner, 2026-10-25): Quickshell 0.2.1, revision dacfa9de,
-// on Fedora with Qt 6.11.2. Qt is >= 6.3, so the two inline `component`
-// blocks below ARE supported on this build; the hardware failure was a bare
-// `topMargin` on a Row, which this Quickshell revision does not expose. Use
-// properties the owning type declares (Controls padding, anchor margins),
-// never a Qt/Controls name guessed from a newer API surface.
+// on Fedora with qt6-qtbase 6.11.2-3.fc44. Qt is >= 6.3, so the two inline
+// `component` blocks below ARE supported. The gate failures were properties,
+// not inline components: Row.topMargin, Text.leftPadding (static scan), then
+// TextArea.lineHeight. Use anchor margins and Text-owned leading; TextArea
+// inherits TextEdit, not Text. The fail-closed owner map covers EVERY type and
+// binding here, but only the owner's ladder ON THE PR BRANCH proves loading.
 import QtQuick
 import QtQuick.Controls
 import Quickshell
@@ -801,14 +802,36 @@ ShellRoot {
                                 TextArea {
                                     id: segmentEditor
                                     width: segmentEditorDelegate.width
-                                    height: Math.max(68, implicitHeight)
+                                    height: Math.max(68, activeFocus ? implicitHeight
+                                        : segmentProse.implicitHeight + topPadding + bottomPadding)
                                     text: segmentEditorDelegate.baseText
+                                    textFormat: TextEdit.PlainText
                                     wrapMode: TextEdit.Wrap
                                     selectByMouse: true
-                                    color: panel.ink
+                                    color: activeFocus ? panel.ink : "transparent"
                                     font.pixelSize: 15
                                     font.family: "serif"
-                                    lineHeight: 1.5
+                                    // TextArea inherits TextEdit, not Text: no lineHeight
+                                    // on the reference build. The unfocused page owns its
+                                    // leading in Text; focus reveals the SAME plain-text
+                                    // editor with native caret/selection line metrics.
+                                    // Text handles no pointer events, so clicks still
+                                    // reach the editor. No rich-text conversion or extra
+                                    // save path; show pending edits, not a stale baseText.
+                                    Text {
+                                        id: segmentProse
+                                        x: segmentEditor.leftPadding
+                                        y: segmentEditor.topPadding
+                                        width: segmentEditor.width - segmentEditor.leftPadding
+                                            - segmentEditor.rightPadding
+                                        visible: !segmentEditor.activeFocus
+                                        text: segmentEditor.text
+                                        textFormat: Text.PlainText
+                                        font: segmentEditor.font
+                                        color: panel.ink
+                                        wrapMode: Text.Wrap
+                                        lineHeight: 1.5
+                                    }
                                     background: Rectangle {
                                         color: "#2f2919"; radius: 8
                                         border.width: 1

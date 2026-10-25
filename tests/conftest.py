@@ -46,9 +46,9 @@ def config():
 def pytest_pyfunc_call(pyfuncitem):
     """Run `async def` test functions via asyncio.run — no plugin dependency.
 
-    The suite is deliberately stdlib-only (pyproject dev extras are pytest +
-    ruff). Sync tests are untouched; coroutine tests simply await inside the
-    loop asyncio.run provides.
+    The suite needs no runtime models or API key (the default dev group is
+    pytest + ruff). Sync tests are untouched; coroutine tests simply await
+    inside the loop asyncio.run provides.
     """
     import asyncio
     import inspect

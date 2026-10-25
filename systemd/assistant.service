@@ -8,6 +8,12 @@ Type=notify
 # The key lives ONLY in this file (0600), outside the repo (Step 1).
 # Optional at Phase 0: no file => GEMINI_MODE=mock, daemon still runs.
 EnvironmentFile=-%h/.config/assistant/gemini.env
+# Install/update from ~/Elaria: uv sync (runtime + dev are the default set).
+# ~/.local/bin/assistd must link to ~/Elaria/.venv/bin/assistd; see GETTING-STARTED.md.
+# Optional ONLY: uv sync --extra embeddings (semantic recall),
+# uv sync --extra diarize (speaker post-pass), uv sync --extra voice (ONNX wake).
+# Repeat chosen extra flags on updates. Wake needs a real .onnx + ECAPA scorer;
+# missing inference/model = wake word paused, not a daemon startup dependency.
 ExecStart=%h/.local/bin/assistd
 Restart=on-failure
 RestartSec=3

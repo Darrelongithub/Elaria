@@ -25,6 +25,7 @@ import json
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,7 @@ def _classify(source: str) -> list[int]:
     """
     kinds = [CODE] * len(source)
     state, prev = CODE, ""
+    block_comment = False
     index, length = 0, len(source)
     while index < length:
         char = source[index]
@@ -73,9 +75,12 @@ def _classify(source: str) -> list[int]:
         if state == CODE:
             if char == "/" and nxt == "/" or char == "/" and nxt == "*":
                 state = COMMENT
+                block_comment = nxt == "*"
                 kinds[index] = kinds[index + 1] = COMMENT
                 index += 1
-            elif char == "/" and prev in "([,:!&|?{;=":
+            elif char == "/" and (prev in "([,:!&|?{;="
+                                  or re.search(r"\b(?:return|throw|case|yield)\s*$",
+                                               source[:index])):
                 state = REGEX
                 kinds[index] = REGEX
             elif char in "\"'":
@@ -101,12 +106,12 @@ def _classify(source: str) -> list[int]:
                 state, prev = CODE, char
         elif state == COMMENT:
             kinds[index] = COMMENT
-            if char == "\n":
+            if char == "\n" and not block_comment:
                 state, prev = CODE, "\n"
                 kinds[index] = CODE
-            elif char == "*" and nxt == "/":
-                kinds[index + 1] = CODE
-                state, prev, index = CODE, "*", index + 1
+            elif block_comment and char == "*" and nxt == "/":
+                kinds[index + 1] = COMMENT
+                state, prev, index = CODE, "", index + 1
         index += 1
     return kinds
 
@@ -564,178 +569,226 @@ def test_the_readme_describes_the_page_she_actually_sees():
     assert "Win+Shift+F2" in readme or "bind" in readme.lower()
 
 
-# -- the owner's Quickshell 0.2.1 / Qt 6.11.2 build (hardware gate 2026-10-25) --
-# The console crashed on a bare `topMargin` assigned to a Row: no Qt Quick Item
-# owns that name. Anchor margins are stable on Item-derived types; padding and
-# inset names belong only to Controls. Keep this deliberately small: layout
-# names whose ownership moved between Qt Quick/Controls releases, not every
-# property in the file.
-_CONTROL_TYPES = frozenset({
-    "Button", "TextField", "TextArea", "CheckBox", "Control", "Popup", "Pane",
+# -- complete, fail-closed console property audit (GATE-FIX 2, 2026-10-25) --
+# Reference build: quickshell 0.2.1 (rev dacfa9de, Fedora),
+# qt6-qtbase 6.11.2-3.fc44.
+#
+# This is a REVIEWED SUBSET, not an implementation of Qt's type system. Every
+# instantiated type and every declarative binding must resolve here; adding a
+# type/member requires checking its owner, not adding another fragile-name
+# denylist. QtQuick's items/animations and QtQuick.Controls' templates were
+# checked against qtdeclarative v6.11.2 (src/quick, src/quicktemplates); Quickshell
+# against dacfa9de (src/window/panelinterface.hpp, windowinterface.hpp,
+# src/wayland/wlr_layershell, src/io/process.hpp, src/io/datastream.hpp).
+#
+# Preserve PR #21's conservative anchor-only policy for Text spacing (no bare
+# Text.leftPadding), even where another Qt build might expose padding. Crucially
+# TextArea inherits TextEdit, NOT Text: neither editor owns lineHeight.
+# PanelWindow is NOT an Item: its anchors are edge booleans, not Item anchors.
+# Inline component bases/properties are read from source, not guessed by name.
+# The parser visits semicolon bindings, grouped/attached members and Behavior
+# targets as well as ordinary multiline bindings. JS objects, strings, comments
+# and regexes are not QML owners. This remains an aid, NOT the branch ladder.
+_FONT_MEMBERS = frozenset({
+    "font", "font.pixelSize", "font.family", "font.letterSpacing", "font.italic", "font.bold",
 })
-# Qt Quick Items/positioners/Text do not inherit Controls padding. Keep the
-# ownership table conservative: only controls and control-derived types here.
-_PADDING_OWNERS = _CONTROL_TYPES
-_INSET_OWNERS = _CONTROL_TYPES
-# Anchor attached properties only exist on QQuickItem-style surfaces. Quickshell
-# PanelWindow is listed separately because it owns the layer-shell anchor group.
-_ANCHOR_OWNERS = frozenset({
-    "Item", "Rectangle", "Column", "Row", "Grid", "Flow", "Text",
-    "TextEdit", "TextInput", "Flickable", "PanelWindow",
-}) | (_CONTROL_TYPES - {"Popup"})
-VERSION_FRAGILE_PROPERTY_OWNERS = {
-    "topMargin": frozenset(),          # never an Item/positioner property
-    "bottomMargin": frozenset(),
-    "leftMargin": frozenset(),
-    "rightMargin": frozenset(),
-    "margins": frozenset({"PanelWindow"}),  # Quickshell layer-margin group
-    "padding": _PADDING_OWNERS,
-    "topPadding": _PADDING_OWNERS,
-    "bottomPadding": _PADDING_OWNERS,
-    "leftPadding": _PADDING_OWNERS,
-    "rightPadding": _PADDING_OWNERS,
-    "topInset": _INSET_OWNERS,
-    "bottomInset": _INSET_OWNERS,
-    "leftInset": _INSET_OWNERS,
-    "rightInset": _INSET_OWNERS,
+_PADDING_MEMBERS = frozenset({"padding", "topPadding", "bottomPadding", "leftPadding", "rightPadding"})
+_INSET_MEMBERS = frozenset({"topInset", "bottomInset", "leftInset", "rightInset"})
+_ITEM_ANCHORS = frozenset("anchors." + name for name in (
+    "fill", "top", "bottom", "left", "right", "horizontalCenter", "verticalCenter", "centerIn",
+    "margins", "topMargin", "bottomMargin", "leftMargin", "rightMargin",
+))
+
+# (base, own reviewed members). Intermediate bases make ownership explicit;
+# the inventory test below pins ALL types actually used by shell.qml.
+QML_PROPERTY_OWNERS = {
+    "QtObject": (None, {"id", "Component.onCompleted"}),
+    "ShellRoot": ("QtObject", set()),
+    "PanelWindow": ("QtObject", {
+        "implicitWidth", "implicitHeight", "color", "exclusiveZone",
+        "anchors.top", "anchors.bottom", "anchors.left", "anchors.right",
+        "margins.top", "margins.bottom", "margins.left", "margins.right",
+        "WlrLayershell.layer", "WlrLayershell.namespace", "WlrLayershell.keyboardFocus",
+    }),
+    "Item": ("QtObject", {
+        "x", "y", "width", "height", "implicitWidth", "implicitHeight", "visible", "opacity",
+        "enabled", "clip", "onActiveFocusChanged",
+    } | _ITEM_ANCHORS),
+    "Rectangle": ("Item", {"color", "radius", "border.width", "border.color", "gradient"}),
+    "Column": ("Item", {"spacing"}),
+    "Row": ("Item", {"spacing"}),
+    "Text": ("Item", {
+        "text", "textFormat", "color", "wrapMode", "elide", "lineHeight", "lineHeightMode",
+        "horizontalAlignment", "verticalAlignment",
+    } | _FONT_MEMBERS),
+    "TextEdit": ("Item", {
+        "text", "textFormat", "color", "wrapMode", "selectByMouse", "onTextChanged",
+    } | _FONT_MEMBERS | _PADDING_MEMBERS),
+    "TextInput": ("Item", {
+        "text", "color", "selectByMouse", "onTextChanged", "onAccepted",
+    } | _FONT_MEMBERS | _PADDING_MEMBERS),
+    "TextArea": ("TextEdit", {"background", "placeholderText", "placeholderTextColor"}
+                 | _INSET_MEMBERS),
+    "TextField": ("TextInput", {"background", "placeholderText", "placeholderTextColor"}
+                  | _INSET_MEMBERS),
+    "Control": ("Item", {"background", "contentItem"}
+                | _FONT_MEMBERS | _PADDING_MEMBERS | _INSET_MEMBERS),
+    "AbstractButton": ("Control", {"text", "onClicked", "checked"}),
+    "Button": ("AbstractButton", {"highlighted"}),
+    "CheckBox": ("AbstractButton", set()),
+    # Retain the negative Popup.anchors regression: Popup is not an Item.
+    "Popup": ("QtObject", _PADDING_MEMBERS | _INSET_MEMBERS),
+    "Flickable": ("Item", {"contentWidth", "contentHeight", "contentY", "boundsBehavior"}),
+    "Repeater": ("Item", {"model", "delegate"}),
+    "Gradient": ("QtObject", set()),
+    "GradientStop": ("QtObject", {"position", "color"}),
+    "Behavior": ("QtObject", {"enabled"}),
+    "NumberAnimation": ("QtObject", {"duration", "easing.type"}),
+    "ColorAnimation": ("QtObject", {"duration", "easing.type"}),
+    "Timer": ("QtObject", {"interval", "running", "repeat", "onTriggered"}),
+    "Process": ("QtObject", {"command", "running", "stdout", "stderr", "onExited"}),
+    "SplitParser": ("QtObject", {"onRead"}),
 }
 
 
-def _qml_blocks(source: str):
-    """(code-only view, object blocks, inline component bases/declarations).
+@dataclass
+class _QmlBlock:
+    type_name: str
+    custom: str | None
+    opened: int
+    closed: int
+    target: str | None = None
 
-    A small structural parser, not a QML engine: QML object heads look like
-    ``Type {`` or ``component Name: Base {``. Comments/strings/regex literals
-    are masked first, then braces are matched so an assignment is checked only
-    against the object that directly owns it.
-    """
-    kinds = _classify(source)
-    skeleton = "".join(
-        char if kind == CODE else ("\n" if char == "\n" else " ")
-        for char, kind in zip(source, kinds)
-    )
-    matching: dict[int, int] = {}
-    stack: list[int] = []
+
+def _qml_blocks(source: str):
+    """Mask literals; find objects, including inline components/Behavior on x."""
+    skeleton = _views(source)[1]
+    matching, stack = {}, []
     for index, char in enumerate(skeleton):
         if char == "{":
             stack.append(index)
         elif char == "}" and stack:
             matching[stack.pop()] = index
-
     head = re.compile(
-        r"(?:(component)\s+([A-Za-z_]\w*)\s*:\s*)?"
-        r"([A-Z][A-Za-z0-9_.]*)\s*\{"
+        r"\b(?:component\s+(?P<custom>[A-Za-z_]\w*)\s*:\s*)?"
+        r"(?P<type>[A-Z][\w.]*)"
+        r"(?:\s+on\s+(?P<target>[A-Za-z_][\w.]*))?\s*\{"
     )
     blocks = []
-    component_bases: dict[str, str] = {}
     for match in head.finditer(skeleton):
-        opened = skeleton.index("{", match.start())
-        if opened not in matching:
-            continue
-        custom = match.group(2) if match.group(1) else None
-        if custom is not None:
-            component_bases[custom] = match.group(3)
-        blocks.append((match.group(3), custom, opened, matching[opened]))
-
-    declared_by_component: dict[str, set[str]] = {}
-    declaration = re.compile(
-        r"(?m)^[ \t]*(?:readonly[ \t]+)?property[ \t]+"
-        r"[A-Za-z_][\w.<>]*[ \t]+([A-Za-z_]\w*)[ \t]*[:=]"
-    )
-    for _type_name, custom, opened, closed in blocks:
-        if custom is None:
-            continue
-        body = skeleton[opened + 1:closed]
-        depth, depths = 0, []
-        for char in body:
-            depths.append(depth)
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth = max(0, depth - 1)
-        declared_by_component[custom] = {
-            match.group(1) for match in declaration.finditer(body)
-            if depths[match.start()] == 0
-        }
-    return skeleton, blocks, component_bases, declared_by_component
+        opened = match.end() - 1
+        if opened in matching:
+            blocks.append(_QmlBlock(match["type"], match["custom"], opened,
+                                    matching[opened], match["target"]))
+    return skeleton, blocks, matching
 
 
-def _body_assignments(skeleton: str, opened: int, closed: int):
-    """Direct ``property: value`` assignments inside one object block."""
-    body = skeleton[opened + 1:closed]
+def _depths(body: str) -> list[int]:
+    """Skip nested QML/JS blocks, arrays AND parenthesized JS object literals."""
     depth, depths = 0, []
     for char in body:
         depths.append(depth)
-        if char == "{":
+        if char in "([{":
             depth += 1
-        elif char == "}":
-            depth = max(0, depth - 1)
-    assignment = re.compile(
-        r"(?m)^([ \t]*)([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)[ \t]*:"
+        elif char in ")]}":
+            depth -= 1
+    return depths
+
+
+def _declared_properties(skeleton: str, block: _QmlBlock) -> set[str]:
+    body = skeleton[block.opened + 1:block.closed]
+    depths = _depths(body)
+    declaration = re.compile(
+        r"\b(?:(?:readonly|required|default)\s+)*property\s+"
+        r"[A-Za-z_][\w.<>]*\s+([A-Za-z_]\w*)"
     )
-    for match in assignment.finditer(body):
-        if depths[match.start()] != 0:
-            continue  # nested object or a JavaScript block
-        line_start = body.rfind("\n", 0, match.start()) + 1
-        if re.match(r"[ \t]*(?:readonly[ \t]+)?property\b", body[line_start:]):
-            continue  # a declaration, not an assignment
-        yield match.group(2), opened + 1 + match.start(2)
+    return {match[1] for match in declaration.finditer(body) if depths[match.start()] == 0}
+
+
+def _body_assignments(skeleton: str, opened: int, closed: int, matching, prefix=""):
+    """(path, source position, is_group), including inline/grouped bindings.
+
+    A group is recursed into, an object/JS value is not. Its child QML objects
+    are visited separately with their OWN owner. A closing object brace may
+    also separate two bindings, without a semicolon.
+    """
+    body = skeleton[opened + 1:closed]
+    depths = _depths(body)
+    entry = re.compile(r"(?:^|[;\n}])\s*([A-Za-z_][\w.]*)\s*([:{])")
+    for match in entry.finditer(body):
+        if depths[match.start(1)] != 0:
+            continue
+        name, separator = match[1], match[2]
+        index = opened + 1 + match.start(1)
+        if separator == "{":
+            # Uppercase heads are object types, not groups. Attached property
+            # groups have the same owner as a dotted attached assignment.
+            if name[0].isupper() and name not in {"WlrLayershell", "Component"}:
+                continue
+            group_open = opened + 1 + match.end() - 1
+            yield prefix + name, index, True
+            yield from _body_assignments(skeleton, group_open, matching[group_open],
+                                         matching, prefix + name + ".")
+        else:
+            yield prefix + name, index, False
+
+
+def _reviewed_members(type_name: str, component_bases, component_properties,
+                      trail=()) -> set[str]:
+    if type_name in trail:
+        raise ValueError(f"cyclic QML base {type_name}")
+    if type_name in component_bases:
+        base = component_bases[type_name]
+        members = component_properties[type_name]
+    elif type_name in QML_PROPERTY_OWNERS:
+        base, members = QML_PROPERTY_OWNERS[type_name]
+    else:
+        raise ValueError(f"unreviewed QML type {type_name}")
+    inherited = (_reviewed_members(base, component_bases, component_properties,
+                                  (*trail, type_name)) if base else set())
+    return inherited | set(members)
 
 
 def _fragile_property_assignments(source: str | None = None) -> list[str]:
-    """Version-fragile names assigned to types that do not own them."""
+    """Fail closed on ANY unreviewed owner/member, not just known bad names."""
     text = qml_source() if source is None else source
-    skeleton, blocks, component_bases, declared_by_component = _qml_blocks(text)
-    errors: list[str] = []
-    for type_name, custom, opened, closed in blocks:
-        resolved = component_bases.get(type_name, type_name)
-        declared = set(declared_by_component.get(type_name, set()))
-        if custom is not None:
-            declared.update(declared_by_component.get(custom, set()))
-        for path, index in _body_assignments(skeleton, opened, closed):
-            parts = path.split(".")
-            name = parts[0]
-            if name == "anchors":
-                # Anchor margins are stable, but only on Item-derived objects
-                # (plus Quickshell's PanelWindow layer-shell anchor group).
-                if resolved not in _ANCHOR_OWNERS:
-                    errors.append(
-                        f"line {text.count(chr(10), 0, index) + 1}: "
-                        f"{type_name} does not own anchors.{parts[-1]}"
-                    )
+    skeleton, blocks, matching = _qml_blocks(text)
+    # Do not mistake an attached group for a new object type.
+    objects = [block for block in blocks if block.type_name not in {"WlrLayershell", "Component"}]
+    bases = {block.custom: block.type_name for block in objects if block.custom}
+    properties = {block.custom: _declared_properties(skeleton, block)
+                  for block in objects if block.custom}
+    errors = []
+    for block in objects:
+        owner = block.custom or block.type_name
+        try:
+            members = _reviewed_members(owner, bases, properties)
+        except ValueError as exc:
+            errors.append(f"line {text.count(chr(10), 0, block.opened) + 1}: {exc}")
+            continue
+        declared = _declared_properties(skeleton, block) | properties.get(owner, set())
+        members |= declared | {f"on{name[0].upper()}{name[1:]}Changed" for name in declared}
+        assignments = list(_body_assignments(skeleton, block.opened, block.closed, matching))
+        # `Behavior on x` writes x on its enclosing owner; the Behavior's own
+        # members and child animations are still scanned separately.
+        for child in objects:
+            if not child.target or not block.opened < child.opened < block.closed:
                 continue
-            if len(parts) > 1:
-                # `margins.top` is a GROUP assignment: check its owner. A
-                # fragile leaf hung off an unrelated group is not ownership.
-                leaf = parts[-1]
-                if name in VERSION_FRAGILE_PROPERTY_OWNERS:
-                    owners = VERSION_FRAGILE_PROPERTY_OWNERS[name]
-                    if name in declared or resolved in owners:
-                        continue
-                    errors.append(
-                        f"line {text.count(chr(10), 0, index) + 1}: "
-                        f"{type_name} does not own group {name}.{parts[1]}"
-                    )
-                elif leaf in VERSION_FRAGILE_PROPERTY_OWNERS:
-                    errors.append(
-                        f"line {text.count(chr(10), 0, index) + 1}: "
-                        f"{name}.{leaf} is not an owned group property"
-                    )
-                continue
-            if name not in VERSION_FRAGILE_PROPERTY_OWNERS:
-                continue
-            owners = VERSION_FRAGILE_PROPERTY_OWNERS[name]
-            if name in declared or resolved in owners:
-                continue
-            errors.append(
-                f"line {text.count(chr(10), 0, index) + 1}: "
-                f"{type_name} does not own {name}"
-            )
+            parents = [parent for parent in objects
+                       if parent.opened < child.opened < parent.closed]
+            if max(parents, key=lambda parent: parent.opened) is block:
+                assignments.append((child.target, child.opened, False))
+        for path, index, group in assignments:
+            allowed = (any(member.startswith(path + ".") for member in members)
+                       if group else path in members)
+            if not allowed:
+                errors.append(f"line {text.count(chr(10), 0, index) + 1}: "
+                              f"{owner} does not own {path} in the reviewed property map")
     return errors
 
 
 def test_the_reference_build_has_no_version_fragile_property_assignments():
-    """Hardware repro: shell.qml:410 assigned Row.topMargin on Quickshell 0.2.1."""
+    """Both hardware repros (Row.topMargin, TextArea.lineHeight), plus ALL owners."""
     assert _fragile_property_assignments() == []
 
 
@@ -778,3 +831,122 @@ def test_the_hardware_gate_records_the_reference_build_and_ladder_first():
     assert "quickshell 0.2.1" in doc
     assert "dacfa9de" in doc
     assert "qt6-qtbase 6.11.2-3.fc44" in doc
+
+
+@pytest.mark.parametrize("source, owner, property_name", [
+    ("Row { topMargin: 2 }", "Row", "topMargin"),
+    ('Text { text: "hello"; leftPadding: 4 }', "Text", "leftPadding"),
+    ("TextArea { lineHeight: 1.5 }", "TextArea", "lineHeight"),
+    ("TextArea {\n    lineHeight: 1.5\n}", "TextArea", "lineHeight"),
+    ("Text { lineHieght: 1.5 }", "Text", "lineHieght"),
+    ('Process { command: ["assist"]; color: "red" }', "Process", "color"),
+    ("PanelWindow { anchors { top: true; topMargin: 2 } }", "PanelWindow", "anchors.topMargin"),
+    ("Text { font { pixelSize: 12; lineHeight: 1.5 } }", "Text", "font.lineHeight"),
+    ("Item { Behavior on lineHeight { NumberAnimation { duration: 20 } } }", "Item", "lineHeight"),
+    ("Item { component Edit: TextArea {}\n Edit { lineHeight: 1.5 } }", "Edit", "lineHeight"),
+])
+def test_the_owner_scan_rejects_unreviewed_members_in_every_binding_form(
+        source, owner, property_name):
+    errors = _fragile_property_assignments(source)
+    assert any(owner in error and property_name in error for error in errors), errors
+
+
+def test_the_owner_scan_fails_closed_for_a_new_qml_type():
+    assert _fragile_property_assignments("FutureWidget { width: 20 }")
+
+
+def test_the_owner_scan_keeps_valid_typography_on_its_owner():
+    assert _fragile_property_assignments("""
+Item {
+    component Prose: Text { lineHeight: 1.5 }
+    Prose { anchors { left: parent.left; leftMargin: 2 }; font.pixelSize: 15 }
+    TextArea { leftPadding: 4; font.family: "serif" }
+    PanelWindow { anchors { top: true }; margins.top: 12 }
+}
+""") == []
+
+
+def test_the_branch_gate_is_the_first_section_and_not_a_post_merge_check():
+    doc = (REPO / "docs" / "console-home" / "hardware-gate.md").read_text()
+    first_section = doc.split("Reference build", 1)[0]
+    assert "No PR touching ui/quickshell/** merges until the owner has run, " \
+           "on the PR branch itself:" in first_section
+    assert "git checkout <branch> && uv sync\n" \
+           "systemctl --user restart elaria-console\n" \
+           "elaria-ladder console        # must reach E before merge" in first_section
+    assert "The ladder on the branch is the only QML truth." in first_section
+
+
+# Every object head, including inline bases and Quickshell/Io types. Behavior
+# was absent from the old regex because its head is `Behavior on property {`.
+CONSOLE_QML_TYPES = frozenset({
+    "ShellRoot", "PanelWindow", "Rectangle", "Gradient", "GradientStop",
+    "Column", "Row", "Item", "Text", "TextArea", "CheckBox", "Flickable", "Repeater",
+    "Button", "TextField", "HomeButton", "NoteField", "Behavior", "ColorAnimation",
+    "NumberAnimation", "Timer", "Process", "SplitParser",
+})
+
+
+def test_every_console_type_and_inline_base_has_a_reviewed_owner_map():
+    skeleton, blocks, _matching = _qml_blocks(qml_source())
+    bases = {block.custom: block.type_name for block in blocks if block.custom}
+    assert bases == {"HomeButton": "Button", "NoteField": "TextField"}
+    inventory = {block.type_name for block in blocks} | set(bases)
+    assert inventory == CONSOLE_QML_TYPES
+    assert inventory <= QML_PROPERTY_OWNERS.keys() | bases.keys()
+    declarations = {block.custom: _declared_properties(skeleton, block)
+                    for block in blocks if block.custom}
+    for type_name in inventory:
+        assert "id" in _reviewed_members(type_name, bases, declarations)
+    assert _fragile_property_assignments() == []
+
+
+@pytest.mark.parametrize("type_name", sorted(CONSOLE_QML_TYPES))
+def test_no_console_type_can_silently_ignore_a_new_assignment(type_name):
+    # Mutation test: even an empty object or an animation is not a scan hole.
+    source = qml_source()
+    _skeleton, blocks, _matching = _qml_blocks(source)
+    block = next(block for block in blocks if block.type_name == type_name)
+    changed = source[:block.opened + 1] + "\n unreviewedGateProperty: 1;" \
+        + source[block.opened + 1:]
+    errors = _fragile_property_assignments(changed)
+    assert len(errors) == 1, errors
+    assert "unreviewedGateProperty" in errors[0]
+
+
+def test_the_scan_tracks_local_declarations_without_reading_js_as_qml():
+    source = r'''
+Item {
+    property int topMargin: 2
+    topMargin: 3
+    onTopMarginChanged: { const data = {lineHeight: 6}; }
+    property var data: ({lineHeight: 1.5, object: {leftPadding: 4}})
+    // TextArea { lineHeight: 1.5 }
+    /* This comment must stay a comment over a newline:
+       Text { leftPadding: 4 }
+    */
+    Text { text: "Row { topMargin: 2 }"; lineHeight: 1.5 }
+    component First: Text { property int leftPadding: 2 }
+    component Second: First {}
+    Second { leftPadding: 4; lineHeight: 1.5 }
+    function probe() { return /TextArea { lineHeight: 1.5 }/.test("anything") }
+}
+'''
+    assert _fragile_property_assignments(source) == []
+
+
+def test_the_segment_page_owns_leading_without_changing_plain_text_editing():
+    source = without_comments()
+    skeleton, blocks, matching = _qml_blocks(qml_source())
+    editor = next(block for block in blocks if block.type_name == "TextArea")
+    bindings = {path for path, _, _ in _body_assignments(
+        skeleton, editor.opened, editor.closed, matching)}
+    assert "lineHeight" not in bindings
+    assert "textFormat: TextEdit.PlainText" in source[editor.opened:editor.closed]
+    prose = next(block for block in blocks if block.type_name == "Text"
+                 and "id: segmentProse" in source[block.opened:block.closed])
+    for binding in ("lineHeight: 1.5", "visible: !segmentEditor.activeFocus",
+                    "text: segmentEditor.text", "textFormat: Text.PlainText"):
+        assert binding in source[prose.opened:prose.closed]
+    # No HTML/paragraph conversion reaches the autosave payload.
+    assert "segmentEditorDelegate.pendingText = segmentEditor.text" in source

@@ -245,7 +245,7 @@ def run_doctor(config) -> dict:
     checks: list[dict] = []
     checks.append(_check(
         "python", sys.version_info >= (3, 11),
-        f"{platform.python_version()} ({sys.executable}) — Fedora target is 3.12 via uv"))
+        f"{platform.python_version()} ({sys.executable}) — supported >=3.11; Fedora 44 owner uses 3.14"))
     checks.append(_check(
         "config file", config.config_found,
         f"{config.config_path} {'found' if config.config_found else 'absent — running on defaults; copy config.toml.example'}"))
@@ -407,8 +407,9 @@ def run_doctor(config) -> dict:
     except KeywordModelUnavailable as exc:
         checks.append(_check(
             "hotword keyword model", False,
-            f"{exc} — wake path stays unarmed until a real .onnx exists "
-            "(training plan: docs/hotword-training-plan.md)"))
+            f"{exc} — wake word paused; push-to-talk and dictation remain available. "
+            "Optional setup: `uv sync --extra voice` and a real .onnx model "
+            "(training plan: docs/hotword-training-plan.md)", warn_only=True))
 
     # Phase 7: language pinning + code-switch guard state (§12.4/§12.5).
     from .asr import code_switching_enabled, configured_languages
