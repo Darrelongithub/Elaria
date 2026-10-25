@@ -225,6 +225,18 @@ speaker = 0
 length_scale = 0.92
 notes = "Round-2 polished contrast; not selected."
 
+# SILENCE HOTFIX (hardware 2026-10-24): she must never speak to silence.
+# A dictate/PTT/wake session whose measured input peak stays below this floor
+# IS silence — whatever the transcriber hallucinated from room noise. She
+# closes silently (no voice reply, no TTS, no ladder line), and the journal
+# + console status carry one plain line: "she heard nothing". Same peak
+# mechanism as capture.stats / `assist doctor`'s level check; the owner's
+# speech is proven at peak 0.8624, so real words clear the floor by an order
+# of magnitude. Voice reply path only — event transcription keeps its own
+# no-signal marker ([event], NO_SIGNAL_PEAK) and never reads this floor.
+[voice]
+silence_floor = 0.05
+
 [capture]
 source = "mic"                      # §10.1 OPEN — blueprint recommendation:
                                     # mic first (Phase 1), mix in Phase 6.

@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .capture import frame_rms
+from .config import DEFAULTS
 from .cost import iso_now
 from .ipc import IpcPrincipal
 from .transcribe import SilenceLadder
@@ -439,6 +440,11 @@ class WakeGuard:
     keyword_model: object = None
     phrase: str = "Elaria"
     now: object = None
+    # SILENCE HOTFIX rule 2/3: the energy floor below which audio is silence
+    # ([voice] silence_floor). The wake path's endpointing is the SAME shared
+    # SilenceLadder, so it gets the same floor: below-floor room/call noise
+    # earns no check-in, and an unspoken-into listen window closes silently.
+    silence_floor: float = DEFAULTS["voice"]["silence_floor"]
 
     def __post_init__(self):
         if self.now is None:
@@ -745,7 +751,8 @@ class WakeGuard:
             checkin_after_s=float(self.settings.get("checkin_after_s", 30.0)),
             speech_rms=self.speech_rms,
             resume_s=float(self.settings.get("resume_s", 0.4)),
-            grace_s=float(self.settings.get("grace_s", 8.0)))
+            grace_s=float(self.settings.get("grace_s", 8.0)),
+            floor_peak=float(self.silence_floor))
         self.session = ListenSession(
             session_id=f"wake-{int(time.time() * 1000)}",
             head=head, fresh=bool(fresh), ladder=ladder)

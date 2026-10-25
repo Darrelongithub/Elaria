@@ -32,7 +32,7 @@ from contextvars import ContextVar
 from . import __version__
 from .asr import local_asr_status
 from .capture import PipeWireCapture, SimulatedCapture
-from .config import Config, load_config, load_humour_profile
+from .config import DEFAULTS, Config, load_config, load_humour_profile
 from .console import ConsoleService, SessionService
 from .cost import day_start_iso, iso_now, month_start_iso
 from .disclosure import (
@@ -58,7 +58,7 @@ from .presence import PresenceService
 from .safety import clear_halt, is_halted, set_halt
 from .showoff import ShowoffError, ShowoffService
 from .store import Store
-from .transcribe import DictationService
+from .transcribe import HEARD_NOTHING, DictationService
 from .tts import STANDARD_ACKS, SpeechResult, SpeechService
 
 MAX_PTT_WAIT_S = 90.0
@@ -196,7 +196,12 @@ class Daemon:
                 config.section("hotword").get("ecapa_cmd"),
                 load_reference(config.section("hotword").get("ecapa_reference")),
                 sample_rate=int(config.section("hotword").get("sample_rate", 16000))),
-            phrase=str(config.section("hotword").get("phrase", "Elaria")))
+            phrase=str(config.section("hotword").get("phrase", "Elaria")),
+            # SILENCE HOTFIX: the wake path's endpointing ladder shares the
+            # one energy floor with dictation — below-floor room/call audio
+            # is silence there too, and silence earns no ladder line.
+            silence_floor=float(config.section("voice").get(
+                "silence_floor", DEFAULTS["voice"]["silence_floor"])))
         self._hotword_task: asyncio.Task | None = None
         self.console = ConsoleService(
             config, self.store, presence=self.presence, sessions=self.sessions,
@@ -241,6 +246,11 @@ class Daemon:
         self._ptt_started_at: float | None = None
         self._ptt_released_at: float | None = None
         self._ptt_capture_target: str | None = None
+        # SILENCE HOTFIX rule 1: the plain-language line the last voice
+        # session left for the console ("she heard nothing"), or None. The
+        # durable record is the session journal (session.silent_close);
+        # this is the surface copy `status`/`console.state` carry.
+        self._last_session_line: str | None = None
         self._last_connectivity_mode = self.mode_manager.status(refresh=False).effective_mode
         self._background_tasks: set[asyncio.Task] = set()
         # One bound for every chat call (owner turns and guest turns): a
@@ -759,6 +769,10 @@ class Daemon:
             "capture": capture,
             "capture_target": capture_target,
             "last_capture": last_capture,
+            # SILENCE HOTFIX rule 1: the plain-language line the last voice
+            # session left ("she heard nothing"), or None. The durable
+            # record is the journal (session.silent_close persona events).
+            "last_session_line": self._last_session_line,
             "reply_substitutions": self._reply_substitution_records(limit=5),
             "hotword": {"armed": self.wake_guard.armed,
                         "state": self.wake_guard.state,
@@ -937,7 +951,14 @@ class Daemon:
         return {"connectivity": status.as_dict()}
 
     async def _console_state(self, params: dict) -> dict:
-        return self.console.snapshot()
+        snapshot = self.console.snapshot()
+        # SILENCE HOTFIX rule 1: the console's status line — her own plain
+        # words about the last voice session ("she heard nothing"), so the
+        # next time the console is open the silence is explained. The data
+        # surface carries it; rendering it prettily is the console-home
+        # round's business, not this hotfix's.
+        snapshot["status_line"] = self._last_session_line
+        return snapshot
 
     async def _console_say(self, params: dict) -> dict:
         """A text turn in the SAME conversation a voice turn writes to."""
@@ -1490,8 +1511,15 @@ class Daemon:
 
         async def dictation_sink(event: dict) -> None:
             # Cached audio only: the soft check-in must never wait on TTS.
+            # SILENCE HOTFIX: the check-in itself is now gated at the source
+            # (transcribe.py) — it can only arrive after a real utterance
+            # landed, so a silent session never queues this playback at all.
             if event.get("event") == "session.checkin" and self.speech.cached_ack("checkin"):
                 self._queue_ack_playback("checkin")
+            if event.get("event") == "session.silent_close":
+                # Rule 1: carry the plain line to console status live — a
+                # session that closed itself must not wait for a release.
+                self._last_session_line = str(event.get("message") or HEARD_NOTHING)
             await self.broadcast(event)
 
         # BUG5: wrap source to mute while speaking. BUG6: the Live transport
@@ -1861,7 +1889,11 @@ class Daemon:
                         result["command"] = None
             # The mode is captured at release time: a new dictation started
             # while this one is finishing must not reroute these words.
-            if session_mode == "command" and result["text"].strip():
+            # SILENCE HOTFIX rule 4: a silence-verdict session never reaches
+            # the reply path — no canned filler, no fallback greeting, no
+            # TTS. After the energy-floor discard its text is empty anyway;
+            # `not no_speech` pins the invariant even if that ever changes.
+            if session_mode == "command" and result["text"].strip() and not no_speech:
                 veto = self._command_gate(result)
                 if veto is not None:
                     # Nothing was routed, so nothing was executed. The words are
@@ -1957,6 +1989,14 @@ class Daemon:
                 # _ptt_processing). The result is already retrievable by
                 # session id; the terminal event comes after the switch.
                 self._ptt_finishing.discard(session_id)
+            # SILENCE HOTFIX rule 1: console status carries the last
+            # finished session's plain line — a silence verdict leaves
+            # "she heard nothing"; a session with a real transcript clears
+            # it. A finisher landing under a NEWER session never touches
+            # the newer session's line (same guard as the mode reset).
+            if session_id is not None and self._ptt_session_id == session_id:
+                self._last_session_line = (
+                    HEARD_NOTHING if (result or {}).get("no_speech") else None)
             # A result may finish after the owner has already started the next
             # dictation. It is still retrievable by session id, but it must not
             # set the mode to idle or release a parked mode switch under the
