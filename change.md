@@ -1041,7 +1041,8 @@ is a vertical gradient, not the paper texture the brief's mood implies.
 
 - Full suite from the repo root: **1,699 passed, 6 skipped** (baseline going in:
   1,652 passed, 6 skipped; +47 cases in `tests/test_console_home.py`). The four
-  QML-reading modules together: 65 passed.
+  QML-reading modules together (`test_console_home`, `test_event_console_surface`,
+  `test_stage_b_console_class`, `test_event_editing`): 66 passed in 3.9 s.
 - `ruff check .`: All checks passed. One character changed outside this round's
   subject to get there: `src/assistant/cli.py:695` dropped an `f` prefix on an
   f-string with no placeholders (F541, left by the event round; printed text
