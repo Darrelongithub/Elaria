@@ -76,7 +76,10 @@ One timing caveat: the `before` half is read out of git history, so this is only
 reproducible from a checkout where `HEAD~1` still holds the pre-round panel —
 i.e. the console-home commit itself. Run later than that, the probes fail on
 purpose rather than drawing the wrong page; treat these PNGs as the record they
-are.
+are. (Checked on 2026-10-25 from the round's own commit, where `HEAD~1` is the
+pre-round panel: all eight files came back byte-identical. On another box the
+font files differ, so expect the same sentences at the same sizes with different
+letterforms — and therefore different wrapping and canvas heights.)
 
 ## What did not move
 
