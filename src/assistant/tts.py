@@ -57,6 +57,10 @@ STANDARD_ACKS = {
     "not_at_this_hour": "No. Not at this hour.",
 }
 
+# Session-open acknowledgement: a locally generated neutral earcon, NOT a
+# spoken sentence and NOT a model call. It stays on the cached <300 ms path.
+SESSION_CUE_KIND = "session_open"
+
 AUDITION_SCRIPT = (
     "On it. Done. Is that all? No. Not at this hour. "
     "Sasa, the March invoice is filed. The six ambiguous ones are parked, "
@@ -741,6 +745,37 @@ class SpeechService:
         return result
 
     # -- cached standard acks (§18 <300ms path) ---------------------------------------
+    def _session_cue_path(self) -> Path:
+        return self.cache_dir / "session-open-cue.wav"
+
+    def ensure_session_cue(self) -> str | None:
+        """Write a short neutral two-tone cue locally; no TTS and no network."""
+        if self.voice_route()[0] == "silent":
+            return None
+        path = self._session_cue_path()
+        try:
+            if path.exists() and path.stat().st_size > 44:
+                return str(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            rate, duration = 24000, 0.09
+            with wave.open(str(path), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(rate)
+                pcm = bytearray()
+                for index in range(int(rate * duration)):
+                    moment = index / rate
+                    envelope = min(1.0, moment / 0.01,
+                                   (duration - moment) / 0.02)
+                    frequency = 660.0 if moment < duration / 2 else 880.0
+                    sample = int(6000 * envelope
+                                 * math.sin(2 * math.pi * frequency * moment))
+                    pcm += struct.pack("<h", sample)
+                wav.writeframes(bytes(pcm))
+            return str(path)
+        except OSError:
+            return None
+
     def _ack_path(self, kind: str) -> Path:
         """The ack file for `kind` UNDER THE ACTIVE ROUTE'S OWN IDENTITY.
 
@@ -749,6 +784,8 @@ class SpeechService:
         previous "a warmed local copy beats silence" substitution put the dormant
         Piper voice on an online turn, which is the one thing the owner forbade.
         """
+        if kind == SESSION_CUE_KIND:
+            return self._session_cue_path()
         route, why = self.voice_route()
         if route == "silent":
             raise TtsUnavailable(why)
@@ -805,6 +842,8 @@ class SpeechService:
         return warmed
 
     def cached_ack(self, kind: str) -> str | None:
+        if kind == SESSION_CUE_KIND:
+            return self.ensure_session_cue()
         if kind not in STANDARD_ACKS:
             return None
         if self.voice_route()[0] == "silent":
@@ -833,6 +872,9 @@ class SpeechService:
                 except Exception as exc:
                     self.last_voice_error = f"voice validation failed: {exc}"
                     raise TtsUnavailable(f"no speech: {exc}") from exc
+        # The session-open cue is sound, not a fifth spoken line; keep the
+        # returned ack shape (four measured phrases) unchanged.
+        self.ensure_session_cue()
         warmed = {}
         for kind, text in STANDARD_ACKS.items():
             warmed[kind] = self.synthesize(text, self._ack_path(kind)).as_dict()
@@ -845,6 +887,15 @@ class SpeechService:
             return {**route, "ack_kind": kind, "audio_path": None, "cached": False,
                     "played": False, "cache_miss": False, "muted": True,
                     "reason": self.voice_route()[1]}
+        if kind == SESSION_CUE_KIND:
+            cue = self.ensure_session_cue()
+            if cue is None:
+                return {**route, "ack_kind": kind, "audio_path": None,
+                        "cached": False, "played": False, "cache_miss": True,
+                        "warning": "neutral session cue could not be written"}
+            return {**route, "ack_kind": kind, "audio_path": cue,
+                    "cached": True, "played": self.play_audio(Path(cue)),
+                    "cache_miss": False, "cue": True, "text": ""}
         path = self.cached_ack(kind)
         if path is None:
             # The ack budget forbids synthesising here. Report it as a cold cache

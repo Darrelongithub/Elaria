@@ -32,12 +32,12 @@
 // copy, `WlrKeyboardFocus.OnDemand`, and the systemd crash fallback. Dress,
 // posture and typography only.
 //
-// The two `component` blocks near the bottom are the only styling
-// abstractions here; inline components need Qt 6.3+, which any Quickshell
-// new enough to accept the unversioned imports below already ships. If this
-// file ever fails to parse on her machine, those two blocks are the first
-// thing to hoist into their own files — nothing else in here is syntax that
-// the previous version did not already use.
+// REFERENCE BUILD (owner, 2026-10-25): Quickshell 0.2.1, revision dacfa9de,
+// on Fedora with Qt 6.11.2. Qt is >= 6.3, so the two inline `component`
+// blocks below ARE supported on this build; the hardware failure was a bare
+// `topMargin` on a Row, which this Quickshell revision does not expose. Use
+// properties the owning type declares (Controls padding, anchor margins),
+// never a Qt/Controls name guessed from a newer API surface.
 import QtQuick
 import QtQuick.Controls
 import Quickshell
@@ -404,39 +404,45 @@ ShellRoot {
                         font.pixelSize: 11
                         elide: Text.ElideRight
                     }
-                    Row {
+                    Item {
                         width: parent.width
-                        spacing: 10
-                        topMargin: 2
-                        Repeater {
-                            model: [
-                                {show: panel.snap.class_mode && panel.snap.class_mode.enabled,
-                                 word: "class mode · voice off"},
-                                {show: panel.snap.company && panel.snap.company.company,
-                                 word: "company · mind what is said"},
-                                {show: panel.snap.showoff && panel.snap.showoff.active,
-                                 word: "showing off · the room can hear"}
-                            ]
-                            delegate: Rectangle {
-                                radius: 7
-                                color: "#3b3220"
-                                border.color: "#554729"
-                                border.width: 1
-                                height: modeWord.implicitHeight + 6
-                                opacity: modelData.show ? 1.0 : 0.0
-                                visible: opacity > 0.001
-                                Behavior on opacity { NumberAnimation { duration: 280; easing.type: Easing.OutQuad } }
-                                Text {
-                                    id: modeWord
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    anchors.left: parent.left
-                                    anchors.leftMargin: 7
-                                    anchors.right: parent.right
-                                    anchors.rightMargin: 7
-                                    text: modelData.word
-                                    color: panel.amber
-                                    font.pixelSize: 10
-                                    elide: Text.ElideRight
+                        height: modeWords.implicitHeight + 2
+                        Row {
+                            id: modeWords
+                            width: parent.width
+                            anchors.top: parent.top
+                            anchors.topMargin: 2
+                            spacing: 10
+                            Repeater {
+                                model: [
+                                    {show: panel.snap.class_mode && panel.snap.class_mode.enabled,
+                                     word: "class mode · voice off"},
+                                    {show: panel.snap.company && panel.snap.company.company,
+                                     word: "company · mind what is said"},
+                                    {show: panel.snap.showoff && panel.snap.showoff.active,
+                                     word: "showing off · the room can hear"}
+                                ]
+                                delegate: Rectangle {
+                                    radius: 7
+                                    color: "#3b3220"
+                                    border.color: "#554729"
+                                    border.width: 1
+                                    height: modeWord.implicitHeight + 6
+                                    opacity: modelData.show ? 1.0 : 0.0
+                                    visible: opacity > 0.001
+                                    Behavior on opacity { NumberAnimation { duration: 280; easing.type: Easing.OutQuad } }
+                                    Text {
+                                        id: modeWord
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        anchors.left: parent.left
+                                        anchors.leftMargin: 7
+                                        anchors.right: parent.right
+                                        anchors.rightMargin: 7
+                                        text: modelData.word
+                                        color: panel.amber
+                                        font.pixelSize: 10
+                                        elide: Text.ElideRight
+                                    }
                                 }
                             }
                         }
@@ -648,11 +654,13 @@ ShellRoot {
                                 id: batteryConfirm
                                 text: "the charger is in — battery confirmed"
                                 contentItem: Text {
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: 4
+                                    anchors.right: parent.right
                                     text: parent.text
                                     color: panel.inkSoft
                                     font.pixelSize: 11
                                     verticalAlignment: Text.AlignVCenter
-                                    leftPadding: 4
                                 }
                             }
                             HomeButton {

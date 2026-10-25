@@ -2,9 +2,9 @@
 socket, wake phrases route locally, and every substitution is logged.
 
 Owner repro 2026-10-20 (hardware): `assist talk "What is 2 plus 2? …"`
-returned the canned check-in line "I am now. What do you need?" for EVERY
-question while `assist cost` showed the calls landing (550 tokens in, ~15 out,
-failure count unchanged). Root cause (BUG F): the 4 s total-turn bound cancelled
+returned a canned check-in for EVERY question while `assist cost` showed the
+calls landing (550 tokens in, ~15 out, failure count unchanged). Root cause
+(BUG F): the 4 s total-turn bound cancelled
 the `asyncio.to_thread(generate)` await — which does NOT stop the worker thread.
 The generation completed and hit the ledger; its text was discarded and the
 canned fallback was stored.

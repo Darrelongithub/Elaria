@@ -37,6 +37,59 @@ from .ipc import DaemonError, DaemonOutcomeUnknown, DaemonUnavailable, call
 # BH-K8: total time `assist plan build` will poll a daemon build before
 # concluding the plan row is stuck (e.g. daemon restarted mid-build).
 _PLAN_BUILD_POLL_DEADLINE_S = 600.0
+# Non-TTY dictate has no Enter to wait for. Poll the daemon's own endpointing
+# state; the budget covers one Live session rotation plus the quiet window.
+_DICTATE_UNTIL_QUIET_POLL_S = 0.2
+
+
+def _positive_seconds(value, default: float) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    return seconds if 0 < seconds < 86400 else default
+
+
+def _dictate_until_quiet_budget(config, mode: str) -> float:
+    settings = config.section("transcribe")
+    windows = settings.get("checkin_after_s")
+    raw_window = windows.get(mode, 20) if isinstance(windows, dict) else windows
+    checkin_s = _positive_seconds(raw_window, 20.0)
+    grace_s = _positive_seconds(settings.get("checkin_grace_s"), 8.0)
+    session_cap_s = _positive_seconds(settings.get("live_session_max_s"), 540.0)
+    return min(1800.0, max(60.0, session_cap_s + checkin_s + grace_s + 30.0))
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return bool(sys.stdin and sys.stdin.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _wait_for_dictation_endpoint(config, session_id: str | None,
+                                 mode: str) -> str:
+    """Wait for the daemon's mode-adaptive endpointing to end this session.
+
+    `ptt.stop` is still the release: the CLI calls it after the capture task
+    has finished so the existing result/finisher path stays exactly the same.
+    A wedged daemon or a superseded session resolves the wait instead of
+    hanging a keybind exec forever.
+    """
+    deadline = time.monotonic() + _dictate_until_quiet_budget(config, mode)
+    while time.monotonic() < deadline:
+        try:
+            status = call(config.socket_path, "status", timeout=3.0)
+        except (DaemonUnavailable, DaemonError, OSError, RuntimeError):
+            return "unavailable"
+        current = status.get("ptt_session_id")
+        if current not in (None, session_id):
+            return "superseded"         # never release another process's PTT
+        if (current == session_id
+                and not status.get("dictation_active", True)):
+            return "closed"
+        time.sleep(_DICTATE_UNTIL_QUIET_POLL_S)
+    return "timeout"
 
 
 # --------------------------------------------------------------------------
@@ -1901,7 +1954,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help="synthesized-WAV length when --wav is omitted "
                                "(default: 10.0)")
     ev_spike.add_argument("--out", help="decision JSON path")
-    dictate_p = sub.add_parser("dictate", help="terminal push-to-talk: Enter to stop")
+    dictate_p = sub.add_parser(
+        "dictate", help="push-to-talk: Enter stops in a terminal; until quiet "
+                        "when stdin is not a TTY")
     dictate_p.add_argument("--command", dest="command_flag", action="store_true",
                            help="route the final transcript through the local intent ladder")
     dictate_p.add_argument("--speak", action="store_true",
@@ -2239,7 +2294,32 @@ def main(argv: list[str] | None = None) -> int:
                            {"mode": "command" if args.command_flag else "narration"},
                            timeout=5.0)
             note = " (SIMULATED capture — no PipeWire here)" if started.get("simulated_capture") else ""
-            input(f"Listening{note}… press Enter to stop. ")
+            terminal_lost = False
+            if _stdin_is_tty():
+                try:
+                    input(f"Listening{note}… press Enter to stop. ")
+                except EOFError:
+                    # A terminal can disappear mid-session. Release the mic and
+                    # answer cleanly; an EOF traceback is never a CLI answer.
+                    print("dictate: terminal input ended; releasing this session.",
+                          file=sys.stderr)
+                    terminal_lost = True
+            else:
+                # A keybind exec has no stdin. The daemon's SilenceLadder owns
+                # endpointing, so wait for it to close the session on quiet
+                # instead of asking for Enter that can never arrive.
+                print(f"Listening{note}… she will stop when you go quiet.",
+                      flush=True)
+                endpoint_state = _wait_for_dictation_endpoint(
+                    config, started.get("session_id"),
+                    "command" if args.command_flag else "narration")
+                if endpoint_state == "superseded":
+                    print("dictate: this session was replaced; leaving the newer "
+                          "talk session alone.", file=sys.stderr)
+                    return 1
+                if endpoint_state != "closed":
+                    print("dictate: endpointing did not close in time; "
+                          "releasing the mic now.", file=sys.stderr)
             # BUG6: the release must be acknowledged at once. The transcript
             # arrives from the daemon afterwards — `ptt.result` waits for it
             # here so the terminal still prints a dictate turn, without ever
@@ -2280,7 +2360,7 @@ def main(argv: list[str] | None = None) -> int:
                       f"audio={result.get('audio_path')}]", file=sys.stderr)
             print(f"[inbox: {result.get('inbox_path')} · clipboard: "
                   f"{(result.get('clipboard') or {}).get('copied')}]", file=sys.stderr)
-            return 0
+            return 1 if terminal_lost else 0
 
         if args.command == "events":
             if args.recent:

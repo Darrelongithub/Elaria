@@ -546,7 +546,7 @@ def test_startup_ack_and_its_tail_reach_neither_live_nor_saved_wav(
             await daemon.aclose()
 
     asyncio.run(run())
-    assert player.calls == ["on_it"], "release must not play a second ack"
+    assert player.calls == ["session_open"], "release must not play a second cue"
 
 
 @pytest.mark.parametrize("suppression", ["explicit", "class", "silent"])

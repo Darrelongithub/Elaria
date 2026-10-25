@@ -140,7 +140,7 @@ def test_bug2_humour_delivery_no_roleplay_asterisks_and_length_discipline():
         "Verbose replies to simple turns must be rejected by length discipline"
 
     # 3. Acceptable terse line
-    acceptable = "I am now. What do you need?"
+    acceptable = "Yes?"
     assert is_valid_chat_reply(acceptable, original_user_text="Elaria, are you awake?")
     assert is_valid_chat_reply("Yes. What's up?", original_user_text="are you there?")
 

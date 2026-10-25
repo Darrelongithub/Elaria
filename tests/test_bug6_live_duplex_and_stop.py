@@ -531,14 +531,23 @@ def test_bug6_cli_dictate_prints_a_turn_and_never_blocks(config, running_daemon)
 
     repo = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": str(repo / "src"), "GEMINI_MODE": "mock"}
-    began = time.monotonic()
-    out = subprocess.run(
-        [sys.executable, "-m", "assistant.cli", "dictate"],
-        input="\n", capture_output=True, text=True, env=env, timeout=60,
-        check=False)
+    # A real terminal, not a pipe: non-TTY dictate now waits for daemon
+    # endpointing. This pin is specifically the unchanged Enter-to-stop path.
+    master_fd, slave_fd = os.openpty()
+    try:
+        os.write(master_fd, b"\n")
+        began = time.monotonic()
+        out = subprocess.run(
+            [sys.executable, "-m", "assistant.cli", "dictate"],
+            stdin=slave_fd, capture_output=True, text=True, env=env,
+            timeout=60, check=False)
+    finally:
+        os.close(master_fd)
+        os.close(slave_fd)
     elapsed = time.monotonic() - began
 
     assert out.returncode == 0, out.stderr
+    assert "press Enter to stop." in out.stdout
     assert out.stdout.strip(), "assist dictate printed no turn"
     assert "(no transcript)" not in out.stdout
     assert "mock transcript" in out.stdout.lower()

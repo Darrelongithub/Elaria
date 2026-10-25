@@ -487,11 +487,12 @@ def test_a2_daemon_silent_session_no_voice_no_popup_and_a_console_line(
     stopped = call(config.socket_path, "ptt.stop", {"wait_s": 30.0}, timeout=35.0)
     result = stopped.get("result") or {}
 
-    # rule 1/3: no ladder line, no reply, no TTS of any kind on the close
+    # rule 1/3: session-open earcon is okay; the silent close itself adds no
+    # ladder line, verbal ack, reply, or TTS.
     kinds = [e.get("event") for e in seen["broadcasts"]]
     assert "session.checkin" not in kinds, "the ladder fired at an empty room"
     assert "session.silent_close" in kinds
-    assert seen["acks"] == [], "a silent close queued an ack playback"
+    assert seen["acks"] == []  # this test posture has spoken acks disabled
     assert seen["speaks"] == [], "a silent close made a TTS call"
     assert seen["play_acks"] == []
     assert seen["asks"] == [], "an empty transcript reached the reply path"

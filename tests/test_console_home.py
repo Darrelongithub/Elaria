@@ -562,3 +562,219 @@ def test_the_readme_describes_the_page_she_actually_sees():
     assert "Elaria · home" in readme
     assert "nothing holding right now" in readme
     assert "Win+Shift+F2" in readme or "bind" in readme.lower()
+
+
+# -- the owner's Quickshell 0.2.1 / Qt 6.11.2 build (hardware gate 2026-10-25) --
+# The console crashed on a bare `topMargin` assigned to a Row: no Qt Quick Item
+# owns that name. Anchor margins are stable on Item-derived types; padding and
+# inset names belong only to Controls. Keep this deliberately small: layout
+# names whose ownership moved between Qt Quick/Controls releases, not every
+# property in the file.
+_CONTROL_TYPES = frozenset({
+    "Button", "TextField", "TextArea", "CheckBox", "Control", "Popup", "Pane",
+})
+# Qt Quick Items/positioners/Text do not inherit Controls padding. Keep the
+# ownership table conservative: only controls and control-derived types here.
+_PADDING_OWNERS = _CONTROL_TYPES
+_INSET_OWNERS = _CONTROL_TYPES
+# Anchor attached properties only exist on QQuickItem-style surfaces. Quickshell
+# PanelWindow is listed separately because it owns the layer-shell anchor group.
+_ANCHOR_OWNERS = frozenset({
+    "Item", "Rectangle", "Column", "Row", "Grid", "Flow", "Text",
+    "TextEdit", "TextInput", "Flickable", "PanelWindow",
+}) | (_CONTROL_TYPES - {"Popup"})
+VERSION_FRAGILE_PROPERTY_OWNERS = {
+    "topMargin": frozenset(),          # never an Item/positioner property
+    "bottomMargin": frozenset(),
+    "leftMargin": frozenset(),
+    "rightMargin": frozenset(),
+    "margins": frozenset({"PanelWindow"}),  # Quickshell layer-margin group
+    "padding": _PADDING_OWNERS,
+    "topPadding": _PADDING_OWNERS,
+    "bottomPadding": _PADDING_OWNERS,
+    "leftPadding": _PADDING_OWNERS,
+    "rightPadding": _PADDING_OWNERS,
+    "topInset": _INSET_OWNERS,
+    "bottomInset": _INSET_OWNERS,
+    "leftInset": _INSET_OWNERS,
+    "rightInset": _INSET_OWNERS,
+}
+
+
+def _qml_blocks(source: str):
+    """(code-only view, object blocks, inline component bases/declarations).
+
+    A small structural parser, not a QML engine: QML object heads look like
+    ``Type {`` or ``component Name: Base {``. Comments/strings/regex literals
+    are masked first, then braces are matched so an assignment is checked only
+    against the object that directly owns it.
+    """
+    kinds = _classify(source)
+    skeleton = "".join(
+        char if kind == CODE else ("\n" if char == "\n" else " ")
+        for char, kind in zip(source, kinds)
+    )
+    matching: dict[int, int] = {}
+    stack: list[int] = []
+    for index, char in enumerate(skeleton):
+        if char == "{":
+            stack.append(index)
+        elif char == "}" and stack:
+            matching[stack.pop()] = index
+
+    head = re.compile(
+        r"(?:(component)\s+([A-Za-z_]\w*)\s*:\s*)?"
+        r"([A-Z][A-Za-z0-9_.]*)\s*\{"
+    )
+    blocks = []
+    component_bases: dict[str, str] = {}
+    for match in head.finditer(skeleton):
+        opened = skeleton.index("{", match.start())
+        if opened not in matching:
+            continue
+        custom = match.group(2) if match.group(1) else None
+        if custom is not None:
+            component_bases[custom] = match.group(3)
+        blocks.append((match.group(3), custom, opened, matching[opened]))
+
+    declared_by_component: dict[str, set[str]] = {}
+    declaration = re.compile(
+        r"(?m)^[ \t]*(?:readonly[ \t]+)?property[ \t]+"
+        r"[A-Za-z_][\w.<>]*[ \t]+([A-Za-z_]\w*)[ \t]*[:=]"
+    )
+    for _type_name, custom, opened, closed in blocks:
+        if custom is None:
+            continue
+        body = skeleton[opened + 1:closed]
+        depth, depths = 0, []
+        for char in body:
+            depths.append(depth)
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth = max(0, depth - 1)
+        declared_by_component[custom] = {
+            match.group(1) for match in declaration.finditer(body)
+            if depths[match.start()] == 0
+        }
+    return skeleton, blocks, component_bases, declared_by_component
+
+
+def _body_assignments(skeleton: str, opened: int, closed: int):
+    """Direct ``property: value`` assignments inside one object block."""
+    body = skeleton[opened + 1:closed]
+    depth, depths = 0, []
+    for char in body:
+        depths.append(depth)
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth = max(0, depth - 1)
+    assignment = re.compile(
+        r"(?m)^([ \t]*)([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)[ \t]*:"
+    )
+    for match in assignment.finditer(body):
+        if depths[match.start()] != 0:
+            continue  # nested object or a JavaScript block
+        line_start = body.rfind("\n", 0, match.start()) + 1
+        if re.match(r"[ \t]*(?:readonly[ \t]+)?property\b", body[line_start:]):
+            continue  # a declaration, not an assignment
+        yield match.group(2), opened + 1 + match.start(2)
+
+
+def _fragile_property_assignments(source: str | None = None) -> list[str]:
+    """Version-fragile names assigned to types that do not own them."""
+    text = qml_source() if source is None else source
+    skeleton, blocks, component_bases, declared_by_component = _qml_blocks(text)
+    errors: list[str] = []
+    for type_name, custom, opened, closed in blocks:
+        resolved = component_bases.get(type_name, type_name)
+        declared = set(declared_by_component.get(type_name, set()))
+        if custom is not None:
+            declared.update(declared_by_component.get(custom, set()))
+        for path, index in _body_assignments(skeleton, opened, closed):
+            parts = path.split(".")
+            name = parts[0]
+            if name == "anchors":
+                # Anchor margins are stable, but only on Item-derived objects
+                # (plus Quickshell's PanelWindow layer-shell anchor group).
+                if resolved not in _ANCHOR_OWNERS:
+                    errors.append(
+                        f"line {text.count(chr(10), 0, index) + 1}: "
+                        f"{type_name} does not own anchors.{parts[-1]}"
+                    )
+                continue
+            if len(parts) > 1:
+                # `margins.top` is a GROUP assignment: check its owner. A
+                # fragile leaf hung off an unrelated group is not ownership.
+                leaf = parts[-1]
+                if name in VERSION_FRAGILE_PROPERTY_OWNERS:
+                    owners = VERSION_FRAGILE_PROPERTY_OWNERS[name]
+                    if name in declared or resolved in owners:
+                        continue
+                    errors.append(
+                        f"line {text.count(chr(10), 0, index) + 1}: "
+                        f"{type_name} does not own group {name}.{parts[1]}"
+                    )
+                elif leaf in VERSION_FRAGILE_PROPERTY_OWNERS:
+                    errors.append(
+                        f"line {text.count(chr(10), 0, index) + 1}: "
+                        f"{name}.{leaf} is not an owned group property"
+                    )
+                continue
+            if name not in VERSION_FRAGILE_PROPERTY_OWNERS:
+                continue
+            owners = VERSION_FRAGILE_PROPERTY_OWNERS[name]
+            if name in declared or resolved in owners:
+                continue
+            errors.append(
+                f"line {text.count(chr(10), 0, index) + 1}: "
+                f"{type_name} does not own {name}"
+            )
+    return errors
+
+
+def test_the_reference_build_has_no_version_fragile_property_assignments():
+    """Hardware repro: shell.qml:410 assigned Row.topMargin on Quickshell 0.2.1."""
+    assert _fragile_property_assignments() == []
+
+
+def test_the_fragile_property_scanner_catches_the_exact_hardware_failure_class():
+    sample = """import QtQuick
+PanelWindow {
+    margins.top: 12
+    Row {
+        topMargin: 2
+        anchors.topMargin: 3
+    }
+    Column {
+        topPadding: 2
+    }
+    Text {
+        leftPadding: 4
+    }
+    component Cue: Button { padding: 8 }
+    Popup {
+        anchors.topMargin: 2
+    }
+}
+"""
+    errors = _fragile_property_assignments(sample)
+    assert any("Row does not own topMargin" in error for error in errors), errors
+    assert any("Column does not own topPadding" in error for error in errors), errors
+    assert any("Text does not own leftPadding" in error for error in errors), errors
+    assert any("Popup does not own anchors.topMargin" in error for error in errors), errors
+    assert not any("PanelWindow does not own group margins" in error
+                   or "Row does not own anchors" in error for error in errors), errors
+    assert not any("Button does not own padding" in error for error in errors), errors
+
+
+def test_the_hardware_gate_records_the_reference_build_and_ladder_first():
+    doc = (REPO / "docs" / "console-home" / "hardware-gate.md").read_text()
+    first = next(line for line in doc.splitlines()
+                 if line.strip() and not line.startswith("#"))
+    assert "elaria-ladder console" in first
+    assert "A–E" in first
+    assert "quickshell 0.2.1" in doc
+    assert "dacfa9de" in doc
+    assert "qt6-qtbase 6.11.2-3.fc44" in doc

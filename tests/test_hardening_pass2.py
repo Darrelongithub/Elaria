@@ -79,10 +79,13 @@ def _fake_server(path: Path, *, reply: bytes, connections: int = 1,
                  hold_open: bool = False):
     """Serve `connections` one-shot clients, sending `reply` to each."""
 
+    ready = threading.Event()
+
     def run():
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
             srv.bind(str(path))
             srv.listen(connections)
+            ready.set()
             for _ in range(connections):
                 conn, _addr = srv.accept()
                 with conn:
@@ -96,9 +99,7 @@ def _fake_server(path: Path, *, reply: bytes, connections: int = 1,
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    deadline = time.time() + 2.0
-    while not path.exists() and time.time() < deadline:
-        time.sleep(0.01)
+    assert ready.wait(timeout=2.0), "fake Unix-socket server did not start listening"
     return thread
 
 
