@@ -59,7 +59,7 @@ from .safety import clear_halt, is_halted, set_halt
 from .showoff import ShowoffError, ShowoffService
 from .store import Store
 from .transcribe import HEARD_NOTHING, DictationService
-from .tts import STANDARD_ACKS, SpeechResult, SpeechService
+from .tts import SESSION_CUE_KIND, STANDARD_ACKS, SpeechResult, SpeechService
 
 MAX_PTT_WAIT_S = 90.0
 
@@ -360,7 +360,9 @@ class Daemon:
         cancelling a fire-and-forget waiter must not reopen the mic while its
         uncancellable thread is still sending audio to the speakers.
         """
-        text = STANDARD_ACKS.get(kind, "")
+        # A cue has no words: text=None holds the duplex gate without
+        # clobbering the last spoken sentence used for echo comparisons.
+        text = None if kind == SESSION_CUE_KIND else STANDARD_ACKS.get(kind, "")
         self._set_speaking(True, text=text)
         playback = asyncio.create_task(asyncio.to_thread(self.speech.play_ack, kind))
         self._ack_playbacks.add(playback)
@@ -826,7 +828,8 @@ class Daemon:
         cache lookup only here; synthesis happens at startup/warm time."""
         ack = self.governor.ack()
         kind = str(params.get("kind") or "on_it")
-        route = self.speech.route(STANDARD_ACKS.get(kind, "On it."))
+        cue = kind == SESSION_CUE_KIND
+        route = self.speech.route("" if cue else STANDARD_ACKS.get(kind, "On it."))
         cached = self.speech.cached_ack(kind)
         class_mode = self.presence.status().enabled
         should_speak = bool(params.get("speak",
@@ -836,7 +839,8 @@ class Daemon:
         if should_speak and cached is None and not route["muted"]:
             await self._await_ack_cache()          # VB-13: boot warming, once
             cached = self.speech.cached_ack(kind)
-        ack["speech"] = {**route, "ack_kind": kind, "audio_path": cached,
+        ack["speech"] = {**route, "ack_kind": kind, "cue": cue,
+                         "audio_path": cached,
                          "cached": cached is not None, "played": False,
                          # A miss while she is supposed to speak is a reported
                          # condition (VB-2), not a verdict: the re-warm below is
@@ -1456,17 +1460,18 @@ class Daemon:
         self._ptt_log("ptt.start.received", params={k: str(v)[:80] for k, v in params.items()})
         if self._dictation_task and not self._dictation_task.done():
             # VB-11: the loser of the race is refused, and a refusal is not a
-            # request to be acknowledged. She is already listening; saying "On it."
-            # again is a second voice event for one press (and double audio when the
-            # user mashes the hotkey). No ack is played and none is queued.
-            route = self.speech.route(STANDARD_ACKS["on_it"])
+            # request to be acknowledged. She is already listening; a second
+            # cue or sentence is two voice events for one press. No ack plays.
+            route = self.speech.route("")
             self._ptt_log("ptt.start.refused_already_listening")
             return {"listening": True, "already_listening": True, "ack": None,
-                    "speech": {**route, "ack_kind": "on_it", "audio_path": None,
+                    "speech": {**route, "ack_kind": SESSION_CUE_KIND,
+                               "cue": True, "audio_path": None,
                                "cached": False, "played": False,
                                "suppressed": "already listening — no second ack"},
                     "note": "already listening"}
-        ack = await self._ack({"kind": "on_it"})
+        # Session open is a neutral earcon, never a full spoken sentence.
+        ack = await self._ack({"kind": SESSION_CUE_KIND})
         self._ptt_log("ptt.start.ack_done")
         capture_cfg = self.config.section("capture")
         frame_ms = int(capture_cfg.get("chunk_ms", 30))
@@ -1913,9 +1918,19 @@ class Daemon:
                         session_id=str(session_id or ""),
                         timeout_s=reply_timeout_s)
                     reply_started = time.monotonic()
+                    from .intents import route as route_intent
+
+                    try:
+                        parsed_intent = route_intent(result["text"])
+                    except Exception:
+                        parsed_intent = None
+                    # Known local commands keep their existing grammar path.
+                    # Real, above-floor speech with no recognized task goes to
+                    # a generated clarification, never a stock ack/greeting.
                     reply_task = asyncio.create_task(self._ask({
                         "text": result["text"],
                         "speak": params.get("speak", True),
+                        "unparsed_command": parsed_intent is None,
                     }))
                     try:
                         done, _pending = await asyncio.wait(
@@ -2827,7 +2842,9 @@ class Daemon:
 
         # The owner can tell her the room has company. That is awareness, not a
         # mode: nothing about voice, class mode or surfacing changes.
-        company_command = detect_company_command(text)
+        unparsed_command = bool(params.get("unparsed_command"))
+        company_command = (None if unparsed_command
+                           else detect_company_command(text))
         if company_command is not None:
             self.disclosure.set_company(company_command, source="owner speech")
 
@@ -2852,17 +2869,23 @@ class Daemon:
                      "Noted — alone again. Secrets and private plans are back "
                      "on the table.")
             via = "local-awareness"
-        intent = None if company_command is not None else route(route_text)
+        intent = (None if company_command is not None or unparsed_command
+                  else route(route_text))
         if intent is not None:
             reply, via = await self._run_intent(intent)
-        if reply is None and wake is not None and wake.is_checkin:
+        if (reply is None and wake is not None and wake.is_checkin
+                and not unparsed_command):
             # "Elaria" / "hey Elaria" alone: a check-in. The settled terse line
             # IS the turn-aware answer — zero Gemini calls (ADOPT-1).
             reply, via = checkin_reply(), "local-hotword-checkin"
 
         if reply is None:
+            unparsed_command = bool(params.get("unparsed_command"))
             # Rung 5/6: assemble the exact context the cheap model needs.
-            hits = await asyncio.to_thread(self.memory.recall, route_text)
+            # A command-mode transcript that matched no local grammar is NOT
+            # a local ack case: request a direct, model-generated clarification.
+            hits = ([] if unparsed_command else
+                    await asyncio.to_thread(self.memory.recall, route_text))
             public_demo = bool(self.showoff.status().get("active"))
             restricted = (self.disclosure.company() or public_demo
                           or speaker != "owner")
@@ -2889,15 +2912,24 @@ class Daemon:
             # route_text: the wake phrase addresses her and is stripped before
             # the model sees the turn ("Elaria, …" is not content).
             body = route_text
-            if history_lines and context:
+            if unparsed_command:
+                body = (
+                    "This is a real voice transcript, but it did not match any "
+                    "recognized local task. Respond in one plain, direct sentence "
+                    "that acknowledges the words and asks the user to say the "
+                    "intended task again. Do not greet, thank, reassure, offer "
+                    "general help, or invent a task.\n\n"
+                    f"Voice transcript: {route_text}"
+                )
+            if not unparsed_command and history_lines and context:
                 body = (f"Context from the user's local memory/index "
                           f"(cite paths plainly):\n{context}\n\n"
                           f"Recent conversation in this session:\n{history_lines}\n\n"
                           f"User: {route_text}")
-            elif context:
+            elif not unparsed_command and context:
                 body = (f"Context from the user's local memory/index "
                           f"(cite paths plainly):\n{context}\n\nUser: {route_text}")
-            elif history_lines:
+            elif not unparsed_command and history_lines:
                 body = (f"Recent conversation in this session:\n{history_lines}\n\n"
                           f"User: {route_text}")
             # System prompt carries the persona governor: no roleplay, terse, no asterisks
@@ -2953,6 +2985,8 @@ class Daemon:
                         reason=f"deadline:{getattr(exc, 'reason', 'total')}",
                         original_len=None, replacement=reply, turn=route_text)
                     await self.broadcast({"event": "live.timeout", "text": text[:40]})
+                if unparsed_command and reply is not None:
+                    via = "gemini-unparsed-command"
                 # Bug 8: a successful generation is delivered VERBATIM — but an
                 # empty one is a failure, not a reply. Fall back turn-aware.
                 if reply is not None and not str(reply).strip():

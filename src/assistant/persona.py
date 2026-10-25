@@ -288,8 +288,9 @@ CHAT_SYSTEM_PROMPT = (
     "Short direct lines: simple check-in turns (are you awake? are you there? "
     "hello) get ONE short line (at most two, <120 chars total), plain and "
     "immediate. Bite, not dreaminess. "
-    "Example: 'Elaria, are you awake?' -> 'I am now. What do you need?' "
-    "(short, direct, no scene). "
+    "A bare wake/check-in receives a single neutral word, not a service "
+    "greeting. A voice transcript with no recognized task gets a plain "
+    "clarification request instead of a canned offer. "
     "Counter-example FORBIDDEN: '*A soft rustle answers you from the quiet, "
     "followed by a slow, measured breath... What is it? Has something happened?*' "
     "Do not wrap replies in quotes or asterisks. "
@@ -326,6 +327,16 @@ FILLER_PHRASES = (
     "i'm here to help",
 )
 
+# Refuse customer-service greetings as generated answers too. This is a
+# validator-only list: these phrases must never be a delivered reply.
+CANNED_REPLY_PHRASES = (
+    "how may i help you",
+    "how may i assist you",
+    "is there anything i can help",
+    "is there something i can assist",
+    "at your service",
+)
+
 def chat_reply_violation(reply: str, *, original_user_text: str = "") -> str | None:
     """The delivery-spec rule this reply breaks, or None when it is acceptable.
 
@@ -341,6 +352,9 @@ def chat_reply_violation(reply: str, *, original_user_text: str = "") -> str | N
     for phrase in FILLER_PHRASES:
         if phrase in lowered:
             return "filler"
+    for phrase in CANNED_REPLY_PHRASES:
+        if phrase in lowered:
+            return "canned-service-reply"
     # No asterisk narration: any '*' is a stage-direction marker in this context.
     # The spec forbids "*A soft rustle...*" and similar.
     if "*" in reply:
@@ -375,11 +389,11 @@ def is_valid_chat_reply(reply: str, *, original_user_text: str = "") -> bool:
     return chat_reply_violation(reply, original_user_text=original_user_text) is None
 
 
-CHECKIN_REPLY = "I am now. What do you need?"
+CHECKIN_REPLY = "Yes?"
 
 
 def checkin_reply() -> str:
-    """The settled check-in line (wake phrase alone, 'are you awake', …)."""
+    """One neutral word for a bare wake phrase; not a service greeting."""
     return CHECKIN_REPLY
 
 

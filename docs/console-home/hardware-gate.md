@@ -1,5 +1,24 @@
 # Console home — the owner's eyeball gate (hardware only, still open)
 
+**Gate step 0 — run `elaria-ladder console` first, expect A–E (E: "surface registered - she is on screen").**
+
+Reference build (owner, 2026-10-25), the build this round targets exactly:
+
+| command | reported result |
+| --- | --- |
+| `quickshell --version` | quickshell 0.2.1 (revision dacfa9de, Fedora) |
+| `rpm -q qt6-qtbase` | qt6-qtbase 6.11.2-3.fc44 |
+
+Qt is >= 6.3, so the two inline `component` blocks are supported here. The
+2026-10-25 D-rung failure was **not** an inline-component parse error: a bare
+`topMargin` was assigned to a `Row`, a property this Quickshell revision does
+not expose. It is now a 2 px `anchors.topMargin` on a wrapper `Item`, which
+owns the anchor group. The checkbox's `Text.leftPadding` was also replaced by
+`anchors.leftMargin` on the owning `Text` item. `tests/test_console_home.py`
+scans the QML for this whole class of
+version-fragile assignments. Hardware re-gate: `elaria-ladder console` must
+reach E.
+
 Nothing in this round was rendered on the Fedora desktop. The suite can prove the
 sentences are generated from the snapshot and that the wiring did not move; it
 cannot prove the page looks like somewhere she wants to live. That is yours to
@@ -52,12 +71,16 @@ captures, so judge the words and let these be the checklist for the look.
 
 ## If the panel is blank
 
-One known-fragile thing was introduced here: the two inline `component` blocks
-(`HomeButton`, `NoteField`) at the end of the PanelWindow need Qt 6.3+. Check
-`journalctl --user -u elaria-console -b` for a QML parse error. If your
-Quickshell is older than that, say so and the fix is mechanical: hoist those two
-blocks into `ui/quickshell/console/HomeButton.qml` and `NoteField.qml` — nothing
-else in the file uses syntax the previous version did not already use.
+On the reference build above, **do not start by hoisting the inline components**:
+Qt 6.11.2 supports them. Check `journalctl --user -u elaria-console -b` for the
+QML property named in the error. The reproduced failure was
+`Cannot assign to non-existent property "topMargin"` at `shell.qml:410`; the
+replacement is a 2 px `anchors.topMargin` on a wrapper `Item` (which owns the
+anchor group), and the checkbox's `Text.leftPadding` is now `anchors.leftMargin`.
+The static scan fails the suite if a margin, padding or inset is assigned to a type that does
+not declare it. If a future machine reports a genuinely older Qt (< 6.3), then
+the mechanical fallback still applies: hoist `HomeButton` and `NoteField` into
+`ui/quickshell/console/HomeButton.qml` and `NoteField.qml`.
 
 ## Also worth an eye, since only you can see it
 

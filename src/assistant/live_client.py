@@ -396,7 +396,7 @@ class SelfHearingLiveTransport:
     """
 
     name = "self_hearing"
-    SELF_TEXT = "Understood, what are you working on that I can help with?"
+    SELF_TEXT = "The requested result is ready."
 
     def __init__(self, *, trigger_after_frames: int = 4,
                  audio_chunk_ms: int = 200, chunks: int = 5,
