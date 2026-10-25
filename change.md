@@ -940,3 +940,119 @@ uses 20 loud frames instead of a 5-frame blip.
 - Hardware definition-of-done (owner to report): silent room ⇒ she stays
   silent, journal shows `she heard nothing`, quota unchanged; one sentence ⇒
   normal reply.
+
+## 2026-10-25 — CONSOLE HOME: the console became her home (`arena/933f020d-elaria`)
+
+**Headline claim: `ui/quickshell/console/shell.qml` now reads as her notebook
+rather than an admin panel, and not one command, retry, mirror handler or
+keyboard-focus rule changed to get there.** Dress, posture and typography — the
+round the silence hotfix scheduled on purpose.
+
+**Why now, and why only now.** The brief carried two preconditions: after the
+silence hotfix (PR #18, merged 2026-10-24) and after the 2026-10-24 event, whose
+spine is frozen until the doors close. Both are satisfied as of today, so this
+round touches the surface and nothing the event depends on. The hotfix left one
+line on the data surface explicitly for this round: `snapshot["status_line"]`
+(`src/assistant/daemon.py`), which the daemon sets to `she heard nothing` during
+a silent voice session. It is rendered **verbatim** in italic amber under the
+heading and vanishes the moment the daemon clears it — the console adds no
+verdict of its own to it.
+
+**What moved (all of it presentation).**
+
+- *No field labels, no empty colon rows.* `plans:`, `jobs:`, `holding:`,
+  `parked:` and the raw `offline_queue` JSON are gone. `houseLines()` speaks one
+  sentence per thing the snapshot actually contains — "plan #5 is ready whenever
+  you are — 6 of 6 have their place, and 2 she would rather you decided on.",
+  "the cloud transcription job is going, on attempt 2.", "she is holding 2 things
+  for you — follow up with Amina, the tax folder.", "1 thing is parked where only
+  you can sort it — invoice.pdf." — and with nothing to say the page says
+  `nothing holding right now — the house is quiet.` instead of standing there
+  with blank labels. A building plan arriving twice in the snapshot
+  (`pending_plans` and `job_progress`, same numbers) is now said once.
+- *The transcript is prose.* Speakers are people: `Darrel said` / `Darrel wrote`
+  (channel `console`) / `Elaria answered`; timestamps quiet at 11 px; serif with
+  `lineHeight: 1.45` at a 30 px side margin, no per-row frame, no alternating
+  stripe. Segment headers are headings, and `## 09:32 · Amina · seg 004
+  (recovered)` is spoken as `09:32 · Amina · part 4, arrived late` — the raw
+  header stays the parse key.
+- *Her input line is a passed note.* Placeholder in her voice — "say it here — I
+  take this the same as your voice" — button "pass it", the 340 ms debounce and
+  the 800 ms status fade kept. `assist talk` is still the exact handler the voice
+  path uses, so voice→text and text→voice remain one conversation.
+- *State changes fade.* 11 `Behavior on opacity` bindings, and every conditional
+  block is `opacity: cond ? 1 : 0` + `visible: opacity > 0.001` with an explicit
+  height, so nothing leaves a strip of blank space when it hides. There is no
+  admin red anywhere in the file: one amber accent (`#e2a95f`) on warm paper.
+- *Failures are sentences.* Daemon down: "she is not answering right now —
+  nothing typed here goes anywhere, and this window keeps knocking on her door."
+  A daemon death mid-event: "the mic went quiet — she is not answering, so
+  nothing new is being written on this page." `plainNote()` maps a traceback, a
+  `*Error:` line or a stray JSON blob to "that did not go through — the event
+  itself is untouched. The detail is in her journal, not on this page.", and a
+  torn snapshot line to "a line of her notes came through torn — the last whole
+  one is still on the page." A preflight refusal still arrives in the CLI's own
+  prose ("on battery (…) — plug in for a 10 h event, or confirm."), because that
+  is a reason she needs, not noise.
+- *Heading* is `Elaria · home`, subtitled "one conversation — said out loud or
+  written here, the same to her"; class mode / company / show-off are words in
+  the header ("class mode · voice off") and always visible when on.
+
+**What did not move — and how that is pinned.** The feed and its 1500 ms retry,
+`assist talk`, the knock actions, every `assist event …` argument list, the
+`Open .txt` path helper, the stat→cat→diff document mirror, the embedded
+segment editors with their 650 ms autosave and stale-edit tail copy,
+`WlrKeyboardFocus.OnDemand`, `WlrLayershell.namespace: "elaria-console"`, and
+the systemd crash fallback (`scripts/event-console-fallback.sh` and
+`systemd/elaria-console.service`, untouched). `tests/test_console_home.py` keeps
+24 wiring strings as exact text (including `eventProcess.command =
+["assist"].concat(args)` and `--base-text=`), asserts `console.say` never
+appears, and fails if the snapshot keys in `src/assistant/console.py` are
+rephrased rather than extended. Button labels stayed verbatim on purpose: the
+only test renamed this round is the `"Your event command"` pin in
+`tests/test_event_console_surface.py`, which now pins the new placeholder.
+
+**Guarding phrasing without a renderer.** There is no Quickshell, no `qmllint`,
+no Wayland compositor in this sandbox, so the copy is checked by *executing it*:
+the test module lifts the QML's own `function` bodies out of the file, runs them
+under `node` against fake snapshots, and asserts what they return. Same idea for
+the pictures: `docs/console-home/render.py` extracts those functions, runs them,
+and draws the ops with Pillow, so `docs/console-home/*.png` are renderings
+generated from the shipped file — explicitly **not** screenshots. The `before`
+images are drawn from the previous revision (`git show HEAD~1:…`) and the script
+hard-fails if that text stops matching, so the pair cannot drift apart. (This
+checkout has a single-commit history, so `HEAD~1` does not exist and the
+`HEAD` fallback is what runs — the pre-round file is `HEAD`, and the images were
+verified against it.)
+
+**Deliberately not done:** voice behaviour, event transport, Hyprland binds,
+quota logic, DOCX export; no new file under `src/`; no palette beyond the one
+accent; no per-delegate animation on the transcript (a Repeater rebuild would
+pulse the whole page every snapshot).
+
+**Known limits of this round's evidence.** Nothing here was rendered on her
+hardware: `docs/console-home/hardware-gate.md` is the owner's eyeball gate and
+it stays OPEN until she reports through Win+Shift+F2. Two honest caveats
+recorded there — the inline `component` blocks need Qt ≥ 6.3 (hoist `HomeButton`
+and `NoteField` into their own files if her Quickshell is older), and the "lamp"
+is a vertical gradient, not the paper texture the brief's mood implies.
+
+**Verification.**
+
+- Full suite from the repo root: **1,699 passed, 6 skipped** (baseline going in:
+  1,652 passed, 6 skipped; +47 cases in `tests/test_console_home.py`). The four
+  QML-reading modules together (`test_console_home`, `test_event_console_surface`,
+  `test_stage_b_console_class`, `test_event_editing`): 66 passed in 3.9 s.
+- `ruff check .`: All checks passed. One character changed outside this round's
+  subject to get there: `src/assistant/cli.py:695` dropped an `f` prefix on an
+  f-string with no placeholders (F541, left by the event round; printed text
+  identical, and newer ruff flags it).
+- `shellcheck` (via `shellcheck-py`; the binary is not installed in the image):
+  clean on `scripts/*.sh`, including the untouched
+  `event-console-fallback.sh`. `bash -n scripts/event-console-fallback.sh`:
+  clean. `git diff --check`: clean.
+- Docs kept honest: `ui/README.md`'s console section rewritten for the home
+  posture (its hardware checklist items 3, 4, 6, 7 now name the words to look
+  for, and item 9 is the owner's eyeball gate);
+  `docs/EVENT-MODE-HARDWARE-CHECKLIST.md` Gate 2 gained a step for the same
+  four sentences.

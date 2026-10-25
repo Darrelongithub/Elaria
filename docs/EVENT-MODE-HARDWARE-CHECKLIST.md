@@ -42,6 +42,17 @@
    durable and state is stopped; transcription may continue asynchronously.
 7. Start an event, close/fail Quickshell, and verify capture continues while
    the fallback notice opens the live `.txt`.
+8. Console home (the 2026-10-25 dress round; owner's eyeball gate, spelled out
+   in `docs/console-home/hardware-gate.md`). Four looks, no commands: with
+   nothing pending the shelf reads `nothing holding right now — the house is
+   quiet.`; during a `--no-transcribe` event the card reads `Elaria is
+   listening — <name>, M:SS into this part.`; the transcript reads as prose at
+   arm's length rather than as log rows; then `systemctl --user stop assistant`
+   once,
+   mid-event, and confirm the failure is one plain sentence in warm text — no
+   red, no code, no trace — and that it clears when the unit is started again.
+   Items 1–7 are the spine and must pass either way; if they pass and this one
+   does not, the dress is the bug, not the event.
 
 ## Gate 3 — one-hour capture soak
 
