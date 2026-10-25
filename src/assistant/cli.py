@@ -692,7 +692,7 @@ def _event_command(args, config) -> int:
                     print(f"         ERROR: {err}")
                 if route_res.get("size_rejection"):
                     math = route_res.get("call_math") or {}
-                    print(f"         → batch route rejected WAV for size/duration.")
+                    print("         → batch route rejected WAV for size/duration.")
                     print(f"         suggested default: "
                           f"{route_res.get('suggested_segment_minutes')} min segments")
                     print(f"         10 h call math: {math.get('summary', '')}")

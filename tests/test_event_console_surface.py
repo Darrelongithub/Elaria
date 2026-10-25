@@ -18,9 +18,13 @@ def test_console_event_methods_are_the_cli_daemon_methods(running_daemon):
 def test_quickshell_has_real_event_controls_and_notebook_surface():
     qml = (Path(__file__).parents[1] / "ui/quickshell/console/shell.qml").read_text()
     for phrase in ("Start event", "Stop event", "Next speaker", "Open .txt",
-                   "Rename", "MD copy", "TXT copy", "Your event command",
-                   "eventTranscript", "speaker next"): 
+                   "Rename", "MD copy", "TXT copy", "eventTranscript", "speaker next"):
         assert phrase in qml
+    # Console-home round (2026-10-25): the same three words are still the only
+    # ones that input accepts, but they are offered as a note to her rather
+    # than a command prompt. Behaviour pins live in tests/test_console_home.py.
+    assert 'placeholderText: "write to her — status, speaker next, stop event"' in qml
+    assert 'Your event command' not in qml
     assert 'eventProcess.command = ["assist"].concat(args)' in qml
 
 
