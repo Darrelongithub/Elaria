@@ -655,17 +655,69 @@ def _event_command(args, config) -> int:
     action = args.event_action
 
     if action == "spike":
-        from .event_spike import run_spike, write_decision
+        from .event_spike import run_both, run_spike, write_decision
 
-        result = run_spike(config,
-                           wav_path=Path(args.wav) if args.wav else None,
-                           minutes=args.minutes)
+        wav_path = Path(args.wav) if args.wav else None
         out = Path(args.out) if args.out else (
             config.data_dir / "events" / "event-spike.json")
+
+        if wav_path is not None:
+            # Real-measurement run: push the owner's WAV through BOTH routes
+            # and label every number with the route it came from. The batch
+            # route is the one event segments actually use on row 3 — it was
+            # never measured before (hardware bug: twice "confirmed row 3"
+            # without actually running the batch call, and --wav was being
+            # silently ignored because no batch route existed).
+            result = run_both(config, wav_path=wav_path, minutes=args.minutes)
+            write_decision(result, out)
+
+            print(f"§0 spike · mode={result['mode']} · wav={wav_path}")
+            print()
+            for label in ("transcribe-live", "batch"):
+                route_res = result["routes"].get(label)
+                if route_res is None:
+                    continue
+                tag = "[LIVE ]" if label == "transcribe-live" else "[BATCH]"
+                print(f"  {tag} route={route_res.get('route')} · "
+                      f"model={route_res.get('model')} · "
+                      f"{route_res.get('minutes', 0):.2f} min · "
+                      f"{route_res.get('wav_size_mb', 0)} MB")
+                print(f"         accepted: {route_res.get('accepted')} · "
+                      f"full transcript: {route_res.get('full_transcript')} · "
+                      f"tokens: {route_res.get('tokens')}"
+                      f"{'' if route_res.get('tokens_measured') else ' (ESTIMATED — not measured)'}"
+                      f" · latency: {route_res.get('latency_s')}s")
+                if route_res.get("error"):
+                    err = route_res["error"]
+                    print(f"         ERROR: {err}")
+                if route_res.get("size_rejection"):
+                    math = route_res.get("call_math") or {}
+                    print(f"         → batch route rejected WAV for size/duration.")
+                    print(f"         suggested default: "
+                          f"{route_res.get('suggested_segment_minutes')} min segments")
+                    print(f"         10 h call math: {math.get('summary', '')}")
+                elif label == "batch" and route_res.get("call_math"):
+                    math = route_res["call_math"]
+                    print(f"         10 h call math: {math.get('summary', '')}")
+                print()
+            decision = result["decision"]
+            print(f"  Decision: row {decision['row']} → {decision['route']} · "
+                  f"{decision['segment_minutes']} min segments · "
+                  f"switch flush: {decision['switch_flush']}")
+            print(f"  {decision['reason']}")
+            print(f"  saved: {out}")
+            return 0
+
+        # Synthesized fallback (no --wav): only the live route is exercised.
+        # The report is labelled [LIVE] so nobody mistakes it for a batch-
+        # route measurement — real batch numbers require a real WAV.
+        result = run_spike(config, minutes=args.minutes)
         write_decision(result, out)
         decision = result["decision"]
-        print(f"§0 spike · mode={result['mode']} · model={result['model']}")
-        print(f"  full transcript: {result['full_transcript']} · "
+        print(f"§0 spike · mode={result['mode']} · model={result['model']} "
+              f"(synthesized {result['minutes']:.1f} min — LIVE route only; "
+              f"pass --wav <real-segment.wav> to measure the batch route)")
+        print(f"  [LIVE] full transcript: {result['full_transcript']} · "
               f"tokens: {result['tokens']}"
               f"{'' if result['tokens_measured'] else ' (ESTIMATED — not measured)'}"
               f" · latency: {result['latency_s']}s")
@@ -1832,10 +1884,22 @@ def build_parser() -> argparse.ArgumentParser:
     ev_speaker.add_argument("name", nargs="?", default=None,
                             help='speaker name, or "next" to cycle the roster')
     ev_spike = event_sub.add_parser(
-        "spike", help="§0 Step 0: one closed WAV through the transcribe-live "
-                      "route; writes the decision-table result")
-    ev_spike.add_argument("--wav", help="existing WAV (default: synthesize)")
-    ev_spike.add_argument("--minutes", type=float, default=10.0)
+        "spike", help="§0 Step 0: measure live + batch transcription routes "
+                      "against a WAV and write the decision-table result. "
+                      "Pass --wav <path> to run both routes against that "
+                      "exact file (REQUIRED for a real batch-route "
+                      "measurement; without it only a synthesized live-"
+                      "route probe runs and the report says so).")
+    ev_spike.add_argument("--wav", help="existing WAV to push through BOTH "
+                                        "routes. Required for a real batch-"
+                                        "route measurement (e.g. the 30-min "
+                                        "~57 MB segment captured on "
+                                        "hardware). If omitted a short "
+                                        "synthetic WAV is generated but "
+                                        "only the LIVE route is exercised.")
+    ev_spike.add_argument("--minutes", type=float, default=10.0,
+                          help="synthesized-WAV length when --wav is omitted "
+                               "(default: 10.0)")
     ev_spike.add_argument("--out", help="decision JSON path")
     dictate_p = sub.add_parser("dictate", help="terminal push-to-talk: Enter to stop")
     dictate_p.add_argument("--command", dest="command_flag", action="store_true",
