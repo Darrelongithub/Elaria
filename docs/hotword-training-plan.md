@@ -9,6 +9,48 @@ The ECAPA scorer is an external hardware-side command (see
 This document pre-commits the evaluation bars **before** any threshold
 tuning. Moving a bar later is a documented decision, not a quiet edit.
 
+## Inference home — ONNX only (GATE-FIX 2, 2026-10-25)
+
+**Decision: option (a), ONNX Runtime on the daemon's normal interpreter.** The
+owner's wake word is **paused at 0 takes**, so there is no deployed model or
+training corpus to migrate. The model artefact is `.onnx` already.
+
+- `wake_guard.OnnxKeywordModel` is the one keyword-inference implementation;
+  `voicetest.OnnxKeywordScorer` delegates to it. Remove the old openWakeWord
+  package/adapter rather than setting its inference flag: openWakeWord 0.6
+  declares `tflite-runtime` on Linux regardless of which model format is used.
+  TFLite 2.14 has no CPython 3.14 wheel/source distribution for Fedora 44.
+- `uv sync --extra voice` is the explicit optional wake command. It selects
+  ONNX Runtime (CPU), **not** TFLite, SpeechBrain or a training stack. Plain
+  `uv sync` selects the daemon runtime + dev group, not the wake extra; ONNX
+  Runtime may also be installed transitively by Whisper/Piper. Having that
+  library installed never arms wake. uv's universal lock includes optional
+  metadata, but contains no openWakeWord/TFLite dependency at all.
+- No wake-only Python 3.11 toolchain is needed. Model training/export and
+  the external `[hotword] ecapa_cmd` scorer remain separate work; we do not
+  install a GPU training environment into the assistant venv.
+- With no configured model, no model file, or an unavailable ONNX Runtime
+  (including a missing native library), `assist doctor` reports **wake word
+  paused** as a warning. The daemon starts normally; `assist hotword start`
+  refuses cleanly before opening capture. PTT/dictation still work. There is
+  **no energy fallback** on the command-authority path.
+
+**Model contract, before any future training:** 16 kHz mono s16le PCM,
+normalized to float32 samples in a `(1, N)` window; one keyword-confidence
+output. The configured trailing window is `[hotword] keyword_window_s` (1 s
+by default, capped at the 2 s RAM ring). An exported model requiring mel
+features must include its extractor, or the shared adapter must be deliberately
+extended and tested before arming. An arbitrary openWakeWord `.onnx` file with
+external feature models is **not** a drop-in substitute for this contract.
+The `assist-voice-test run` CLI remains the labelled synthetic/energy plumbing
+harness; its results are not trained-keyword accuracy. No sample counts or
+hardware accuracy are claimed by this packaging fix.
+
+The old emergency command
+`uv sync --all-groups --all-extras --no-install-package tflite-runtime` is
+historical recovery advice, not the supported installation path after this fix.
+See [GETTING-STARTED.md](../GETTING-STARTED.md) for default install/update commands.
+
 ---
 
 ## 1. Phrases and buckets

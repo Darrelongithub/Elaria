@@ -990,8 +990,16 @@ Two separate jobs, often confused:
 
 | Job | Tech (local, offline) | Cost on this laptop |
 |---|---|---|
-| **Hear the keyword** ("Elaria") | Keyword-spotting model (openWakeWord-class), custom word trainable | Tiny — a few % of one core, always-on |
+| **Hear the keyword** ("Elaria") | Custom `.onnx` keyword model through ONNX Runtime (one shared inference adapter) | Tiny — a few % of one core, always-on |
 | **Know it's you** | Speaker verification: your voiceprint (embedding model, SpeechBrain ECAPA-class) compared against an enrolled sample | Runs only *after* the keyword fires — a fraction of a second |
+
+**Packaging decision, 2026-10-25 (GATE-FIX 2):** wake inference uses ONNX
+Runtime on the normal interpreter, not Linux openWakeWord/TFLite and not a
+separate Python 3.11 toolchain. `uv sync --extra voice` is opt-in; plain
+`uv sync` installs the working daemon + dev tools. Wake is **paused at 0 takes**;
+a missing extra/model must report “wake word paused”, never prevent daemon or
+doctor startup. The executable seam, model contract and no-migration rationale
+are recorded in [the hotword training plan](docs/hotword-training-plan.md#inference-home--onnx-only-gate-fix-2-2026-10-25).
 
 **How it works in the daemon:**
 

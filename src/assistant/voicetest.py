@@ -253,27 +253,23 @@ class EnergyScorer:
         return min(1.0, rms * 4)
 
 
-class OpenWakeWordScorer:  # pragma: no cover - needs Fedora + trained model
-    """Real keyword spotting. Requires `pip install 'assistant[voice]'`
-    and a custom 'Elaria' model (four syllables, eh-LAR-ee-uh — chosen
-    for low false-trigger risk; any rename re-runs this whole test)."""
+class OnnxKeywordScorer:
+    """The harness adapter to the daemon's single ONNX keyword implementation.
 
-    name = "openwakeword"
+    Optional `uv sync --extra voice` plus the owner's real .onnx model. The
+    synthetic/energy plumbing harness still runs without either; it does not
+    claim keyword accuracy. No openWakeWord/TFLite inference path remains.
+    """
+
+    name = "onnx"
 
     def __init__(self, model_path: str):
-        try:
-            from openwakeword.model import Model
-        except ImportError as exc:
-            raise RuntimeError("keyword model needs the voice extra: "
-                               "uv sync --extra voice (Fedora machine)") from exc
-        self._model = Model(wakeword_models=[model_path])
+        from .wake_guard import OnnxKeywordModel
+
+        self._model = OnnxKeywordModel.load(model_path)
 
     def score(self, pcm: bytes) -> float:
-        import numpy as np
-
-        audio = np.frombuffer(pcm, dtype=np.int16)
-        predictions = self._model.predict(audio)
-        return float(max(predictions.values())) if predictions else 0.0
+        return self._model.score_window(pcm)
 
 
 class SyntheticSource:

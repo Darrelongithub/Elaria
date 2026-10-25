@@ -74,9 +74,9 @@ hotkey yet (`assist ptt start/stop` already ack locally); wire it in Phase 1.
 
 ```bash
 sudo dnf install -y git pipewire-utils wireplumber wl-clipboard libnotify uv
-uv python install 3.12
+# Fedora 44 CPython 3.14 works; no separate wake-only interpreter required.
 git clone <this repo> ~/Elaria && cd ~/Elaria
-uv sync --extra live --extra offline --extra tts  # local Whisper + Piper; add --extra voice later for ECAPA/openWakeWord
+uv sync                      # runtime + dev; optional shelves: GETTING-STARTED.md
 uv run assist doctor          # the honest check — paste into every bug report
 
 cp config.toml.example ~/.config/assistant/config.toml   # then edit VERIFY values
@@ -98,7 +98,7 @@ No key yet? Everything still runs — `GEMINI_MODE` defaults to **mock**
 
 | Piece | Where | Notes |
 |---|---|---|
-| `assist-voice-test` (§13.10) | `src/assistant/voicetest.py` | Ring buffer (never persisted), LED (terminal + Waybar state file), event log `{ts, keyword_score, speaker_score, latency_ms}`, one-key/`label` labelling, accuracy `report` with threshold suggested *from labelled impostor data*, `corpus-check`/`enroll` for ECAPA sidecars. Models are pluggable: `--source synthetic` runs anywhere today; `pipewire`/openWakeWord/ECAPA need `--extra voice` + a trained “Elaria” model on Fedora. Baseline: consistency **0.96**, **3.9h** negative corpus. |
+| `assist-voice-test` (§13.10) | `src/assistant/voicetest.py` | Ring buffer (never persisted), LED (terminal + Waybar state file), event log `{ts, keyword_score, speaker_score, latency_ms}`, one-key/`label` labelling, accuracy `report` with threshold suggested *from labelled impostor data*, `corpus-check`/`enroll` for ECAPA sidecars. Models are pluggable: `--source synthetic` runs anywhere today; real keyword inference uses the same ONNX adapter as the daemon (`--extra voice` + a trained “Elaria” `.onnx`); ECAPA stays an external command. Wake is paused at 0 takes; the default harness is plumbing only. Baseline: consistency **0.96**, **3.9h** negative corpus. |
 | Daemon (`assistd`) | `daemon.py` | asyncio, systemd `--user`, Unix socket `0600` NDJSON, no TCP. Handlers: `status/cost/ack/halt/resume/ptt.start/stop/result/ask` (`ptt.stop` acks the release immediately; `ptt.result` returns the transcript when it exists, optionally waiting). Startup recovery reports uncommitted journal intents (§4.2). |
 | `assist` CLI | `cli.py` | Thin IPC client; `doctor/status/cost/halt/resume/ask/ptt`; `status --waybar` emits Waybar JSON. `doctor`/`cost` work with the daemon down. |
 | Gemini client + harness | `gemini_client.py` | Models by role, per-model RPM limiter, backoff, **ledger write on every call**, cheapest-first with escalation only on *verified* failure (§17: `escalate_after_failures=2`, `max_scaffold_calls=6`). |

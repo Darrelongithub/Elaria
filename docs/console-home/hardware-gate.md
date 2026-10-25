@@ -2,6 +2,27 @@
 
 **Gate step 0 — run `elaria-ladder console` first, expect A–E (E: "surface registered - she is on screen").**
 
+## Branch gate — before merge, not after
+
+No PR touching ui/quickshell/** merges until the owner has run, on the PR branch itself:
+
+```text
+git checkout <branch> && uv sync
+systemctl --user restart elaria-console
+elaria-ladder console        # must reach E before merge
+```
+
+The sandbox has no Quickshell and no Wayland; renderings and static scans are aids, not proof. The ladder on the branch is the only QML truth.
+
+For GATE-FIX 2, leave the PR **open, not merged** until the owner posts the
+branch/commit tested and the A–E result. Also run plain `uv sync`, then
+`systemctl --user restart assistant` and `systemctl --user is-active assistant`:
+the result must be `active`. A green suite or a successful package sync in the
+sandbox does not close either hardware gate. Re-run on the branch if QML changes
+after the owner's test.
+
+### Reference build
+
 Reference build (owner, 2026-10-25), the build this round targets exactly:
 
 | command | reported result |
@@ -10,14 +31,30 @@ Reference build (owner, 2026-10-25), the build this round targets exactly:
 | `rpm -q qt6-qtbase` | qt6-qtbase 6.11.2-3.fc44 |
 
 Qt is >= 6.3, so the two inline `component` blocks are supported here. The
-2026-10-25 D-rung failure was **not** an inline-component parse error: a bare
-`topMargin` was assigned to a `Row`, a property this Quickshell revision does
-not expose. It is now a 2 px `anchors.topMargin` on a wrapper `Item`, which
-owns the anchor group. The checkbox's `Text.leftPadding` was also replaced by
-`anchors.leftMargin` on the owning `Text` item. `tests/test_console_home.py`
-scans the QML for this whole class of
-version-fragile assignments. Hardware re-gate: `elaria-ladder console` must
-reach E.
+2026-10-25 D-rung failures were **not** inline-component parse errors:
+
+- `Row.topMargin`: replaced with `anchors.topMargin` on the owning Item/Row
+  anchor group (PR #21).
+- `Text.leftPadding`: the conservative static scan replaced it with the
+  owning item's `anchors.leftMargin` (PR #21).
+- `TextArea.lineHeight` at 811:37: `TextArea` inherits `TextEdit`, not `Text`.
+  The unfocused segment now renders through a plain `Text` with 1.5 leading.
+  Focusing reveals the same plain-text editor with native caret/selection
+  metrics; blurring restores the prose view using the editor's current text,
+  including pending edits. No HTML conversion, new save path or timer change.
+
+`tests/test_console_home.py` now fails closed on **every** declarative property
+binding and unreviewed type, rather than just margin/padding/inset names.
+The audit includes semicolon-packed bindings, grouped and attached members,
+`Behavior on …` targets, and the `HomeButton: Button` / `NoteField: TextField`
+inline inheritance. Its explicit inventory covers all 23 type names:
+`ShellRoot`, `PanelWindow`, `Process`, `SplitParser`, `Item`, `Rectangle`, `Row`,
+`Column`, `Text`, `TextArea`, `CheckBox`, `Flickable`, `Repeater`, `Gradient`,
+`GradientStop`, `Timer`, `Behavior`, `NumberAnimation`, `ColorAnimation`,
+`Button`, `TextField`, `HomeButton`, `NoteField`. Adding a member requires an
+owner-map review, never an implicit pass. This is a deliberately conservative
+reviewed subset, not a substitute QML engine. Hardware re-gate: the ladder
+**on this PR branch** must reach E.
 
 Nothing in this round was rendered on the Fedora desktop. The suite can prove the
 sentences are generated from the snapshot and that the wiring did not move; it
@@ -47,8 +84,11 @@ captures, so judge the words and let these be the checklist for the look.
 3. **Prose at arm's length.** With a few turns in the conversation (say something,
    then `assist talk "and now by hand"`), the transcript must read like a page:
    names as people (`Darrel said`, `Darrel wrote`, `Elaria answered`), serif,
-   ~1.5 leading, timestamps small and quiet. If the measure or the leading is
-   wrong for your eyes at your distance, say so — that is a one-line change in
+   ~1.5 leading, timestamps small and quiet. In a live event, click a segment:
+   the native plain-text editor must focus, select and edit normally; walk away
+   and confirm the 1.5-leading view shows the edits (including during autosave).
+   If the measure or the leading is wrong for your eyes at your distance, say
+   so — that is a typography change in
    the QML, and it is the point of this round.
 4. **One deliberate failure.** While an event is open, `systemctl --user stop
    assistant`. The console must say, in warm text and not in red: the event
@@ -73,14 +113,34 @@ captures, so judge the words and let these be the checklist for the look.
 
 On the reference build above, **do not start by hoisting the inline components**:
 Qt 6.11.2 supports them. Check `journalctl --user -u elaria-console -b` for the
-QML property named in the error. The reproduced failure was
-`Cannot assign to non-existent property "topMargin"` at `shell.qml:410`; the
-replacement is a 2 px `anchors.topMargin` on a wrapper `Item` (which owns the
-anchor group), and the checkbox's `Text.leftPadding` is now `anchors.leftMargin`.
-The static scan fails the suite if a margin, padding or inset is assigned to a type that does
-not declare it. If a future machine reports a genuinely older Qt (< 6.3), then
-the mechanical fallback still applies: hoist `HomeButton` and `NoteField` into
+QML property named in the error. Known failures were `Row.topMargin` at
+`shell.qml:410` and `TextArea.lineHeight` at `shell.qml:811`; the static scan
+also rejected `Text.leftPadding`. The replacements are owner-scoped anchor
+margins and `Text`-owned leading, not another guessed Controls property.
+The scan now rejects every unaudited type/member. If a future machine reports
+a genuinely older Qt (< 6.3), then the mechanical fallback still applies:
+hoist `HomeButton` and `NoteField` into
 `ui/quickshell/console/HomeButton.qml` and `NoteField.qml`.
+
+## After merge — on main (not a replacement for the branch gate)
+
+- Hold `Win+F2`, speak, release: local earcon, then the Flare reply.
+- A silence verdict must still say `she heard nothing`.
+- In a terminal, `assist dictate` still uses Enter to stop.
+
+## Deferred debt — unchanged by this fix
+
+- `assist ladder` productisation; upstream `%%` fix plus scripts `--help`
+  smoke tests; `assist doctor` Quickshell-binary check.
+- Structured plain-language daemon lifecycle lines to stdout (session
+  open/close, verdicts, failures) so journald becomes a real sensor. Until
+  then the ladder's wake chain must use `assist status` fields
+  `dictation_active` / `ptt_session_id`, **not journal grep**; the owner's
+  assistant journal was empty even during live sessions.
+- PTT session watchdog: a missed release bind left the owner's mic open for
+  about nine minutes. A configurable ceiling (suggested five minutes) and a
+  visible auto-close marker belong to the debt round; this PR does not claim
+  to implement a watchdog.
 
 ## Also worth an eye, since only you can see it
 

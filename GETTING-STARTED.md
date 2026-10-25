@@ -4,6 +4,83 @@ Companion to `assistant-blueprint.md`. This is the build order, with commands th
 
 **One owner, some helpers:** this is your project. Mentors and debuggers help with code review and troubleshooting, and they need *repo access* — not credentials. Don't share your key file with anyone. If a mentor wants to exercise the real API on his own machine, he creates his own free project and key in ten minutes (§12.9).
 
+## Install or update the working runtime (GATE-FIX 2)
+
+From a fresh checkout, **plain `uv sync` is sufficient** for the daemon's
+Python runtime and the default dev tools. No `--all-extras` recovery command
+is needed. On the owner's Fedora 44 / CPython 3.14 laptop (Python >= 3.11 is
+supported):
+
+```bash
+git clone https://github.com/Darrelongithub/Elaria.git ~/Elaria
+cd ~/Elaria
+uv sync
+uv run assist --help
+uv run assist doctor
+```
+
+For an existing checkout, start at `cd ~/Elaria`; check out the PR branch
+before syncing when following the [console branch gate](docs/console-home/hardware-gate.md).
+Runtime dependencies (`google-genai`, `httpx`, `faster-whisper`, `piper-tts`,
+including their CTranslate2/ONNX Runtime dependencies) live in
+`[project].dependencies`. `pytest` and `ruff` live in the default `dev`
+dependency-group. `uv.lock` pins the reviewed resolution; do not depend on
+packages left behind in an old `.venv`. Installing packages does not download
+Whisper/Piper models, provide an API key, or enable the dormant local voice.
+Mock mode remains keyless and network-free; live audio still needs the Fedora
+prerequisites, owner config/key and model assets described below.
+
+Install the service once (the links must point at **this** checkout's venv):
+
+```bash
+mkdir -p ~/.local/bin ~/.config/systemd/user
+ln -sf "$PWD/.venv/bin/assistd" ~/.local/bin/assistd
+ln -sf "$PWD/.venv/bin/assist" ~/.local/bin/assist
+cp systemd/assistant.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now assistant
+```
+
+After a normal update, or to recover the gutted venv:
+
+```bash
+cd ~/Elaria
+uv sync
+systemctl --user restart assistant
+systemctl --user is-active assistant     # must say active
+```
+
+### Genuinely optional shelves (none is selected by plain sync)
+
+| Capability | Exact sync command | Still needed |
+| --- | --- | --- |
+| Semantic embeddings beyond the hashing baseline | `uv sync --extra embeddings` | model assets; larger ML stack |
+| Speaker diarization post-pass | `uv sync --extra diarize` | model access/assets; channel diarization works without it |
+| Wake keyword inference | `uv sync --extra voice` | a real owner `.onnx` model and external ECAPA scorer; **paused at 0 takes** |
+
+Repeat the desired extra flags on subsequent syncs to keep optional shelves
+installed; combine flags if using more than one. `--extra live`, `--extra
+offline`, `--extra tts` are compatibility names only: those runtimes are now
+always installed. `--extra dev` remains a pip/old-command compatibility alias;
+plain uv uses the default `dev` group instead.
+
+**Wake choice: ONNX Runtime only**, through `wake_guard.OnnxKeywordModel`,
+shared with the test harness adapter. No `openwakeword` package or
+`tflite-runtime` dependency remains: openWakeWord pulled Linux TFLite even
+for ONNX models, and TFLite 2.14 had no cp314 wheel/source distribution.
+No Python 3.11 wake-only toolchain and no migration are needed. The existing
+`voice` extra is opt-in, never a default group; ONNX Runtime can already be
+present for Whisper/Piper without arming the wake path. uv locks optional
+metadata together, but neither the default selection nor the lock contains
+TFLite. Missing runtime/model means **wake word paused**, not a daemon or
+doctor crash; push-to-talk and terminal dictation do not depend on wake.
+See the [inference decision and model contract](docs/hotword-training-plan.md#inference-home--onnx-only-gate-fix-2-2026-10-25).
+
+The owner's emergency `uv sync --all-groups --all-extras --no-install-package
+tflite-runtime` was a workaround for the old package graph, **not** the new
+installation instruction. Use plain `uv sync` now. Do not enable the large
+embeddings/diarization stacks just to repair the daemon.
+
 ---
 
 ## Step 0 — Verify the load-bearing assumption (do this first)
@@ -66,10 +143,11 @@ sudo dnf install -y git pipewire-utils wireplumber wl-clipboard libnotify uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Then let `uv` manage Python itself, so you're not coupled to Fedora's version:
+Fedora 44's CPython 3.14 is supported; no downgrade is required. If you
+prefer an independently managed interpreter, install one explicitly:
 
 ```bash
-uv python install 3.12
+uv python install 3.14
 ```
 
 **Verify everything:**
@@ -177,24 +255,24 @@ audio/
 
 `fixtures/` is **committed**, deliberately. It's the shared debugging artifact — the thing a mentor works against.
 
-**`pyproject.toml`:**
+**`pyproject.toml` (current default-sync contract; see the real file for extras):**
 
 ```toml
 [project]
 name = "assistant"
 version = "0.0.1"
-requires-python = ">=3.12"
-dependencies = [
-  "google-genai",
-  "httpx",
-  "tomli-w",
-]
+requires-python = ">=3.11"
+dependencies = ["google-genai>=2.0.0", "httpx>=0.27", "faster-whisper>=1.1", "piper-tts"]
 
 [project.scripts]
 assist = "assistant.cli:main"
+assistd = "assistant.daemon:main"
 
 [dependency-groups]
-dev = ["pytest", "pytest-asyncio", "ruff"]
+dev = ["pytest>=8", "ruff"]
+
+[tool.uv]
+default-groups = ["dev"]
 ```
 
 **`systemd/assistant.service`:**
