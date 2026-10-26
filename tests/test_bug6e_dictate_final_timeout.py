@@ -7,6 +7,8 @@ close/final wait fails.
 
 from __future__ import annotations
 
+import pytest
+
 import asyncio
 import json
 import struct
@@ -20,6 +22,20 @@ from assistant.store import Store
 from assistant.transcribe import DictationService
 
 FRAME_SAMPLES = SAMPLE_RATE * 30 // 1000
+
+
+@pytest.fixture(autouse=True)
+def _force_simulated_capture(monkeypatch):
+    """No bug6-class test may open the real mic (owner order 2026-10-26).
+
+    The bug6 suite failed on the laptop where the CLI-subprocess dictate
+    test opened the REAL microphone (~0 s of room audio → "no speech
+    captured" instead of the scripted mock transcript) while the headless
+    sandbox silently fell back to SimulatedCapture. Tests that
+    deliberately exercise capture-selection (target wiring) opt out with
+    monkeypatch.delenv("ASSIST_CAPTURE").
+    """
+    monkeypatch.setenv("ASSIST_CAPTURE", "simulated")
 
 
 def _speech_frame() -> bytes:

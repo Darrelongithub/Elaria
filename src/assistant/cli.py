@@ -303,15 +303,41 @@ def run_doctor(config) -> dict:
             "[quota] verified = true with rpm/tpm/rpd per model. Until then these "
             "figures are guesses and treated as such."))
     voice_model = config.voice_model()
-    checks.append(_check(
-        "model ids", False,
-        "configured: " + ", ".join(sorted({
-            config.model_for_role(r) for r in
-            ("default", "organise", "cleanup", "chat", "transcribe_live",
-             "transcribe_batch", "voice")}))
-        + f" · voice route: {voice_model} (Live native audio)"
-        + " — unverified until a live models.list (names churn, §11.3); "
-          "run `assist voice models` on the owner's machine"))
+    # Scene-2 closure (2026-10-26): `assist voice models` records a live
+    # verification stamp (state_dir/voice-models-verified.json). When present,
+    # the "model ids unverified" WARN downgrades to a pass citing it.
+    verification = None
+    try:
+        stamp_path = config.state_dir / "voice-models-verified.json"
+        if stamp_path.is_file():
+            import json as _json
+            verification = _json.loads(stamp_path.read_text(encoding="utf-8"))
+    except Exception:
+        verification = None
+    if verification:
+        checks.append(_check(
+            "model ids", True,
+            "configured: " + ", ".join(sorted({
+                config.model_for_role(r) for r in
+                ("default", "organise", "cleanup", "chat", "transcribe_live",
+                 "transcribe_batch", "voice")}))
+            + f" · voice route: {voice_model} (Live native audio)"
+            + f" — verified live {verification.get('verified_at')} via "
+              "`assist voice models`: configured_missing="
+            + str(verification.get("configured_missing") or [])
+            + f", {verification.get('models_count')} models listed"
+            + (" (listing ≠ callability — retired ids may still list)"
+               if verification else "")))
+    else:
+        checks.append(_check(
+            "model ids", False,
+            "configured: " + ", ".join(sorted({
+                config.model_for_role(r) for r in
+                ("default", "organise", "cleanup", "chat", "transcribe_live",
+                 "transcribe_batch", "voice")}))
+            + f" · voice route: {voice_model} (Live native audio)"
+            + " — unverified until a live models.list (names churn, §11.3); "
+              "run `assist voice models` on the owner's machine"))
     # Stage A: Flare is a LIVE voice. A TTS-preview model in this key is the
     # exact configuration that produced "Voice name Flare is not supported".
     checks.append(_check(

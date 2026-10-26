@@ -1316,12 +1316,40 @@ class GeminiClient:
                 live = self._transport.list_models()
                 missing = [m for m in configured
                            if not any(m == name or m in name for name in live)]
-                return {**result, "verified": True, "models": live,
-                        "live_models": [m for m in live if "live" in m.lower()],
-                        "configured_missing": missing}
+                payload = {**result, "verified": True, "models": live,
+                           "live_models": [m for m in live if "live" in m.lower()],
+                           "configured_missing": missing}
+                self._record_model_verification(payload)
+                return payload
             except Exception as exc:
                 return {**result, "verified": False, "models": configured,
                         "error": f"{type(exc).__name__}: {exc}"}
         return {**result, "verified": False, "models": configured,
                 "error": ("mock/no-key — model IDs unverified until a live "
                           "models.list (see §11)")}
+
+    def _record_model_verification(self, payload: dict) -> None:
+        """Stamp the live models.list verification where doctor can consume it.
+
+        `assist voice models` IS the verification step (scene 2, 2026-10-26):
+        a successful live listing records configured_missing and the voice
+        catalogue facts, and `assist doctor` downgrades its "model ids
+        unverified" WARN against this stamp. Never raises.
+        """
+        import json
+
+        try:
+            stamp = {
+                "verified_at": iso_now(),
+                "configured_missing": payload.get("configured_missing") or [],
+                "models_count": len(payload.get("models") or []),
+                "voice_model": payload.get("voice_model"),
+                "catalogue_model": (payload.get("catalogue") or {}).get("model"),
+                "catalogue_count": (payload.get("catalogue") or {}).get("count"),
+            }
+            state = self.config.state_dir
+            state.mkdir(parents=True, exist_ok=True)
+            (state / "voice-models-verified.json").write_text(
+                json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
+        except Exception:  # noqa: S110 - a stamp write must never break the listing
+            pass

@@ -18,10 +18,7 @@ nothing here can touch a real desktop.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-
-import pytest
 
 from assistant import initiative as initiative_module
 from assistant.initiative import (
@@ -71,7 +68,6 @@ def _emit_with_capture(config, knock, *, class_mode=False, tmp_path=None):
 
     def runner(argv, **kw):
         calls.append(list(argv))
-        return None
 
     signal = KnockSignal(config, runner=runner)
     out = signal.emit(knock, class_mode=class_mode)
@@ -125,7 +121,7 @@ def test_no_topic_reason_or_fragment_ever_reaches_argv(
         knock = _raise_secret_knock(service)
     finally:
         store.close()
-    out, calls = _emit_with_capture(config, knock)
+    _out, calls = _emit_with_capture(config, knock)
     assert calls, "nothing ran — the property would be vacuous"
     fragments = {SECRET_TOPIC, SECRET_REASON, "gym", "INVOICE", "2026-SECRET",
                  "7731", "overdue", "invoice for the gym", "leg-day"}

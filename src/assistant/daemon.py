@@ -1209,6 +1209,16 @@ class Daemon:
     # -- hotword: wake-knock model (never straight hit->listening) ----------
     def _hotword_capture_factory(self):
         """Always-on capture for the wake path (production mic path)."""
+        if os.environ.get("ASSIST_CAPTURE", "").strip().lower() in (
+                "simulated", "mock", "fake"):
+            # Same hermeticity seam as ptt.start (owner order 2026-10-26):
+            # bug6-class tests never open the real mic, wake path included.
+            from .capture import SimulatedCapture
+
+            return SimulatedCapture(speech_frames=100_000,
+                                    frame_ms=int(self.config.section(
+                                        "capture").get("chunk_ms", 30)),
+                                    realtime=True)
         from .capture import PipeWireCapture
 
         capture_cfg = self.config.section("capture")
@@ -1600,6 +1610,15 @@ class Daemon:
         capture_cfg = self.config.section("capture")
         frame_ms = int(capture_cfg.get("chunk_ms", 30))
         source_kind = params.get("source") or capture_cfg.get("source", "mic")
+        # Test-hermeticity seam (owner order 2026-10-26): bug6-class tests
+        # must never open the real mic — the CLI-subprocess dictate test
+        # captured ~0 s of room audio on the laptop and reported "no speech
+        # captured" where the scripted mock transcript was expected. An
+        # env-forced simulated capture fixes it for in-process daemons and
+        # spawned CLIs alike.
+        if os.environ.get("ASSIST_CAPTURE", "").strip().lower() in (
+                "simulated", "mock", "fake"):
+            source_kind = "simulated"
         # BUG 6 (2026-10-20): dictate used to spawn pw-record with NO --target
         # (params["target"] was never set by `assist dictate`) while the owner's
         # working microphone sat in config. Resolution order: explicit param →
