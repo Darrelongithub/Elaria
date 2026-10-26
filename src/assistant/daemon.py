@@ -1842,7 +1842,24 @@ class Daemon:
                 self._ptt_mark_terminal(
                     session_id, self._ptt_unfinished_payload(session_id))
 
+        if task is None:
+            # Stream D (2026-10-26): double-stop idempotency. The
+            # Win-first release can fire TWO release binds (both the
+            # legacy bindr and the ignore_mods bindri match), and any
+            # stop on an already-closed session must be a clean no-op —
+            # WITH its own schema line, never a silent nothing.
+            if self._ptt_processing:
+                noop_reason = "finish-in-flight"
+            elif session_id is not None and session_id in self._ptt_results:
+                noop_reason = "already-closed"
+            else:
+                noop_reason = "no-active-session"
+            log_event("stop.noop", session_id=str(session_id or ""),
+                      verdict=noop_reason,
+                      detail=(f"source={stop_source}; no active "
+                              "dictation — idempotent no-op"))
         response = {"listening": False, **ack, "result": None,
+                    "noop": task is None,
                     "processing": task is not None or self._ptt_processing,
                     "session_id": session_id,
                     "connectivity": self.mode_manager.status(refresh=False).as_dict()}
@@ -2086,8 +2103,15 @@ class Daemon:
             # the reply path — no canned filler, no fallback greeting, no
             # TTS. After the energy-floor discard its text is empty anyway;
             # `not no_speech` pins the invariant even if that ever changes.
-            if session_mode == "command" and result["text"].strip() and not no_speech:
-                veto = self._command_gate(result)
+            if (result["text"].strip() and not no_speech
+                    and session_mode in ("command", "conversation", "narration")):
+                # SILENCE HOTFIX rule 4 (preserved): empty / below-floor /
+                # garbage sessions never reach the reply path — the gate is
+                # the one the command path always had. A completed voice
+                # turn WITH real text now answers in every session mode
+                # (stream E: "the last code wall before her voice").
+                veto = (self._command_gate(result)
+                        if session_mode == "command" else None)
                 if veto is not None:
                     # Nothing was routed, so nothing was executed. The words are
                     # still reported (they are the user's dictation, kept in the
@@ -2095,8 +2119,6 @@ class Daemon:
                     result["command"] = veto
                     result["narration"] = veto["note"]
                 else:
-                    # Known grammar climbs the local ladder first; open text
-                    # follows the same offline queue policy as `ask`.
                     # Her own words were already stripped from result["text"]
                     # above (BH-K2); what remains is the user's and may route.
                     reply_timeout_s = max(
@@ -2105,6 +2127,13 @@ class Daemon:
                         "dictate.reply_generation_start",
                         session_id=str(session_id or ""),
                         timeout_s=reply_timeout_s)
+                    # Schema line for the gate: the reply invocation is a
+                    # journal fact, not only a persona-event whisper.
+                    log_event("reply.invocation", session_id=str(session_id or ""),
+                              verdict="invoked",
+                              detail=(f"mode={session_mode}; "
+                                      f"text_chars={len(result['text'])}; "
+                                      f"speak={params.get('speak', True)}"))
                     reply_started = time.monotonic()
                     from .intents import route as route_intent
 
@@ -2112,14 +2141,17 @@ class Daemon:
                         parsed_intent = route_intent(result["text"])
                     except Exception:
                         parsed_intent = None
-                    # Known local commands keep their existing grammar path.
-                    # Real, above-floor speech with no recognized task goes to
-                    # a generated clarification, never a stock ack/greeting.
-                    reply_task = asyncio.create_task(self._ask({
+                    ask_params = {
                         "text": result["text"],
                         "speak": params.get("speak", True),
-                        "unparsed_command": parsed_intent is None,
-                    }))
+                    }
+                    if session_mode == "command":
+                        # Known local commands keep their existing grammar
+                        # path. Real, above-floor speech with no recognized
+                        # task goes to a generated clarification, never a
+                        # stock ack/greeting.
+                        ask_params["unparsed_command"] = parsed_intent is None
+                    reply_task = asyncio.create_task(self._ask(ask_params))
                     try:
                         done, _pending = await asyncio.wait(
                             {reply_task}, timeout=reply_timeout_s,
@@ -2161,7 +2193,12 @@ class Daemon:
                                       "failed."),
                             "error": str(exc)[:200],
                         }
-                if isinstance(result.get("command"), dict):
+                # Narration (the dictation pillar) keeps its factual
+                # report as the narration line — her spoken answer rides
+                # in the reply. Command and conversation let the reply
+                # BE the narration, as the command path always did.
+                if (isinstance(result.get("command"), dict)
+                        and session_mode != "narration"):
                     result["narration"] = result["command"].get(
                         "reply", result["narration"])
         except Exception as exc:
@@ -2196,6 +2233,9 @@ class Daemon:
                 # every session end carries today's spend on stdout).
                 capture = (result or {}).get("capture") or {}
                 model_of_record = (result or {}).get("model")
+                transcript_state = ("no_speech" if (result or {}).get("no_speech")
+                                    else "no_final" if (result or {}).get("no_final")
+                                    else "final")
                 log_event("session.close", session_id=session_id,
                           peak=capture.get("peak"),
                           verdict=("silence" if (result or {}).get("no_speech")
@@ -2204,8 +2244,8 @@ class Daemon:
                                    if model_of_record else "")
                                   + f"{self._dictation_session_mode or 'narration'} "
                                   f"session closed — "
-                                  f"{len(str((result or {}).get('text') or (result or {}).get('narration') or ''))} "
-                                  "chars"
+                                  f"text_chars={len(str((result or {}).get('text') or ''))} "
+                                  f"({transcript_state})"
                                   + (f"; audio kept at {(result or {}).get('audio_path')}"
                                      if (result or {}).get("audio_path") else "")))
                 try:

@@ -316,6 +316,13 @@ speech_resume_s = 0.4
 # own hotkey release — an abandoned dictation held the mic for ~50 minutes.
 checkin_grace_s = 8.0
 
+# Scene-3b-REDO (stream E): the bounded post-release wait for the final
+# transcript. Named and configurable — the budget shows up in every
+# final.wait schema line, so a silent lengthening can never hide. Below
+# this wait a clean stop still falls back to the saved WAV; past it the
+# session closes honestly with final.timeout naming what happened.
+final_wait_s = 12.0
+
 # VB-8: a command-mode transcript below this ASR confidence — or flagged by
 # cleanup as unreliable — is never routed to an intent, so a mumble that sounds
 # like "undo." cannot reverse files. Unknown confidence still allows read-only

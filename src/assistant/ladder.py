@@ -50,17 +50,24 @@ class Rung:
 
 @dataclass
 class BindEntry:
-    """One bind from `hyprctl -j binds`.
+    """One bind from `hyprctl -j binds` (or the config text fallback).
 
     `token` is the canonical chord ("shiftsuperf2"); `had_mods` records
     whether the bind carried ANY modifier specification (mask or mod text) —
     a bare-F2 candidate must have none, so a bind whose `$variable` fails to
     resolve can never masquerade as a bare press (the rung-E disease).
+
+    `ignore_mods` is the release-bind order-robustness flag: True/False when
+    the source exposes it (`ignore_mods` in the JSON), None when it does
+    not — 0.56.2's `hyprctl -j binds` omits the field, so the config-text
+    flag letters (`bindri` etc.) carry that truth instead. Scene 4 reads the
+    truth from the dump OR the config, never from silence.
     """
     token: str                 # canonical chord: mods in mask-bit order + key
     release: bool              # True for `bindr`-style release binds
     had_mods: bool             # raw mods/modmask present
     key: str                   # the bind's key, lowercased ("f2")
+    ignore_mods: bool | None = None
 
 
 # The compositor-resolved modifier mask as `hyprctl -j binds` reports it in
@@ -69,6 +76,22 @@ class BindEntry:
 _MOD_BITS = ((1, "SHIFT"), (2, "CAPS"), (4, "CTRL"), (8, "ALT"),
              (16, "NUM"), (32, "MOD3"), (64, "SUPER"), (128, "MOD5"))
 _KEYCODE_KEYS = {68: "f2"}    # evdev KEY_F2 — only used when `key` is empty
+
+# Bind flag letters as the v0.56.2 legacy parser reads them
+# (src/config/legacy/ConfigManager.cpp handleBind, ~1518–1540):
+# BINDARGS = keyword.substr(4), one letter per flag; an unknown letter is
+# "bind: invalid flag". `c` (click) and `g` (drag) IMPLY release. This table
+# is what teaches the ladder `bindri` and friends — the flag-combined
+# keyword forms scene 4 must read truth from.
+_BIND_FLAGS = {
+    "l": "locked", "r": "release", "e": "repeat", "m": "mouse",
+    "n": "non_consuming", "a": "auto_consuming", "t": "transparent",
+    "i": "ignore_mods", "s": "separate", "o": "long_press",
+    "d": "has_description", "p": "no_inhibit", "c": "click",
+    "g": "drag", "u": "submap_universal", "k": "per_device",
+    "x": "allow_input_capture",
+}
+_RELEASE_IMPLYING_FLAGS = frozenset("rcg")
 
 
 def _decode_modmask(mask: int) -> list[str]:
@@ -261,6 +284,109 @@ class Ladder:
             out = new
         return out
 
+    def _conf_bind_lines(self) -> list[dict]:
+        """Every `bind[flags] = mods, key, ...` line from the config text.
+
+        The dump's JSON is chord authority (scene-2 rule), but 0.56.2 does
+        NOT expose `ignore_mods` in `hyprctl -j binds` — the flag letters in
+        the config keyword are the only truth for release-form flags. Flag
+        letters are parsed with the v0.56.2 table above, so `bindri`,
+        `bindrl`, `bindl`… all read correctly and an unknown letter is named
+        in the line, never silently ignored.
+        """
+        out: list[dict] = []
+        for path in self._hypr_config_files():
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:  # noqa: S112 - an unreadable include contributes no binds; the rung evidence reports what stayed unresolved
+                continue
+            for line in text.splitlines():
+                stripped = line.split("#", 1)[0].strip()
+                match = re.match(r"bind([a-zA-Z]*)\s*=\s*(.*)$", stripped)
+                if not match:
+                    continue
+                flags = set(match.group(1).lower())
+                unknown = flags - set(_BIND_FLAGS)
+                args = [a.strip() for a in match.group(2).split(",")]
+                if len(args) < 2:
+                    continue
+                out.append({
+                    "keyword": "bind" + match.group(1),
+                    "flags": flags,
+                    "unknown_flags": sorted(unknown),
+                    "release": bool(flags & _RELEASE_IMPLYING_FLAGS),
+                    "ignore_mods": "i" in flags,
+                    "mods_raw": args[0],
+                    "key": args[1].lower(),
+                })
+        return out
+
+    def _entries_from_conf(self) -> tuple[list[BindEntry], str]:
+        """BindEntry list from config text alone (hyprctl unavailable).
+
+        "the truth from the dump OR the config either way": when the dump
+        cannot be read, the config lines still teach the rungs what binds
+        exist — with the same unresolvable-variable honesty as the JSON path
+        (a `$var` that fails to expand is named and never counts as bare).
+        """
+        variables = self._hypr_variables()
+        entries: list[BindEntry] = []
+        unresolved: set[str] = set()
+        for line in self._conf_bind_lines():
+            mods_raw = line["mods_raw"]
+            mods: list[str] = []
+            had_mods = False
+            if mods_raw.strip():
+                had_mods = True
+                expanded = self._expand_vars(mods_raw, variables)
+                for name in self._VAR.findall(mods_raw):
+                    var = name[0] or name[1]
+                    if var not in variables:
+                        unresolved.add(f"${var}")
+                    elif not str(variables[var]).strip():
+                        unresolved.add(f"${var} (expands to empty)")
+                mods = [m for m in re.split(r"[\s+]+", expanded) if m]
+                if not mods:
+                    mods = [mods_raw.strip()]
+                    unresolved.add(f"{mods_raw.strip()} (expands to empty)")
+            key_expanded = self._expand_vars(line["key"], variables).lower()
+            entries.append(BindEntry(
+                token=_mod_token(mods, key_expanded),
+                release=line["release"],
+                had_mods=had_mods,
+                key=key_expanded,
+                ignore_mods=line["ignore_mods"]))
+        why = (f"{len(entries)} bind entries (from config text"
+               + ("; unresolved vars: " + ", ".join(sorted(unresolved))
+                  if unresolved else "")
+               + ")")
+        return entries, why
+
+    def _release_forms(self, entries: list[BindEntry],
+                       key: str) -> tuple[bool, bool]:
+        """(legacy_release, ignore_mods_release) for one key.
+
+        Truth order: the dump's `ignore_mods` field when the compositor
+        exposes it; else the config-text flag letters (`bindri` vs `bindr`).
+        A release entry with neither source is the legacy form until proven
+        otherwise — the scene-3b WARN, never silently modern.
+        """
+        conf = []
+        variables = self._hypr_variables()
+        for line in self._conf_bind_lines():
+            if (self._expand_vars(line["key"], variables).lower() == key
+                    and line["release"]):
+                conf.append(line)
+        json_rel = [e for e in entries if e.key == key and e.release]
+        exposed = [e.ignore_mods for e in json_rel
+                   if e.ignore_mods is not None]
+        if exposed:
+            return (any(v is False for v in exposed), any(exposed))
+        if conf:
+            return (any(not l["ignore_mods"] for l in conf),
+                    any(l["ignore_mods"] for l in conf))
+        return (bool(json_rel), False)
+
     def _bind_entries(self) -> tuple[list[BindEntry], str]:
         """Every bind from `hyprctl -j binds`, or ([], why).
 
@@ -273,8 +399,11 @@ class Ladder:
         counts as a bare key press.
         """
         data, why = self.hyprctl_json("binds")
-        if data is None:
-            return [], why
+        if data is None or (isinstance(data, list) and not data):
+            # "the truth from the dump OR the config either way": with no
+            # readable dump the config text still teaches the rungs.
+            conf_entries, conf_why = self._entries_from_conf()
+            return conf_entries, f"{conf_why}; hyprctl: {why}"
         variables = self._hypr_variables()
         entries: list[BindEntry] = []
         unresolved: set[str] = set()
@@ -321,11 +450,14 @@ class Ladder:
                         mods = [mod.strip()]
                         unresolved.add(f"{mod.strip()} (expands to empty)")
             key_expanded = self._expand_vars(key, variables).lower()
+            raw_ignore = entry.get("ignore_mods")
             entries.append(BindEntry(
                 token=_mod_token(mods, key_expanded),
                 release=bool(entry.get("release")),
                 had_mods=had_mods,
-                key=key_expanded))
+                key=key_expanded,
+                ignore_mods=(bool(raw_ignore)
+                             if isinstance(raw_ignore, bool) else None)))
         why = f"{len(entries)} bind entries"
         if masks_used:
             why += "; chords from compositor modmask"
@@ -353,11 +485,17 @@ class Ladder:
         release = any(e.release for e in bare)
         return press, release
 
-    @staticmethod
-    def _bare_f2_evidence(press: bool, release: bool, why: str) -> str:
-        text = f"bare-F2 press bind={'PRESENT (forbidden)' if press else 'absent'}"
-        if release:
+    def _bare_f2_evidence(self, press: bool, release: bool, why: str,
+                          entries: list[BindEntry] | None = None) -> str:
+        text = (f"bare-F2 press bind="
+                f"{'PRESENT (forbidden)' if press else 'absent'}")
+        legacy_release, ignore_release = self._release_forms(
+            entries or [], "f2") if release else (False, False)
+        if release and legacy_release:
             text += "; WARN legacy release-stop bind (WP3 replaces)"
+        if release and ignore_release:
+            text += ("; release-stop ignore_mods present "
+                     "(bindri flag — WP3 form, order-robust)")
         return f"{text} ({why})"
 
     # -- shared rung probes --------------------------------------------------
@@ -457,7 +595,7 @@ class Ladder:
             press, release = self._bare_f2(entries)
             ok = raise_bind and not press
             return ok, (f"Win+Shift+F2 raise bind={'present' if raise_bind else 'ABSENT'}"
-                        f"; {self._bare_f2_evidence(press, release, why)}")
+                        f"; {self._bare_f2_evidence(press, release, why, entries)}")
 
         def rung_d():
             active, unit_evidence = self.probe_units("elaria-console.service")
@@ -491,7 +629,7 @@ class Ladder:
             return press_bind and halt and not bare_press, (
                 f"Win+F2 press={'present' if press_bind else 'ABSENT'}"
                 f"; Win+Shift+F12 halt={'present' if halt else 'ABSENT'}"
-                f"; {self._bare_f2_evidence(bare_press, bare_release, why)}")
+                f"; {self._bare_f2_evidence(bare_press, bare_release, why, entries)}")
 
         def rung_b():
             return self.probe_scripts("assist", "assistd")

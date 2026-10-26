@@ -106,6 +106,9 @@ def test_live_close_without_final_falls_back_to_saved_wav_and_logs_capture(
         **config.raw.get("transcribe", {}),
         "inbox_dir": str(tmp_path / "inbox"),
         "copy_to_clipboard": False,
+        # the boundedness assertions below measure against THIS budget —
+        # final_wait_s is configurable now, so the test states it
+        "final_wait_s": 0.5,
     }
     store = Store(tmp_path / "bug6e.db")
     service = DictationService(config, store, None)
@@ -192,6 +195,9 @@ def test_failed_saved_wav_fallback_returns_explicit_no_final(
         **config.raw.get("transcribe", {}),
         "inbox_dir": str(tmp_path / "inbox"),
         "copy_to_clipboard": False,
+        # the boundedness assertions below measure against THIS budget —
+        # final_wait_s is configurable now, so the test states it
+        "final_wait_s": 0.5,
     }
     store = Store(tmp_path / "bug6e-no-final.db")
     service = DictationService(config, store, None)

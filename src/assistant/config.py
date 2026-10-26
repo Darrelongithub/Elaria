@@ -504,6 +504,10 @@ DEFAULTS: dict = {
         # long AFTER the check-in closes the session instead of holding the mic.
         "speech_resume_s": 0.4,
         "checkin_grace_s": 8.0,
+        # Scene-3b-REDO stream E: the bounded post-release wait for the final
+        # transcript. Named and configurable — the budget shows up in every
+        # final.wait schema line, so a silent lengthening can never hide.
+        "final_wait_s": 12.0,
         # VB-8: a command transcript below this ASR confidence (or flagged by
         # cleanup) is never executed. Unknown confidence still allows read-only
         # intents, never a mutating one.

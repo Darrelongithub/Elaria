@@ -287,6 +287,10 @@ class DictationService:
         # and how much silence after the one check-in closes the session (VB-5/6).
         self.resume_s = float(settings.get("speech_resume_s", 0.4))
         self.grace_s = float(settings.get("checkin_grace_s", 8.0))
+        # Scene-3b-REDO stream E: the post-release wait for the final
+        # transcript is a budget, named and configurable — never a magic
+        # constant (the 2.5 s wall the reply regression died behind).
+        self.final_wait_s = float(settings.get("final_wait_s", 12.0))
         self.audio_dir = config.data_dir / "audio"
 
     def _connectivity(self):
@@ -838,24 +842,47 @@ class DictationService:
                     live_failures.append(f"activity_end: {exc}")
                     notes.append(f"Live activity_end failed ({exc}); will use committed text or saved-WAV fallback")
 
+                collector_state = ("none" if collector is None
+                                   else "done" if collector.done() else "alive")
+                final_wait_started = time.monotonic()
+                final_wait_note = ""
+                # Stream E (2026-10-26): schema events that name the
+                # flush. final.wait fires at EVERY flush of a live
+                # session — its absence in a journal is the signal that
+                # we hung up before the flush arrived. final.received /
+                # final.timeout say what actually happened, naming a
+                # dead collector honestly instead of pretending to wait.
+                log_event("final.wait", session_id=session_id,
+                          verdict="waiting",
+                          detail=(f"budget_s={self.final_wait_s}; "
+                                  f"collector={collector_state}; "
+                                  f"activity_end_ok={activity_end_ok}"))
                 if activity_end_ok and collector is not None:
                     try:
                         await self._await_lifecycle(
                             "dictate.transcript_final_wait",
                             wait_for_live_terminal(collector,
                                                    collector_terminal_event),
-                            timeout_s=self.FINAL_TRANSCRIPT_TIMEOUT_S,
+                            timeout_s=self.final_wait_s,
                             session_id=session_id)
                     except TimeoutError:
                         live_terminal_missing = True
+                        final_wait_note = (f"budget expired after "
+                                           f"{self.final_wait_s}s")
                         notes.append(
                             "Live final transcript timed out after activity_end; "
                             "will use committed text or saved-WAV fallback")
                     except Exception as exc:
                         live_terminal_missing = True
                         live_failed = True
+                        final_wait_note = f"final wait failed ({exc})"
                         live_failures.append(f"final wait: {exc}")
-                        notes.append(f"Live final wait failed ({exc}); will use committed text or saved-WAV fallback")
+                        notes.append(f"Live final wait failed ({exc}); "
+                                     "will use committed text or saved-WAV fallback")
+                elif collector is None:
+                    final_wait_note = "no live collector — final wait skipped"
+                elif not activity_end_ok:
+                    final_wait_note = "activity_end failed — final wait skipped"
                 diagnostics = {}
                 try:
                     describe = getattr(transport, "diagnostics", None)
@@ -868,11 +895,37 @@ class DictationService:
                           event_counts=dict(live_event_counts), transport=diagnostics)
                 finals = _final_texts(collected)
                 final_text = " ".join(finals).strip()
-                if not final_text:
+                waited_s = round(time.monotonic() - final_wait_started, 3)
+                if final_text:
+                    log_event("final.received", session_id=session_id,
+                              verdict="received",
+                              detail=(f"text_chars={len(final_text)}; "
+                                      f"waited_s={waited_s}"
+                                      + (f"; {final_wait_note}"
+                                         if final_wait_note else "")))
+                else:
                     live_terminal_missing = True
                     self._log("dictate.live_no_final", session_id=session_id,
                               activity_end_ok=activity_end_ok,
                               frames_seen=frames_seen)
+                    note = final_wait_note
+                    if not note:
+                        # A collector that finished WITHOUT delivering a final
+                        # is the sever: the link died mid-utterance. (A
+                        # collector that finished AFTER its final is the
+                        # healthy path — that lands in final.received.) The
+                        # CURRENT state decides: death can come mid-wait.
+                        collector_dead = (collector is None or collector.done())
+                        note = ("collector ended with no final "
+                                "(live link died?)"
+                                if collector_dead
+                                else "terminal reached with no final text")
+                    log_event("final.timeout", level="warn",
+                              session_id=session_id,
+                              verdict="missing",
+                              detail=(f"waited_s={waited_s}; "
+                                      f"collector={collector_state}; "
+                                      + note))
             duplex = {}
             if transport is not None and getattr(transport, "gate", None) is not None:
                 duplex = transport.gate.snapshot()
