@@ -705,38 +705,74 @@ class SpeechService:
             return 120.0
         return min(1800.0, max(15.0, seconds * 1.5 + 10.0))
 
-    def _player_command(self) -> list[str] | None:
+    def _player_candidates(self) -> list[list[str]]:
+        """Every player worth trying, in order (scene-3b, 2026-10-26).
+
+        `auto` lists all installed players — the first binary is a PREFERENCE,
+        not a commitment: a player that exists but fails (non-zero exit,
+        spawn error, timeout) must not be the end of playback while another
+        candidate could still make sound (the owner's paplay worked when the
+        ack chain reported played:false).
+        """
         setting = str(self.config.section("tts").get("player", "auto"))
         if setting == "none":
-            return None
+            return []
         if setting != "auto":
             parts = shlex.split(setting)
-            return parts if parts and shutil.which(parts[0]) else None
-        for candidate in ("pw-play", "paplay", "aplay"):
-            if shutil.which(candidate):
-                return [candidate]
-        return None
+            return [parts] if parts and shutil.which(parts[0]) else []
+        return [[c] for c in ("pw-play", "paplay", "aplay") if shutil.which(c)]
+
+    def _play_with_detail(self, path: Path) -> dict:
+        """Play `path`, trying each candidate player in order.
+
+        Returns {played, player, argv, returncode, error}: every failure mode
+        (no player binary, spawn error, non-zero exit with the stderr tail,
+        timeout) is recorded — silence with a reason, never a bare False.
+        """
+        candidates = self._player_candidates()
+        if not candidates:
+            self.last_voice_error = (
+                "no audio player available (pw-play/paplay/aplay) or "
+                "[tts] player = none")
+            return {"played": False, "player": None, "argv": None,
+                    "returncode": None, "error": self.last_voice_error}
+        attempts: list[str] = []
+        last: dict = {}
+        for command in candidates:
+            argv = [*command, str(path)]
+            # VB-10: the player is spawned with PR_SET_PDEATHSIG in its own
+            # session, so a killed daemon cannot leave audio playing (or the
+            # sink claimed). An injected test runner keeps the plain
+            # signature — it must not have to know about prctl.
+            protect = self._player_runner is subprocess.run
+            try:
+                result = self._player_runner(
+                    argv, capture_output=True,
+                    timeout=self._playback_timeout_s(path),
+                    **(child_kwargs() if protect else {}))
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                err = f"{command[0]}: {type(exc).__name__}: {exc}"
+                attempts.append(err)
+                last = {"played": False, "player": command[0], "argv": argv,
+                        "returncode": None, "error": err}
+                continue
+            returncode = getattr(result, "returncode", 0)
+            if returncode == 0:
+                return {"played": True, "player": command[0], "argv": argv,
+                        "returncode": 0, "error": ""}
+            stderr = getattr(result, "stderr", b"") or b""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", "replace")
+            err = f"{command[0]} exited {returncode}: {str(stderr).strip()[:200]}"
+            attempts.append(err)
+            last = {"played": False, "player": command[0], "argv": argv,
+                    "returncode": returncode, "error": err}
+        self.last_voice_error = "; ".join(attempts)[:400]
+        return {**last, "played": False,
+                "error": self.last_voice_error or "playback failed"}
 
     def play_audio(self, path: Path) -> bool:
-        command = self._player_command()
-        if command is None:
-            return False
-        # VB-10: the player is spawned with PR_SET_PDEATHSIG in its own session,
-        # so a killed daemon cannot leave audio playing (or the sink claimed).
-        # An injected test runner keeps the plain signature — it must not have to
-        # know about prctl to stand in for a player.
-        protect = self._player_runner is subprocess.run
-        try:
-            result = self._player_runner([*command, str(path)], capture_output=True,
-                                         timeout=self._playback_timeout_s(path),
-                                         **(child_kwargs() if protect else {}))
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            # A hung or missing player is reported silence, like any other
-            # speech failure - it must not escape a fire-and-forget task and
-            # print "exception was never retrieved" into the daemon log.
-            self.last_voice_error = f"audio player failed: {type(exc).__name__}: {exc}"
-            return False
-        return getattr(result, "returncode", 0) == 0
+        return bool(self._play_with_detail(path).get("played"))
 
     def speak(self, text: str, *, play: bool = True) -> SpeechResult:
         route, why = self.voice_route()
@@ -916,9 +952,12 @@ class SpeechService:
                 return {**route, "ack_kind": kind, "audio_path": None,
                         "cached": False, "played": False, "cache_miss": True,
                         "warning": "neutral session cue could not be written"}
+            detail = self._play_with_detail(Path(cue))
             return {**route, "ack_kind": kind, "audio_path": cue,
-                    "cached": True, "played": self.play_audio(Path(cue)),
-                    "cache_miss": False, "cue": True, "text": ""}
+                    "cached": True, "played": detail["played"],
+                    "cache_miss": False, "cue": True, "text": "",
+                    "player": detail.get("player"), "argv": detail.get("argv"),
+                    "error": detail.get("error") or None}
         path = self.cached_ack(kind)
         if path is None:
             # The ack budget forbids synthesising here. Report it as a cold cache
@@ -933,9 +972,12 @@ class SpeechService:
             return {**route, "ack_kind": kind, "audio_path": None, "cached": False,
                     "played": False, "cache_miss": False, "muted": True,
                     "reason": self.voice_route()[1]}
+        detail = self._play_with_detail(Path(path))
         return {**route, "ack_kind": kind, "audio_path": path,
-                "cached": True, "played": self.play_audio(Path(path)),
-                "cache_miss": False}
+                "cached": True, "played": detail["played"],
+                "cache_miss": False,
+                "player": detail.get("player"), "argv": detail.get("argv"),
+                "error": detail.get("error") or None}
 
     # -- auditions -----------------------------------------------------------------------
     def generate_auditions(self, text: str | None = None,

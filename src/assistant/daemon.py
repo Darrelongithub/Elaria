@@ -371,6 +371,7 @@ class Daemon:
         self._set_speaking(True, text=text)
         playback = asyncio.create_task(asyncio.to_thread(self.speech.play_ack, kind))
         self._ack_playbacks.add(playback)
+        session_id = str(self._ptt_session_id or "")
 
         def finished(task: asyncio.Task) -> None:
             self._ack_playbacks.discard(task)
@@ -379,13 +380,31 @@ class Daemon:
 
         playback.add_done_callback(finished)
 
+        def log_outcome(result: dict) -> None:
+            """Scene-3b sensor: the playback outcome is reported, never
+            swallowed — `ack.played`/`ack.failed` carry the player argv and
+            any error detail so the next scene reads truth from the journal."""
+            played = bool(result.get("played"))
+            detail = (f"ack_kind={kind} player={result.get('player') or '-'} "
+                      f"argv={' '.join(str(a) for a in (result.get('argv') or [])) or '-'}")
+            if not played and result.get("error"):
+                detail += f" error={result['error']}"
+            log_event("ack.played" if played else "ack.failed",
+                      level="info" if played else "warn",
+                      session_id=session_id,
+                      verdict="played" if played else "failed",
+                      detail=detail)
+
         async def wait_for_playback():
             try:
-                return await asyncio.shield(playback)
+                result = await asyncio.shield(playback)
             except Exception as exc:
                 await self.broadcast({"event": "speech.error", "ack_kind": kind,
                                       "error": str(exc)})
-                return {"played": False, "error": str(exc)}
+                result = {"played": False, "error": str(exc)}
+            log_outcome(result if isinstance(result, dict) else {"played": False,
+                                                                 "error": "no result"})
+            return result
 
         return self._track_task(asyncio.create_task(wait_for_playback()))
 
@@ -844,8 +863,17 @@ class Daemon:
         class_mode = self.presence.status().enabled
         should_speak = bool(params.get("speak",
                                       self.config.section("tts").get("speak_acks", True)))
+        # Scene-3b reporting fix: whenever nothing is going to play, the ack
+        # says WHY (the owner's evidence read played:false with no explanation
+        # on a stop ack that is silent by design).
+        suppressed = None
         if class_mode:
             should_speak = False       # spoken acks OFF in class mode
+            suppressed = "class mode: spoken acks OFF"
+        elif not should_speak:
+            suppressed = ("speak=False requested (release ack — never "
+                          "spoken by design)" if params.get("speak") is False
+                          else "speak_acks off in [tts]")
         if should_speak and cached is None and not route["muted"]:
             await self._await_ack_cache()          # VB-13: boot warming, once
             cached = self.speech.cached_ack(kind)
@@ -857,8 +885,7 @@ class Daemon:
                          # what makes the next press audible.
                          "cache_miss": cached is None and not route["muted"],
                          "class_mode": class_mode,
-                         "speak_suppressed": ("class mode: spoken acks OFF"
-                                              if class_mode else None)}
+                         "speak_suppressed": suppressed}
         if cached is None:
             self._schedule_rewarm_if_requested()   # VB-2: miss -> one warm cycle
         if should_speak and cached:
