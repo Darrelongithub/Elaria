@@ -51,9 +51,12 @@ printf '%s\n' "$now" > "$stamp"
     [[ -n "$txt_path" ]] && printf ' Live document: %s' "$txt_path"
     printf '\n'
 } >&2
+# NOTIFICATION PRIVACY (owner order 2026-10-26): notifications are signals,
+# not carriers. The body is a fixed static sentence only — the live document
+# path is journal material (stderr above), never notification content.
 if command -v notify-send >/dev/null 2>&1; then
     if [[ -n "$txt_path" ]]; then
-        notify-send "Elaria · event notebook" "$message"$'\n'"$txt_path" || true
+        notify-send "Elaria · event notebook" "$message" || true
     else
         notify-send "Elaria · console" "$message" || true
     fi

@@ -132,7 +132,8 @@ announce = true
 snooze_hours = 24             # "later" -> commitment memory
 retire_after_ignores = 3      # same topic ignored 3x is retired
 urgent_in_class_mode = true   # class mode = urgent-only, and silent
-notify_identity = "Elaria · knock"   # its own identity; nothing else uses it
+# notification identity/title/body are fixed in code (privacy rule 2026-10-26):
+# title "Elaria wants to talk", static body, no content knob.
 sound = "~/.local/share/assistant/sounds/knock.wav"
 notify = true
 play_sound = true

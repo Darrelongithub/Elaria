@@ -557,7 +557,8 @@ DEFAULTS: dict = {
         "urgent_in_class_mode": True,   # class mode = urgent-only, silently
         # A knock has its OWN notification identity and its OWN short sound.
         # Nothing else ever uses these (§19.2: not errors, not completions).
-        "notify_identity": "Elaria · knock",
+        # The identity/title/body are FIXED in code (notification privacy,
+        # owner order 2026-10-26) — there is deliberately no content knob.
         "sound": "~/.local/share/assistant/sounds/knock.wav",
         "notify": True,
         "play_sound": True,
