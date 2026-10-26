@@ -50,9 +50,45 @@ class Rung:
 
 @dataclass
 class BindEntry:
-    """One bind from `hyprctl -j binds`: its canonical key token + release flag."""
-    token: str                 # "supershiftf2" style — mods resolved, joined
+    """One bind from `hyprctl -j binds`.
+
+    `token` is the canonical chord ("shiftsuperf2"); `had_mods` records
+    whether the bind carried ANY modifier specification (mask or mod text) —
+    a bare-F2 candidate must have none, so a bind whose `$variable` fails to
+    resolve can never masquerade as a bare press (the rung-E disease).
+    """
+    token: str                 # canonical chord: mods in mask-bit order + key
     release: bool              # True for `bindr`-style release binds
+    had_mods: bool             # raw mods/modmask present
+    key: str                   # the bind's key, lowercased ("f2")
+
+
+# The compositor-resolved modifier mask as `hyprctl -j binds` reports it in
+# `modmask` (owner truth dump 2026-10-26: 64 = SUPER alone, 65 = SUPER+SHIFT).
+# XKB/X11 bit layout — the SUPER bit is 64.
+_MOD_BITS = ((1, "SHIFT"), (2, "CAPS"), (4, "CTRL"), (8, "ALT"),
+             (16, "NUM"), (32, "MOD3"), (64, "SUPER"), (128, "MOD5"))
+_KEYCODE_KEYS = {68: "f2"}    # evdev KEY_F2 — only used when `key` is empty
+
+
+def _decode_modmask(mask: int) -> list[str]:
+    return [name for _bit, name in _MOD_BITS if mask & _bit]
+
+
+def _canonical_mods(words) -> list[str]:
+    """Mod words in mask-bit order, deduped; unknown words keep input order."""
+    upper = [str(w).upper() for w in words]
+    ordered = [name for _bit, name in _MOD_BITS if name in upper]
+    seen = set(ordered)
+    for word in words:
+        if str(word).upper() not in seen:
+            ordered.append(str(word))
+            seen.add(str(word).upper())
+    return ordered
+
+
+def _mod_token(words, key: str) -> str:
+    return "".join(m.lower() for m in _canonical_mods(words)) + key.lower()
 
 
 @dataclass
@@ -228,11 +264,13 @@ class Ladder:
     def _bind_entries(self) -> tuple[list[BindEntry], str]:
         """Every bind from `hyprctl -j binds`, or ([], why).
 
-        Truth forms handled: `mod` as a bitmask number (real hyprctl), as a
-        literal string ("SUPER SHIFT"), or as a variable string ("$mainMod
-        SHIFT" — resolved against the config-file variable definitions);
-        `mods` as a string or list is accepted too. One token per bind:
-        "supershiftf2". Release binds (`bindr`) carry `release: true`.
+        Authority order (scene-2 rebuild, owner rule 2026-10-26): the
+        compositor-resolved numeric `modmask` is TRUTH (the real payload
+        field — `mod`/`mods` do not exist in it); config-text variable
+        expansion is a FALLBACK for string-shaped fakes only, never
+        authority. A bind whose mod text fails to resolve — or whose
+        variable expands to empty — is named in the evidence and never
+        counts as a bare key press.
         """
         data, why = self.hyprctl_json("binds")
         if data is None:
@@ -240,53 +278,79 @@ class Ladder:
         variables = self._hypr_variables()
         entries: list[BindEntry] = []
         unresolved: set[str] = set()
+        masks_used = False
         for entry in data if isinstance(data, list) else []:
-            key = str(entry.get("key") or entry.get("bind") or "").strip()
+            key = (str(entry.get("key") or entry.get("bind") or "").strip()
+                   or _KEYCODE_KEYS.get(int(entry.get("keycode") or 0), ""))
             if not key:
                 continue
-            mod = entry.get("mod")
-            if mod is None:
-                mod = entry.get("mods")
-            if isinstance(mod, (list, tuple)):
-                mod = " ".join(str(m) for m in mod)
-            if isinstance(mod, str):
-                expanded = self._expand_vars(mod, variables)
-                for name in self._VAR.findall(mod):
-                    var = name[0] or name[1]
-                    if var not in variables:
-                        unresolved.add(f"${var}")
-                mods = [m for m in re.split(r"[\s+]+", expanded) if m]
-            elif isinstance(mod, int) and mod:
-                mods = [name for bit, name in
-                        ((1, "SHIFT"), (2, "CTRL"), (4, "ALT"), (8, "SUPER"))
-                        if mod & bit]
+            # mask first: modmask (real payload) then any int-shaped alias
+            mask = entry.get("modmask")
+            if mask is None:
+                for alias in ("mod", "mods"):
+                    candidate = entry.get(alias)
+                    if isinstance(candidate, int):
+                        mask = candidate
+                        break
+            mods: list[str] = []
+            had_mods = False
+            if isinstance(mask, int):
+                masks_used = True
+                mods = _decode_modmask(mask)
+                had_mods = bool(mods)
             else:
-                mods = []
-            key_expanded = self._expand_vars(key, variables)
-            token = ("".join(m.lower() for m in mods)
-                     + key_expanded.lower()).replace(" ", "")
-            release = bool(entry.get("release"))
-            entries.append(BindEntry(token=token, release=release))
+                mod = entry.get("mod")
+                if mod is None:
+                    mod = entry.get("mods")
+                if isinstance(mod, (list, tuple)):
+                    mod = " ".join(str(m) for m in mod)
+                if isinstance(mod, str) and mod.strip():
+                    had_mods = True
+                    expanded = self._expand_vars(mod, variables)
+                    for name in self._VAR.findall(mod):
+                        var = name[0] or name[1]
+                        if var not in variables:
+                            unresolved.add(f"${var}")
+                        elif not str(variables[var]).strip():
+                            unresolved.add(f"${var} (expands to empty)")
+                    mods = [m for m in re.split(r"[\s+]+", expanded) if m]
+                    if not mods:
+                        # non-empty mod text that expanded to nothing: keep
+                        # the raw text in the chord so it can never read as a
+                        # bare key — silently expanding to empty is forbidden.
+                        mods = [mod.strip()]
+                        unresolved.add(f"{mod.strip()} (expands to empty)")
+            key_expanded = self._expand_vars(key, variables).lower()
+            entries.append(BindEntry(
+                token=_mod_token(mods, key_expanded),
+                release=bool(entry.get("release")),
+                had_mods=had_mods,
+                key=key_expanded))
         why = f"{len(entries)} bind entries"
+        if masks_used:
+            why += "; chords from compositor modmask"
         if unresolved:
             why += f"; unresolved vars: {', '.join(sorted(unresolved))}"
         return entries, why
 
     @staticmethod
     def _bind_matches(keys: list[str], *want: str) -> bool:
-        lowered = [k.lower().replace(" ", "") for k in keys]
-        needle = "".join(want).lower().replace(" ", "")
-        return any(needle == k or needle in k for k in lowered)
+        """Exact canonical chord match: SUPER+SHIFT+F2 never reads as SUPER+F2."""
+        want_mods, want_key = list(want[:-1]), want[-1]
+        needle = _mod_token(want_mods, want_key)
+        return any(needle == k.lower() for k in keys)
 
     @staticmethod
     def _bare_f2(entries: list[BindEntry]) -> tuple[bool, bool]:
-        """(press_bare, release_bare) — bare-F2 with no modifiers.
+        """(press_bare, release_bare) — bare-F2: key F2 with NO modifier spec.
 
         Forbidden = a bare-F2 press/dispatch bind. A legacy `bindr = , F2`
-        release-stop is tolerated until WP3 (WARN, never STUCK).
+        release-stop is tolerated until WP3 (WARN, never STUCK). A bind that
+        merely FAILED to resolve its $variables is never bare (`had_mods`).
         """
-        press = any(e.token == "f2" and not e.release for e in entries)
-        release = any(e.token == "f2" and e.release for e in entries)
+        bare = [e for e in entries if e.key == "f2" and not e.had_mods]
+        press = any(not e.release for e in bare)
+        release = any(e.release for e in bare)
         return press, release
 
     @staticmethod

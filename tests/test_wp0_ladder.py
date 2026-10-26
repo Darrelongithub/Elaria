@@ -230,8 +230,135 @@ def test_mods_key_and_plus_separated_mods_also_tokenise(config, tmp_path):
     responses["hyprctl -j binds"] = (0, binds, "")
     ladder = _ladder(config, responses, hypr_config=conf)
     entries, why = ladder._bind_entries()
-    assert [e.token for e in entries] == ["superf2", "supershiftf2",
-                                          "supershiftf12"], why
+    assert [e.token for e in entries] == ["superf2", "shiftsuperf2",
+                                          "shiftsuperf12"], why
+
+
+# -- the owner's real bind shape (scene-2 truth dump 2026-10-26) -----------
+# Copied VERBATIM from the laptop's `hyprctl -j binds` output (F2 filter):
+# the payload field is `modmask` (64 = SUPER, 65 = SUPER+SHIFT), `key` carries
+# the name, `release` marks bindr. The F12 halt entry is derived from the same
+# dumped shape and the real config line `bind = SUPER SHIFT, F12, exec,
+# assist halt` (hyprland.conf:210) — modmask 65 as dumped for SUPER+SHIFT.
+
+DUMP_F2_PRESS = {
+    "locked": False, "mouse": False, "release": False, "repeat": False,
+    "longPress": False, "non_consuming": False, "auto_consuming": False,
+    "has_description": False, "modmask": 64, "submap": "",
+    "submap_universal": "false", "key": "F2", "keycode": 0,
+    "catch_all": False, "description": "", "allow_input_capture": False,
+    "dispatcher": "exec", "arg": "assist ptt start"}
+DUMP_F2_RELEASE = {
+    "locked": False, "mouse": False, "release": True, "repeat": False,
+    "longPress": False, "non_consuming": False, "auto_consuming": False,
+    "has_description": False, "modmask": 0, "submap": "",
+    "submap_universal": "false", "key": "F2", "keycode": 0,
+    "catch_all": False, "description": "", "allow_input_capture": False,
+    "dispatcher": "exec", "arg": "assist ptt stop"}
+DUMP_F2_RAISE = {
+    "locked": False, "mouse": False, "release": False, "repeat": False,
+    "longPress": False, "non_consuming": False, "auto_consuming": False,
+    "has_description": False, "modmask": 65, "submap": "",
+    "submap_universal": "false", "key": "F2", "keycode": 0,
+    "catch_all": False, "description": "", "allow_input_capture": False,
+    "dispatcher": "exec",
+    "arg": "/home/darrel/.local/bin/elaria-console-open"}
+DUMP_F12_HALT = {
+    "locked": False, "mouse": False, "release": False, "repeat": False,
+    "longPress": False, "non_consuming": False, "auto_consuming": False,
+    "has_description": False, "modmask": 65, "submap": "",
+    "submap_universal": "false", "key": "F12", "keycode": 0,
+    "catch_all": False, "description": "", "allow_input_capture": False,
+    "dispatcher": "exec", "arg": "assist halt"}
+DUMP_BINDS = json.dumps(
+    [DUMP_F2_PRESS, DUMP_F2_RELEASE, DUMP_F2_RAISE, DUMP_F12_HALT])
+
+
+def test_scene3_gate_truthful_rungs_from_the_owner_dump(config):
+    """The scene-3 gate, asserted against the real dumped shape: Win+F2
+    press PRESENT, halt PRESENT, raise PRESENT, bare-F2 press ABSENT, and
+    the legacy release-stop WARN retained."""
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (0, DUMP_BINDS, "")
+    ladder = _ladder(config, responses)
+    text, ok = render(ladder.run("wake") + ladder.run("console"))
+    assert ok, text
+    assert "Win+F2 press=present" in text
+    assert "Win+Shift+F12 halt=present" in text
+    assert "Win+Shift+F2 raise bind=present" in text
+    assert "bare-F2 press bind=absent" in text
+    assert "WARN legacy release-stop bind (WP3 replaces)" in text
+    assert "chain STUCK" not in text
+
+
+def test_modmask_is_authority_mod_text_is_fallback_only(config):
+    """Scene-2 phantom root cause: the real payload has NO mod/mods field —
+    only `modmask`. When both exist, the compositor mask wins; when only mod
+    text exists (fakes/config), variable expansion is the fallback (covered
+    by test_variable_fallback_resolves_the_owner_dollar_form)."""
+    entry = dict(DUMP_F2_PRESS)
+    entry["mods"] = "$wrongVar SHIFT"
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (
+        0, json.dumps([entry, DUMP_F2_RELEASE, DUMP_F2_RAISE, DUMP_F12_HALT]), "")
+    text, ok = render(_ladder(config, responses).run("wake"))
+    assert ok, text
+    assert "Win+F2 press=present" in text
+
+
+def test_variable_fallback_resolves_the_owner_dollar_form(config, tmp_path):
+    # hyprland.conf:21 — the owner's exact definition form: `$mainMod = SUPER`
+    conf = tmp_path / "hyprland.conf"
+    conf.write_text("$mainMod = SUPER\n", encoding="utf-8")
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (
+        0, json.dumps([{"key": "F2", "mods": "$mainMod"},
+                       {"key": "F2", "mods": "$mainMod SHIFT"},
+                       {"key": "F12", "mods": "$mainMod SHIFT"},
+                       {"key": "F2", "mods": "", "release": True}]), "")
+    text, ok = render(_ladder(config, responses, hypr_config=conf).run("wake"))
+    assert ok, text
+    assert "Win+F2 press=present" in text
+    assert "Win+Shift+F12 halt=present" in text
+    assert "WARN legacy release-stop bind (WP3 replaces)" in text
+
+
+def test_unresolved_variable_never_makes_a_bare_f2_press(config, tmp_path):
+    # The rung-E disease, forbidden: a bind whose $mainMod fails to resolve
+    # must NOT collapse to a phantom bare-F2 press — it stays unresolved and
+    # is NAMED in the evidence.
+    conf = tmp_path / "hyprland.conf"
+    conf.write_text("# no definitions at all\n", encoding="utf-8")
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (
+        0, json.dumps([{"key": "F2", "mods": "$mainMod"}]), "")
+    text, ok = render(_ladder(config, responses, hypr_config=conf).run("wake"))
+    assert not ok
+    assert "Win+F2 press=ABSENT" in text
+    assert "bare-F2 press bind=absent" in text        # never a phantom
+    assert "unresolved vars: $mainMod" in text
+
+
+def test_empty_expanding_variable_never_makes_a_bare_f2_press(config, tmp_path):
+    # Silently expanding to empty is the same disease: forbidden.
+    conf = tmp_path / "hyprland.conf"
+    conf.write_text("set = mainMod,\n", encoding="utf-8")
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (
+        0, json.dumps([{"key": "F2", "mods": "$mainMod"}]), "")
+    text, ok = render(_ladder(config, responses, hypr_config=conf).run("wake"))
+    assert not ok
+    assert "bare-F2 press bind=absent" in text
+    assert "expands to empty" in text
+
+
+def test_keycode_only_f2_is_still_recognised(config):
+    # the owner's dump filter used keycode==68 (evdev KEY_F2) as well as key
+    entry = {"modmask": 0, "key": "", "keycode": 68, "release": True}
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (0, json.dumps([entry]), "")
+    text, _ok = render(_ladder(config, responses).run("wake"))
+    assert "WARN legacy release-stop bind (WP3 replaces)" in text
 
 
 def test_every_rung_prints_reached_stuck_or_na_with_evidence(config):
