@@ -629,7 +629,8 @@ class SpeechService:
             # §4.8: a synthesis failure is a visible marker — reported silence,
             # never a covered-over local voice. The text is kept in the journal.
             log_event("tts.failed", level="error", verdict="failed",
-                      detail=(f"gemini native audio failed: {exc} — reported "
+                      detail=(f"model_version={request.get('model')}; "
+                              f"gemini native audio failed: {exc} — reported "
                               "silence; the local voice stays dormant"))
             raise TtsUnavailable(f"no speech for this turn: {exc}. The local voice is "
                                  "dormant by amendment 2026-10-20 and will not cover a "
@@ -637,7 +638,8 @@ class SpeechService:
         self.last_voice_error = None
         self.write_wav(path, audio["pcm"], audio.get("sample_rate", 24000))
         log_event("tts.synthesised", verdict="synthesised",
-                  detail=(f"gemini-native-audio wrote {path} "
+                  detail=(f"model_version={request.get('model')}; "
+                          f"gemini-native-audio wrote {path} "
                           f"({len(audio.get('pcm', b'')) // 2} samples)"))
         return SpeechResult(text=text, backend="gemini-native-audio",
                             voice_id=str(request["voice_name"]), audio_path=str(path),

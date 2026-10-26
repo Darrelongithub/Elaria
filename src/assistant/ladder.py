@@ -1,8 +1,9 @@
 """`assist ladder` — the hardware truth ladder, productised (§4.8, WP0 EYES).
 
 Four chains — console, wake, voice, event — each a list of rungs. Every rung
-reads TRUTH through a named mechanism and prints REACHED or STUCK with its
-evidence:
+reads TRUTH through a named mechanism and prints REACHED, STUCK or N/A with
+its evidence (N/A = the rung does not apply right now; only STUCK fails a
+chain):
 
 - binds    via `hyprctl -j` (JSON, never grepped prose),
 - scripts  via `test -x`,
@@ -41,7 +42,17 @@ OVERLAY_NAMESPACE = "elaria-overlay"
 class Rung:
     id: str                    # "A".."E" (console chain) or a word
     question: str              # what the rung asks, in plain words
-    probe: Callable[[], tuple[bool, str]]   # -> (reached, evidence)
+    # -> (reached, evidence). True = REACHED, False = STUCK, None = N/A
+    # (the rung does not apply right now — e.g. event rung E with no event
+    # running). N/A never blocks a chain; only STUCK does.
+    probe: Callable[[], tuple[bool | None, str]]
+
+
+@dataclass
+class BindEntry:
+    """One bind from `hyprctl -j binds`: its canonical key token + release flag."""
+    token: str                 # "supershiftf2" style — mods resolved, joined
+    release: bool              # True for `bindr`-style release binds
 
 
 @dataclass
@@ -51,13 +62,13 @@ class ChainResult:
 
     @property
     def reached(self) -> bool:
-        return all(r["reached"] for r in self.rungs)
+        return all(r.get("state") != "STUCK" for r in self.rungs)
 
     @property
     def furthest(self) -> str:
         last = None
         for row in self.rungs:
-            if row["reached"]:
+            if row.get("state") == "REACHED":
                 last = row["id"]
             else:
                 break
@@ -65,15 +76,21 @@ class ChainResult:
 
 
 def _evaluate(chain: str, rungs: list[Rung]) -> ChainResult:
-    """Call every probe once; a raising probe is a STUCK rung, never a crash."""
+    """Call every probe once; a raising probe is a STUCK rung, never a crash.
+
+    Tri-state (scene-1 fix): True → REACHED, False → STUCK, None → N/A.
+    """
     rows: list[dict] = []
     for rung in rungs:
         try:
             reached, evidence = rung.probe()
         except Exception as exc:
             reached, evidence = False, f"probe error: {type(exc).__name__}: {exc}"
+        state = ("REACHED" if reached is True
+                 else "N/A" if reached is None else "STUCK")
         rows.append({"id": rung.id, "question": rung.question,
-                     "reached": bool(reached), "evidence": evidence})
+                     "reached": reached is True, "state": state,
+                     "evidence": evidence})
     return ChainResult(chain, rows)
 
 
@@ -83,12 +100,16 @@ class Ladder:
     def __init__(self, config, *, runner: Callable = subprocess.run,
                  which: Callable[[str], str | None] = shutil.which,
                  status: Callable[[], dict] | None = None,
-                 repo_root: Path | None = None):
+                 repo_root: Path | None = None,
+                 hypr_config: Path | None = None):
         self.config = config
         self._run = runner
         self._which = which
         self._status = status
         self._repo = repo_root or Path(__file__).resolve().parents[2]
+        # Hyprland config file (for $variable definitions). None = the
+        # standard location; tests inject a temp file.
+        self._hypr_config = hypr_config
 
     # -- truth mechanisms ----------------------------------------------------
     def _sh(self, argv: list[str]) -> tuple[int, str]:
@@ -130,39 +151,150 @@ class Ladder:
         return self._sh(["journalctl", "--user", "-u", unit, "-b",
                          "--no-pager", "-n", "200"])[1], "journalctl"
 
-    def _bind_keys(self) -> tuple[list[str], str]:
-        """All bound key strings from `hyprctl -j binds`, or ([], why).
+    # -- Hyprland config variables ($mainMod-style) ---------------------------
+    _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
-        Real `hyprctl -j binds` carries `mod` as a bitmask number; fakes and
-        configs may use a string ("SUPER SHIFT"). Both become one token per
-        bind: "supershiftf2".
+    def _hypr_config_files(self) -> list[Path]:
+        """The Hyprland config file plus every `source =` include, cycle-safe."""
+        start = self._hypr_config or (Path.home() / ".config/hypr/hyprland.conf")
+        seen: set[Path] = set()
+        out: list[Path] = []
+
+        def walk(path: Path) -> None:
+            try:
+                resolved = path.expanduser().resolve()
+            except Exception:
+                return
+            if resolved in seen or not resolved.is_file():
+                return
+            seen.add(resolved)
+            out.append(resolved)
+            try:
+                text = resolved.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return
+            for line in text.splitlines():
+                stripped = line.split("#", 1)[0].strip()
+                match = re.match(r"source\s*=\s*(.+)$", stripped)
+                if match:
+                    target = Path(match.group(1).strip()).expanduser()
+                    if not target.is_absolute():
+                        target = resolved.parent / target
+                    walk(target)
+
+        walk(start)
+        return out
+
+    def _hypr_variables(self) -> dict[str, str]:
+        """Config-file variable definitions: `set = name, value` and `$name = value`.
+
+        Scene-1 fix: `hyprctl -j binds` reports mods as WRITTEN — a
+        `$mainMod SHIFT` bind never tokenised to "supershiftf2" before these
+        definitions were resolved (the owner's scene-1 ladder claimed
+        Win+F2 / Win+Shift+F2 / Win+Shift+F12 all ABSENT while live).
+        """
+        variables: dict[str, str] = {}
+        for path in self._hypr_config_files():
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:  # noqa: S112 - an unreadable config file contributes no variables; the rung evidence reports what stays unresolved
+                continue
+            for line in text.splitlines():
+                stripped = line.split("#", 1)[0].strip()
+                match = re.match(r"set\s*=\s*([^,=]+)\s*,\s*(.*)$", stripped)
+                if match:
+                    variables[match.group(1).strip()] = match.group(2).strip()
+                    continue
+                match = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", stripped)
+                if match:
+                    variables[match.group(1)] = match.group(2).strip()
+        return variables
+
+    def _expand_vars(self, text: str, variables: dict[str, str],
+                     depth: int = 4) -> str:
+        """`$mainMod` / `${mainMod}` → the config value (values may nest)."""
+        out = text
+        for _ in range(depth):
+            def sub(match: re.Match) -> str:
+                name = match.group(1) or match.group(2)
+                return variables.get(name, match.group(0))
+
+            new = self._VAR.sub(sub, out)
+            if new == out:
+                break
+            out = new
+        return out
+
+    def _bind_entries(self) -> tuple[list[BindEntry], str]:
+        """Every bind from `hyprctl -j binds`, or ([], why).
+
+        Truth forms handled: `mod` as a bitmask number (real hyprctl), as a
+        literal string ("SUPER SHIFT"), or as a variable string ("$mainMod
+        SHIFT" — resolved against the config-file variable definitions);
+        `mods` as a string or list is accepted too. One token per bind:
+        "supershiftf2". Release binds (`bindr`) carry `release: true`.
         """
         data, why = self.hyprctl_json("binds")
         if data is None:
             return [], why
-        tokens: list[str] = []
+        variables = self._hypr_variables()
+        entries: list[BindEntry] = []
+        unresolved: set[str] = set()
         for entry in data if isinstance(data, list) else []:
             key = str(entry.get("key") or entry.get("bind") or "").strip()
             if not key:
                 continue
             mod = entry.get("mod")
+            if mod is None:
+                mod = entry.get("mods")
+            if isinstance(mod, (list, tuple)):
+                mod = " ".join(str(m) for m in mod)
             if isinstance(mod, str):
-                mods = mod.split()
+                expanded = self._expand_vars(mod, variables)
+                for name in self._VAR.findall(mod):
+                    var = name[0] or name[1]
+                    if var not in variables:
+                        unresolved.add(f"${var}")
+                mods = [m for m in re.split(r"[\s+]+", expanded) if m]
             elif isinstance(mod, int) and mod:
                 mods = [name for bit, name in
                         ((1, "SHIFT"), (2, "CTRL"), (4, "ALT"), (8, "SUPER"))
                         if mod & bit]
             else:
                 mods = []
-            tokens.append(("".join(m.lower() for m in mods)
-                           + key.lower()).replace(" ", ""))
-        return tokens, f"{len(tokens)} bind entries"
+            key_expanded = self._expand_vars(key, variables)
+            token = ("".join(m.lower() for m in mods)
+                     + key_expanded.lower()).replace(" ", "")
+            release = bool(entry.get("release"))
+            entries.append(BindEntry(token=token, release=release))
+        why = f"{len(entries)} bind entries"
+        if unresolved:
+            why += f"; unresolved vars: {', '.join(sorted(unresolved))}"
+        return entries, why
 
     @staticmethod
     def _bind_matches(keys: list[str], *want: str) -> bool:
         lowered = [k.lower().replace(" ", "") for k in keys]
         needle = "".join(want).lower().replace(" ", "")
         return any(needle == k or needle in k for k in lowered)
+
+    @staticmethod
+    def _bare_f2(entries: list[BindEntry]) -> tuple[bool, bool]:
+        """(press_bare, release_bare) — bare-F2 with no modifiers.
+
+        Forbidden = a bare-F2 press/dispatch bind. A legacy `bindr = , F2`
+        release-stop is tolerated until WP3 (WARN, never STUCK).
+        """
+        press = any(e.token == "f2" and not e.release for e in entries)
+        release = any(e.token == "f2" and e.release for e in entries)
+        return press, release
+
+    @staticmethod
+    def _bare_f2_evidence(press: bool, release: bool, why: str) -> str:
+        text = f"bare-F2 press bind={'PRESENT (forbidden)' if press else 'absent'}"
+        if release:
+            text += "; WARN legacy release-stop bind (WP3 replaces)"
+        return f"{text} ({why})"
 
     # -- shared rung probes --------------------------------------------------
     def probe_scripts(self, *scripts: str) -> tuple[bool, str]:
@@ -253,16 +385,15 @@ class Ladder:
             return self.probe_units("assistant.service", "elaria-console.service")
 
         def rung_c():
-            keys, why = self._bind_keys()
-            if not keys:
+            entries, why = self._bind_entries()
+            if not entries:
                 return False, f"cannot read binds ({why})"
-            raise_bind = self._bind_matches(keys, "SUPER", "SHIFT", "F2")
-            bare_f2 = any(re.fullmatch(r"f2", (k or "").strip().lower())
-                          for k in keys)
-            ok = raise_bind and not bare_f2
+            raise_bind = self._bind_matches([e.token for e in entries],
+                                            "SUPER", "SHIFT", "F2")
+            press, release = self._bare_f2(entries)
+            ok = raise_bind and not press
             return ok, (f"Win+Shift+F2 raise bind={'present' if raise_bind else 'ABSENT'}"
-                        f"; bare-F2 bind={'PRESENT (forbidden)' if bare_f2 else 'absent'}"
-                        f" ({why})")
+                        f"; {self._bare_f2_evidence(press, release, why)}")
 
         def rung_d():
             active, unit_evidence = self.probe_units("elaria-console.service")
@@ -286,17 +417,17 @@ class Ladder:
 
     def wake_chain(self) -> ChainResult:
         def rung_a():
-            keys, why = self._bind_keys()
-            if not keys:
+            entries, why = self._bind_entries()
+            if not entries:
                 return False, f"cannot read binds ({why})"
-            press = self._bind_matches(keys, "SUPER", "F2")
-            halt = self._bind_matches(keys, "SUPER", "SHIFT", "F12")
-            bare_f2 = any(re.fullmatch(r"f2", (k or "").strip().lower())
-                          for k in keys)
-            return press and halt and not bare_f2, (
-                f"Win+F2 press={'present' if press else 'ABSENT'}"
+            tokens = [e.token for e in entries]
+            press_bind = self._bind_matches(tokens, "SUPER", "F2")
+            halt = self._bind_matches(tokens, "SUPER", "SHIFT", "F12")
+            bare_press, bare_release = self._bare_f2(entries)
+            return press_bind and halt and not bare_press, (
+                f"Win+F2 press={'present' if press_bind else 'ABSENT'}"
                 f"; Win+Shift+F12 halt={'present' if halt else 'ABSENT'}"
-                f"; bare-F2={'PRESENT (forbidden)' if bare_f2 else 'absent'} ({why})")
+                f"; {self._bare_f2_evidence(bare_press, bare_release, why)}")
 
         def rung_b():
             return self.probe_scripts("assist", "assistd")
@@ -382,20 +513,27 @@ class Ladder:
                           f"segment/marker counts come from event.status ({why})")
 
         def rung_e():
-            event, why = self.status_fields()
-            if event is None:
-                return False, why
+            # Scene-1 fix: N/A when no event is running; STUCK only when an
+            # event IS running and its live document is unreadable.
+            status, why = self.status_fields()
+            event = {}
             try:
                 from .ipc import call
 
-                status = call(self.config.socket_path, "event.status", timeout=2.0)
+                event = call(self.config.socket_path, "event.status", timeout=2.0)
             except Exception:
-                status = {}
-            document = status.get("document") if isinstance(status, dict) else None
+                event = ((status or {}).get("event") or {})
+            if not isinstance(event, dict) or not event:
+                return None, f"N/A — no event running (event state unreadable: {why})"
+            if not event.get("running"):
+                return None, "N/A — no event is running"
+            document = event.get("document")
             if not document:
-                return False, "no live document path readable"
+                return False, ("event is running but no live document path "
+                               "is readable")
             exists = Path(str(document)).exists()
-            return exists, f"live document {document} ({'present' if exists else 'MISSING'})"
+            return exists, (f"live document {document} "
+                            f"({'present' if exists else 'MISSING'})")
 
         return _evaluate("event", [
             Rung("A", "is the assist binary executable?", rung_a),
@@ -416,17 +554,22 @@ class Ladder:
 
 
 def render(results: list[ChainResult]) -> tuple[str, bool]:
-    """Plain-text report: every rung prints REACHED or STUCK with evidence."""
+    """Plain-text report: every rung prints REACHED, STUCK or N/A with evidence.
+
+    N/A = the rung does not apply right now (e.g. event rung E with no event
+    running). Only STUCK fails a chain.
+    """
     lines: list[str] = []
     all_ok = True
     for result in results:
         lines.append(f"{result.chain} chain")
         for row in result.rungs:
-            reached = row["reached"]
-            all_ok = all_ok and reached
+            state = row.get("state") or ("REACHED" if row["reached"] else "STUCK")
+            if state == "STUCK":
+                all_ok = False
             lines.append(
                 f"{row['id']} {row['question']} — "
-                f"{'REACHED' if reached else 'STUCK'}: {row['evidence']}")
+                f"{state}: {row['evidence']}")
         lines.append(f"furthest rung reached: {result.furthest}"
                      + ("" if result.reached else " — chain STUCK"))
         lines.append("")

@@ -86,6 +86,16 @@ class HangingSource:
         self.closed = True
 
 
+# The shipped `[voice] silence_floor` default (config.DEFAULTS). These tests
+# must read the SHIPPED semantics, never the machine's live tuning: scene-1
+# triage found the laptop's ambient config ([voice] silence_floor tuned for a
+# near-clipping mic) flipping `test_real_signal_capture_source_produces_a_
+# live_transcript` to a no-speech verdict — "no speech captured" where the
+# scripted mock transcript was expected. Capture was already mocked; the leak
+# was ambient CONFIG through load_config(). [TESTED-ONLY]
+_SHIPPED_SILENCE_FLOOR = 0.05
+
+
 def _service_config(tmp_path):
     from assistant.config import load_config
 
@@ -93,7 +103,21 @@ def _service_config(tmp_path):
     config.raw["cleanup"] = {**config.raw.get("cleanup", {}), "enabled": False}
     config.raw["transcribe"] = {**config.raw.get("transcribe", {}),
                                 "inbox_dir": str(tmp_path / "inbox")}
+    config.raw["voice"] = {**config.raw.get("voice", {}),
+                           "silence_floor": _SHIPPED_SILENCE_FLOOR}
     return config
+
+
+@pytest.fixture(autouse=True)
+def _pin_ambient_voice_config(config):
+    """Pin the verdict-affecting knobs before any daemon/service is built.
+
+    The `config` fixture is `load_config()` — on the owner's laptop that
+    merges ~/.config/assistant/config.toml. Autouse so daemon-based tests
+    (which build DictationService at init, reading silence_floor once) are
+    hermetic too.
+    """
+    config.raw.setdefault("voice", {})["silence_floor"] = _SHIPPED_SILENCE_FLOOR
 
 
 def _run(coro):

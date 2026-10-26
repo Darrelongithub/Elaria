@@ -1,9 +1,13 @@
 """WP0 EYES: the productised hardware ladder (§4.8) — [TESTED-ONLY].
 
-Every rung reads truth through its named mechanism and prints REACHED or
-STUCK with evidence. Rung E of the console chain is the rewritten one (§3c):
-a journal "Configuration Loaded" proxy PLUS a layer-namespace check — never
-`hyprctl clients`, never a grep for "quickshell".
+Every rung reads truth through its named mechanism and prints REACHED, STUCK
+or N/A with evidence (scene-1 semantics: N/A when the rung does not apply;
+a bare-F2 *press* bind is forbidden, a legacy `bindr = , F2` release-stop is
+WARN-tolerated until WP3; Hyprland `$mainMod`-style variables in binds are
+resolved from the config-file definitions). Rung E of the console chain is
+the rewritten one (§3c): a journal "Configuration Loaded" proxy PLUS a
+layer-namespace check — never `hyprctl clients`, never a grep for
+"quickshell".
 """
 
 from __future__ import annotations
@@ -46,11 +50,12 @@ def _router(responses: dict[str, tuple[int, str, str]]):
     return run
 
 
-def _ladder(config, responses, status=None):
+def _ladder(config, responses, status=None, hypr_config=None):
     return Ladder(
         config,
         runner=_router(responses),
         which=lambda name: f"/usr/bin/{name}",
+        hypr_config=hypr_config,
         status=status or (lambda: {
             "dictation_active": False, "ptt_session_id": None,
             "session_holders": [], "hotword": {"armed": False},
@@ -121,24 +126,121 @@ def test_rung_e_never_consults_hyprctl_clients(config):
     ladder.run("console")
 
 
-def test_bare_f2_bind_is_structurally_impossible_to_miss(config):
+def test_bare_f2_press_bind_is_structurally_impossible_to_miss(config):
     bare = json.dumps([{"key": "F2", "mod": ""}])
     responses = _console_responses()
     responses["hyprctl -j binds"] = (0, bare, "")
     text, ok = render(_ladder(config, responses).run("console")
                       + _ladder(config, responses).run("wake"))
     assert not ok
-    assert "bare-F2" in text
-    assert "PRESENT (forbidden)" in text
+    assert "bare-F2 press bind=PRESENT (forbidden)" in text
 
 
-def test_every_rung_prints_reached_or_stuck_with_evidence(config):
+def test_bare_f2_release_stop_is_a_warn_never_stuck(config):
+    # Scene-1 ruling: `bindr = , F2` release-stop is legacy-tolerated until
+    # WP3 — WARN "legacy release-stop bind (WP3 replaces)", never STUCK.
+    binds = json.dumps([
+        {"key": "F2", "mod": "SUPER"},
+        {"key": "F2", "mod": "SUPER SHIFT"},
+        {"key": "F12", "mod": "SUPER SHIFT"},
+        {"key": "F2", "mod": "", "release": True},
+    ])
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (0, binds, "")
+    text, ok = render(_ladder(config, responses).run("console")
+                      + _ladder(config, responses).run("wake"))
+    assert ok, text
+    assert "WARN legacy release-stop bind (WP3 replaces)" in text
+    assert "STUCK" not in text
+
+
+def test_bare_f2_press_beats_the_release_tolerance(config):
+    binds = json.dumps([
+        {"key": "F2", "mod": "SUPER"},
+        {"key": "F2", "mod": "SUPER SHIFT"},
+        {"key": "F12", "mod": "SUPER SHIFT"},
+        {"key": "F2", "mod": ""},                      # forbidden press
+        {"key": "F2", "mod": "", "release": True},     # tolerated release
+    ])
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (0, binds, "")
+    text, ok = render(_ladder(config, responses).run("wake"))
+    assert not ok
+    assert "bare-F2 press bind=PRESENT (forbidden)" in text
+    assert "WARN legacy release-stop bind (WP3 replaces)" in text
+
+
+# -- Hyprland $variable binds (scene-1 fix) ---------------------------------
+
+def _var_binds():
+    return json.dumps([
+        {"key": "F2", "mod": "$mainMod"},
+        {"key": "F2", "mod": "$mainMod SHIFT"},
+        {"key": "F12", "mod": "$mainMod SHIFT"},
+    ])
+
+
+def test_bind_variables_resolve_from_set_definitions(config, tmp_path):
+    conf = tmp_path / "hyprland.conf"
+    conf.write_text("# owner config\nset = mainMod, SUPER\n", encoding="utf-8")
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (0, _var_binds(), "")
+    ladder = _ladder(config, responses, hypr_config=conf)
+    text, ok = render(ladder.run("console") + ladder.run("wake"))
+    assert ok, text
+    assert "Win+F2 press=present" in text
+    assert "Win+Shift+F2 raise bind=present" in text
+    assert "Win+Shift+F12 halt=present" in text
+
+
+def test_bind_variables_resolve_from_dollar_definitions_and_includes(
+        config, tmp_path):
+    # Legacy `$name = value` form, in a `source =`d include.
+    include = tmp_path / "vars.conf"
+    include.write_text("$mainMod = SUPER\n", encoding="utf-8")
+    conf = tmp_path / "hyprland.conf"
+    conf.write_text(f"source = {include}\n", encoding="utf-8")
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (0, _var_binds(), "")
+    text, ok = render(_ladder(config, responses, hypr_config=conf).run("wake"))
+    assert ok, text
+    assert "Win+F2 press=present" in text
+
+
+def test_unresolved_bind_variables_are_reported_not_hidden(config, tmp_path):
+    conf = tmp_path / "hyprland.conf"
+    conf.write_text("# no definitions at all\n", encoding="utf-8")
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (0, _var_binds(), "")
+    text, ok = render(_ladder(config, responses, hypr_config=conf).run("wake"))
+    assert not ok
+    assert "Win+F2 press=ABSENT" in text
+    assert "unresolved vars: $mainMod" in text
+
+
+def test_mods_key_and_plus_separated_mods_also_tokenise(config, tmp_path):
+    conf = tmp_path / "hyprland.conf"
+    conf.write_text("set = mainMod, SUPER\n", encoding="utf-8")
+    binds = json.dumps([
+        {"key": "F2", "mods": "$mainMod"},
+        {"key": "F2", "mods": ["$mainMod", "SHIFT"]},
+        {"key": "F12", "mod": "$mainMod+SHIFT"},
+    ])
+    responses = _console_responses()
+    responses["hyprctl -j binds"] = (0, binds, "")
+    ladder = _ladder(config, responses, hypr_config=conf)
+    entries, why = ladder._bind_entries()
+    assert [e.token for e in entries] == ["superf2", "supershiftf2",
+                                          "supershiftf12"], why
+
+
+def test_every_rung_prints_reached_stuck_or_na_with_evidence(config):
     text, _ok = render(_ladder(config, _console_responses()).run("all"))
     rung_lines = [line for line in text.splitlines()
                   if line[:2] in ("A ", "B ", "C ", "D ", "E ")]
     assert len(rung_lines) == 20, text   # 4 chains x 5 rungs
     for line in rung_lines:
-        assert ("REACHED" in line) or ("STUCK" in line), line
+        assert ("REACHED" in line) or ("STUCK" in line) or ("N/A" in line), line
         assert ": " in line, line
     for chain in ("console chain", "wake chain", "voice chain", "event chain"):
         assert chain in text
@@ -182,6 +284,35 @@ def test_event_chain_reports_segment_and_marker_counts(config, monkeypatch):
     assert "segments=3" in text
     assert "markers=2" in text
     assert "live document" in text
+
+
+def test_event_rung_e_is_na_when_no_event_is_running(config, monkeypatch):
+    # Scene-1 ruling: N/A when no event is running — never STUCK.
+    monkeypatch.setattr(
+        "assistant.ipc.call",
+        lambda socket, method, timeout=2.0: {
+            "running": False, "segments_written": 0, "marker_count": 0,
+            "document": None})
+    text, ok = render(_ladder(config, _console_responses(),
+                              status=lambda: {"session_holders": []}).run("event"))
+    assert ok, text
+    assert "E does the live document exist on disk? — N/A" in text
+    assert "no event is running" in text
+    assert "chain STUCK" not in text
+
+
+def test_event_rung_e_is_stuck_only_when_running_and_document_unreadable(
+        config, monkeypatch):
+    monkeypatch.setattr(
+        "assistant.ipc.call",
+        lambda socket, method, timeout=2.0: {
+            "running": True, "segments_written": 1, "marker_count": 0,
+            "document": None})
+    text, ok = render(_ladder(config, _console_responses(),
+                              status=lambda: {"session_holders": [{"kind": "event"}]}).run("event"))
+    assert not ok
+    assert "event is running but no live document path is readable" in text
+    assert "STUCK" in text
 
 
 def test_cli_and_elaria_ladder_entry_points(config, capsys, monkeypatch):

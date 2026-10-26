@@ -180,3 +180,55 @@ def test_quota_refusal_emits_a_counter_line(config, journal_stream, tmp_path):
     lines = [l for l in journal_stream.getvalue().splitlines()
              if "quota.counter" in l]
     assert lines and "rejected" in lines[0]
+    # Scene-1 merge gate: a model outcome names its model in the line.
+    assert "model_version=gemini-3.5-flash-lite" in lines[0]
+
+
+# -- model_version on the press path (scene-1 merge gate) -------------------
+
+class _SpeechSource:
+    """The AsyncFrameSource shape: a few frames of synthetic speech."""
+
+    def __init__(self, frames):
+        self._frames = frames
+        self.target = "fake-speech-node"
+        self.stalled = False
+        self.closed = False
+
+    async def frames(self):
+        for frame in self._frames:
+            yield frame
+
+    async def aclose(self):
+        self.closed = True
+
+
+def test_transcription_landed_line_carries_model_version(
+        config, journal_stream, tmp_path):
+    # The merge gate: a press that lands a transcript produces a schema line
+    # with model_version — which model served it, provable from the journal.
+    import struct
+
+    from assistant.capture import SAMPLE_RATE
+    from assistant.live_client import ScriptedLiveTransport
+    from assistant.transcribe import DictationService
+
+    frame_samples = SAMPLE_RATE * 30 // 1000
+    speech = struct.pack(f"<{frame_samples}h", *([6000] * frame_samples))
+    config.raw["cleanup"] = {**config.raw.get("cleanup", {}), "enabled": False}
+    config.raw["transcribe"] = {**config.raw.get("transcribe", {}),
+                                "inbox_dir": str(tmp_path / "inbox")}
+    store = Store(tmp_path / "mv.db")
+    try:
+        service = DictationService(config, store, None)
+        source = _SpeechSource([speech for _ in range(40)])
+        result = asyncio.run(service.dictate(
+            source, transport_factory=ScriptedLiveTransport))
+    finally:
+        store.close()
+    assert result.raw_text.strip()
+    landed = [l for l in journal_stream.getvalue().splitlines()
+              if "transcription.landed" in l]
+    assert landed, journal_stream.getvalue()
+    assert "model_version=" in landed[0], landed[0]
+    assert (result.model or "unknown") in landed[0], landed[0]

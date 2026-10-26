@@ -914,9 +914,10 @@ class GeminiClient:
         used = self.store.calls_since(day_start_iso())
         if used >= self._daily_cap:
             log_event("quota.counter", level="warn", verdict="rejected",
-                      detail=(f"daily soft cap reached ({used}/{self._daily_cap} "
-                              "live calls) — refused locally, queued for the "
-                              "midnight Pacific reset"))
+                      detail=(f"model_version={model}; " if model else "")
+                             + (f"daily soft cap reached ({used}/{self._daily_cap} "
+                                "live calls) — refused locally, queued for the "
+                                "midnight Pacific reset"))
             raise QuotaExhausted(
                 f"daily soft cap reached ({used}/{self._daily_cap} live calls). "
                 "Queue and wait for the reset (midnight Pacific) — cascade "
@@ -945,7 +946,8 @@ class GeminiClient:
                         source = ("[quota.models.{}.{}]".format(
                             family, "rpd_cap" if allowed == cap and cap else "rpd"))
                         log_event("quota.counter", level="warn", verdict="rejected",
-                                  detail=(f"per-model daily quota reached for "
+                                  detail=(f"model_version={model}; "
+                                          f"per-model daily quota reached for "
                                           f"{model} ({used_model}/{allowed} today — "
                                           f"{source}) — refused locally"))
                         raise QuotaExhausted(

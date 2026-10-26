@@ -194,6 +194,10 @@ class SessionResult:
     # A missing Live final is distinct from silence: the saved WAV may still
     # contain speech and is retained for a later retry/re-transcription.
     no_final: bool = False
+    # The model of record for this session (scene-1 merge gate): rides into
+    # the §4.8 schema lines as `model_version=…` so a press can be proven to
+    # have been served, and by which model.
+    model: str | None = None
 
 
 def _final_texts(events) -> list[str]:
@@ -1166,7 +1170,8 @@ class DictationService:
                 flagged=False, duration_s=duration_s, transcript_id=None,
                 notes=notes, confidence=confidence, cloud_status=cloud_status,
                 connectivity_mode=(connectivity.effective_mode
-                                   if connectivity else None))
+                                   if connectivity else None),
+                model=model)
         try:
             result = self._enqueue_offline_work(
                 result, offline=use_offline_chain,
@@ -1205,7 +1210,8 @@ class DictationService:
             # keeps the recording, referenced by path (prime directive).
             log_event("transcription.deferred", level="warn",
                       session_id=session_id, verdict="no_final",
-                      detail=("no final transcript returned — audio kept at "
+                      detail=(f"model_version={getattr(result, 'model', None) or model}; "
+                              "no final transcript returned — audio kept at "
                               f"{audio_path if audio_path else '(memory only)'}, "
                               "retained for retry"))
         else:
@@ -1216,7 +1222,8 @@ class DictationService:
             # §4.8: the transcription landed — text committed, audio kept.
             log_event("transcription.landed", session_id=session_id,
                       verdict="landed",
-                      detail=(f"{len(shown)} chars committed"
+                      detail=(f"model_version={getattr(result, 'model', None) or model}; "
+                              f"{len(shown)} chars committed"
                               + (f"; audio kept at {audio_path}" if audio_path
                                  else "")))
         await emit_lifecycle_event(
@@ -1314,7 +1321,8 @@ class DictationService:
             inbox_path=str(inbox_path) if inbox_path else None,
             clipboard=clipboard, flagged=flagged, duration_s=duration_s,
             transcript_id=transcript_id, notes=notes, confidence=confidence,
-            cloud_status=cloud_status, connectivity_mode=connectivity_mode)
+            cloud_status=cloud_status, connectivity_mode=connectivity_mode,
+            model=(cleanup.model if cleanup and cleanup.model else model))
 
     def _ledger_live_session(self, backend: str, duration_s: float, *, ok: bool,
                              error: str | None = None) -> None:

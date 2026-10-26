@@ -915,7 +915,9 @@ class Daemon:
         log_event("transcription.rejected", level="warn",
                   session_id=str(result.get("session_id") or ""),
                   verdict="rejected",
-                  detail=("nothing executed — " + "; ".join(reasons)
+                  detail=((f"model_version={result['model']}; "
+                           if result.get("model") else "")
+                          + "nothing executed — " + "; ".join(reasons)
                           + f"; transcript kept: {text[:60]!r}"))
         return {
             "via": "refused",
@@ -1997,6 +1999,9 @@ class Daemon:
                 "capture": getattr(session, "capture", None),
                 "no_speech": no_speech,
                 "no_final": no_final,
+                # Scene-1 merge gate: the model of record for this session —
+                # surfaced as `model_version=` on the §4.8 schema lines.
+                "model": getattr(session, "model", None),
                 # Factual narration from real state (§13.1) — no model call.
                 "narration": ("no speech captured" if no_speech else
                               "No final transcript received; captured audio is "
@@ -2134,11 +2139,14 @@ class Daemon:
                 # §4.8 schema lines: session.close (+ a quota counter line so
                 # every session end carries today's spend on stdout).
                 capture = (result or {}).get("capture") or {}
+                model_of_record = (result or {}).get("model")
                 log_event("session.close", session_id=session_id,
                           peak=capture.get("peak"),
                           verdict=("silence" if (result or {}).get("no_speech")
                                    else "closed"),
-                          detail=(f"{self._dictation_session_mode or 'narration'} "
+                          detail=((f"model_version={model_of_record}; "
+                                   if model_of_record else "")
+                                  + f"{self._dictation_session_mode or 'narration'} "
                                   f"session closed — "
                                   f"{len(str((result or {}).get('text') or (result or {}).get('narration') or ''))} "
                                   "chars"
