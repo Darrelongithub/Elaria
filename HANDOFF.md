@@ -170,6 +170,58 @@ Owner hardware evidence (12:07–12:26) [HW-PROVEN]:
 - Stream A sensors landed before any fix: `stop.requested`
   (source=cli|bind|watchdog) at every stop entry.
 
+### Scene 3b-REDO (2026-10-26) — streams D + E; sensors before fixes
+
+Owner hardware evidence (16:27–16:40) [HW-PROVEN]: earcon FIXED and
+sensor-proven (`ack.played ack_kind=session_open player=pw-play` on the
+press) — do NOT re-fix; release bind DEAD (the §7 bindr probe log absent
+after a real cycle; no `stop.requested`; the session ran to its watchdog
+close). Stream C NEGATIVE: the 12:25 manual stop closed session
+`714a2a8f37e6` with `transcription.deferred` no_final in the same second
+as `session.close`, quota 0 user-turn — "she has never answered anything,
+from any path, all week". Both no_final closes reported "67 chars".
+
+Verified facts (research, this order) [TESTED-ONLY, cited in the phase
+report]:
+
+- **`bindri` IS supported on 0.56.2 legacy conf.** v0.56.2
+  `src/config/legacy/ConfigManager.cpp` `handleBind`: `BINDARGS =
+  command.substr(4)`, `case 'r': release = true`, `case 'i': ignoreMods =
+  true`; unknown flags return "bind: invalid flag" (typos surface at
+  reload). ⇒ the paste-safe `bindri = , F2, …` line is valid.
+- **`hyprctl -j binds` does NOT expose `ignore_mods` in 0.56.2.** v0.56.2
+  `src/debug/HyprCtl.cpp` binds serializer emits exactly the owner's dump
+  field set (locked, mouse, release, repeat, longPress, non_consuming,
+  auto_consuming, has_description, modmask, submap, submap_universal,
+  key, keycode, catch_all, description, allow_input_capture, dispatcher,
+  arg). ⇒ the ladder reads the flag from the dump "if exposed", and from
+  the config-text flag letters (`bindri` vs `bindr`) otherwise.
+- **"67 chars" is NOT transcript information.** It is
+  `len(text or narration)` in the `session.close` detail: for a no_final
+  close the user text is empty, so it measured the fixed fallback
+  narration "No final transcript received; captured audio is retained for
+  retry." — 67 characters. The close detail now reports
+  `text_chars=N (final|no_final|no_speech)` honestly.
+- **The flush DID wait, but short and silent.** stop → close signals
+  activity_end + a bounded final wait
+  (`FINAL_TRANSCRIPT_TIMEOUT_S = 2.5`) — too short — and
+  `wait_for_live_terminal` returns instantly when the collector is
+  already done (the severed-link geometry: same-second deferred↔close).
+  The wait budget is now `[transcribe] final_wait_s` (default 12.0,
+  visible in every `final.wait` line) and the journal carries
+  `final.wait` / `final.received` / `final.timeout` naming the dead
+  collector honestly. `final.wait` always fires at flush — its absence
+  means we hung up before the flush arrived.
+- **Kept-audio backlog (WP5 owns the consumer — do NOT build it here):**
+  3 wavs sit with no retry consumer: `audio/20261026-120742-1beaea.wav`
+  (12:07 watchdog session), session `714a2a8f37e6`'s wav (path in its
+  `transcription.deferred` line; expected name form
+  `20261026-122117-714a2a.wav` [UNVERIFIED name — read the exact path
+  from the deferred line]), and the 16:33 session `05698335f231`'s wav
+  (also a watchdog close; expected name form `20261026-163353-056983.wav`
+  [UNVERIFIED name]). All three either eventually transcribe+answer or
+  are explicitly marked never-retried — no third state (§6.8).
+
 ## 5. Lessons and watch items
 
 1. **Daemon-was-stale lesson (scene 1):** the scene ran status-dependent
@@ -210,17 +262,30 @@ Owner hardware evidence (12:07–12:26) [HW-PROVEN]:
      honours `knock["silent"]` now: zero audio AND zero subprocess. Shared
      tests live in `tests/test_notify_privacy.py`. [TESTED-ONLY; the laptop
      audible behaviour is scene-3's to confirm.]
+4. **Alias-causation for the silence week is RETRACTED (owner ruling
+   2026-10-26, scene 3b-REDO stream D).** The theory that `-latest`
+   model aliases resolving server-side to the retired
+   `gemini-2.5-flash-lite` caused the reply regression is no longer the
+   explanation and must not be re-asserted in any report. The **official
+   cause of death** is the pair the hardware evidence proved:
+   **release-never-fires** (the bindr trigger never fired on 0.56.2
+   legacy conf in either modifier order — stream D fixes it with the
+   `bindri`/ignore_mods form) **+ sever-without-final** (the flush either
+   waited 2.5 s or returned instantly on a dead collector, closing the
+   session with no final transcript so no reply invocation could ever
+   exist — stream E fixes the flush and completes the turn). The model-ID
+   pinning work stands on its own merits (§6.2) but is not the funeral.
 
 ## 6. Known open defects (logged, not fixed — see phase reports)
 
 1. `eventSnap` ReferenceErrors in `ui/quickshell/console/shell.qml` (~lines
    563–975 unqualified; WP2).
-2. The reply-regression candidate cannot be proven from the sandbox: the
-   retired ID `gemini-2.5-flash-lite` appears NOWHERE in the repo (0 hits),
-   but the reply path ran on `-latest` aliases that can resolve server-side to
-   it. Pinned now; proof needs a live call / `assist cost` failure rows on the
-   laptop. If the owner's live `~/.config/assistant/config.toml` still names
-   the retired ID, doctor now hard-fails on it.
+2. ~~The reply-regression candidate cannot be proven from the sandbox:
+   the retired ID `gemini-2.5-flash-lite`…~~ **Alias-causation RETRACTED
+   (§5.4).** The retired ID appears NOWHERE in the repo (0 hits) and the
+   model pinning stands as hygiene (doctor hard-fails if the owner's live
+   config still names it), but the reply regression's cause of death is
+   release-never-fires + sever-without-final, not alias resolution.
 3. File-fallback *logic* (swapping to `gemini-3.5-flash-lite` when the STT
    primary is unavailable) is not wired yet — the ID is pinned
    (`model_file_fallback`); the swap belongs to WP5.
@@ -249,43 +314,54 @@ Owner hardware evidence (12:07–12:26) [HW-PROVEN]:
 
 ## 7. The next action
 
-**Scene 3b (owner, laptop) — the release-path probe.** The gate is
+**Scene 4 (owner, laptop) — the natural-cycle gate.** The gate is
 RESTATED unchanged and still red: a NATURAL Win+F2 hold-speak-release
-cycle must produce earcon at press, session close at release, final
-transcript, spoken reply, and schema lines for each. WP1 stays parked.
+cycle must produce earcon at press, session close AT RELEASE, final
+transcript, spoken reply, and schema lines for each. WP1 stays parked
+until it lands. Scene 3b-REDO (streams D + E) landed the two
+gate-blocking code walls; scene 4 is the proof.
 
-1. **The bindr probe (manual editor edit — NEVER sed; HTML-escaping has
-   bitten this project).** Add directly below hyprland.conf line 213:
+**The bindr probe is RETIRED.** The `stop.requested` schema line with
+`source=bind` IS the probe now: absent = the bind never fired;
+present-but-failed = the stop arrived. No probe line, no `/tmp` log, no
+delete step.
+
+1. **Pull + daemon restart FIRST** (the stale-daemon lesson, §5.1):
+   `git pull` on `arena/c2a7085d-elaria`, `uv sync`, then
+   `systemctl --user daemon-reload && systemctl --user restart assistant`.
+   Confirm the restart before anything status-dependent.
+2. **The paste-safe bindri append (D.2) — no editor, no sed
+   (HTML-escaping has bitten this project).** One shell line, appended so
+   hyprland.conf line 213 stays exactly where it is:
 
    ```
-   bindr = , F2, exec, sh -c 'date >>/tmp/elaria-release-probe.log'
+   echo 'bindri = , F2, exec, assist ptt stop --stop-source bind' >> ~/.config/hypr/hyprland.conf && hyprctl reload
    ```
 
-   then `hyprctl reload`, one Win+F2 hold-speak-release cycle, then
-   `cat /tmp/elaria-release-probe.log`, then delete the probe line.
-
-   - **Timestamp present** → the bindr fires; diff the bind-exec vs
-     terminal environments (an `env -0` dump through the same probe if
-     needed) and find why `assist ptt stop` no-ops from the bind while
-     working from a shell.
-   - **File absent/empty** → the bindr NEVER fires on 0.56.2 legacy
-     conf. Escalation recommendation (owner decision): the structural
-     fix is the Lua release bind with `ignore_mods` (WP3) — propose
-     pulling WP3 forward for the BINDS ONLY. Interim stopgap (never
-     final; hold-to-talk UX is the settled design): temporary
-     `SUPER+SHIFT+F3 = assist ptt stop --stop-source bind`.
-2. **A clean cycle** on the branch build (daemon restarted on branch
-   code first — the stale-daemon lesson): press → earcon; release →
-   `stop.requested` schema line; transcript + spoken reply +
-   `model_version` on the transcription line. `stop.requested` absent =
-   the bind never fired; present-but-failed = the stop arrived.
-3. **paplay the ack wav directly** to verify it:
-   `paplay ~/.local/share/assistant/voice-cache/speech-c3355e59132b6af3283d.wav`
-4. **The journal tail** 60+ s after a manual `assist ptt stop` of a live
-   session — expect `transcription.landed` with `model_version`, the
-   reply invocation, `quota.counter` 1 user-turn, `session.close`, and
-   whether Flare spoke. (This tail is Stream C's trigger: its landing
-   closes the completion-evidence record in §5.)
-
-Both outcomes are decisions: a failed scene produces a log dump and a
-diagnosis, never a retry loop. <=30 min, daylight.
+   Both release binds then exist (legacy `bindr` line 213 + the WP3-form
+   `bindri`); the ladder reports both — `WARN legacy release-stop bind`
+   (line 213) plus `ignore_mods present (bindri flag — WP3 form)`.
+3. **One natural cycle** (≤30 min, daylight): Win+F2 hold, speak, release
+   (F2 first, Win still down — the order that used to leak). Expect, from
+   the schema journal alone: `session.open` + `ack.played` at press,
+   `stop.requested source=bind` AT RELEASE, `final.wait`, `final.received`
+   (or `final.timeout` naming what happened), `transcription.landed` with
+   `model_version`, `reply.invocation`, `quota.counter` 1 user-turn, the
+   spoken reply (`tts.synthesised`), `session.close` with
+   `text_chars=N (final)`. Both outcomes are decisions: a failed scene
+   produces a log dump and a diagnosis, never a retry loop.
+4. **Dump truth check** (scene 4 reads the dump OR the config):
+   `hyprctl -j binds` — the release entries are there (0.56.2 does not
+   expose `ignore_mods`, so the config-text flag letters carry that
+   truth; the ladder's evidence says which form is present). Run
+   `assist ladder` and read the wake-chain rung-A evidence.
+5. **One deliberate Win-first release** (release WIN while F2 is still
+   held, then F2): BOTH release binds fire — the double-stop idempotency
+   proof. Expect TWO `stop.requested source=bind` lines and ONE
+   `stop.noop` (verdict `finish-in-flight` or `already-closed`) with no
+   error and no second finisher.
+6. **The journal tail** 60+ s after the cycle — the completion-evidence
+   record from scene 3b's stream C: `transcription.landed` with
+   `model_version`, `reply.invocation`, `quota.counter` 1 user-turn,
+   `session.close`, and whether Flare spoke. If the gate is green, the
+   scene report is the merge-gate evidence for PR #23.
