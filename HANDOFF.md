@@ -37,6 +37,17 @@ each).
    BLOCKED-known for the WP0 scene (eventSnap defect is WP2's named fix; this
    sandbox has no Qt toolchain). WP2 productises the pre-gate.
 4. **HANDOFF.md created** as the running state document (this file).
+5. **Ad-hoc `elaria-ladder` ruling (open-question 1 of the WP0 report):**
+   the design-side record says the ad-hoc script carried console + wake
+   chains only; its wake journal sensor was known-bad (fixed by WP0's
+   schema lines) and its rung E was the known false-negative. No unique
+   checks beyond the productised reconstruction — but that record is
+   [UNVERIFIED-laptop], so the scene includes
+   `cat ~/.local/bin/elaria-ladder`; a unique rung there ⇒ reconcile before
+   merge. Disposition after scene green: replace `~/.local/bin/elaria-ladder`
+   with a shim (`exec assist ladder "$@"`); `elaria-console-open` STAYS
+   (SUPER+SHIFT+F2 targets it until WP3); `elaria-door` stays unused. The
+   scene report IS the merge gate for PR #23; WP1 starts only after it lands.
 
 ## Sandbox facts (this build environment — NOT the laptop)
 
@@ -78,8 +89,11 @@ The owner runs, on the laptop, in daylight:
 
 ```bash
 git checkout arena/c2a7085d-elaria && uv sync && uv run assist doctor
+cat ~/.local/bin/elaria-ladder   # reconcile vs productised rungs (decision 5)
 uv run assist ladder          # or: elaria-ladder console  (expect A–E truthful)
 ```
+
+(Full checklist: `docs/phase-reports/2026-10-25-wp0-eyes.md` NEXT GATE.)
 
 Expected: every chain prints REACHED/STUCK with evidence; `assist doctor`
 shows the new checks (forbidden model ids, model registry, capture node
