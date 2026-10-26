@@ -165,7 +165,13 @@ def test_transcribe_live_committed_envelope_finishes_without_model_turn(
         assert store.recent_transcripts(1)[0]["raw_text"] == USER_TEXT
         assert any(e.get("event") == "transcript.interim" and e["text"] == PREVIEW
                    for e in events)
-        assert len([s for s in session.sent if "audio" in s]) == 356
+        audio_calls = [s for s in session.sent if "audio" in s]
+        # Stream F (2026-10-26): capture frames coalesce into the documented
+        # 100ms wire chunks (356 x 30ms -> 106 full + flushed tail = 107 sends),
+        # but every frame's bytes must still reach the wire — the pin is
+        # byte-preserving, not send-count-preserving.
+        assert sum(len(s["audio"].data) for s in audio_calls) == 356 * 960
+        assert len(audio_calls) == 107
         assert list(session.sent[0]) == ["activity_start"]
         assert list(session.sent[-1]) == ["activity_end"]
         assert session.config.response_modalities == ["TEXT"]

@@ -616,12 +616,14 @@ class GenaiLiveTransport:
         self._input_parts: list[str] = []
         # Counters/flags only: no audio or transcript text in lifecycle logs.
         self._receive_counts: Counter[str] = Counter()
-        self._audio_frames_sent = 0
+        self._audio_frames_sent = 0        # capture frames pushed in (spy)
         # Stream F sensors (2026-10-26): the deciding fork lives on the wire,
         # so every message type is counted and what WE push is metered.
+        self._audio_chunks_sent = 0        # wire chunks, not capture frames
         self._audio_bytes_sent = 0
         self._audio_chunk_frames_max = 0   # samples in the largest chunk sent
         self._audio_mime = "audio/pcm;rate=16000"
+        self._audio_pending = b""
         self._signals_sent: Counter[str] = Counter()
         self._wire_counts: Counter[str] = Counter()
         self._wire_samples: list[str] = []
@@ -739,7 +741,7 @@ class GenaiLiveTransport:
             "types": dict(self._wire_counts),
             "samples": list(self._wire_samples),
             "audio_sent": {
-                "chunks": self._audio_frames_sent,
+                "chunks": self._audio_chunks_sent,
                 "bytes": self._audio_bytes_sent,
                 "format": "audio/pcm",
                 "rate": 16000,
@@ -862,20 +864,42 @@ class GenaiLiveTransport:
         self._signals_sent["activity_start"] += 1
         await self._session.send_realtime_input(activity_start=types.ActivityStart())
 
-    async def send_audio(self, pcm: bytes) -> None:
+    # Live-transcribe "Sending audio" (ai.google.dev/gemini-api/docs/live-api/
+    # live-transcribe): raw 16-bit PCM at 16kHz mono little-endian, sent in
+    # chunks of 100ms (1,024 to 2,048 frames). Capture yields 30ms frames
+    # (480 samples / 960 bytes) — undersized on the wire — so coalesce to the
+    # documented cadence here and flush the tail before ActivityEnd. This is
+    # the one wire deviation the F.2/F.3 docs cross-check found (2026-10-26).
+    _CHUNK_SAMPLES = 1600        # 100 ms @ 16 kHz, inside the 1,024–2,048 range
+    _SAMPLE_WIDTH = 2            # s16le mono
+
+    async def _send_pcm_chunk(self, chunk: bytes) -> None:
         from google.genai import types
 
         await self._session.send_realtime_input(
-            audio=types.Blob(data=pcm, mime_type=self._audio_mime))
+            audio=types.Blob(data=chunk, mime_type=self._audio_mime))
+        self._audio_chunks_sent += 1
+        self._audio_bytes_sent += len(chunk)
+        self._audio_chunk_frames_max = max(
+            self._audio_chunk_frames_max, len(chunk) // self._SAMPLE_WIDTH)
+
+    async def send_audio(self, pcm: bytes) -> None:
         self._audio_frames_sent += 1
-        self._audio_bytes_sent += len(pcm)
-        frames = len(pcm) // 2   # s16le mono
-        self._audio_chunk_frames_max = max(self._audio_chunk_frames_max, frames)
+        self._audio_pending += pcm
+        chunk_bytes = self._CHUNK_SAMPLES * self._SAMPLE_WIDTH
+        while len(self._audio_pending) >= chunk_bytes:
+            chunk, self._audio_pending = (
+                self._audio_pending[:chunk_bytes],
+                self._audio_pending[chunk_bytes:])
+            await self._send_pcm_chunk(chunk)
 
     async def activity_end(self) -> None:
         from google.genai import types
 
         self._signals_sent["activity_end"] += 1
+        tail, self._audio_pending = self._audio_pending, b""
+        if tail:
+            await self._send_pcm_chunk(tail)   # tail BEFORE ActivityEnd
         await self._session.send_realtime_input(activity_end=types.ActivityEnd())
 
     async def events(self) -> AsyncIterator[LiveEvent]:

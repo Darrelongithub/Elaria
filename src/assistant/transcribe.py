@@ -1071,6 +1071,22 @@ class DictationService:
                                   f"{round(session_peak, 4)} under floor "
                                   f"{round(self.silence_floor, 4)}"))
 
+            # Watch-item hardening (2026-10-26, stream F): close the
+            # transport BEFORE cancelling the collector, so the receiver
+            # stops producing into a queue nobody drains before its
+            # consumer dies. WP1 owns the 1.4 GB daemon-run profile.
+            if transport is not None:
+                try:
+                    await self._await_lifecycle(
+                        "dictate.transport_close", transport.close(),
+                        timeout_s=self.TRANSPORT_CLOSE_TIMEOUT_S,
+                        session_id=session_id)
+                    self._log("dictate.transport_closed", session_id=session_id)
+                except Exception as exc:
+                    notes.append(f"Live transport close did not finish cleanly ({exc})")
+                    self._log("dictate.transport_close_failed", session_id=session_id,
+                              error=f"{type(exc).__name__}: {exc}"[:200])
+
             if collector is not None and not collector.done():
                 self._log("dictate.collector_cancel_start", session_id=session_id)
                 collector.cancel()
@@ -1083,18 +1099,6 @@ class DictationService:
                     self._log("dictate.collector_cancelled", session_id=session_id)
                 except Exception as exc:
                     notes.append(f"Live event collector did not stop cleanly ({exc})")
-
-            if transport is not None:
-                try:
-                    await self._await_lifecycle(
-                        "dictate.transport_close", transport.close(),
-                        timeout_s=self.TRANSPORT_CLOSE_TIMEOUT_S,
-                        session_id=session_id)
-                    self._log("dictate.transport_closed", session_id=session_id)
-                except Exception as exc:
-                    notes.append(f"Live transport close did not finish cleanly ({exc})")
-                    self._log("dictate.transport_close_failed", session_id=session_id,
-                              error=f"{type(exc).__name__}: {exc}"[:200])
             try:
                 await self._await_lifecycle(
                     "dictate.source_close", source.aclose(),

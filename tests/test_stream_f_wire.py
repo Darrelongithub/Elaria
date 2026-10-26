@@ -107,7 +107,9 @@ def test_model_dump_responses_count_too():
 
 
 # ------------------------------------------------------------------ F.3
-def test_audio_sent_meters_chunks_bytes_format_and_rate():
+def test_send_audio_coalesces_to_documented_100ms_chunks():
+    """Capture yields 30ms frames; the documented wire chunk is 100ms
+    (1,024-2,048 frames). 10 x 480-sample frames = 3 x 1,600-sample chunks."""
     tr = _transport()
     session = _FakeSession()
     tr._session = session
@@ -115,23 +117,50 @@ def test_audio_sent_meters_chunks_bytes_format_and_rate():
 
     async def drive():
         await tr.activity_start()
-        for _ in range(3):
+        for _ in range(10):
             await tr.send_audio(frame)
         await tr.activity_end()
 
     asyncio.run(drive())
     sent = tr.wire_stats()["audio_sent"]
     assert sent["chunks"] == 3
-    assert sent["bytes"] == 3 * len(frame)
+    assert sent["bytes"] == 10 * len(frame)
     assert sent["format"] == "audio/pcm"
     assert sent["rate"] == 16000
-    assert sent["chunk_frames_max"] == 480
+    assert sent["chunk_frames_max"] == 1600
     assert tr.wire_stats()["signals"] == {"activity_start": 1, "activity_end": 1}
     # the wire shapes themselves (google-genai converter targets)
     assert "activity_start" in session.sent[0]
-    assert "audio" in session.sent[1]
-    assert session.sent[1]["audio"].mime_type == "audio/pcm;rate=16000"
     assert "activity_end" in session.sent[-1]
+    for call in session.sent[1:-1]:
+        assert len(call["audio"].data) == 3200, "100ms = 1,600 samples = 3,200 bytes"
+        assert call["audio"].mime_type == "audio/pcm;rate=16000"
+
+
+def test_activity_end_flushes_tail_before_activity_end():
+    """The final partial chunk must not be lost (fail loud: audio never
+    lost) and must precede ActivityEnd on the wire."""
+    tr = _transport()
+    session = _FakeSession()
+    tr._session = session
+    frame = b"\x01\x00" * 480            # 5 frames = 2,400 samples = 4,800 B
+
+    async def drive():
+        await tr.activity_start()
+        for _ in range(5):
+            await tr.send_audio(frame)
+        await tr.activity_end()
+
+    asyncio.run(drive())
+    kinds = ["activity_start" if "activity_start" in call else
+             "activity_end" if "activity_end" in call else "audio"
+             for call in session.sent]
+    assert kinds == ["activity_start", "audio", "audio", "activity_end"]
+    sizes = [len(call["audio"].data) for call in session.sent[1:-1]]
+    assert sizes == [3200, 1600]         # full chunk + flushed tail
+    sent = tr.wire_stats()["audio_sent"]
+    assert sent["chunks"] == 2
+    assert sent["bytes"] == 4800
 
 
 def test_duplex_forwards_wire_stats():
