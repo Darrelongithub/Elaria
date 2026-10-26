@@ -926,6 +926,32 @@ class DictationService:
                               detail=(f"waited_s={waited_s}; "
                                       f"collector={collector_state}; "
                                       + note))
+                # Stream F sensors (2026-10-26): the deciding fork lives on
+                # the wire. ws.histogram counts every message type the Live
+                # session received (unparsed shapes sampled, text-only);
+                # audio.sent meters what we actually pushed to the socket.
+                wire = None
+                describe_wire = getattr(transport, "wire_stats", None)
+                if callable(describe_wire):
+                    try:
+                        wire = describe_wire()
+                    except Exception:  # a sensor never breaks close
+                        wire = None
+                if isinstance(wire, dict):
+                    types = wire.get("types") or {}
+                    samples = wire.get("samples") or []
+                    log_event("ws.histogram", session_id=session_id,
+                              verdict="wire",
+                              detail=(f"types={json.dumps(types, sort_keys=True)}"
+                                      + (f"; samples={json.dumps(samples)[:600]}"
+                                         if samples else "")))
+                    sent = wire.get("audio_sent") or {}
+                    log_event("audio.sent", session_id=session_id,
+                              verdict="sent",
+                              detail=(f"chunks={int(sent.get('chunks') or 0)} "
+                                      f"bytes={int(sent.get('bytes') or 0)} "
+                                      f"format={sent.get('format') or '?'} "
+                                      f"rate={sent.get('rate') or '?'}"))
             duplex = {}
             if transport is not None and getattr(transport, "gate", None) is not None:
                 duplex = transport.gate.snapshot()

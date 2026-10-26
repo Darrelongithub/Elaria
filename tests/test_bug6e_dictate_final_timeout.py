@@ -7,13 +7,13 @@ close/final wait fails.
 
 from __future__ import annotations
 
-import pytest
-
 import asyncio
 import json
 import struct
 import time
 from pathlib import Path
+
+import pytest
 
 from assistant import asr
 from assistant.asr import Transcript

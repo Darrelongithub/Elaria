@@ -315,6 +315,10 @@ class DuplexLiveTransport:
         return describe() if callable(describe) else {
             "transport": getattr(self._inner, "name", type(self._inner).__name__)}
 
+    def wire_stats(self) -> dict:
+        describe = getattr(self._inner, "wire_stats", None)
+        return describe() if callable(describe) else {}
+
     async def close(self) -> None:
         self.gate.playback_ended()
         await self._inner.close()
@@ -613,6 +617,14 @@ class GenaiLiveTransport:
         # Counters/flags only: no audio or transcript text in lifecycle logs.
         self._receive_counts: Counter[str] = Counter()
         self._audio_frames_sent = 0
+        # Stream F sensors (2026-10-26): the deciding fork lives on the wire,
+        # so every message type is counted and what WE push is metered.
+        self._audio_bytes_sent = 0
+        self._audio_chunk_frames_max = 0   # samples in the largest chunk sent
+        self._audio_mime = "audio/pcm;rate=16000"
+        self._signals_sent: Counter[str] = Counter()
+        self._wire_counts: Counter[str] = Counter()
+        self._wire_samples: list[str] = []
 
     async def connect(self, resumption_handle: str | None = None) -> None:
         from google.genai import types
@@ -639,6 +651,103 @@ class GenaiLiveTransport:
         self._input_parts.clear()
         if text:
             await self._queue.put(LiveEvent("final", text=text))
+
+    # Fields WE convert into LiveEvents — anything else on the wire is
+    # unparsed, counted, and sampled (text-only) up to three times.
+    _PARSED_RESPONSE_FIELDS = frozenset(
+        {"server_content", "go_away", "session_resumption_update"})
+    _PARSED_CONTENT_FIELDS = frozenset(
+        {"model_turn", "output_transcription", "interim_input_transcription",
+         "input_transcription", "turn_complete"})
+
+    def _sample_wire(self, tag: str, payload) -> None:
+        """Up to 3 unparsed-message samples: text fields ONLY, never audio
+        bytes, max ~200 chars each (F.1)."""
+        if len(self._wire_samples) >= 3:
+            return
+        texts: list[str] = []
+
+        def walk(obj, depth: int = 0) -> None:
+            if depth > 4 or sum(map(len, texts)) >= 200:
+                return
+            if isinstance(obj, str):
+                texts.append(obj)
+            elif isinstance(obj, dict):
+                for value in obj.values():
+                    if isinstance(value, (bytes, bytearray)):
+                        continue
+                    walk(value, depth + 1)
+            elif isinstance(obj, (list, tuple)):
+                for value in obj[:8]:
+                    walk(value, depth + 1)
+            elif hasattr(obj, "__dict__"):
+                walk({k: v for k, v in vars(obj).items()
+                      if not k.startswith("_")}, depth + 1)
+
+        walk(payload)
+        sample = " ".join(texts).strip()[:200] or "(no text fields)"
+        self._wire_samples.append(f"{tag}: {sample}")
+
+    @staticmethod
+    def _as_dict(obj):
+        """SDK pydantic models dump to dicts; test doubles are often
+        namespaces — normalise one level so counting stays SDK-churn-proof."""
+        if isinstance(obj, dict):
+            return obj
+        try:
+            if hasattr(obj, "model_dump"):
+                dumped = obj.model_dump(exclude_none=True)
+                return dumped if isinstance(dumped, dict) else {}
+            return {k: v for k, v in vars(obj).items()
+                    if not k.startswith("_")}
+        except Exception:  # counting must never break the receiver
+            return {}
+
+    def _note_wire(self, response) -> None:
+        """Count every message type the Live session receives (F.1).
+
+        google-genai surfaces parsed LiveServerMessage objects, not raw WS
+        frames, so the type of a message is the set of populated fields —
+        `message` counts every message, `server_content.*` and the top-level
+        names count each field within it. Unparsed shapes are sampled.
+        """
+        self._wire_counts["message"] += 1
+        dumped = self._as_dict(response)
+        if not dumped:
+            self._wire_counts["unparsed.(unreadable)"] += 1
+            self._sample_wire("unparsed.(unreadable)", response)
+            return
+        for key, value in dumped.items():
+            if value is None:
+                continue
+            if key == "server_content":
+                for sub, sub_value in self._as_dict(value).items():
+                    if sub_value is None:
+                        continue
+                    tag = f"server_content.{sub}"
+                    self._wire_counts[tag] += 1
+                    if sub not in self._PARSED_CONTENT_FIELDS:
+                        self._sample_wire(tag, {sub: sub_value})
+            else:
+                self._wire_counts[key] += 1
+                if key not in self._PARSED_RESPONSE_FIELDS:
+                    self._sample_wire(key, {key: value})
+
+    def wire_stats(self) -> dict:
+        """The F.1/F.3 sensors, flat and JSON-safe, for the close lines."""
+        return {
+            "types": dict(self._wire_counts),
+            "samples": list(self._wire_samples),
+            "audio_sent": {
+                "chunks": self._audio_frames_sent,
+                "bytes": self._audio_bytes_sent,
+                "format": "audio/pcm",
+                "rate": 16000,
+                "mime": self._audio_mime,
+                "chunk_frames_max": self._audio_chunk_frames_max,
+            },
+            "signals": dict(self._signals_sent),
+        }
 
     async def _receive_content(self, content) -> None:
         # BUG6: output audio and output transcription are HER OWN speech.
@@ -719,6 +828,7 @@ class GenaiLiveTransport:
                 async for response in self._session.receive():
                     received = True
                     self._receive_counts["responses"] += 1
+                    self._note_wire(response)
                     if getattr(response, "go_away", None) is not None:
                         await self._queue.put(LiveEvent("go_away"))
                     update = getattr(response, "session_resumption_update", None)
@@ -749,18 +859,23 @@ class GenaiLiveTransport:
     async def activity_start(self) -> None:
         from google.genai import types
 
+        self._signals_sent["activity_start"] += 1
         await self._session.send_realtime_input(activity_start=types.ActivityStart())
 
     async def send_audio(self, pcm: bytes) -> None:
         from google.genai import types
 
         await self._session.send_realtime_input(
-            audio=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000"))
+            audio=types.Blob(data=pcm, mime_type=self._audio_mime))
         self._audio_frames_sent += 1
+        self._audio_bytes_sent += len(pcm)
+        frames = len(pcm) // 2   # s16le mono
+        self._audio_chunk_frames_max = max(self._audio_chunk_frames_max, frames)
 
     async def activity_end(self) -> None:
         from google.genai import types
 
+        self._signals_sent["activity_end"] += 1
         await self._session.send_realtime_input(activity_end=types.ActivityEnd())
 
     async def events(self) -> AsyncIterator[LiveEvent]:
