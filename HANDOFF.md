@@ -213,14 +213,32 @@ report]:
   collector honestly. `final.wait` always fires at flush — its absence
   means we hung up before the flush arrived.
 - **Kept-audio backlog (WP5 owns the consumer — do NOT build it here):**
-  3 wavs sit with no retry consumer: `audio/20261026-120742-1beaea.wav`
+  4 wavs sit with no retry consumer: `audio/20261026-120742-1beaea.wav`
   (12:07 watchdog session), session `714a2a8f37e6`'s wav (path in its
   `transcription.deferred` line; expected name form
   `20261026-122117-714a2a.wav` [UNVERIFIED name — read the exact path
-  from the deferred line]), and the 16:33 session `05698335f231`'s wav
-  (also a watchdog close; expected name form `20261026-163353-056983.wav`
-  [UNVERIFIED name]). All three either eventually transcribe+answer or
-  are explicitly marked never-retried — no third state (§6.8).
+  from the deferred line]), the 16:33 session `05698335f231`'s wav (also
+  a watchdog close; expected name form `20261026-163353-056983.wav`
+  [UNVERIFIED name]), and `audio/20261026-191330-d297f1.wav` (19:13
+  session `d297f1…`, scene 4, the release-bind cycle — the stream-F
+  DIAGNOSTIC one-shot transcribes it for housekeeping only and does NOT
+  discharge the contract). All four either eventually transcribe+answer
+  or are explicitly marked never-retried — no third state (§6.8).
+
+### Scene 4 (2026-10-26) — wall one falls; the final is on the wire
+
+- **Release bind WORKS** [HW-PROVEN]: the owner's natural cycle logged
+  `stop.requested source=bind` at release. **Wall one is fallen.**
+- **Flush mechanism PROVEN-WORKING** [HW-PROVEN]: `final.wait
+  collector=alive activity_end_ok=True → final.timeout waited_s=12.054 →
+  deferred no_final, text_chars=0`. Quota 0 user-turn; silence rules
+  respected. Wall two is refined, not fallen: the mechanics all run and
+  the gate is still red — the FINAL TRANSCRIPT itself is missing, on the
+  wire, four sessions running.
+- 4th wav kept: `audio/20261026-191330-d297f1.wav` (backlog above).
+- Owner ruling (this order): stream F asks why the Live API withholds
+  the final — sensors before fixes, protocol citations before any fix,
+  $0 spend except F.4's single diagnostic file call.
 
 ## 5. Lessons and watch items
 
@@ -275,6 +293,19 @@ report]:
    session with no final transcript so no reply invocation could ever
    exist — stream E fixes the flush and completes the turn). The model-ID
    pinning work stands on its own merits (§6.2) but is not the funeral.
+5. **Scene-4 rulings (owner 2026-10-26) and the stream-F rules that
+   follow them.** Wall one fallen / wall two refined (§4). Stream F is
+   the wire question, and these rules are standing: commits ordered
+   **sensors before fixes**; F.2 protocol citations REQUIRED before any
+   fix; $0 budget — F.4's single file call is the only new API spend;
+   sandbox tests use fakes, no live calls; no force-push; F.4 is a
+   DIAGNOSTIC one-shot — do NOT build the retry consumer (WP5 owns it);
+   the 1.4 GB watch item is report-finding only (profile in WP1 unless
+   the fix is trivial — the cleanup-order swap was, and landed); F.5
+   budget changes only after F.2 lands. And the run-page format rule the
+   owner set after twice running the command and missing the cycle:
+   **§7 separates EARS steps from TERMINAL steps strictly, and no
+   physical action ever appears inside a paste-able block.**
 
 ## 6. Known open defects (logged, not fixed — see phase reports)
 
@@ -312,56 +343,91 @@ report]:
    (WP3 trigger watches for 0.57), quickshell 0.2.1 frozen (do not upgrade),
    Mic1 capture node non-silent (doctor now checks; run it there).
 
-## 7. The next action
+## 7. The next action — Scene 5: the merge-gate run (stream F sensors in)
 
-**Scene 4 (owner, laptop) — the natural-cycle gate.** The gate is
-RESTATED unchanged and still red: a NATURAL Win+F2 hold-speak-release
-cycle must produce earcon at press, session close AT RELEASE, final
-transcript, spoken reply, and schema lines for each. WP1 stays parked
-until it lands. Scene 3b-REDO (streams D + E) landed the two
-gate-blocking code walls; scene 4 is the proof.
+Read the format rule first: **every step below is EITHER a TERMINAL
+step (a paste-able block — nothing physical happens while it is on
+screen) OR an EARS step (hands and ears only — no terminal involved).**
+They are never mixed inside one block. Do the steps in order. Scene
+budget: 30 min, daylight, laptop+phone in earshot; both outcomes are
+decisions.
 
-**The bindr probe is RETIRED.** The `stop.requested` schema line with
-`source=bind` IS the probe now: absent = the bind never fired;
-present-but-failed = the stop arrived. No probe line, no `/tmp` log, no
-delete step.
+### Step 0 — TERMINAL: get the stream-F work and restart on branch code
 
-1. **Pull + daemon restart FIRST** (the stale-daemon lesson, §5.1):
-   `git pull` on `arena/c2a7085d-elaria`, `uv sync`, then
-   `systemctl --user daemon-reload && systemctl --user restart assistant`.
-   Confirm the restart before anything status-dependent.
-2. **The paste-safe bindri append (D.2) — no editor, no sed
-   (HTML-escaping has bitten this project).** One shell line, appended so
-   hyprland.conf line 213 stays exactly where it is:
+```
+cd ~/assistant && git fetch origin && git checkout arena/c2a7085d-elaria && git pull && uv sync && systemctl --user daemon-reload && systemctl --user restart assistant && sleep 2 && assist doctor | tail -12
+```
 
-   ```
-   echo 'bindri = , F2, exec, assist ptt stop --stop-source bind' >> ~/.config/hypr/hyprland.conf && hyprctl reload
-   ```
+Expect: doctor green (or only known markers). If it is not, STOP and
+report — do not continue the run.
 
-   Both release binds then exist (legacy `bindr` line 213 + the WP3-form
-   `bindri`); the ladder reports both — `WARN legacy release-stop bind`
-   (line 213) plus `ignore_mods present (bindri flag — WP3 form)`.
-3. **One natural cycle** (≤30 min, daylight): Win+F2 hold, speak, release
-   (F2 first, Win still down — the order that used to leak). Expect, from
-   the schema journal alone: `session.open` + `ack.played` at press,
-   `stop.requested source=bind` AT RELEASE, `final.wait`, `final.received`
-   (or `final.timeout` naming what happened), `transcription.landed` with
-   `model_version`, `reply.invocation`, `quota.counter` 1 user-turn, the
-   spoken reply (`tts.synthesised`), `session.close` with
-   `text_chars=N (final)`. Both outcomes are decisions: a failed scene
-   produces a log dump and a diagnosis, never a retry loop.
-4. **Dump truth check** (scene 4 reads the dump OR the config):
-   `hyprctl -j binds` — the release entries are there (0.56.2 does not
-   expose `ignore_mods`, so the config-text flag letters carry that
-   truth; the ladder's evidence says which form is present). Run
-   `assist ladder` and read the wake-chain rung-A evidence.
-5. **One deliberate Win-first release** (release WIN while F2 is still
-   held, then F2): BOTH release binds fire — the double-stop idempotency
-   proof. Expect TWO `stop.requested source=bind` lines and ONE
-   `stop.noop` (verdict `finish-in-flight` or `already-closed`) with no
-   error and no second finisher.
-6. **The journal tail** 60+ s after the cycle — the completion-evidence
-   record from scene 3b's stream C: `transcription.landed` with
-   `model_version`, `reply.invocation`, `quota.counter` 1 user-turn,
-   `session.close`, and whether Flare spoke. If the gate is green, the
-   scene report is the merge-gate evidence for PR #23.
+### Step 1 — TERMINAL: DIAGNOSTIC housekeeping (one shot — not a feature)
+
+```
+assist transcribe ~/.local/share/assistant/audio/20261026-191330-d297f1.wav
+```
+
+This is the stream-F DIAGNOSTIC for the scene-4 kept wav (what was said
+at 19:13). One call only. It prints one line of plain text; paste that
+line back in the PR thread. WP5 owns the real retry consumer — this
+call does not create it and does not discharge the kept-wav contract.
+
+### Step 2 — EARS ONLY. The natural cycle. No terminal.
+
+1. Hold Win+F2. You should HEAR the press earcon the moment F2 lands.
+2. Speak one real sentence — a sentence you would actually say.
+3. Release F2 WHILE STILL HOLDING WIN.
+4. Wait and listen, at most the final-wait budget (12 s default). You
+   should HEAR her spoken reply at the end of the wait.
+5. Write down WHAT SHE SAID before touching the terminal.
+
+### Step 3 — TERMINAL: the cycle dump
+
+```
+journalctl --user -u assistant --since -6min -o cat | grep -E "ptt.start|stop.requested|final.wait|final.received|final.timeout|ws.histogram|audio.sent|reply.invocation|quota.check|session.close|transcription.deferred" | tail -12
+```
+
+Expected lines (either outcome is a decision):
+
+- `ws.histogram session=… types={…}` — the wire. **transcript-family
+  counts must be nonzero** (`server_content.input_transcription` and/or
+  `server_content.interim_input_transcription`); zero of both = the
+  audio never reached the model (the other fork).
+- `audio.sent session=… chunks=N bytes=M format=audio/pcm rate=16000` —
+  N and M nonzero; `bytes/N` ≈ 3200 = the documented 100 ms chunks.
+- `final.wait …` then `final.received …` with text (not
+  `final.timeout … text_chars=0`).
+- `reply.invocation … reply.char.count=N` with N > 0.
+- quota: `user-turns (schema.expected)` = 1.
+- `session.close … model_version=…` and a `transcription.deferred` line
+  ONLY if something failed (the wav is kept either way).
+
+A red run with these lines is a COMPLETE run for stream F: the
+histogram picks the fork. Report both the lines and what she said.
+
+### Step 4 — EARS ONLY. The double-stop proof. No terminal.
+
+1. Hold Win+F2. Hear the press earcon again.
+2. Speak a SHORT sentence (a few words is enough).
+3. Release WIN FIRST, then F2 (the opposite order from Step 2).
+4. Listen: there should be no jam, no second behaviour — the release
+   just ends it.
+
+### Step 5 — TERMINAL: the tail dump
+
+```
+journalctl --user -u assistant --since -3min -o cat | grep -E "stop.requested|stop.noop|bind|STUCK" | tail -6
+```
+
+Expected: `stop.requested` (source=bind) and `stop.noop` where a second
+stop found nothing to do — one stop only, nothing jammed. Bare-F2
+strictness stays as scene 1 ruled: press/dispatch forbidden, release
+legacy-tolerated until WP3.
+
+### After the run
+
+Report, in the PR thread, with tags: what the histogram showed
+(transcript-family counts or their absence), `audio.sent` N/M, which
+fork it picks, the two EARS outcomes (including WHAT SHE SAID), and the
+quota number. Both red and green are decisions. §5 order after the
+gate: WP1→WP2→WP4→WP5→WP3 (jump if rpm hyprland ≥ 0.57)→WP6.
