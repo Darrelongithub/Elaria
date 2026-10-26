@@ -232,3 +232,75 @@ def test_transcription_landed_line_carries_model_version(
     assert landed, journal_stream.getvalue()
     assert "model_version=" in landed[0], landed[0]
     assert (result.model or "unknown") in landed[0], landed[0]
+
+
+# -- scene-3b sensors: stop.requested at every stop entry ----------------------
+# Owner evidence 2026-10-26: the release bind never stopped the session and
+# NOTHING in the journal could say whether the stop arrived. These tests pin
+# the sensor that makes "bind never fired" vs "stop arrived and failed" a
+# text-only distinction.
+
+class _HoldOpenCapture(SimulatedCapture):
+    def __init__(self, target=None, frame_ms=30, stall_timeout_s=None, **kwargs):
+        super().__init__(speech_frames=100_000, frame_ms=frame_ms, realtime=True)
+
+
+def _events_named(journal_stream, name: str) -> list[str]:
+    return [ln for ln in journal_stream.getvalue().splitlines()
+            if ln.split(" ", 6)[2] == name]
+
+
+def test_stop_requested_is_emitted_with_cli_source(config, journal_stream,
+                                                   monkeypatch):
+    monkeypatch.setattr("assistant.daemon.PipeWireCapture", _HoldOpenCapture)
+    daemon = Daemon(config)
+    try:
+        async def drive():
+            assert (await daemon._ptt_start({}))["listening"] is True
+            return await daemon._ptt_stop({"wait_s": 0})
+
+        asyncio.run(drive())
+        lines = _events_named(journal_stream, "stop.requested")
+        assert lines, journal_stream.getvalue()
+        assert "source=cli" in lines[0]
+        sid = lines[0].split(" ", 6)[3]
+        assert sid not in ("", "-"), lines
+    finally:
+        daemon.store.close()
+
+
+def test_stop_requested_carries_the_bind_source(config, journal_stream,
+                                                monkeypatch):
+    monkeypatch.setattr("assistant.daemon.PipeWireCapture", _HoldOpenCapture)
+    daemon = Daemon(config)
+    try:
+        async def drive():
+            assert (await daemon._ptt_start({}))["listening"] is True
+            return await daemon._ptt_stop({"wait_s": 0, "stop_source": "bind"})
+
+        asyncio.run(drive())
+        lines = _events_named(journal_stream, "stop.requested")
+        assert lines and "source=bind" in lines[0]
+    finally:
+        daemon.store.close()
+
+
+def test_watchdog_close_is_a_stop_entry_too(config, journal_stream, monkeypatch):
+    import time
+
+    monkeypatch.setattr("assistant.daemon.PipeWireCapture", _HoldOpenCapture)
+    daemon = Daemon(config)
+    try:
+        async def drive():
+            assert (await daemon._ptt_start({}))["listening"] is True
+            daemon._ptt_started_at = time.monotonic() - 3600.0
+            return await daemon._watchdog_tick()
+
+        assert asyncio.run(drive()) is True
+        lines = _events_named(journal_stream, "stop.requested")
+        assert lines, journal_stream.getvalue()
+        assert "source=watchdog" in lines[0]
+        close = _events_named(journal_stream, "watchdog.close")
+        assert close, "the watchdog close marker keeps its own schema line"
+    finally:
+        daemon.store.close()

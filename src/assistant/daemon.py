@@ -1766,6 +1766,16 @@ class Daemon:
         """
         wait_s = self._ptt_wait_budget(params)
         self._ptt_log("ptt.stop.received", session_id=str(self._ptt_session_id or ""))
+        # Scene-3b sensor (2026-10-26): every stop entry leaves a schema line
+        # FIRST — the next scene must distinguish "bind never fired" (no
+        # stop.requested at all) from "stop arrived and failed" (a line here)
+        # from text alone. Sources: cli | bind | watchdog.
+        stop_source = str(
+            params.get("stop_source")
+            or ("watchdog" if params.get("watchdog") else "cli"))
+        log_event("stop.requested", session_id=str(self._ptt_session_id or ""),
+                  verdict="requested",
+                  detail=f"source={stop_source}")
         ack = await self._ack({"kind": "on_it", "speak": False})
         task = self._dictation_task
         session_id = self._ptt_session_id

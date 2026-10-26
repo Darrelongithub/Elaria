@@ -1,7 +1,8 @@
 # HANDOFF — cold-resume state (Blueprint v2 wiring spec build)
 
-Last updated: 2026-10-26 (scene-2 order executed: streams 1–3 on branch;
-scene 3 = the owner's ladder rerun + the press; PR #23 merge gate unchanged)
+Last updated: 2026-10-26 (scene-3b evidence triaged: streams A–C; the
+release-path probe is the owner's next scene; merge gate RESTATED unchanged
+and still red)
 Branch: `arena/c2a7085d-elaria` · base `ed20344` (main)
 Authority: MASTER BUILD PROMPT — ELARIA, BLUEPRINT V2 WIRING SPEC (2026-10-25)
 
@@ -148,6 +149,27 @@ a closed WAV. The run fell back to the proven batch engine (decision row
 cites this record** when wiring the segment/Files-API route choice.
 [HW-PROVEN]
 
+### Scene 3b (2026-10-26) — release path is the regression; sensors first
+
+Owner hardware evidence (12:07–12:26) [HW-PROVEN]:
+- The press bind fires via hyprland exec (session.open at 12:07:42 and
+  12:21:17). The release never stops: the 12:07 session ran to
+  `watchdog.close` at 303.8 s with no stop from the bindr. A manual
+  `assist ptt stop` WORKS (ack JSON: session, processing:true,
+  result:null) — daemon/CLI/socket/Live-flush innocent; suspicion
+  concentrates on the bindr trigger itself (probe in §7).
+- The pasted ack object (`ack_kind:on_it, played:false, cached:true`) is
+  `ptt.stop`'s ACK — `speak=False` by design on release ("no spoken ack
+  on release") — so `played:false` there is honest. What the evidence
+  exposes is the REPORTING hole: no surface anywhere says whether a
+  queued playback actually played (Stream B fixes the player chain and
+  adds `ack.played`/`ack.failed` schema events with argv + error).
+- Deferred audio kept (`audio/20261026-120742-1beaea.wav`, "retained for
+  retry") with 0 user-turn calls at 12:12 — audit found NO consumer for
+  kept no-final audio (§6.8 defect, owning phase WP5).
+- Stream A sensors landed before any fix: `stop.requested`
+  (source=cli|bind|watchdog) at every stop entry.
+
 ## 5. Lessons and watch items
 
 1. **Daemon-was-stale lesson (scene 1):** the scene ran status-dependent
@@ -210,28 +232,60 @@ cites this record** when wiring the segment/Files-API route choice.
 6. Event-smoke segment-rotation timing (§5.3) — WP5.
 7. bug6 real-mic leak — seam applied (§5.3), status [BROKEN-laptop,
    main-parity] until the owner re-runs. Not gating PR #23.
+8. **Deferred-retry limbo (scene-3b audit, 2026-10-26) — owning phase WP5.**
+   "retained for retry" is a MESSAGE ONLY: the no-final path
+   (`transcribe.py` → `transcription.deferred` verdict=no_final) keeps the
+   wav and says "retained for retry", but NOTHING consumes it — the
+   offline queue (`enqueue_transcription`) only covers
+   `pending_cloud_transcription` (low-confidence offline), never the
+   no-final/watchdog-severed case. Contract owed (owner order): the kept
+   12:07 wav (`audio/20261026-120742-1beaea.wav`) is the standing test
+   case — it either eventually transcribes and answers, or is explicitly
+   marked never-retried. No third state. [TESTED-ONLY audit; the limbo is
+   visible in the owner's ledger.]
 8. Machine facts to confirm on the laptop: `rpm -q hyprland` exact version
    (WP3 trigger watches for 0.57), quickshell 0.2.1 frozen (do not upgrade),
    Mic1 capture node non-silent (doctor now checks; run it there).
 
 ## 7. The next action
 
-**Scene 3 — the owner runs, on the laptop** (daylight, ≤30 min):
+**Scene 3b (owner, laptop) — the release-path probe.** The gate is
+RESTATED unchanged and still red: a NATURAL Win+F2 hold-speak-release
+cycle must produce earcon at press, session close at release, final
+transcript, spoken reply, and schema lines for each. WP1 stays parked.
 
-1. Truth dumps (already provided 2026-10-26 — keep for the record).
-2. Ladder rerun on branch code: `uv run assist ladder` — scene-3 gate:
-   Win+F2 press **PRESENT**, Win+Shift+F12 halt **PRESENT**, Win+Shift+F2
-   raise **PRESENT**, bare-F2 press **ABSENT**, legacy release-stop
-   **WARN** retained. (Restart the daemon on branch code first — §5.1.)
-3. **THE PRESS:** Win+F2, one sentence, release — then
-   `journalctl --user -u assistant -b | tail`. The press's schema lines
-   must carry `model_version=…` on the transcription line.
+1. **The bindr probe (manual editor edit — NEVER sed; HTML-escaping has
+   bitten this project).** Add directly below hyprland.conf line 213:
 
-**Merge PR #23 when:** stream-1 tests green in sandbox (DONE) + scene-3
-ladder truthful + the press produces schema lines with `model_version`.
-Then the `elaria-ladder` shim disposition runs (decision 2.5), and WP1
-opens: Flare TTS-side check, earcon-before-capture, AEC, cache hit-ratio,
-mic-gain and silence-verdict review.
+   ```
+   bindr = , F2, exec, sh -c 'date >>/tmp/elaria-release-probe.log'
+   ```
+
+   then `hyprctl reload`, one Win+F2 hold-speak-release cycle, then
+   `cat /tmp/elaria-release-probe.log`, then delete the probe line.
+
+   - **Timestamp present** → the bindr fires; diff the bind-exec vs
+     terminal environments (an `env -0` dump through the same probe if
+     needed) and find why `assist ptt stop` no-ops from the bind while
+     working from a shell.
+   - **File absent/empty** → the bindr NEVER fires on 0.56.2 legacy
+     conf. Escalation recommendation (owner decision): the structural
+     fix is the Lua release bind with `ignore_mods` (WP3) — propose
+     pulling WP3 forward for the BINDS ONLY. Interim stopgap (never
+     final; hold-to-talk UX is the settled design): temporary
+     `SUPER+SHIFT+F3 = assist ptt stop --stop-source bind`.
+2. **A clean cycle** on the branch build (daemon restarted on branch
+   code first — the stale-daemon lesson): press → earcon; release →
+   `stop.requested` schema line; transcript + spoken reply +
+   `model_version` on the transcription line. `stop.requested` absent =
+   the bind never fired; present-but-failed = the stop arrived.
+3. **paplay the ack wav directly** to verify it:
+   `paplay ~/.local/share/assistant/voice-cache/speech-c3355e59132b6af3283d.wav`
+4. **The journal tail** 60+ s after a manual `assist ptt stop` of a live
+   session — expect `transcription.landed` with `model_version`, the
+   reply invocation, `quota.counter` 1 user-turn, `session.close`, and
+   whether Flare spoke. (This tail is Stream C's trigger: its landing
+   closes the completion-evidence record in §5.)
 
 Both outcomes are decisions: a failed scene produces a log dump and a
-diagnosis, never a retry loop.
+diagnosis, never a retry loop. <=30 min, daylight.

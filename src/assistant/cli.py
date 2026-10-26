@@ -1987,6 +1987,9 @@ def build_parser() -> argparse.ArgumentParser:
     ptt_p.add_argument("--mode", choices=["narration", "conversation", "command"],
                        help="session mode for start; command routes via the local ladder")
     ptt_p.add_argument("--source", help="capture source override")
+    ptt_p.add_argument("--stop-source", choices=["cli", "bind"],
+                       help="who asked for the stop (schema sensor: binds pass "
+                            "'bind' so a release can be told from a terminal stop)")
     ptt_p.add_argument("--speak", action="store_true",
                        help="for command stop: speak the reply locally")
     ptt_p.add_argument("--wait", action="store_true",
@@ -2571,6 +2574,8 @@ def main(argv: list[str] | None = None) -> int:
                 params["speak"] = True
             if action == "stop" and args.wait:
                 params["wait_s"] = 90.0
+            if action == "stop" and args.stop_source:
+                params["stop_source"] = args.stop_source
             result = call(config.socket_path, f"ptt.{action}", params,
                           timeout=95.0 if (action == "stop" and args.wait) else 3.0)
             print(json.dumps(result))
