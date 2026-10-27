@@ -848,3 +848,78 @@ ruff clean.** Same as `462fa98`. The corrected baseline holds.
 ### Standing commitment re-armed, both clauses
 
 On every base movement: re-run the drift check **and** re-measure the suite.
+
+---
+
+## 2026-10-27 — DOCTRINE RATIFIED (TWO CLAUSES) + GATE 1e RE-DATED TO b3db316 + THE STALE-NOTICE CATCH
+
+Report 011 is the record. The design chat adopted both flags as doctrine and immediately
+supplied a test case — which the test case itself failed.
+
+### RULING 21 — FLAG 1 ADOPTED AS DOCTRINE
+
+The standing commitment is **two clauses**: every base movement requires the drift check
+**and** a suite re-measure at activation time. A.1 proved a baseline can move without the
+contract moving.
+
+### RULING 22 — FLAG 2 CONFIRMED
+
+The GATE 1e window re-dates and the full check re-runs on ANY further base movement
+before fixture authorship.
+
+### RULING 23 — NEW CANONICAL SUITE BASELINE (both lanes)
+
+**1,925 passed / 6 skipped / 0 errors, ruff clean.** My measurement supersedes the commit
+message and every prior report. The A.1 arc — found in my lane, offered as a one-liner,
+adopted by mainline, measured back by me — is recorded as the cross-lane doctrine's first
+full closed loop.
+
+### RULING 24 — manifest path shape accepted; Q13 confirmed as pre-fixture next-activation
+work, correctly flagged.
+
+### RULING 25 — posture unchanged: STOPPED AT GATE 1. Sheets 1+2 numbers gate everything;
+PR #24 stands as the durable record.
+
+### THE STALE-NOTICE CATCH — the doctrine's first real payoff
+
+The design chat's own notice named `018d109` as the current tip and told me to verify
+rather than trust it. **The actual origin tip at activation was
+`b3db316914235caee40f4c650072c9e06fb0288c`** — one commit beyond the notice.
+
+Not Stream H's fault: their `HANDOFF.md` record shows their activation verified
+`origin tip = 018d109`, and `b3db316` **is the commit that records that verification**.
+The notice was accurate when written and had been overtaken by the very commit it
+described.
+
+**Had I accepted the notice's SHA, I would have re-dated GATE 1e to a baseline that was no
+longer the tip** and reported a clean check against the wrong commit. Fetching the origin
+tip at activation time is not ceremony — it paid for itself on the first try.
+
+### Two-clause check vs `b3db316` — CLEAN
+
+| Check | Result |
+|---|---|
+| `git diff 018d109..b3db316 -- src/assistant/journal_log.py` | **empty — untouched** |
+| `git diff 018d109..b3db316 -- src/` | **empty — no source change at all** |
+| `audio kept at` sites | **4, character-identical, same line numbers** |
+| Three WP7 event names | **all still emitted** |
+| Full §2 verification table vs b3db316's actual module | **ALL 12 CHECKS PASS** |
+| Pre-existing verdict collision | **still present** → §2.1 still load-bearing |
+| Suite, measured in a throwaway worktree on CPython 3.11 | **1925 passed / 6 skipped / 0 errors, ruff clean — UNCHANGED** |
+
+A docs-only commit could not have moved the suite, and it did not. The measurement ran
+anyway, because the doctrine is unconditional and A.1 taught that assuming a change is
+inert is how a baseline goes stale.
+
+### Useful structural fact from Stream H's record
+
+`journal_log.py` was last touched by `30abf30` (stream G), and **`log_event` is generic —
+"event is the caller's naming", no allowlist**. That is why `capture.lifecycle` needed no
+journal-side change. For my lane it means new schema events need no coordination with the
+journal machinery, so future additive lines are **inert by construction** unless they
+collide on verdict.
+
+### Standing commitment re-armed (two clauses, now doctrine)
+
+On every base movement: re-run the drift check **and** re-measure the suite, against the
+**origin tip at activation time**.
