@@ -105,7 +105,8 @@ def running_daemon(config):
         current = asyncio.current_task()
         clients = [task for task in asyncio.all_tasks()
                    if task is not current and not task.done()
-                   and task.get_coro().__qualname__ == "serve.<locals>._client"]
+                   and getattr(task.get_coro(), "__qualname__", "")
+                   == "serve.<locals>._client"]
         if clients:
             await asyncio.wait_for(
                 asyncio.gather(*clients, return_exceptions=True), timeout=3)

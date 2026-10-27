@@ -566,6 +566,9 @@ class DictationService:
                           error=f"{type(exc).__name__}: {exc}"[:200])
 
         final_text = ""
+        # Flush-local otherwise: the offline path skips the flush block,
+        # and the H.1 route line reads this at the gate on every path.
+        final_wait_note = ""
         confidence: float | None = None
         connectivity = self._connectivity()
         offline_at_start = bool(connectivity and connectivity.is_offline)
@@ -609,6 +612,12 @@ class DictationService:
         captured_bytes = 0
         peak_rms = 0.0
         session_peak = 0.0
+        # Stream H.4 capture-lifecycle sensors (2026-10-27): the owner
+        # reports "the microphone takes a minute to start and stop" —
+        # aggregate numbers only, never content.
+        dictate_started_mono = time.monotonic()
+        first_frame_latency_ms = None
+        first_speech_frame_s = None
         frames_seen = 0
         capture_label = str(getattr(source, "target", None) or "default")
 
@@ -747,8 +756,19 @@ class DictationService:
                 captured_bytes += len(frame)
                 level = frame_rms(frame)
                 peak_rms = max(peak_rms, level)
-                session_peak = max(session_peak, pcm_peak(frame))
+                frame_peak = pcm_peak(frame)
+                session_peak = max(session_peak, frame_peak)
                 frame_s = len(frame) / 2 / 16000
+                # H.4: press→first-frame latency and where in the kept
+                # wav the first non-silent frame sits (HDA DSP power-up
+                # can clip first words; ACTIVITY_START 0s is ambiguous).
+                if frames_seen == 1:
+                    first_frame_latency_ms = round(
+                        (time.monotonic() - dictate_started_mono) * 1000, 1)
+                if first_speech_frame_s is None and (
+                        frame_peak >= self.silence_floor):
+                    first_speech_frame_s = round(
+                        (captured_bytes - len(frame)) / 2 / 16000, 3)
                 # BUG6: half-duplex inside the Live session. While her output
                 # is playing (or inside the ~400 ms guard), a frame is her own
                 # voice through the speakers. It is not buffered (a rotation
@@ -1101,6 +1121,8 @@ class DictationService:
                 "silence_floor": round(self.silence_floor, 4),
                 "duration_s": round(duration_s, 3), "gated_frames": gated_frames,
                 "stalled": stalled, "no_speech": no_speech,
+                "first_frame_latency_ms": first_frame_latency_ms,
+                "first_speech_frame_s": first_speech_frame_s,
             }
             if stalled:
                 notes.append("capture stalled — the capture process delivered no data")
@@ -1164,6 +1186,14 @@ class DictationService:
                         timeout_s=self.TRANSPORT_CLOSE_TIMEOUT_S,
                         session_id=session_id)
                     self._log("dictate.transport_closed", session_id=session_id)
+                    # H.4: stream-closed-at, a schema fact at session
+                    # close (the "mic keeps running" worry is
+                    # privacy-adjacent — the close time is evidence).
+                    log_event("stream.closed", session_id=session_id,
+                              verdict="closed",
+                              detail=(f"live stream closed "
+                                      f"{round(time.monotonic() - dictate_started_mono, 3)}s "
+                                      f"after session start"))
                 except Exception as exc:
                     notes.append(f"Live transport close did not finish cleanly ({exc})")
                     self._log("dictate.transport_close_failed", session_id=session_id,
@@ -1241,6 +1271,25 @@ class DictationService:
         clean_terminal = not live_terminal_missing and not live_failed
         tail_unconfirmed = uncommitted_speech_s > 0 and not clean_terminal
         needs_fallback = (not final_text or tail_unconfirmed) and not no_speech
+        # Stream H.1 (2026-10-27): the post-timeout ROUTE is a schema
+        # fact. The scene-6 "no fallback attempt" reading came from a
+        # journal where the attempt only existed as persona lifecycle
+        # rows — from here on the route and the fallback outcome are
+        # schema lines, and the timeout kind (adaptive abandon vs budget)
+        # rides the reason.
+        route_reason = (final_wait_note
+                        or ("final received" if final_text else "no wait note"))
+        log_event("post_timeout_route", session_id=session_id,
+                  verdict=("fallback" if needs_fallback else "deferred"),
+                  detail=(f"reason={route_reason}; "
+                          f"needs_fallback={str(bool(needs_fallback)).lower()}; "
+                          f"no_speech={str(bool(no_speech)).lower()}; "
+                          f"final={'yes' if final_text else 'no'}; "
+                          f"timeout_kind="
+                          + ("adaptive_abandon"
+                             if "adaptive abandon" in route_reason
+                             else "budget" if "timed out" in route_reason
+                             or "budget expired" in route_reason else "none")))
         if final_text and needs_fallback:
             notes.append(
                 f"Live transcript may be incomplete: {uncommitted_speech_s:.2f}s "
@@ -1265,6 +1314,11 @@ class DictationService:
                         session_id=session_id, audio_path=str(audio_path),
                         offline=use_offline_chain)
                     fallback_text = str(getattr(fallback, "text", "") or "").strip()
+                    outcome_detail = ("returned no transcript" if not fallback_text
+                                      else f"returned {len(fallback_text)} chars")
+                    log_event("fallback.outcome", session_id=session_id,
+                              verdict=("landed" if fallback_text else "empty"),
+                              detail=f"file-transcription leg {outcome_detail}")
                     if fallback_text:
                         final_text = fallback_text
                         backend = str(getattr(fallback, "backend", backend))
@@ -1279,6 +1333,9 @@ class DictationService:
                     else:
                         notes.append("saved-WAV fallback returned no transcript")
                 except Exception as exc:
+                    log_event("fallback.outcome", level="warn",
+                              session_id=session_id, verdict="error",
+                              detail=f"file-transcription leg failed: {exc}")
                     await emit_lifecycle_event(
                         "dictate.fallback_error_emit",
                         {"event": "error", "error": str(exc),

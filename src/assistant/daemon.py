@@ -259,6 +259,9 @@ class Daemon:
         self._last_session_line: str | None = None
         self._last_connectivity_mode = self.mode_manager.status(refresh=False).effective_mode
         self._background_tasks: set[asyncio.Task] = set()
+        # H.4 probes are passive sensors — kept out of _background_tasks
+        # so "await the ack waiters" bookkeeping never swallows them.
+        self._probe_tasks: set[asyncio.Task] = set()
         # One bound for every chat call (owner turns and guest turns): a
         # stalled transport must return a spoken fact, never freeze the
         # console (BH-I12).
@@ -555,6 +558,11 @@ class Daemon:
     def _track_task(self, task: asyncio.Task) -> asyncio.Task:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _spawn_probe(self, task: asyncio.Task) -> asyncio.Task:
+        self._probe_tasks.add(task)
+        task.add_done_callback(self._probe_tasks.discard)
         return task
 
     def _meeting_mode(self) -> str:
@@ -1811,6 +1819,14 @@ class Daemon:
                     is_playback_active=self.is_speaking,
                     session_id=session_id)))
             self._ptt_log("ptt.start.dictate_spawned", session_id=session_id)
+            # Stream H.4 (2026-10-27): the owner sees the mic in-use
+            # indicator linger after a session ("takes a minute to …
+            # stop"). Privacy-adjacent: probe the capture node's
+            # PipeWire state ~5s after the dictation task ends and log
+            # `capture.node_state`. Best-effort and bounded — no
+            # PipeWire on this box means one honest "probe unavailable".
+            self._spawn_probe(asyncio.create_task(self._mic_release_probe(
+                session_id, self._dictation_task)))
         except Exception as exc:
             self._ptt_log("ptt.start.dictate_spawn_failed", session_id=session_id, error=f"{type(exc).__name__}: {exc}"[:200])
             raise
@@ -1821,6 +1837,67 @@ class Daemon:
                 "capture_target": str(getattr(self._capture_source, "target", None)
                                       or "default"),
                 "connectivity": connectivity.as_dict()}
+
+    #: H.4: seconds after session close before the mic-state probe runs.
+    MIC_RELEASE_PROBE_DELAY_S = 5.0
+
+    async def _mic_release_probe(self, session_id: str, task) -> None:
+        """H.4 sensor: was the capture node actually RELEASED after the
+        session closed? PipeWire node state ~5s after close — the
+        in-use indicator lingering is privacy-adjacent evidence."""
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=600)
+            except Exception:  # noqa: S110 - the probe is evidence, not cleanup
+                pass
+        await asyncio.sleep(self.MIC_RELEASE_PROBE_DELAY_S)
+        target = str(getattr(self._capture_source, "target", None) or "")
+        verdict = "unknown"
+        detail = "probe unavailable (pw-cli/pactl not found)"
+        for argv in (("pw-cli", "ls", "Node"), ("pactl", "list", "sources")):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL)
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+            except Exception:  # noqa: S112 - try the next probe; the
+                continue        # final verdict line reports what happened
+            text = out.decode("utf-8", "replace")
+            state = self._probe_state(text, target)
+            if state is not None:
+                verdict = state
+                detail = (f"{argv[0]} reports capture node "
+                          f"{target or '(default)'} state {state} "
+                          f"{self.MIC_RELEASE_PROBE_DELAY_S:g}s after close")
+                break
+            detail = (f"{argv[0]} ran but named no state for "
+                      f"{target or '(default)'}")
+        try:
+            log_event("capture.node_state", session_id=session_id,
+                      verdict=verdict, detail=detail)
+        except Exception:  # noqa: S110 - a broken journal never kills a probe
+            pass
+
+    @staticmethod
+    def _probe_state(text: str, target: str):
+        """Find the capture node's state in pw-cli/pactl output (text
+        shapes differ; best-effort, None when nothing matches)."""
+        norm = text.replace("\r", "")
+        blocks = norm.split("\n\n") if "\n\n" in norm else [norm]
+        if target:
+            chosen = [b for b in blocks if target in b]
+        else:
+            chosen = [b for b in blocks if "input" in b.lower()]
+        for block in chosen or blocks:
+            for line in block.splitlines():
+                low = line.strip().lower()
+                if low.startswith("state"):
+                    tail = low.split("state", 1)[1]
+                    for word in ("running", "idle", "suspended", "error",
+                                 "unavailable", "streaming"):
+                        if word in tail:
+                            return word
+        return None
 
     @staticmethod
     def _ptt_wait_budget(params: dict) -> float:
@@ -3590,7 +3667,8 @@ class Daemon:
                 capture_error = exc
         tasks = [
             t for t in (*extra_tasks, self._dictation_task, meeting_task,
-                        *self._meeting_stop_tasks, *self._background_tasks)
+                        *self._meeting_stop_tasks, *self._background_tasks,
+                        *self._probe_tasks)
             if t is not None
         ]
         for task in tasks:
