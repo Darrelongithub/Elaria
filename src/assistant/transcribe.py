@@ -1021,6 +1021,9 @@ class DictationService:
                                       f" retries={int(wire.get('setup_retries') or 0)}"
                                       f"; voice_end={str(bool(wire.get('voice_end'))).lower()}"
                                       f"; transcript_family={int(wire.get('transcript_family') or 0)}"
+                                      f" commits={int(wire.get('transcript_commits') or 0)}"
+                                      f" dupes={int(wire.get('transcript_dupes') or 0)}"
+                                      f" snapshots={int(wire.get('transcript_snapshots') or 0)}"
                                       f"; types={json.dumps(types, sort_keys=True)}"
                                       + (f"; samples={json.dumps(samples)[:600]}"
                                          if samples else "")))

@@ -629,6 +629,14 @@ class GenaiLiveTransport:
         self._wire_samples: list[str] = []
         self._voice_end_seen = False
         self._transcript_family = 0
+        # G.7.1 shape sensors: how many input_transcription envelopes the
+        # wire delivered vs how many committed finals we emitted — the
+        # scene-6 number that says whether the model streams deltas
+        # (parts > commits) or one-shot segments (parts == commits).
+        self._transcript_parts = 0
+        self._transcript_commits = 0
+        self._transcript_dupes = 0
+        self._transcript_snapshots = 0
         self._setup_complete = False
         self._wire_session_id: str | None = None
         self._setup_retries = 0
@@ -820,6 +828,10 @@ class GenaiLiveTransport:
             "wire_session_id": self._wire_session_id,
             "voice_end": self._voice_end_seen,
             "transcript_family": self._transcript_family,
+            "transcript_parts": self._transcript_parts,
+            "transcript_commits": self._transcript_commits,
+            "transcript_dupes": self._transcript_dupes,
+            "transcript_snapshots": self._transcript_snapshots,
             "audio_sent": {
                 "chunks": self._audio_chunks_sent,
                 "bytes": self._audio_bytes_sent,
@@ -871,6 +883,8 @@ class GenaiLiveTransport:
                 # Requiring its optional `finished` flag misclassified these
                 # finals as interims and forced saved-WAV batch fallback (6f).
                 if text.strip():
+                    self._transcript_parts += 1
+                    self._transcript_commits += 1
                     await self._queue.put(LiveEvent("final", text=text))
             else:
                 # Conversational Live uses text deltas in this SAME field.
