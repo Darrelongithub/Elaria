@@ -34,6 +34,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 import wave
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -135,6 +136,10 @@ class SpeechResult:
     cloud_voice: bool = False
     muted: bool = False
     error: str | None = None
+    # G.6 latency marks (monotonic): synth completion and player spawn,
+    # so reply→synth and synth→audible are measured, never inferred.
+    synth_mark: float | None = None
+    play_mark: float | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -722,12 +727,17 @@ class SpeechService:
             return [parts] if parts and shutil.which(parts[0]) else []
         return [[c] for c in ("pw-play", "paplay", "aplay") if shutil.which(c)]
 
-    def _play_with_detail(self, path: Path) -> dict:
+    def _play_with_detail(self, path: Path, *, synth_mark: float | None = None,
+                          session_id: str | None = None) -> dict:
         """Play `path`, trying each candidate player in order.
 
         Returns {played, player, argv, returncode, error}: every failure mode
         (no player binary, spawn error, non-zero exit with the stderr tail,
         timeout) is recorded — silence with a reason, never a bare False.
+
+        G.6: when `session_id` is given (the reply path), a successful
+        spawn emits `audio.first_byte` — the playback-start sensor that
+        closes the synth→audible blind spot. Acks keep their own events.
         """
         candidates = self._player_candidates()
         if not candidates:
@@ -745,6 +755,7 @@ class SpeechService:
             # sink claimed). An injected test runner keeps the plain
             # signature — it must not have to know about prctl.
             protect = self._player_runner is subprocess.run
+            spawn_mark = time.monotonic()
             try:
                 result = self._player_runner(
                     argv, capture_output=True,
@@ -758,8 +769,16 @@ class SpeechService:
                 continue
             returncode = getattr(result, "returncode", 0)
             if returncode == 0:
-                return {"played": True, "player": command[0], "argv": argv,
-                        "returncode": 0, "error": ""}
+                if session_id is not None:
+                    since = ("" if synth_mark is None else
+                             f"since_synth_s={round(spawn_mark - synth_mark, 3)}; ")
+                    log_event("audio.first_byte", session_id=str(session_id),
+                              verdict="audible",
+                              detail=f"{since}player={command[0]}; wav={path.name}")
+                last = {"played": True, "player": command[0], "argv": argv,
+                        "returncode": 0, "error": "",
+                        "play_mark": spawn_mark}
+                return last
             stderr = getattr(result, "stderr", b"") or b""
             if isinstance(stderr, bytes):
                 stderr = stderr.decode("utf-8", "replace")
@@ -774,7 +793,8 @@ class SpeechService:
     def play_audio(self, path: Path) -> bool:
         return bool(self._play_with_detail(path).get("played"))
 
-    def speak(self, text: str, *, play: bool = True) -> SpeechResult:
+    def speak(self, text: str, *, play: bool = True,
+              session_id: str | None = None) -> SpeechResult:
         route, why = self.voice_route()
         if route == "silent":
             # Muted on purpose and reported as such - an intentional silence the
@@ -791,6 +811,9 @@ class SpeechService:
             self.last_voice_error = str(exc)
             return SpeechResult(text=text.strip(), backend="none", voice_id="none",
                                 local=False, muted=True, error=str(exc))
+        # G.6 marks: synthesize() has returned = synth complete (cache hits
+        # included); the player spawn mark lands in _play_with_detail.
+        result.synth_mark = time.monotonic()
         if play and result.audio_path:
             route_after, why_after = self.voice_route()
             if route_after == "silent":
@@ -800,7 +823,11 @@ class SpeechService:
                     played=False, local=False, cloud_voice=False,
                     muted=True, error=why_after,
                 )
-            result.played = self.play_audio(Path(result.audio_path))
+            detail = self._play_with_detail(Path(result.audio_path),
+                                            synth_mark=result.synth_mark,
+                                            session_id=session_id)
+            result.played = bool(detail.get("played"))
+            result.play_mark = detail.get("play_mark")
         return result
 
     # -- cached standard acks (§18 <300ms path) ---------------------------------------

@@ -198,6 +198,9 @@ class SessionResult:
     # the §4.8 schema lines as `model_version=…` so a press can be proven to
     # have been served, and by which model.
     model: str | None = None
+    # G.6 latency sensor: monotonic mark at final.received / final.timeout,
+    # so release→final is measured, never inferred.
+    final_mark: float | None = None
 
 
 def _final_texts(events) -> list[str]:
@@ -488,6 +491,7 @@ class DictationService:
         no_speech = False
         no_final = False
         live_terminal_missing = False
+        final_mark: float | None = None   # G.6: set at final.* classification
         frame_loop_completed = False
         transport: LiveTransport | None = None
         collector: asyncio.Task | None = None
@@ -896,6 +900,7 @@ class DictationService:
                 finals = _final_texts(collected)
                 final_text = " ".join(finals).strip()
                 waited_s = round(time.monotonic() - final_wait_started, 3)
+                final_mark = time.monotonic()
                 if final_text:
                     log_event("final.received", session_id=session_id,
                               verdict="received",
@@ -940,9 +945,13 @@ class DictationService:
                 if isinstance(wire, dict):
                     types = wire.get("types") or {}
                     samples = wire.get("samples") or []
+                    setup_ok = bool(wire.get("setup_complete"))
                     log_event("ws.histogram", session_id=session_id,
                               verdict="wire",
-                              detail=(f"types={json.dumps(types, sort_keys=True)}"
+                              detail=(f"setup={'ok' if setup_ok else 'missing'}"
+                                      f"; voice_end={str(bool(wire.get('voice_end'))).lower()}"
+                                      f"; transcript_family={int(wire.get('transcript_family') or 0)}"
+                                      f"; types={json.dumps(types, sort_keys=True)}"
                                       + (f"; samples={json.dumps(samples)[:600]}"
                                          if samples else "")))
                     sent = wire.get("audio_sent") or {}
@@ -1255,6 +1264,8 @@ class DictationService:
                 connectivity_mode=(connectivity.effective_mode
                                    if connectivity else None),
                 model=model)
+        if final_mark is not None and getattr(result, "final_mark", None) is None:
+            result.final_mark = final_mark
         try:
             result = self._enqueue_offline_work(
                 result, offline=use_offline_chain,

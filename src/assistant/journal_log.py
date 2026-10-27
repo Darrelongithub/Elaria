@@ -9,7 +9,9 @@ Schema, one line per event, space-separated:
 - `event`   dotted name from the §4.8 list (session.open, session.close,
             silence.verdict, transcription.landed, transcription.deferred,
             transcription.rejected, tts.cached, tts.synthesised, tts.failed,
-            quota.counter, watchdog.close, goaway.close).
+            quota.counter, watchdog.close, goaway.close — and the stream-F/G
+            sensors ws.histogram, audio.sent, audio.first_byte, latency.table,
+            final.wait, final.received, final.timeout).
 - `session_id`  the ptt/dictation/session id, or `-`.
 - `peak`    the measured input peak for the session, or `-`.
 - `verdict` one plain word (listening, silence, landed, deferred, rejected,

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import math
 import os
@@ -273,6 +274,10 @@ class Daemon:
         # gate closed for the real worker lifetime; a text-duration estimate can
         # expire while synthesis is still delayed (I4).
         self._speech_playbacks: set[asyncio.Task] = set()
+        # G.6 latency stages per session: release → final → reply →
+        # synth → audible, each a monotonic mark, emitted as latency.table.
+        self._stage_marks: dict[str, dict[str, float]] = {}
+        self._latency_emitted: set[str] = set()
         # BUG F / Bug 8 (2026-10-20): the single 4 s total-turn bound is gone.
         # Two deadlines from [gemini]: a streaming first-token deadline (a
         # transport with no first token is dead) and a generous total bound (a
@@ -331,22 +336,74 @@ class Daemon:
             self._speaking_until = __import__("time").monotonic() + guard_s
             # Don't clear text immediately; let guard expire
 
-    def _start_speech_task(self, text: str, *, play: bool = True) -> asyncio.Task:
+    def _start_speech_task(self, text: str, *, play: bool = True,
+                           session_id: str | None = None) -> asyncio.Task:
         """Start one TTS call; a playing call owns the duplex gate through finish (I4)."""
         if play:
             self._set_speaking(True, text=text)
+        # session_id only rides when there is one — speech doubles with the
+        # older `speak(text, play=...)` signature stay valid.
+        speak_kwargs = {"play": play}
+        if session_id:
+            speak_kwargs["session_id"] = session_id
         worker = asyncio.create_task(asyncio.to_thread(
-            self.speech.speak, text, play=play))
+            self.speech.speak, text, **speak_kwargs))
         if play:
             self._speech_playbacks.add(worker)
 
             def finished(task: asyncio.Task) -> None:
                 self._speech_playbacks.discard(task)
                 self._set_speaking(False, text=text)
+                self._collect_speech_marks(session_id, task)
                 self._consume_task_result(task)
 
             worker.add_done_callback(finished)
         return worker
+
+    def _stage(self, session_id, name: str, mark: float | None = None) -> None:
+        marks = self._stage_marks.setdefault(str(session_id or ""), {})
+        marks.setdefault(name, mark if mark is not None else time.monotonic())
+
+    def _collect_speech_marks(self, session_id, task: asyncio.Task) -> None:
+        """Fold the speech result's synth/play marks into the stage table
+        and emit latency.table once the last leg lands (G.6)."""
+        try:
+            result = task.result()
+        except Exception:
+            self._emit_latency_table(session_id, final=True)
+            return
+        synth = getattr(result, "synth_mark", None)
+        play = getattr(result, "play_mark", None)
+        if synth is not None:
+            self._stage(session_id, "synth", synth)
+        if play is not None:
+            self._stage(session_id, "audible", play)
+        self._emit_latency_table(session_id, final=True)
+
+    def _emit_latency_table(self, session_id, *, final: bool = False) -> None:
+        sid = str(session_id or "")
+        if sid in self._latency_emitted:
+            return
+        marks = self._stage_marks.get(sid) or {}
+        if len(marks) < 2:
+            return
+        required = ("release", "final", "reply", "synth", "audible")
+        if (not final and "reply" in marks
+                and "synth" not in marks and "audible" not in marks):
+            return   # reply speech still pending — the callback emits
+        self._latency_emitted.add(sid)
+        order = [m for m in required if m in marks]
+        legs = []
+        for a, b in itertools.pairwise(order):
+            legs.append(f"{a}_to_{b}_s={round(marks[b] - marks[a], 3)}")
+        if "release" in marks and "audible" in marks:
+            legs.append(f"release_to_audible_s="
+                        f"{round(marks['audible'] - marks['release'], 3)}")
+        missing = [m for m in required if m not in marks]
+        log_event("latency.table", session_id=sid, verdict="stages",
+                  detail="; ".join(legs)
+                         + (f"; missing={','.join(missing)}" if missing else ""))
+        self._stage_marks.pop(sid, None)
 
     def is_speaking(self) -> bool:
         return bool(self._ack_playbacks or self._speech_playbacks) or (
@@ -569,7 +626,9 @@ class Daemon:
         synthesis of the same text (BH-I4).
         """
         try:
-            worker = self._start_speech_task(text, play=True)
+            worker = self._start_speech_task(
+                text, play=True,
+                session_id=(route or {}).get("session_id") or None)
             result = await asyncio.shield(worker)
             if result.error and not route.get("muted"):
                 await self.broadcast({"event": "speech.error", "error": result.error,
@@ -585,7 +644,8 @@ class Daemon:
         # return its real audio path, but never hang a handler on slow Live TTS
         # (BUG1). On timeout the SAME task keeps running in the background - a
         # second `speak()` would double the audio (BH-I4).
-        route = self.speech.route(text)
+        route = {**self.speech.route(text),
+                 "session_id": str(params.get("session_id") or "") or None}
         requested = params.get("speak")
         auto = (requested is None
                 and self.config.section("tts").get("speak_replies", False))
@@ -1803,6 +1863,7 @@ class Daemon:
         log_event("stop.requested", session_id=str(self._ptt_session_id or ""),
                   verdict="requested",
                   detail=f"source={stop_source}")
+        self._stage(self._ptt_session_id, "release")
         ack = await self._ack({"kind": "on_it", "speak": False})
         task = self._dictation_task
         session_id = self._ptt_session_id
@@ -2089,6 +2150,8 @@ class Daemon:
             # filler resemblance. raw_text stays the ASR record (it matches
             # the stored transcript row); only the shown/routed text loses
             # her words, and the user's remainder is always kept.
+            if getattr(session, "final_mark", None) is not None:
+                self._stage(str(session_id or ""), "final", session.final_mark)
             stripped = self._strip_self_echo(result["text"])
             if stripped != result["text"]:
                 result["text"] = stripped
@@ -2135,6 +2198,7 @@ class Daemon:
                                       f"text_chars={len(result['text'])}; "
                                       f"speak={params.get('speak', True)}"))
                     reply_started = time.monotonic()
+                    self._stage(str(session_id or ""), "reply", reply_started)
                     from .intents import route as route_intent
 
                     try:
@@ -2144,6 +2208,7 @@ class Daemon:
                     ask_params = {
                         "text": result["text"],
                         "speak": params.get("speak", True),
+                        "session_id": str(session_id or ""),
                     }
                     if session_mode == "command":
                         # Known local commands keep their existing grammar
@@ -2233,6 +2298,10 @@ class Daemon:
                 # every session end carries today's spend on stdout).
                 capture = (result or {}).get("capture") or {}
                 model_of_record = (result or {}).get("model")
+                # G.6: every session ends with its measured stage table
+                # (a no-reply session emits here; a reply session emits at
+                # speech completion, so this call is its backstop).
+                self._emit_latency_table(session_id)
                 transcript_state = ("no_speech" if (result or {}).get("no_speech")
                                     else "no_final" if (result or {}).get("no_final")
                                     else "final")

@@ -627,6 +627,10 @@ class GenaiLiveTransport:
         self._signals_sent: Counter[str] = Counter()
         self._wire_counts: Counter[str] = Counter()
         self._wire_samples: list[str] = []
+        self._voice_end_seen = False
+        self._transcript_family = 0
+        self._setup_complete = False
+        self._wire_session_id: str | None = None
 
     async def connect(self, resumption_handle: str | None = None) -> None:
         from google.genai import types
@@ -646,7 +650,17 @@ class GenaiLiveTransport:
             self._session = await self._context.__aenter__()
         except Exception as exc:
             raise LiveUnavailable(f"Live connect failed: {exc}") from exc
+        self._note_setup(self._session)
         self._receiver = asyncio.create_task(self._receive_loop())
+
+    def _note_setup(self, session) -> None:
+        """G.2 sensor: the SDK reads exactly one message in connect() and
+        proceeds even when it is not setup_complete (live.py). The
+        Enterprise docs warn that streaming audio before setup_complete
+        can yield empty transcriptions — so keep the evidence."""
+        setup = getattr(session, "setup_complete", None)
+        self._setup_complete = setup is not None
+        self._wire_session_id = getattr(setup, "session_id", None) or None
 
     async def _flush_input(self) -> None:
         text = "".join(self._input_parts).strip()
@@ -663,9 +677,14 @@ class GenaiLiveTransport:
          "input_transcription", "turn_complete"})
 
     def _sample_wire(self, tag: str, payload) -> None:
-        """Up to 3 unparsed-message samples: text fields ONLY, never audio
-        bytes, max ~200 chars each (F.1)."""
-        if len(self._wire_samples) >= 3:
+        """Text-only samples of what actually arrived on the wire.
+
+        F.1 sampled unparsed shapes only; G.2 extends sampling to ALL
+        message types so a scene dump shows the payloads themselves.
+        Rules unchanged: text fields ONLY, never audio bytes, max ~200
+        chars each, up to 3 samples per type tag."""
+        same = sum(1 for s in self._wire_samples if s.startswith(f"{tag}: "))
+        if same >= 3:
             return
         texts: list[str] = []
 
@@ -728,18 +747,28 @@ class GenaiLiveTransport:
                         continue
                     tag = f"server_content.{sub}"
                     self._wire_counts[tag] += 1
-                    if sub not in self._PARSED_CONTENT_FIELDS:
-                        self._sample_wire(tag, {sub: sub_value})
+                    self._sample_wire(tag, {sub: sub_value})
+                    if sub in ("input_transcription",
+                               "interim_input_transcription"):
+                        self._transcript_family += 1
             else:
                 self._wire_counts[key] += 1
-                if key not in self._PARSED_RESPONSE_FIELDS:
-                    self._sample_wire(key, {key: value})
+                self._sample_wire(key, {key: value})
+                if key == "voice_activity":
+                    activity = self._as_dict(value)
+                    kind = str(activity.get("voice_activity_type") or "")
+                    if kind.upper().endswith("ACTIVITY_END"):
+                        self._voice_end_seen = True
 
     def wire_stats(self) -> dict:
         """The F.1/F.3 sensors, flat and JSON-safe, for the close lines."""
         return {
             "types": dict(self._wire_counts),
             "samples": list(self._wire_samples),
+            "setup_complete": self._setup_complete,
+            "wire_session_id": self._wire_session_id,
+            "voice_end": self._voice_end_seen,
+            "transcript_family": self._transcript_family,
             "audio_sent": {
                 "chunks": self._audio_chunks_sent,
                 "bytes": self._audio_bytes_sent,

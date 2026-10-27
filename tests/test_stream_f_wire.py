@@ -70,8 +70,11 @@ def test_histogram_counts_every_message_type_and_field():
     assert types["server_content.interim_input_transcription"] == 1
     assert types["server_content.turn_complete"] == 1
     assert types["go_away"] == 1
-    # parsed types never sample
-    assert stats["samples"] == []
+    # G.2 (2026-10-27): sampling covers ALL message types now — the scene
+    # dump must show the payloads themselves, parsed or not.
+    joined = " ".join(stats["samples"])
+    assert "server_content.interim_input_transcription:" in joined
+    assert "go_away:" in joined
 
 
 def test_unparsed_types_are_sampled_text_only_max_three():
@@ -88,7 +91,11 @@ def test_unparsed_types_are_sampled_text_only_max_three():
     assert stats["types"]["tool_call"] == 5
     assert stats["types"]["server_content.interrupted"] == 5
     samples = stats["samples"]
-    assert len(samples) == 3, samples        # up to 3 samples, never more
+    # G.2: up to 3 samples PER type (was 3 globally over unparsed only).
+    assert len(samples) == 6, samples
+    assert sum(1 for s in samples if s.startswith("tool_call: ")) == 3
+    assert sum(1 for s in samples
+               if s.startswith("server_content.interrupted: ")) == 3
     assert all(len(s) <= 220 for s in samples)
     joined = " ".join(samples)
     assert "weather" in joined and "Nairobi" in joined   # text fields kept
