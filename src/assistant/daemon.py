@@ -1771,6 +1771,15 @@ class Daemon:
         self._ptt_finishing.discard(session_id)
         self._ptt_started_at = time.monotonic()
         self._ptt_released_at = None
+        # G.7.4 (2026-10-27): per-session transients must not outlive their
+        # session (third-party bug class: a crashed session's flags carried
+        # over until restart). The G.6 stage tables are keyed by session id
+        # — keep the last few (a reply still playing owes its table) and
+        # prune everything older, so a crash cannot accumulate them forever.
+        for _sid in list(self._stage_marks)[:-4]:
+            self._stage_marks.pop(_sid, None)
+        if len(self._latency_emitted) > 16:
+            self._latency_emitted = set(list(self._latency_emitted)[-8:])
         self._ptt_capture_target = str(getattr(self._capture_source, "target", None) or "default")
         # BUG 6d: a session replaced before it produced a result is TERMINAL.
         # Mark it now — "superseded, finished without a result" — so any

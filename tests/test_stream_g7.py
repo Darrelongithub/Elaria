@@ -275,3 +275,34 @@ def test_multi_segment_turns_commit_separately_and_join_at_flush():
     from assistant.transcribe import _final_texts
     assert " ".join(_final_texts(events)) == "First segment. Second segment."
 
+
+
+# ------------------------------------------------------- G.7.4 reset
+def test_session_open_prunes_crashed_session_transients(config):
+    """A crashed session's per-session state must not survive into new
+    sessions (or grow without bound). The 6d reset block already handles
+    the ptt flags; the G.6 stage tables are the G.7.4 pin target."""
+    from assistant.daemon import Daemon
+
+    daemon = Daemon(config)
+    try:
+        for i in range(10):
+            daemon._stage(f"old-{i}", "release", float(i))
+            daemon._latency_emitted.add(f"old-{i}")
+        assert len(daemon._stage_marks) == 10
+
+        async def drive():
+            assert (await daemon._ptt_start({}))["listening"] is True
+            return daemon._ptt_session_id
+
+        sid = asyncio.run(drive())
+        # the last 4 stage tables survive (an in-flight reply owes its
+        # table) — the older crash leftovers are gone
+        assert len(daemon._stage_marks) <= 4
+        assert "old-0" not in daemon._stage_marks
+        assert daemon._ptt_session_id == sid
+        # ptt flags are the 6d contract: fresh session state
+        assert daemon._ptt_released_at is None
+        assert daemon._ptt_results.get(sid) is None
+    finally:
+        daemon.store.close()
