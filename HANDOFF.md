@@ -424,6 +424,20 @@ report]:
    owner re-rules with those numbers in hand**. The double-stop proof
    is scene 7's FIRST physical step — it has been missed twice (scene 5
    and scene 6 both ran natural cycles only).
+10. **Cross-lane re-verification protocol (ruled 2026-10-27, design-chat
+    ride-along).** Standing re-verification targets the ORIGIN TIP AT
+    ACTIVATION TIME: fetch and diff the then-tip against the lane's
+    last verified baseline BEFORE authoring fixtures — never a fixed
+    SHA from a notice. Cross-lane notices are conveniences, never
+    gates; relay claims are verified, not trusted (007 §2) — including
+    the notice that carried this rule. This activation (2026-10-27)
+    verified by direct read: origin tip = `018d109` = last verified
+    baseline (empty diff, `main` still at `ed20344`); `journal_log.py`
+    untouched by scene-readiness (last touch `30abf30`, stream G);
+    `log_event` is generic — "event is the caller's naming", no
+    allowlist — so `capture.lifecycle` needed no journal-side change.
+    The moving baseline SHA is carried in the lane's session memory,
+    updated at the end of every activation.
 
 ## 6. Known open defects (logged, not fixed — see phase reports)
 
