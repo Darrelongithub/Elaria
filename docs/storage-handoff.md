@@ -569,3 +569,50 @@ re-fetching `arena/storage` and force-checking-out (safe: every local file was
 verified present in the target tree, and everything of mine was already pushed).
 Local `arena/e7a1cca5-elaria` was also re-pinned to origin's `b181712` so a stray
 push could not rewrite shared history.
+
+---
+
+## 2026-10-27 — A.2-R RECEIVED AND VERIFIED (supersedes A.2; A.1 stands unchanged)
+
+Report 007 is the answer. This is the entry a future turn reads first.
+
+**A.2-R adopts the storage lane's corrections and is itself correct on every point** —
+the first relay in this exchange to survive verification unchanged. Verified by running
+`journal_log.py`, not by trusting the relay:
+
+- `split(" ", 6)` → **6 parts (no detail) or 7 (detail present)**, with `parts[6]`
+  byte-intact and spaces preserved. Confirmed against the two REAL detail strings.
+- `parts[4]` is `peak`, `parts[5]` is `verdict`, `parts[6]` is `detail`.
+- Detail absence = **ABSENT** (line rstrip'd, ends at `verdict`), never `-`. Dash
+  placeholders apply to `session_id`/`peak`/`verdict` only.
+- `session_id` is 12-hex on PTT/dictation, 32-hex at `daemon.py:2646`/`:2694`, or `-`.
+  **Never regex-gate `^[0-9a-f]{12}$`** — it silently drops Stream-F/G sensor lines.
+- `"audio kept at {path}"` phrasing CONFIRMED at `transcribe.py:1390` and `:415`.
+
+**THE VERIFIED BINDING CONTRACT** is recorded verbatim in report 007 §2, with six
+reference output lines straight from `journal_log.py`, so no future turn ever re-derives
+it from a relay.
+
+**GATE 1e — WINDOW STILL OPEN, AND THE BASE HAS NOT MOVED.**
+`git ls-remote origin refs/heads/arena/c2a7085d-elaria` is still
+`f915d8e396d3fed0b3c77af7b21b2031c09ede5b`; `git log f915d8e..FETCH_HEAD` is empty.
+**No shape drift and no phrasing drift since the window opened.** A.2-R's "flag any
+change" instruction is satisfied by this negative result: the flag is *no change,
+contract stands as verified at `f915d8e`*. No fixtures authored, nothing in PR #24
+consumes the contract yet, and the window closes only after the owner's scene numbers.
+
+**A.1 — conftest defect: STOOD DOWN, unchanged.** Stream H's. Report 006 is
+authoritative over report 005 §3.3, as A.2-R directs. Baseline to hold: **1913 passed /
+6 skipped / 1 error (pre-existing, CPython 3.11 only), ruff clean.**
+
+**One residual risk A.2-R does not cover, carried forward and still open:**
+`_flat()` normalises whitespace in every field, so a kept-audio path containing a
+newline, tab or repeated spaces is **not byte-faithful** inside `detail`. Not a schema
+change, so A.2-R's flag instruction does not reach it. Mitigation is the existing
+design: directory poll = belt, journal tail = suspenders; the manifest resolves
+artifacts from the filesystem scan and treats the journal as corroboration, never as
+the authoritative path source. Recorded so nobody "optimises" the poll away later.
+
+**Standing commitment:** every time the PR base moves, the §1 verification table is
+re-run and the §2 contract re-issued or drift reported. That is the mechanism that
+keeps GATE 1e honest without anyone having to remember to ask.
