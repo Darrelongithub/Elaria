@@ -573,6 +573,19 @@ class FixtureLiveTransport:
         return None
 
 
+#: G.7.1 delta hygiene (third-party rule set, adopted 2026-10-27):
+#: control characters and <ctrl-token>/<ctrl:…> artifacts never reach text.
+_CTRL_ARTIFACT = re.compile(r"<ctrl[^>]*>", re.IGNORECASE)
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+#: A sentence-final boundary ends a segment (punctuation optional on
+#: VERBATIM output, so this is a trigger, never a requirement).
+_SEGMENT_END = re.compile(r"[.!?…][\"'\u201d\u2019)\]]*$")
+
+
+def _clean_transcript_text(text: str) -> str:
+    return _CTRL_ARTIFACT.sub("", _CONTROL_CHARS.sub("", str(text or "")))
+
+
 class GenaiLiveTransport:
     """Real Gemini Live session via google-genai (manual VAD, TEXT out).
 
@@ -637,6 +650,10 @@ class GenaiLiveTransport:
         self._transcript_commits = 0
         self._transcript_dupes = 0
         self._transcript_snapshots = 0
+        self._transcript_commit_reasons: Counter[str] = Counter()
+        self._transcript_pending: list[str] = []
+        self._transcript_debounce: asyncio.TimerHandle | None = None
+        self._last_interim: str | None = None
         self._setup_complete = False
         self._wire_session_id: str | None = None
         self._setup_retries = 0
@@ -832,6 +849,7 @@ class GenaiLiveTransport:
             "transcript_commits": self._transcript_commits,
             "transcript_dupes": self._transcript_dupes,
             "transcript_snapshots": self._transcript_snapshots,
+            "transcript_commit_reasons": dict(self._transcript_commit_reasons),
             "audio_sent": {
                 "chunks": self._audio_chunks_sent,
                 "bytes": self._audio_bytes_sent,
@@ -842,6 +860,79 @@ class GenaiLiveTransport:
             },
             "signals": dict(self._signals_sent),
         }
+
+    # -- G.7.1 transcript accumulation (2026-10-27) ------------------------
+    # The wire may deliver input_transcription as one-shot segments (the
+    # documented shape: one finalized envelope per speech turn) or as
+    # deltas accumulated client-side and finalized at the turn boundary
+    # (SDK Transcription.finished says the shape is type-legal; the
+    # third-party audit reports exactly this). Both land in one path:
+    # accumulate with hygiene, commit one final per segment on any
+    # completion trigger. The 6f contract survives: a standalone envelope
+    # commits on the debounce gap alone (finished is optional on
+    # transcribe-live and must never be required).
+    _TRANSCRIPT_DEBOUNCE_S = 0.4
+
+    def _push_transcript_part(self, part: str) -> None:
+        if not part:
+            return
+        if self._transcript_pending and part == self._transcript_pending[-1]:
+            self._transcript_dupes += 1          # consecutive identical
+            return
+        joined = "".join(self._transcript_pending)
+        if joined and part.startswith(joined):
+            self._transcript_snapshots += 1      # cumulative hypothesis
+            self._transcript_pending = [part]
+            return
+        if joined and joined.endswith(part):
+            self._transcript_dupes += 1          # re-delivered tail
+            return
+        self._transcript_pending.append(part)
+
+    @staticmethod
+    def _join_transcript_pending(parts: list[str]) -> str:
+        """Delta parts carry their own whitespace (raw concat at whitespace
+        boundaries); anything else is a word/segment boundary (space).
+        Known residual, pinned: sub-word deltas without whitespace join
+        with a space."""
+        out = ""
+        for part in parts:
+            if not out:
+                out = part
+            elif part[:1].isspace() or out[-1:].isspace():
+                out += part
+            else:
+                out += " " + part
+        return out.strip()
+
+    def _schedule_transcript_debounce(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._transcript_debounce is not None:
+            self._transcript_debounce.cancel()
+
+        def fire() -> None:
+            self._transcript_debounce = None
+            asyncio.ensure_future(self._commit_transcript("debounce"))
+
+        self._transcript_debounce = loop.call_later(
+            self._TRANSCRIPT_DEBOUNCE_S, fire)
+
+    async def _commit_transcript(self, reason: str) -> None:
+        if self._transcript_debounce is not None:
+            self._transcript_debounce.cancel()
+            self._transcript_debounce = None
+        if not self._transcript_pending:
+            return
+        text = self._join_transcript_pending(self._transcript_pending)
+        self._transcript_pending = []
+        if not text:
+            return
+        self._transcript_commits += 1
+        self._transcript_commit_reasons[reason] += 1
+        await self._queue.put(LiveEvent("final", text=text))
 
     async def _receive_content(self, content) -> None:
         # BUG6: output audio and output transcription are HER OWN speech.
@@ -869,7 +960,10 @@ class GenaiLiveTransport:
         interim = getattr(content, "interim_input_transcription", None)
         if interim is not None and getattr(interim, "text", None):
             self._receive_counts["interim_input_transcription"] += 1
-            await self._queue.put(LiveEvent("interim", text=interim.text))
+            cleaned_interim = _clean_transcript_text(interim.text)
+            if cleaned_interim and cleaned_interim != self._last_interim:
+                self._last_interim = cleaned_interim
+                await self._queue.put(LiveEvent("interim", text=cleaned_interim))
 
         transcription = getattr(content, "input_transcription", None)
         if transcription is not None:
@@ -879,13 +973,31 @@ class GenaiLiveTransport:
             if finished:
                 self._receive_counts["input_finished"] += 1
             if self._transcription_only:
-                # This envelope IS the committed segment on transcribe-live.
-                # Requiring its optional `finished` flag misclassified these
-                # finals as interims and forced saved-WAV batch fallback (6f).
-                if text.strip():
+                # 6f's lesson keeps its teeth: `finished` is OPTIONAL on
+                # transcribe-live and must never gate a commit. G.7.1 adds
+                # shape tolerance on top — parts accumulate (hygiene,
+                # dedupe, snapshot-supersede) and one final per segment is
+                # committed on the earliest trigger: `finished`, the
+                # debounce gap (the standalone-envelope case), a
+                # turn_complete boundary, or receiver-loop exit.
+                part = _clean_transcript_text(text)
+                if part.strip():
                     self._transcript_parts += 1
-                    self._transcript_commits += 1
-                    await self._queue.put(LiveEvent("final", text=text))
+                    self._push_transcript_part(part)
+                    self._schedule_transcript_debounce()
+                    # A segment that ends itself commits now — the 6f
+                    # contract (a committed envelope surfaces its final
+                    # immediately) and the documented one-shot shape.
+                    # Delta streams whose pieces carry sentence boundaries
+                    # split here into segments that the flush space-joins
+                    # intact; VERBATIM fragments fall through to the other
+                    # triggers.
+                    if _SEGMENT_END.search(
+                            self._join_transcript_pending(
+                                self._transcript_pending).rstrip()):
+                        await self._commit_transcript("segment")
+                if finished:
+                    await self._commit_transcript("finished")
             else:
                 # Conversational Live uses text deltas in this SAME field.
                 # Preserve whitespace between deltas and support an empty
@@ -902,6 +1014,8 @@ class GenaiLiveTransport:
             self._receive_counts["turn_complete"] += 1
             if not self._transcription_only:
                 await self._flush_input()
+            else:
+                await self._commit_transcript("turn_complete")
             # BH-K3: surface the boundary for BOTH model shapes (it was
             # swallowed for the transcription-only model, so neither the
             # diagnostics nor a recorded fixture could show where the
@@ -940,6 +1054,10 @@ class GenaiLiveTransport:
                     raise LiveUnavailable("Live receive stream ended without a response")
                 await asyncio.sleep(0)
         except Exception as exc:
+            # A dead link must not eat an uncommitted segment (prime
+            # directive: the words are data too) — commit first, then
+            # report the failure.
+            await self._commit_transcript("loop_exit")
             await self._queue.put(LiveEvent("error", error=str(exc)))
 
     def diagnostics(self) -> dict:
