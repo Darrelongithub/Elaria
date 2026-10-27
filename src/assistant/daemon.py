@@ -1826,7 +1826,8 @@ class Daemon:
             # `capture.node_state`. Best-effort and bounded — no
             # PipeWire on this box means one honest "probe unavailable".
             self._spawn_probe(asyncio.create_task(self._mic_release_probe(
-                session_id, self._dictation_task)))
+                session_id, self._dictation_task,
+                str(getattr(self._capture_source, "target", None) or ""))))
         except Exception as exc:
             self._ptt_log("ptt.start.dictate_spawn_failed", session_id=session_id, error=f"{type(exc).__name__}: {exc}"[:200])
             raise
@@ -1841,7 +1842,8 @@ class Daemon:
     #: H.4: seconds after session close before the mic-state probe runs.
     MIC_RELEASE_PROBE_DELAY_S = 5.0
 
-    async def _mic_release_probe(self, session_id: str, task) -> None:
+    async def _mic_release_probe(self, session_id: str, task,
+                                 target: str = "") -> None:
         """H.4 sensor: was the capture node actually RELEASED after the
         session closed? PipeWire node state ~5s after close — the
         in-use indicator lingering is privacy-adjacent evidence."""
@@ -1851,7 +1853,6 @@ class Daemon:
             except Exception:  # noqa: S110 - the probe is evidence, not cleanup
                 pass
         await asyncio.sleep(self.MIC_RELEASE_PROBE_DELAY_S)
-        target = str(getattr(self._capture_source, "target", None) or "")
         verdict = "unknown"
         detail = "probe unavailable (pw-cli/pactl not found)"
         for argv in (("pw-cli", "ls", "Node"), ("pactl", "list", "sources")):

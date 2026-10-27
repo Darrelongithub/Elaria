@@ -58,7 +58,21 @@ ARM_MODELS = {
     "B": "gemini-3.8-live",
 }
 
-DEFAULT_WAV = os.path.join("audio", "20261027-064450-77cc4e.wav")
+DEFAULT_WAV_NAME = "20261027-064450-77cc4e.wav"
+
+
+def _find_default_wav() -> str:
+    """The kept wavs live in the daemon's audio dir on the owner's
+    machine (XDG data home); ./audio works for a repo-local copy."""
+    candidates = [
+        os.path.join(os.path.expanduser("~"), ".local", "share",
+                     "assistant", "audio", DEFAULT_WAV_NAME),
+        os.path.join("audio", DEFAULT_WAV_NAME),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
 
 
 def _ts(started: float) -> str:
@@ -222,8 +236,10 @@ def main() -> int:
     parser.add_argument("--arm", choices=sorted(ARM_MODELS), default="A")
     parser.add_argument("--model", default=None,
                         help="override the arm's model id")
-    parser.add_argument("--wav", default=DEFAULT_WAV,
-                        help=f"16 kHz mono 16-bit wav (default: {DEFAULT_WAV})")
+    parser.add_argument("--wav", default=None,
+                        help="16 kHz mono 16-bit wav (default: the kept "
+                             f"{DEFAULT_WAV_NAME} under ~/.local/share/"
+                             "assistant/audio or ./audio)")
     parser.add_argument("--listen", type=float, default=30.0,
                         help="seconds to listen after activity_end (default 30)")
     parser.add_argument("--pace", choices=("realtime", "burst"),
@@ -231,7 +247,8 @@ def main() -> int:
                         help="stream the wav in real time (default) or burst")
     args = parser.parse_args()
     model = args.model or ARM_MODELS[args.arm]
-    return asyncio.run(_run(args.arm, model, args.wav, args.listen,
+    wav = args.wav or _find_default_wav()
+    return asyncio.run(_run(args.arm, model, wav, args.listen,
                             args.pace))
 
 

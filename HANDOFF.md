@@ -228,9 +228,9 @@ report]:
     UNRESOLVED (scene 6: second cycle, same shape)
   - `audio/20261026-191330-d297f1.wav` (19:13) — **RESOLVED = `<noise>`**
     (the stream-F diagnostic found no intelligible speech)
-  - `audio/20261027-064450-77cc4efb.wav` (06:45, session 77cc4efb1886)
+  - `audio/20261027-064450-77cc4e.wav` (06:45, session 77cc4efb1886)
     — **RESOLVED = replied** (fallback transcription answered the turn)
-    [UNVERIFIED name — read the deferred line]
+    [name per the stream-H order — the H.3 repro streams this one]
   The six unresolved either eventually transcribe+answer or are
   explicitly marked never-retried — no third state (§6.8).
 
