@@ -192,6 +192,72 @@ the recomputed numbers in front of him.** Both outcomes are decisions.
 
 ---
 
+# AMENDMENT, 2026-10-27 (design chat ruling, appended — the original text above is not rewritten)
+
+## A.1 Lever (d) was a relay corruption; the menu is four levers, corrected verbatim
+
+The fragment this report originally recorded as an incomplete "(d) event/flight
+recordin…" was **lever (c)'s guard clause mis-fused onto (d)**. The corrected menu,
+verbatim and complete:
+
+- **(a) FLAC cold-only** — decode-back hash-verified, manifest-state-changed,
+  never silent; build only on explicit owner go.
+- **(b) Second target** — new free-tier account; owner account decision.
+- **(c) Retention-class prune** — resolved PTT wavs with transcripts landed, past
+  an owner-set age, as an owner-visible recorded restic forget/prune decision;
+  **auto-delete never exists; event/flight recordings never pruned without
+  explicit owner order.**
+- **(d) Do nothing** — the `remote_free < 2 GB` knock is the designed pressure
+  gauge; the owner picks among (a)/(b)/(c) when it fires, with real numbers in
+  hand.
+
+**A fifth idea was raised by me and rejected as a never-ruled non-lever:**
+excluding event/flight recordings from the cold class entirely. It contradicts
+audio-never-lost — flight recordings with no offsite copy are exactly the
+single-copy risk class this whole design fences. If the measured numbers ever make
+event-class isolation attractive, it goes to the owner as a decision with numbers,
+not as a re-reading of a corrupted line.
+
+## A.2 SIZING TARGET RULED: MONTHLY 8-hour events
+
+> "DESIGN TARGET: MONTHLY 8-hour events (11.06 GB/yr raw). Rationale: monthly is
+> the highest frequency that survives the zero-compression floor (21.7 months) —
+> nothing unverified is load-bearing. The measured compression ratio from scene
+> sheet 2 is HEADROOM, not a requirement."
+
+**Combined-profile allowance (ruling's figure, independently verified, no drift):**
+
+```
+usable-before-knock = 20 GB − 2 GB gauge floor          = 18 GB
+events at monthly   = 12 × 921.6 MB                     = 11.06 GB/yr
+daily budget        = 18 − 11.06                        = 6.9 GB/yr
+                    = 6.9 GB ÷ 365                      = 18.9 MB/day
+                    = 18.9 MB ÷ 1.92 MB per kept-minute = 9.8 ≈ 10 kept-min/day
+at 2× compression   = 19.6 ≈ 20 kept-min/day
+```
+
+The ruling's "~10 kept-min/day at floor, ~20 at 2×" checks out against my own
+constants.
+
+**Relief path if Scene Sheet 2's CURRENT profile measures above ~10 kept-min/day:
+lever (c) only.** Auto-delete never exists; event/flight recordings never pruned
+without explicit owner order.
+
+**Standing rejections unchanged:** FLAC and second-target pre-build remain
+rejected ("documented, not built") — monthly needs neither at the floor.
+Event-class exclusion remains a rejected non-lever. If sheet-2 reality measures
+fortnightly or worse, the menu re-opens **with numbers**, via the gauge or the
+sheet — never before, never silently.
+
+## A.3 What Scene Sheet 2 must therefore answer
+
+Row 15 already asks for expected minutes/day of new kept audio. Against the ruled
+target it now has a specific job: **compare the measured CURRENT profile to the
+~10 kept-min/day allowance and the measured event frequency to monthly**, and
+report the comparison. It is not an invitation to re-litigate the target.
+
+---
+
 ## OPEN QUESTIONS
 
 **Q10 — lever (d) is incomplete.** The ruling as received reads "(d) event/flight
