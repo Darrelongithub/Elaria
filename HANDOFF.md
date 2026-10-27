@@ -334,6 +334,37 @@ report]:
    item sized from the scene-6 latency table. And the run-page format
    rule stands twice over: §7 separates EARS from TERMINAL strictly and
    no physical action ever appears inside a paste-able block.
+8. **G.7 rulings (pre-scene guard + audit triage, 2026-10-27).** Stream
+   G is approved as landed; scene 6 stays the next hardware step and
+   G.7.1 was the only scene-blocking item (landed: `319cb37` →
+   `2ed6661` → `32500b4`). Provenance rule for third-party audit
+   material (the design-chat read of an unlicensed abandonware project):
+   ideas only, ZERO code copied, every claim tagged [CODE-READ,
+   third-party, UNVERIFIED against current docs], and G.1-class
+   docs-first verification BINDS before anything is implemented — the
+   delta-accumulation work moved only after the docs/types diff named
+   both shapes. Rulings that follow: G.7.1's shape-tolerant parser is
+   the standing collector (one-shot segments AND deltas both land as one
+   clean final per segment; 6f's rule survives — `finished` is optional
+   on transcribe-live and never gates a commit); the join-rule residual
+   (sub-word deltas without whitespace join with a space) is pinned,
+   named, and stays until evidence says otherwise. G.7.2: halt/stop
+   does NOT stop mid-reply playback (mechanism named: nothing kills the
+   player — the wav finishes; PR_SET_PDEATHSIG only fires when the
+   daemon dies) — NOT fixed this round; it is a WP1 item beside
+   streaming playback, sharing G.7.3's interrupt mechanism. G.7.3 is
+   the WP1 streaming-playback design brief (attached to the stream-G.7
+   phase report): chunked playback queue (~50 ms / 2,400 B slices at
+   24 kHz, first-chunk start, interrupt = drain + flag + turn-state
+   reset, cutoff <100 ms) + early-dispatch pipelining; sized from
+   scene 6's latency.table split; target unchanged (≤ 8 s
+   release→audible). G.7.4: the session.open reset contract is pinned
+   (6d-era flags hold; the G.6 stage tables now prune at open). G.7.5
+   is notes only: half-duplex mic gating → WP1 AEC decision (unknown
+   #6) + WP4 wake-arming context; session_resumption → WP5
+   flight/reconnect reference (G.1's handle-only sending stays);
+   bounded queues + TaskGroup/BaseExceptionGroup → the WP1 1.4 GB
+   profiled run.
 
 ## 6. Known open defects (logged, not fixed — see phase reports)
 
@@ -413,9 +444,12 @@ Expected lines (GATE v2's evidence — either outcome is a decision):
   route** (`backend=gemini_live` on the ptt.result). `final.timeout` or
   `transcription.deferred` means the fallback path answered: a degraded
   mode, never a gate-passer — report it as red.
-- `ws.histogram … setup=ok retries=0 … transcript_family=N` with N > 0;
-  `samples=[…]` now show the message payloads themselves (text-only) —
-  quote them if anything is odd.
+- `ws.histogram … setup=ok retries=0 … transcript_family=N commits=M
+  dupes=D snapshots=S` with N > 0 — and M tells the wire shape:
+  `M < N` proves delta accumulation happened (third-party shape),
+  `M == N` proves one-shot segments (documented shape). `samples=[…]`
+  show the message payloads themselves (text-only) — quote them if
+  anything is odd.
 - `audio.sent … chunks=N bytes=M format=audio/pcm rate=16000` with
   `bytes/N ≈ 3200`.
 - `latency.table …` with every leg measured: release_to_final_s
