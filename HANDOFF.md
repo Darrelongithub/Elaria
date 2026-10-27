@@ -559,7 +559,7 @@ header):
 ### Step 6 — TERMINAL: the cycle dump — the stream-H sensors answer now
 
 ```
-journalctl --user -u assistant --since "3 minutes ago" -o cat | grep -E "ws.histogram|audio.sent|final\.|transcription\.|post_timeout_route|fallback.outcome|latency.table|capture.stats|stream.closed|capture.node_state" | tail -20
+journalctl --user -u assistant --since "3 minutes ago" -o cat | grep -E "ws.histogram|audio.sent|final\.|transcription\.|post_timeout_route|fallback.outcome|latency.table|capture.lifecycle|stream.closed|capture.node_state" | tail -20
 ```
 
 Quote the lot. What each line settles:
@@ -574,8 +574,8 @@ Quote the lot. What each line settles:
   recovered here; scene 6 could not say why it did not.
 - `latency.table …` — the 8 s clock: release_to_final / reply_to_synth
   / synth_to_audible against GATE v2.
-- `capture.stats … first_frame_latency_ms=… first_speech_frame_s=…` —
-  the mic-start numbers.
+- `capture.lifecycle … first_frame_latency_ms=… first_speech_frame_s=…`
+  — the mic-start numbers (aggregate only).
 - `stream.closed …` + `capture.node_state …` (~5 s after close) — the
   mic-stop numbers; `state suspended/idle` = actually released,
   `running` = the indicator was telling the truth.

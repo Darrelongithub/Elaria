@@ -1145,6 +1145,19 @@ class DictationService:
             except Exception as exc:
                 self._log("dictate.capture_stats_log_failed", session_id=session_id,
                           error=f"{type(exc).__name__}: {exc}"[:200])
+            # H.4 (2026-10-27): the mic-lifecycle numbers ride the SCHEMA
+            # journal, not just capture.stats — journalctl must answer the
+            # "does start/stop feel slow" question in the scene dump.
+            # Aggregate only: latency and offsets, never content.
+            log_event("capture.lifecycle", session_id=session_id,
+                      verdict=("ok" if first_frame_latency_ms is not None
+                               else "no-frames"),
+                      detail=(f"node={capture_label}; "
+                              f"first_frame_latency_ms="
+                              f"{first_frame_latency_ms if first_frame_latency_ms is not None else 'n/a'}; "
+                              f"first_speech_frame_s="
+                              f"{first_speech_frame_s if first_speech_frame_s is not None else 'n/a'}; "
+                              f"frames={frames_seen} bytes={captured_bytes}"))
             if no_speech:
                 # Rule 1: the session journal carries the same plain line.
                 # Durable before any close await, like capture.stats — a

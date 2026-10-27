@@ -148,7 +148,15 @@ def test_capture_stats_carry_lifecycle_numbers(config, tmp_path, monkeypatch):
     assert result.capture["first_frame_latency_ms"] >= 0
     # 3 silent frames x 30ms = 0.09s into the kept wav
     assert result.capture["first_speech_frame_s"] == 0.09
-    assert "stream.closed" in stream.getvalue()
+    out = stream.getvalue()
+    assert "stream.closed" in out
+    # the mic-lifecycle numbers ride the SCHEMA journal (journalctl),
+    # not just capture.stats — the scene-7 dump reads this line
+    assert "capture.lifecycle" in out
+    lifecycle_line = next(ln for ln in out.splitlines()
+                          if "capture.lifecycle" in ln)
+    assert "first_frame_latency_ms=" in lifecycle_line
+    assert "first_speech_frame_s=0.09" in lifecycle_line
 
 
 def test_mic_release_probe_logs_node_state(config):
