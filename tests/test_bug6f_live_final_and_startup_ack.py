@@ -34,6 +34,20 @@ TAIL_FRAME = struct.pack("<480h", *([4000] * 480))
 USER_FRAME = struct.pack("<480h", *([6000] * 480))
 
 
+@pytest.fixture(autouse=True)
+def _force_simulated_capture(monkeypatch):
+    """No bug6-class test may open the real mic (owner order 2026-10-26).
+
+    The bug6 suite failed on the laptop where the CLI-subprocess dictate
+    test opened the REAL microphone (~0 s of room audio → "no speech
+    captured" instead of the scripted mock transcript) while the headless
+    sandbox silently fell back to SimulatedCapture. Tests that
+    deliberately exercise capture-selection (target wiring) opt out with
+    monkeypatch.delenv("ASSIST_CAPTURE").
+    """
+    monkeypatch.setenv("ASSIST_CAPTURE", "simulated")
+
+
 def message(**content):
     return NS(server_content=NS(**content))
 
@@ -151,7 +165,13 @@ def test_transcribe_live_committed_envelope_finishes_without_model_turn(
         assert store.recent_transcripts(1)[0]["raw_text"] == USER_TEXT
         assert any(e.get("event") == "transcript.interim" and e["text"] == PREVIEW
                    for e in events)
-        assert len([s for s in session.sent if "audio" in s]) == 356
+        audio_calls = [s for s in session.sent if "audio" in s]
+        # Stream F (2026-10-26): capture frames coalesce into the documented
+        # 100ms wire chunks (356 x 30ms -> 106 full + flushed tail = 107 sends),
+        # but every frame's bytes must still reach the wire — the pin is
+        # byte-preserving, not send-count-preserving.
+        assert sum(len(s["audio"].data) for s in audio_calls) == 356 * 960
+        assert len(audio_calls) == 107
         assert list(session.sent[0]) == ["activity_start"]
         assert list(session.sent[-1]) == ["activity_end"]
         assert session.config.response_modalities == ["TEXT"]
@@ -432,6 +452,8 @@ def test_ack_gate_is_reserved_before_queueing_and_tracks_actual_player_lifetime(
 @pytest.mark.parametrize("batch_fallback", [False, True])
 def test_startup_ack_and_its_tail_reach_neither_live_nor_saved_wav(
         config, tmp_path, monkeypatch, batch_fallback):
+    # capture-selection test: un-force the hermetic seam
+    monkeypatch.delenv("ASSIST_CAPTURE", raising=False)
     config.raw["cleanup"]["enabled"] = False
     config.raw["transcribe"]["inbox_dir"] = str(tmp_path / "inbox")
     config.raw["tts"]["speak_acks"] = True

@@ -47,6 +47,9 @@ default-groups = ["dev"]
 assist = "assistant.cli:main"
 assistd = "assistant.daemon:main"
 assist-voice-test = "assistant.voicetest:main"
+# The hardware truth ladder (§4.8) — same productised ladder as
+# `assist ladder`; this name is what the hardware-gate docs run.
+elaria-ladder = "assistant.ladder:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/assistant"]

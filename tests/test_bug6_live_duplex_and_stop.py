@@ -64,6 +64,20 @@ class FakeClock:
 FRAME_S = 0.03
 
 
+@pytest.fixture(autouse=True)
+def _force_simulated_capture(monkeypatch):
+    """No bug6-class test may open the real mic (owner order 2026-10-26).
+
+    The bug6 suite failed on the laptop where the CLI-subprocess dictate
+    test opened the REAL microphone (~0 s of room audio → "no speech
+    captured" instead of the scripted mock transcript) while the headless
+    sandbox silently fell back to SimulatedCapture. Tests that
+    deliberately exercise capture-selection (target wiring) opt out with
+    monkeypatch.delenv("ASSIST_CAPTURE").
+    """
+    monkeypatch.setenv("ASSIST_CAPTURE", "simulated")
+
+
 def frame_bytes() -> bytes:
     import struct
 
@@ -530,7 +544,8 @@ def test_bug6_cli_dictate_prints_a_turn_and_never_blocks(config, running_daemon)
     import sys
 
     repo = Path(__file__).resolve().parents[1]
-    env = {**os.environ, "PYTHONPATH": str(repo / "src"), "GEMINI_MODE": "mock"}
+    env = {**os.environ, "PYTHONPATH": str(repo / "src"),
+            "GEMINI_MODE": "mock", "ASSIST_CAPTURE": "simulated"}
     # A real terminal, not a pipe: non-TTY dictate now waits for daemon
     # endpointing. This pin is specifically the unchanged Enter-to-stop path.
     master_fd, slave_fd = os.openpty()

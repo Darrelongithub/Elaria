@@ -5,11 +5,15 @@
 # confirmed against aistudio.google.com/rate-limit on YOUR account (§11).
 
 [gemini]
-# Models by role (§3.2). Cheapest-first is the default (§17 reasoning harness).
-model_default        = "gemini-flash-lite-latest"   # VERIFY exact ID on your account
-model_organise       = "gemini-flash-lite-latest"   # VERIFY
-model_cleanup        = "gemini-flash-lite-latest"   # VERIFY
-model_chat           = "gemini-flash-latest"        # VERIFY
+# Models by role (§3.2). PINNED ids only (§4.1 registry, Phase 0 pin fix
+# approved 2026-10-25): `-latest` aliases may resolve server-side to a retired
+# model (gemini-2.5-flash-lite was retired 2026-10-20) and are allowed only for
+# non-identity chat experimentation. `assist doctor` asserts this table.
+model_default        = "gemini-3.5-flash-lite"    # chat/intent + housekeeping
+model_organise       = "gemini-3.5-flash-lite"
+model_cleanup        = "gemini-3.5-flash-lite"
+model_chat           = "gemini-3.5-flash-lite"    # the reply path
+model_file_fallback  = "gemini-3.5-flash-lite"    # only when the STT primary is down
 model_transcribe_live  = "gemini-3.5-transcribe-live"
 model_transcribe_batch = "gemini-3.5-transcribe"   # dedicated batch STT model
 # Her ONE voice (owner decisions 2026-10-19 and 2026-10-20). Flare is the ONLY
@@ -36,8 +40,10 @@ allowed_voices             = ["Flare"]
 # Voice-audio cache: files are keyed by the ACTIVE route's own identity (voice +
 # model online; voice + model + speaker + length_scale offline), so a voice change
 # can never replay the previous voice's audio (VB-1).
-# Escalation ladder for the reasoning harness: cheapest -> next tier (§17).
-escalation_ladder    = ["gemini-flash-lite-latest", "gemini-flash-latest"]
+# Escalation ladder for the reasoning harness (§4.1): start at chat/intent,
+# climb ONE tier on verified failure. gemini-3.8-flash is escalation-only by
+# doctrine (free ~20 RPD — do not point housekeeping at it).
+escalation_ladder    = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
 escalate_after_failures = 2
 max_scaffold_calls      = 6
 # BUG F / Bug 8: two deadlines, not one. The FIRST-TOKEN deadline catches a
@@ -63,6 +69,7 @@ flash_rpd = 20
 flash_lite_rpm = 15
 flash_lite_tpm = 250000
 flash_lite_rpd = 500
+flash_lite_rpd_cap = 400   # §4.1 chat/intent config cap — stricter of rpd/cap
 transcribe_live_rpm = 0
 transcribe_live_tpm = 20000
 transcribe_live_rpd = 0
@@ -78,7 +85,8 @@ rpd = 20
 [quota.models.flash-lite]
 rpm = 15
 tpm = 250000
-rpd = 500
+rpd = 500        # the owner-measured free ceiling (~500)
+rpd_cap = 400    # §4.1: chat/intent config cap; headroom for fallback + housekeeping
 
 [quota.models.transcribe-live]
 rpm = 0            # 0 = unlimited
@@ -124,7 +132,8 @@ announce = true
 snooze_hours = 24             # "later" -> commitment memory
 retire_after_ignores = 3      # same topic ignored 3x is retired
 urgent_in_class_mode = true   # class mode = urgent-only, and silent
-notify_identity = "Elaria · knock"   # its own identity; nothing else uses it
+# notification identity/title/body are fixed in code (privacy rule 2026-10-26):
+# title "Elaria wants to talk", static body, no content knob.
 sound = "~/.local/share/assistant/sounds/knock.wav"
 notify = true
 play_sound = true
@@ -289,6 +298,9 @@ grace_s = 8.0
 [transcribe]
 reconnect_replay_s = 30             # rolling buffer replayed on session reset (§3.5)
 live_session_max_s = 540            # rotate before the ~10min Live lifetime
+# WP0 watchdog (§4.2): auto-close a PTT/live session that still holds the mic
+# at this ceiling, with a visible marker (a missed release once held it ~9 min).
+ptt_session_ceiling_s = 300
 save_audio = true                   # always keep raw audio (§12.5)
 inbox_dir = ""                    # empty = $XDG_DATA_HOME/assistant/inbox
 copy_to_clipboard = true            # wl-copy only — X11 tools fail silently
@@ -303,6 +315,20 @@ speech_resume_s = 0.4
 # microphone, the "listening" state and the Live session stay open until the user's
 # own hotkey release — an abandoned dictation held the mic for ~50 minutes.
 checkin_grace_s = 8.0
+
+# Scene-3b-REDO (stream E): the bounded post-release wait for the final
+# transcript. Named and configurable — the budget shows up in every
+# final.wait schema line, so a silent lengthening can never hide. Below
+# this wait a clean stop still falls back to the saved WAV; past it the
+# session closes honestly with final.timeout naming what happened.
+final_wait_s = 12.0
+
+# Stream G.4 (2026-10-27): the adaptive early-abandon grace. When the
+# server's voice-activity END has arrived with zero transcript-family
+# messages, the documented prompt final is already overdue — wait only
+# this long more, never the full final_wait_s ceiling (which stays the
+# hard bound for the healthy case).
+final_abandon_grace_s = 3.0
 
 # VB-8: a command-mode transcript below this ASR confidence — or flagged by
 # cleanup as unreliable — is never routed to an intent, so a mumble that sounds

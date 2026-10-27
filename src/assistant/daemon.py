@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import math
 import os
@@ -43,6 +44,7 @@ from .disclosure import (
 from .gemini_client import GeminiClient
 from .initiative import InitiativeError, InitiativeService, KnockSignal
 from .ipc import IpcPrincipal, ipc_peer_principal, serve
+from .journal_log import log_event
 from .modes import ModeManager
 from .offline_queue import CloudQueue
 from .organiser import OrganiserService
@@ -246,6 +248,10 @@ class Daemon:
         self._ptt_started_at: float | None = None
         self._ptt_released_at: float | None = None
         self._ptt_capture_target: str | None = None
+        # WP0 watchdog (§4.2): the last auto-close marker, or None. Status
+        # carries it so "why did the mic drop" is answerable without a journal
+        # dive (the schema line + persona event remain the durable record).
+        self._last_watchdog_close: dict | None = None
         # SILENCE HOTFIX rule 1: the plain-language line the last voice
         # session left for the console ("she heard nothing"), or None. The
         # durable record is the session journal (session.silent_close);
@@ -253,6 +259,9 @@ class Daemon:
         self._last_session_line: str | None = None
         self._last_connectivity_mode = self.mode_manager.status(refresh=False).effective_mode
         self._background_tasks: set[asyncio.Task] = set()
+        # H.4 probes are passive sensors — kept out of _background_tasks
+        # so "await the ack waiters" bookkeeping never swallows them.
+        self._probe_tasks: set[asyncio.Task] = set()
         # One bound for every chat call (owner turns and guest turns): a
         # stalled transport must return a spoken fact, never freeze the
         # console (BH-I12).
@@ -268,6 +277,10 @@ class Daemon:
         # gate closed for the real worker lifetime; a text-duration estimate can
         # expire while synthesis is still delayed (I4).
         self._speech_playbacks: set[asyncio.Task] = set()
+        # G.6 latency stages per session: release → final → reply →
+        # synth → audible, each a monotonic mark, emitted as latency.table.
+        self._stage_marks: dict[str, dict[str, float]] = {}
+        self._latency_emitted: set[str] = set()
         # BUG F / Bug 8 (2026-10-20): the single 4 s total-turn bound is gone.
         # Two deadlines from [gemini]: a streaming first-token deadline (a
         # transport with no first token is dead) and a generous total bound (a
@@ -326,22 +339,74 @@ class Daemon:
             self._speaking_until = __import__("time").monotonic() + guard_s
             # Don't clear text immediately; let guard expire
 
-    def _start_speech_task(self, text: str, *, play: bool = True) -> asyncio.Task:
+    def _start_speech_task(self, text: str, *, play: bool = True,
+                           session_id: str | None = None) -> asyncio.Task:
         """Start one TTS call; a playing call owns the duplex gate through finish (I4)."""
         if play:
             self._set_speaking(True, text=text)
+        # session_id only rides when there is one — speech doubles with the
+        # older `speak(text, play=...)` signature stay valid.
+        speak_kwargs = {"play": play}
+        if session_id:
+            speak_kwargs["session_id"] = session_id
         worker = asyncio.create_task(asyncio.to_thread(
-            self.speech.speak, text, play=play))
+            self.speech.speak, text, **speak_kwargs))
         if play:
             self._speech_playbacks.add(worker)
 
             def finished(task: asyncio.Task) -> None:
                 self._speech_playbacks.discard(task)
                 self._set_speaking(False, text=text)
+                self._collect_speech_marks(session_id, task)
                 self._consume_task_result(task)
 
             worker.add_done_callback(finished)
         return worker
+
+    def _stage(self, session_id, name: str, mark: float | None = None) -> None:
+        marks = self._stage_marks.setdefault(str(session_id or ""), {})
+        marks.setdefault(name, mark if mark is not None else time.monotonic())
+
+    def _collect_speech_marks(self, session_id, task: asyncio.Task) -> None:
+        """Fold the speech result's synth/play marks into the stage table
+        and emit latency.table once the last leg lands (G.6)."""
+        try:
+            result = task.result()
+        except Exception:
+            self._emit_latency_table(session_id, final=True)
+            return
+        synth = getattr(result, "synth_mark", None)
+        play = getattr(result, "play_mark", None)
+        if synth is not None:
+            self._stage(session_id, "synth", synth)
+        if play is not None:
+            self._stage(session_id, "audible", play)
+        self._emit_latency_table(session_id, final=True)
+
+    def _emit_latency_table(self, session_id, *, final: bool = False) -> None:
+        sid = str(session_id or "")
+        if sid in self._latency_emitted:
+            return
+        marks = self._stage_marks.get(sid) or {}
+        if len(marks) < 2:
+            return
+        required = ("release", "final", "reply", "synth", "audible")
+        if (not final and "reply" in marks
+                and "synth" not in marks and "audible" not in marks):
+            return   # reply speech still pending — the callback emits
+        self._latency_emitted.add(sid)
+        order = [m for m in required if m in marks]
+        legs = []
+        for a, b in itertools.pairwise(order):
+            legs.append(f"{a}_to_{b}_s={round(marks[b] - marks[a], 3)}")
+        if "release" in marks and "audible" in marks:
+            legs.append(f"release_to_audible_s="
+                        f"{round(marks['audible'] - marks['release'], 3)}")
+        missing = [m for m in required if m not in marks]
+        log_event("latency.table", session_id=sid, verdict="stages",
+                  detail="; ".join(legs)
+                         + (f"; missing={','.join(missing)}" if missing else ""))
+        self._stage_marks.pop(sid, None)
 
     def is_speaking(self) -> bool:
         return bool(self._ack_playbacks or self._speech_playbacks) or (
@@ -366,6 +431,7 @@ class Daemon:
         self._set_speaking(True, text=text)
         playback = asyncio.create_task(asyncio.to_thread(self.speech.play_ack, kind))
         self._ack_playbacks.add(playback)
+        session_id = str(self._ptt_session_id or "")
 
         def finished(task: asyncio.Task) -> None:
             self._ack_playbacks.discard(task)
@@ -374,13 +440,31 @@ class Daemon:
 
         playback.add_done_callback(finished)
 
+        def log_outcome(result: dict) -> None:
+            """Scene-3b sensor: the playback outcome is reported, never
+            swallowed — `ack.played`/`ack.failed` carry the player argv and
+            any error detail so the next scene reads truth from the journal."""
+            played = bool(result.get("played"))
+            detail = (f"ack_kind={kind} player={result.get('player') or '-'} "
+                      f"argv={' '.join(str(a) for a in (result.get('argv') or [])) or '-'}")
+            if not played and result.get("error"):
+                detail += f" error={result['error']}"
+            log_event("ack.played" if played else "ack.failed",
+                      level="info" if played else "warn",
+                      session_id=session_id,
+                      verdict="played" if played else "failed",
+                      detail=detail)
+
         async def wait_for_playback():
             try:
-                return await asyncio.shield(playback)
+                result = await asyncio.shield(playback)
             except Exception as exc:
                 await self.broadcast({"event": "speech.error", "ack_kind": kind,
                                       "error": str(exc)})
-                return {"played": False, "error": str(exc)}
+                result = {"played": False, "error": str(exc)}
+            log_outcome(result if isinstance(result, dict) else {"played": False,
+                                                                 "error": "no result"})
+            return result
 
         return self._track_task(asyncio.create_task(wait_for_playback()))
 
@@ -476,6 +560,11 @@ class Daemon:
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    def _spawn_probe(self, task: asyncio.Task) -> asyncio.Task:
+        self._probe_tasks.add(task)
+        task.add_done_callback(self._probe_tasks.discard)
+        return task
+
     def _meeting_mode(self) -> str:
         if self._meeting is not None:
             return "meeting"
@@ -545,7 +634,9 @@ class Daemon:
         synthesis of the same text (BH-I4).
         """
         try:
-            worker = self._start_speech_task(text, play=True)
+            worker = self._start_speech_task(
+                text, play=True,
+                session_id=(route or {}).get("session_id") or None)
             result = await asyncio.shield(worker)
             if result.error and not route.get("muted"):
                 await self.broadcast({"event": "speech.error", "error": result.error,
@@ -561,7 +652,8 @@ class Daemon:
         # return its real audio path, but never hang a handler on slow Live TTS
         # (BUG1). On timeout the SAME task keeps running in the background - a
         # second `speak()` would double the audio (BH-I4).
-        route = self.speech.route(text)
+        route = {**self.speech.route(text),
+                 "session_id": str(params.get("session_id") or "") or None}
         requested = params.get("speak")
         auto = (requested is None
                 and self.config.section("tts").get("speak_replies", False))
@@ -768,6 +860,11 @@ class Daemon:
             "dictation_active": bool(self._dictation_task and not self._dictation_task.done()),
             "dictation_processing": self._ptt_processing,
             "ptt_session_id": self._ptt_session_id,
+            # §4.2: the honest enumeration of mic/Live holders (free tier: 3
+            # concurrent Live sessions). The ladder's wake chain reads this.
+            "session_holders": self._session_holders(),
+            "session_ceiling_s": self._session_ceiling_s(),
+            "last_watchdog_close": self._last_watchdog_close,
             "capture": capture,
             "capture_target": capture_target,
             "last_capture": last_capture,
@@ -834,8 +931,17 @@ class Daemon:
         class_mode = self.presence.status().enabled
         should_speak = bool(params.get("speak",
                                       self.config.section("tts").get("speak_acks", True)))
+        # Scene-3b reporting fix: whenever nothing is going to play, the ack
+        # says WHY (the owner's evidence read played:false with no explanation
+        # on a stop ack that is silent by design).
+        suppressed = None
         if class_mode:
             should_speak = False       # spoken acks OFF in class mode
+            suppressed = "class mode: spoken acks OFF"
+        elif not should_speak:
+            suppressed = ("speak=False requested (release ack — never "
+                          "spoken by design)" if params.get("speak") is False
+                          else "speak_acks off in [tts]")
         if should_speak and cached is None and not route["muted"]:
             await self._await_ack_cache()          # VB-13: boot warming, once
             cached = self.speech.cached_ack(kind)
@@ -847,8 +953,7 @@ class Daemon:
                          # what makes the next press audible.
                          "cache_miss": cached is None and not route["muted"],
                          "class_mode": class_mode,
-                         "speak_suppressed": ("class mode: spoken acks OFF"
-                                              if class_mode else None)}
+                         "speak_suppressed": suppressed}
         if cached is None:
             self._schedule_rewarm_if_requested()   # VB-2: miss -> one warm cycle
         if should_speak and cached:
@@ -900,6 +1005,15 @@ class Daemon:
                            f"{threshold:.2f}")
         if unknown and mutating:
             reasons.append("confidence is unknown and the intent would change files")
+        # §4.8: a rejected transcription is a visible marker line — the text
+        # is kept (it is in the journal), nothing ran, and the reason is plain.
+        log_event("transcription.rejected", level="warn",
+                  session_id=str(result.get("session_id") or ""),
+                  verdict="rejected",
+                  detail=((f"model_version={result['model']}; "
+                           if result.get("model") else "")
+                          + "nothing executed — " + "; ".join(reasons)
+                          + f"; transcript kept: {text[:60]!r}"))
         return {
             "via": "refused",
             "executed": False,
@@ -1190,6 +1304,16 @@ class Daemon:
     # -- hotword: wake-knock model (never straight hit->listening) ----------
     def _hotword_capture_factory(self):
         """Always-on capture for the wake path (production mic path)."""
+        if os.environ.get("ASSIST_CAPTURE", "").strip().lower() in (
+                "simulated", "mock", "fake"):
+            # Same hermeticity seam as ptt.start (owner order 2026-10-26):
+            # bug6-class tests never open the real mic, wake path included.
+            from .capture import SimulatedCapture
+
+            return SimulatedCapture(speech_frames=100_000,
+                                    frame_ms=int(self.config.section(
+                                        "capture").get("chunk_ms", 30)),
+                                    realtime=True)
         from .capture import PipeWireCapture
 
         capture_cfg = self.config.section("capture")
@@ -1403,6 +1527,111 @@ class Daemon:
         except Exception:
             return
 
+    # -- WP0 watchdog (§4.2): the 5-minute session ceiling -------------------
+    def _session_ceiling_s(self) -> float:
+        try:
+            return float(self.config.section("transcribe").get(
+                "ptt_session_ceiling_s",
+                DEFAULTS["transcribe"]["ptt_session_ceiling_s"]))
+        except (TypeError, ValueError):
+            return float(DEFAULTS["transcribe"]["ptt_session_ceiling_s"])
+
+    def _session_holders(self) -> list[dict]:
+        """Every session currently holding a mic / a Live slot (§4.2).
+
+        The free tier allows 3 concurrent Live sessions; this is the honest
+        enumeration `assist status` and the ladder's wake chain read. A row
+        exists exactly while a holder exists — no caching, no guessing.
+        """
+        holders: list[dict] = []
+        now = time.monotonic()
+        sid = self._ptt_session_id
+        if sid is not None and (self._dictation_task is not None
+                                or sid in self._ptt_finishing):
+            age = (round(now - self._ptt_started_at, 1)
+                   if self._ptt_started_at is not None else None)
+            holders.append({
+                "kind": "ptt" if self._dictation_task is not None else "ptt-finishing",
+                "session_id": sid,
+                "age_s": age,
+                "live": True,
+                "capture_target": self._ptt_capture_target,
+            })
+        meeting = self._meeting
+        if meeting is not None:
+            started = meeting.get("started_mono")
+            holders.append({
+                "kind": "meeting",
+                "session_id": meeting.get("session_id"),
+                "age_s": (round(now - started, 1)
+                          if isinstance(started, (int, float)) else None),
+                "live": False,
+            })
+        try:
+            state = getattr(self.event_service, "_state", None)
+            if isinstance(state, dict) and state.get("status") == "running":
+                holders.append({
+                    "kind": "event",
+                    "session_id": state.get("session_id") or state.get("event_id"),
+                    "age_s": None,
+                    "live": False,
+                })
+        except Exception:  # noqa: S110 - a broken read is one fewer holder row
+            pass
+        return holders
+
+    async def _watchdog_tick(self, *, now: float | None = None) -> bool:
+        """Auto-close a PTT/live session past the ceiling. True iff closed.
+
+        The close is the graceful release path (finisher, terminal result,
+        broadcasts) — never a hard cancel — and it leaves a visible marker in
+        three places: the stdout schema line, the store's journal, and
+        `assist status` (`last_watchdog_close`). The recording is kept by the
+        session itself and its path lands in the session's own close line.
+        """
+        ceiling = self._session_ceiling_s()
+        sid = self._ptt_session_id
+        if (sid is None or self._ptt_started_at is None
+                or self._ptt_released_at is not None
+                or sid in self._ptt_finishing
+                or self._dictation_task is None or self._dictation_task.done()):
+            return False
+        age = (now if now is not None else time.monotonic()) - self._ptt_started_at
+        if age < ceiling:
+            return False
+        marker = {
+            "session_id": sid,
+            "age_s": round(age, 1),
+            "ceiling_s": ceiling,
+            "capture_target": self._ptt_capture_target,
+            "message": (f"watchdog closed session {sid} after "
+                        f"{round(age, 1)} s — the mic was still held past the "
+                        f"{ceiling:g} s ceiling; the recording is kept"),
+        }
+        try:
+            self.store.log_persona_event(
+                iso_now(), "watchdog.close", json.dumps(marker))
+        except Exception:  # noqa: S110 - the schema line below is the marker
+            pass
+        log_event("watchdog.close", level="warn", session_id=sid,
+                  verdict="closed", detail=marker["message"])
+        self._last_watchdog_close = {**marker, "ts": iso_now()}
+        try:
+            await self._ptt_stop({"wait_s": 0, "watchdog": True})
+        except Exception as exc:
+            self._ptt_log("ptt.watchdog_close_failed", session_id=sid,
+                          error=f"{type(exc).__name__}: {exc}"[:200])
+        return True
+
+    async def _session_watchdog_loop(self) -> None:
+        """Periodic ceiling sweep. Cheap when nothing is holding."""
+        while True:
+            await asyncio.sleep(15.0)
+            try:
+                await self._watchdog_tick()
+            except Exception as exc:      # never die: the watchdog is a sensor
+                print(f"[assistd] session watchdog tick failed: {exc}", flush=True)
+
     @staticmethod
     def _consume_task_result(task: asyncio.Future) -> None:
         if task.cancelled():
@@ -1476,6 +1705,15 @@ class Daemon:
         capture_cfg = self.config.section("capture")
         frame_ms = int(capture_cfg.get("chunk_ms", 30))
         source_kind = params.get("source") or capture_cfg.get("source", "mic")
+        # Test-hermeticity seam (owner order 2026-10-26): bug6-class tests
+        # must never open the real mic — the CLI-subprocess dictate test
+        # captured ~0 s of room audio on the laptop and reported "no speech
+        # captured" where the scripted mock transcript was expected. An
+        # env-forced simulated capture fixes it for in-process daemons and
+        # spawned CLIs alike.
+        if os.environ.get("ASSIST_CAPTURE", "").strip().lower() in (
+                "simulated", "mock", "fake"):
+            source_kind = "simulated"
         # BUG 6 (2026-10-20): dictate used to spawn pw-record with NO --target
         # (params["target"] was never set by `assist dictate`) while the owner's
         # working microphone sat in config. Resolution order: explicit param →
@@ -1541,6 +1779,15 @@ class Daemon:
         self._ptt_finishing.discard(session_id)
         self._ptt_started_at = time.monotonic()
         self._ptt_released_at = None
+        # G.7.4 (2026-10-27): per-session transients must not outlive their
+        # session (third-party bug class: a crashed session's flags carried
+        # over until restart). The G.6 stage tables are keyed by session id
+        # — keep the last few (a reply still playing owes its table) and
+        # prune everything older, so a crash cannot accumulate them forever.
+        for _sid in list(self._stage_marks)[:-4]:
+            self._stage_marks.pop(_sid, None)
+        if len(self._latency_emitted) > 16:
+            self._latency_emitted = set(list(self._latency_emitted)[-8:])
         self._ptt_capture_target = str(getattr(self._capture_source, "target", None) or "default")
         # BUG 6d: a session replaced before it produced a result is TERMINAL.
         # Mark it now — "superseded, finished without a result" — so any
@@ -1559,6 +1806,11 @@ class Daemon:
                 self._ptt_unfinished_payload(old_session_id,
                                              superseded_by=session_id))
         self._ptt_log("ptt.start.session_create", session_id=session_id, capture_target=self._ptt_capture_target, mode=self._dictation_session_mode)
+        # §4.8 schema line: session.open — the live sensor for "is a session
+        # holding the mic right now" (the ladder's wake chain reads these).
+        log_event("session.open", session_id=session_id, verdict="listening",
+                  detail=(f"{self._dictation_session_mode} session open — "
+                          f"capture target {self._ptt_capture_target}"))
         try:
             self._dictation_task = self._track_task(asyncio.create_task(
                 self.dictation.dictate(
@@ -1567,6 +1819,15 @@ class Daemon:
                     is_playback_active=self.is_speaking,
                     session_id=session_id)))
             self._ptt_log("ptt.start.dictate_spawned", session_id=session_id)
+            # Stream H.4 (2026-10-27): the owner sees the mic in-use
+            # indicator linger after a session ("takes a minute to …
+            # stop"). Privacy-adjacent: probe the capture node's
+            # PipeWire state ~5s after the dictation task ends and log
+            # `capture.node_state`. Best-effort and bounded — no
+            # PipeWire on this box means one honest "probe unavailable".
+            self._spawn_probe(asyncio.create_task(self._mic_release_probe(
+                session_id, self._dictation_task,
+                str(getattr(self._capture_source, "target", None) or ""))))
         except Exception as exc:
             self._ptt_log("ptt.start.dictate_spawn_failed", session_id=session_id, error=f"{type(exc).__name__}: {exc}"[:200])
             raise
@@ -1577,6 +1838,67 @@ class Daemon:
                 "capture_target": str(getattr(self._capture_source, "target", None)
                                       or "default"),
                 "connectivity": connectivity.as_dict()}
+
+    #: H.4: seconds after session close before the mic-state probe runs.
+    MIC_RELEASE_PROBE_DELAY_S = 5.0
+
+    async def _mic_release_probe(self, session_id: str, task,
+                                 target: str = "") -> None:
+        """H.4 sensor: was the capture node actually RELEASED after the
+        session closed? PipeWire node state ~5s after close — the
+        in-use indicator lingering is privacy-adjacent evidence."""
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=600)
+            except Exception:  # noqa: S110 - the probe is evidence, not cleanup
+                pass
+        await asyncio.sleep(self.MIC_RELEASE_PROBE_DELAY_S)
+        verdict = "unknown"
+        detail = "probe unavailable (pw-cli/pactl not found)"
+        for argv in (("pw-cli", "ls", "Node"), ("pactl", "list", "sources")):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL)
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+            except Exception:  # noqa: S112 - try the next probe; the
+                continue        # final verdict line reports what happened
+            text = out.decode("utf-8", "replace")
+            state = self._probe_state(text, target)
+            if state is not None:
+                verdict = state
+                detail = (f"{argv[0]} reports capture node "
+                          f"{target or '(default)'} state {state} "
+                          f"{self.MIC_RELEASE_PROBE_DELAY_S:g}s after close")
+                break
+            detail = (f"{argv[0]} ran but named no state for "
+                      f"{target or '(default)'}")
+        try:
+            log_event("capture.node_state", session_id=session_id,
+                      verdict=verdict, detail=detail)
+        except Exception:  # noqa: S110 - a broken journal never kills a probe
+            pass
+
+    @staticmethod
+    def _probe_state(text: str, target: str):
+        """Find the capture node's state in pw-cli/pactl output (text
+        shapes differ; best-effort, None when nothing matches)."""
+        norm = text.replace("\r", "")
+        blocks = norm.split("\n\n") if "\n\n" in norm else [norm]
+        if target:
+            chosen = [b for b in blocks if target in b]
+        else:
+            chosen = [b for b in blocks if "input" in b.lower()]
+        for block in chosen or blocks:
+            for line in block.splitlines():
+                low = line.strip().lower()
+                if low.startswith("state"):
+                    tail = low.split("state", 1)[1]
+                    for word in ("running", "idle", "suspended", "error",
+                                 "unavailable", "streaming"):
+                        if word in tail:
+                            return word
+        return None
 
     @staticmethod
     def _ptt_wait_budget(params: dict) -> float:
@@ -1618,6 +1940,17 @@ class Daemon:
         """
         wait_s = self._ptt_wait_budget(params)
         self._ptt_log("ptt.stop.received", session_id=str(self._ptt_session_id or ""))
+        # Scene-3b sensor (2026-10-26): every stop entry leaves a schema line
+        # FIRST — the next scene must distinguish "bind never fired" (no
+        # stop.requested at all) from "stop arrived and failed" (a line here)
+        # from text alone. Sources: cli | bind | watchdog.
+        stop_source = str(
+            params.get("stop_source")
+            or ("watchdog" if params.get("watchdog") else "cli"))
+        log_event("stop.requested", session_id=str(self._ptt_session_id or ""),
+                  verdict="requested",
+                  detail=f"source={stop_source}")
+        self._stage(self._ptt_session_id, "release")
         ack = await self._ack({"kind": "on_it", "speak": False})
         task = self._dictation_task
         session_id = self._ptt_session_id
@@ -1657,7 +1990,24 @@ class Daemon:
                 self._ptt_mark_terminal(
                     session_id, self._ptt_unfinished_payload(session_id))
 
+        if task is None:
+            # Stream D (2026-10-26): double-stop idempotency. The
+            # Win-first release can fire TWO release binds (both the
+            # legacy bindr and the ignore_mods bindri match), and any
+            # stop on an already-closed session must be a clean no-op —
+            # WITH its own schema line, never a silent nothing.
+            if self._ptt_processing:
+                noop_reason = "finish-in-flight"
+            elif session_id is not None and session_id in self._ptt_results:
+                noop_reason = "already-closed"
+            else:
+                noop_reason = "no-active-session"
+            log_event("stop.noop", session_id=str(session_id or ""),
+                      verdict=noop_reason,
+                      detail=(f"source={stop_source}; no active "
+                              "dictation — idempotent no-op"))
         response = {"listening": False, **ack, "result": None,
+                    "noop": task is None,
                     "processing": task is not None or self._ptt_processing,
                     "session_id": session_id,
                     "connectivity": self.mode_manager.status(refresh=False).as_dict()}
@@ -1870,6 +2220,9 @@ class Daemon:
                 "capture": getattr(session, "capture", None),
                 "no_speech": no_speech,
                 "no_final": no_final,
+                # Scene-1 merge gate: the model of record for this session —
+                # surfaced as `model_version=` on the §4.8 schema lines.
+                "model": getattr(session, "model", None),
                 # Factual narration from real state (§13.1) — no model call.
                 "narration": ("no speech captured" if no_speech else
                               "No final transcript received; captured audio is "
@@ -1884,6 +2237,8 @@ class Daemon:
             # filler resemblance. raw_text stays the ASR record (it matches
             # the stored transcript row); only the shown/routed text loses
             # her words, and the user's remainder is always kept.
+            if getattr(session, "final_mark", None) is not None:
+                self._stage(str(session_id or ""), "final", session.final_mark)
             stripped = self._strip_self_echo(result["text"])
             if stripped != result["text"]:
                 result["text"] = stripped
@@ -1898,8 +2253,15 @@ class Daemon:
             # the reply path — no canned filler, no fallback greeting, no
             # TTS. After the energy-floor discard its text is empty anyway;
             # `not no_speech` pins the invariant even if that ever changes.
-            if session_mode == "command" and result["text"].strip() and not no_speech:
-                veto = self._command_gate(result)
+            if (result["text"].strip() and not no_speech
+                    and session_mode in ("command", "conversation", "narration")):
+                # SILENCE HOTFIX rule 4 (preserved): empty / below-floor /
+                # garbage sessions never reach the reply path — the gate is
+                # the one the command path always had. A completed voice
+                # turn WITH real text now answers in every session mode
+                # (stream E: "the last code wall before her voice").
+                veto = (self._command_gate(result)
+                        if session_mode == "command" else None)
                 if veto is not None:
                     # Nothing was routed, so nothing was executed. The words are
                     # still reported (they are the user's dictation, kept in the
@@ -1907,8 +2269,6 @@ class Daemon:
                     result["command"] = veto
                     result["narration"] = veto["note"]
                 else:
-                    # Known grammar climbs the local ladder first; open text
-                    # follows the same offline queue policy as `ask`.
                     # Her own words were already stripped from result["text"]
                     # above (BH-K2); what remains is the user's and may route.
                     reply_timeout_s = max(
@@ -1917,21 +2277,33 @@ class Daemon:
                         "dictate.reply_generation_start",
                         session_id=str(session_id or ""),
                         timeout_s=reply_timeout_s)
+                    # Schema line for the gate: the reply invocation is a
+                    # journal fact, not only a persona-event whisper.
+                    log_event("reply.invocation", session_id=str(session_id or ""),
+                              verdict="invoked",
+                              detail=(f"mode={session_mode}; "
+                                      f"text_chars={len(result['text'])}; "
+                                      f"speak={params.get('speak', True)}"))
                     reply_started = time.monotonic()
+                    self._stage(str(session_id or ""), "reply", reply_started)
                     from .intents import route as route_intent
 
                     try:
                         parsed_intent = route_intent(result["text"])
                     except Exception:
                         parsed_intent = None
-                    # Known local commands keep their existing grammar path.
-                    # Real, above-floor speech with no recognized task goes to
-                    # a generated clarification, never a stock ack/greeting.
-                    reply_task = asyncio.create_task(self._ask({
+                    ask_params = {
                         "text": result["text"],
                         "speak": params.get("speak", True),
-                        "unparsed_command": parsed_intent is None,
-                    }))
+                        "session_id": str(session_id or ""),
+                    }
+                    if session_mode == "command":
+                        # Known local commands keep their existing grammar
+                        # path. Real, above-floor speech with no recognized
+                        # task goes to a generated clarification, never a
+                        # stock ack/greeting.
+                        ask_params["unparsed_command"] = parsed_intent is None
+                    reply_task = asyncio.create_task(self._ask(ask_params))
                     try:
                         done, _pending = await asyncio.wait(
                             {reply_task}, timeout=reply_timeout_s,
@@ -1973,7 +2345,12 @@ class Daemon:
                                       "failed."),
                             "error": str(exc)[:200],
                         }
-                if isinstance(result.get("command"), dict):
+                # Narration (the dictation pillar) keeps its factual
+                # report as the narration line — her spoken answer rides
+                # in the reply. Command and conversation let the reply
+                # BE the narration, as the command path always did.
+                if (isinstance(result.get("command"), dict)
+                        and session_mode != "narration"):
                     result["narration"] = result["command"].get(
                         "reply", result["narration"])
         except Exception as exc:
@@ -2004,6 +2381,39 @@ class Daemon:
                 # _ptt_processing). The result is already retrievable by
                 # session id; the terminal event comes after the switch.
                 self._ptt_finishing.discard(session_id)
+                # §4.8 schema lines: session.close (+ a quota counter line so
+                # every session end carries today's spend on stdout).
+                capture = (result or {}).get("capture") or {}
+                model_of_record = (result or {}).get("model")
+                # G.6: every session ends with its measured stage table
+                # (a no-reply session emits here; a reply session emits at
+                # speech completion, so this call is its backstop).
+                self._emit_latency_table(session_id)
+                transcript_state = ("no_speech" if (result or {}).get("no_speech")
+                                    else "no_final" if (result or {}).get("no_final")
+                                    else "final")
+                log_event("session.close", session_id=session_id,
+                          peak=capture.get("peak"),
+                          verdict=("silence" if (result or {}).get("no_speech")
+                                   else "closed"),
+                          detail=((f"model_version={model_of_record}; "
+                                   if model_of_record else "")
+                                  + f"{self._dictation_session_mode or 'narration'} "
+                                  f"session closed — "
+                                  f"text_chars={len(str((result or {}).get('text') or ''))} "
+                                  f"({transcript_state})"
+                                  + (f"; audio kept at {(result or {}).get('audio_path')}"
+                                     if (result or {}).get("audio_path") else "")))
+                try:
+                    day = day_start_iso()
+                    log_event("quota.counter", session_id=session_id,
+                              verdict="counted",
+                              detail=(f"today: {self.store.user_turn_calls_since(day)} "
+                                      f"user-turn call(s), "
+                                      f"{self.store.housekeeping_calls_since(day)} "
+                                      "housekeeping call(s) on the ledger"))
+                except Exception:  # noqa: S110 - a counter read never breaks close
+                    pass
             # SILENCE HOTFIX rule 1: console status carries the last
             # finished session's plain line — a silence verdict leaves
             # "she heard nothing"; a session with a real transcript clears
@@ -2315,7 +2725,9 @@ class Daemon:
         self.mode = "meeting"
         await self.broadcast({"event": "status.changed", "mode": self.mode})
         self._meeting = {"session_id": session_id, "dual": dual, "frames": frames,
-                         "task": asyncio.create_task(collect())}
+                         "task": asyncio.create_task(collect()),
+                         "started_mono": time.monotonic(),
+                         "started_at": iso_now()}
         return {"state": "meeting"}
 
     async def _meeting_stop(self, params: dict) -> dict:
@@ -3214,6 +3626,9 @@ class Daemon:
                              on_disconnect=self._subscribers.discard)
         connectivity_task = asyncio.create_task(self._connectivity_loop())
         knock_task = asyncio.create_task(self._knock_due_loop())
+        # WP0 watchdog (§4.2): auto-close a PTT/live session past the ceiling
+        # with a visible marker (a missed release once held the mic ~9 min).
+        watchdog_task = asyncio.create_task(self._session_watchdog_loop())
         _sd_notify("READY=1")
         print(f"[assistd] Elaria up · mode={self.config.gemini_mode} "
               f"· socket={self.config.socket_path}", flush=True)
@@ -3228,7 +3643,8 @@ class Daemon:
             async with server:
                 await stop.wait()
         finally:
-            await self.aclose(extra_tasks=(connectivity_task, warm_task, knock_task))
+            await self.aclose(extra_tasks=(connectivity_task, warm_task, knock_task,
+                                           watchdog_task))
 
     async def aclose(self, *, extra_tasks=()) -> None:
         if self._stop_event is not None:
@@ -3252,7 +3668,8 @@ class Daemon:
                 capture_error = exc
         tasks = [
             t for t in (*extra_tasks, self._dictation_task, meeting_task,
-                        *self._meeting_stop_tasks, *self._background_tasks)
+                        *self._meeting_stop_tasks, *self._background_tasks,
+                        *self._probe_tasks)
             if t is not None
         ]
         for task in tasks:

@@ -315,6 +315,10 @@ class DuplexLiveTransport:
         return describe() if callable(describe) else {
             "transport": getattr(self._inner, "name", type(self._inner).__name__)}
 
+    def wire_stats(self) -> dict:
+        describe = getattr(self._inner, "wire_stats", None)
+        return describe() if callable(describe) else {}
+
     async def close(self) -> None:
         self.gate.playback_ended()
         await self._inner.close()
@@ -569,6 +573,19 @@ class FixtureLiveTransport:
         return None
 
 
+#: G.7.1 delta hygiene (third-party rule set, adopted 2026-10-27):
+#: control characters and <ctrl-token>/<ctrl:…> artifacts never reach text.
+_CTRL_ARTIFACT = re.compile(r"<ctrl[^>]*>", re.IGNORECASE)
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+#: A sentence-final boundary ends a segment (punctuation optional on
+#: VERBATIM output, so this is a trigger, never a requirement).
+_SEGMENT_END = re.compile(r"[.!?…][\"'\u201d\u2019)\]]*$")
+
+
+def _clean_transcript_text(text: str) -> str:
+    return _CTRL_ARTIFACT.sub("", _CONTROL_CHARS.sub("", str(text or "")))
+
+
 class GenaiLiveTransport:
     """Real Gemini Live session via google-genai (manual VAD, TEXT out).
 
@@ -612,33 +629,332 @@ class GenaiLiveTransport:
         self._input_parts: list[str] = []
         # Counters/flags only: no audio or transcript text in lifecycle logs.
         self._receive_counts: Counter[str] = Counter()
-        self._audio_frames_sent = 0
+        self._audio_frames_sent = 0        # capture frames pushed in (spy)
+        # Stream F sensors (2026-10-26): the deciding fork lives on the wire,
+        # so every message type is counted and what WE push is metered.
+        self._audio_chunks_sent = 0        # wire chunks, not capture frames
+        self._audio_bytes_sent = 0
+        self._audio_chunk_frames_max = 0   # samples in the largest chunk sent
+        self._audio_mime = "audio/pcm;rate=16000"
+        self._audio_pending = b""
+        self._signals_sent: Counter[str] = Counter()
+        self._wire_counts: Counter[str] = Counter()
+        self._wire_samples: list[str] = []
+        self._voice_end_seen = False
+        self._transcript_family = 0
+        # G.7.1 shape sensors: how many input_transcription envelopes the
+        # wire delivered vs how many committed finals we emitted — the
+        # scene-6 number that says whether the model streams deltas
+        # (parts > commits) or one-shot segments (parts == commits).
+        self._transcript_parts = 0
+        self._transcript_commits = 0
+        self._transcript_dupes = 0
+        self._transcript_snapshots = 0
+        self._transcript_commit_reasons: Counter[str] = Counter()
+        self._transcript_pending: list[str] = []
+        self._transcript_debounce: asyncio.TimerHandle | None = None
+        self._last_interim: str | None = None
+        self._setup_complete = False
+        self._wire_session_id: str | None = None
+        self._setup_retries = 0
 
-    async def connect(self, resumption_handle: str | None = None) -> None:
+    @staticmethod
+    def _build_config(resumption_handle: str | None = None):
+        """The Live session setup, field-for-field the docs' Manual VAD
+        (push-to-talk) example for realtime transcription (G.1, 2026-10-27,
+        ai.google.dev/gemini-api/docs/live-api/live-transcribe §Manual VAD):
+
+            config = types.LiveConnectConfig(
+                response_modalities=["TEXT"],
+                realtime_input_config=types.RealtimeInputConfig(
+                    automatic_activity_detection=types.AutomaticActivityDetection(
+                        disabled=True)
+                ),
+                input_audio_transcription=types.AudioTranscriptionConfig(),
+            )
+
+        Two deviations the G.1 diff named are GONE:
+        - `language_codes` was `["en"]` (bare ISO-639, not the documented
+          BCP-47 shape and not in the model's supported table). The
+          canonical form is `[]` = automatic detection — which is also the
+          documented mode for bilingual, code-switching speech.
+        - `session_resumption` was ALWAYS sent (`handle=None` → wire
+          `sessionResumption: {}`); the docs omit it. It now rides only
+          when a rotation handle actually exists.
+        """
         from google.genai import types
 
         config = types.LiveConnectConfig(
             # ONE-VOICE RULE: Gemini Live is ears + text only. Native audio
             # output is never Elaria's voice; local TTS speaks returned text.
             response_modalities=[types.Modality.TEXT],
-            input_audio_transcription=types.AudioTranscriptionConfig(),
+            input_audio_transcription=types.AudioTranscriptionConfig(
+                language_codes=[],   # documented auto-detect form
+            ),
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
             ),
-            session_resumption=types.SessionResumptionConfig(handle=resumption_handle),
         )
+        if resumption_handle:
+            config.session_resumption = types.SessionResumptionConfig(
+                handle=resumption_handle)
+        return config
+
+    async def connect(self, resumption_handle: str | None = None) -> None:
+        config = self._build_config(resumption_handle)
         self._context = self._client.aio.live.connect(model=self._model, config=config)
-        try:
-            self._session = await self._context.__aenter__()
-        except Exception as exc:
-            raise LiveUnavailable(f"Live connect failed: {exc}") from exc
+        # The google-genai SDK reads exactly ONE message in connect() and
+        # proceeds even when it is not setup_complete (live.py ~1217). The
+        # Enterprise model page is explicit: streaming audio before
+        # setup_complete "can cause the session to cancel unexpectedly and
+        # may result in empty transcriptions". So: prove the setup, and on
+        # a missing setup_complete take ONE fresh session before trusting
+        # this link (G.3, 2026-10-27).
+        for attempt in (1, 2):
+            try:
+                self._session = await self._context.__aenter__()
+            except Exception as exc:
+                raise LiveUnavailable(f"Live connect failed: {exc}") from exc
+            self._note_setup(self._session)
+            if self._setup_complete or attempt == 2:
+                break
+            self._setup_retries += 1
+            context, self._context = self._context, None
+            try:
+                await context.__aexit__(None, None, None)
+            except Exception:  # noqa: S110 - a failed exit never blocks the retry
+                pass
+            self._context = self._client.aio.live.connect(
+                model=self._model, config=config)
         self._receiver = asyncio.create_task(self._receive_loop())
+
+    def _note_setup(self, session) -> None:
+        """G.2 sensor: the SDK reads exactly one message in connect() and
+        proceeds even when it is not setup_complete (live.py). The
+        Enterprise docs warn that streaming audio before setup_complete
+        can yield empty transcriptions — so keep the evidence."""
+        setup = getattr(session, "setup_complete", None)
+        self._setup_complete = setup is not None
+        self._wire_session_id = getattr(setup, "session_id", None) or None
 
     async def _flush_input(self) -> None:
         text = "".join(self._input_parts).strip()
         self._input_parts.clear()
         if text:
             await self._queue.put(LiveEvent("final", text=text))
+
+    # Fields WE convert into LiveEvents — anything else on the wire is
+    # unparsed, counted, and sampled (text-only) up to three times.
+    _PARSED_RESPONSE_FIELDS = frozenset(
+        {"server_content", "go_away", "session_resumption_update"})
+    _PARSED_CONTENT_FIELDS = frozenset(
+        {"model_turn", "output_transcription", "interim_input_transcription",
+         "input_transcription", "turn_complete"})
+
+    def _sample_wire(self, tag: str, payload) -> None:
+        """Text-only samples of what actually arrived on the wire.
+
+        F.1 sampled unparsed shapes only; G.2 extends sampling to ALL
+        message types so a scene dump shows the payloads themselves.
+        Rules unchanged: text fields ONLY, never audio bytes, max ~200
+        chars each, up to 3 samples per type tag."""
+        same = sum(1 for s in self._wire_samples if s.startswith(f"{tag}: "))
+        if same >= 3:
+            return
+        texts: list[str] = []
+
+        def walk(obj, depth: int = 0) -> None:
+            if depth > 4 or sum(map(len, texts)) >= 200:
+                return
+            if isinstance(obj, str):
+                texts.append(obj)
+            elif isinstance(obj, dict):
+                for value in obj.values():
+                    if isinstance(value, (bytes, bytearray)):
+                        continue
+                    walk(value, depth + 1)
+            elif isinstance(obj, (list, tuple)):
+                for value in obj[:8]:
+                    walk(value, depth + 1)
+            elif hasattr(obj, "__dict__"):
+                walk({k: v for k, v in vars(obj).items()
+                      if not k.startswith("_")}, depth + 1)
+
+        walk(payload)
+        sample = " ".join(texts).strip()[:200] or "(no text fields)"
+        self._wire_samples.append(f"{tag}: {sample}")
+
+    @staticmethod
+    def _as_dict(obj):
+        """SDK pydantic models dump to dicts; test doubles are often
+        namespaces — normalise one level so counting stays SDK-churn-proof."""
+        if isinstance(obj, dict):
+            return obj
+        try:
+            if hasattr(obj, "model_dump"):
+                dumped = obj.model_dump(exclude_none=True)
+                return dumped if isinstance(dumped, dict) else {}
+            return {k: v for k, v in vars(obj).items()
+                    if not k.startswith("_")}
+        except Exception:  # counting must never break the receiver
+            return {}
+
+    def _note_wire(self, response) -> None:
+        """Count every message type the Live session receives (F.1).
+
+        google-genai surfaces parsed LiveServerMessage objects, not raw WS
+        frames, so the type of a message is the set of populated fields —
+        `message` counts every message, `server_content.*` and the top-level
+        names count each field within it. Unparsed shapes are sampled.
+
+        H.2 (2026-10-27): EVERY counted type now appears in samples —
+        including `message`, the per-response total that read as an
+        unidentified payload type in scene 5/6 dumps. Each message's
+        sample names its populated fields/subtypes (text-only, ≤200
+        chars, never audio bytes), and a response with no populated
+        fields — a model notice/error shape the parser cannot name —
+        gets its own counted type so it can never hide in the total.
+        """
+        self._wire_counts["message"] += 1
+        dumped = self._as_dict(response)
+        if not dumped:
+            self._wire_counts["unparsed.(unreadable)"] += 1
+            self._sample_wire("unparsed.(unreadable)", response)
+            self._sample_wire("message", {"shape": ["(unreadable)"]})
+            return
+        shape: list[str] = []
+        for key, value in dumped.items():
+            if value is None:
+                continue
+            if key == "server_content":
+                for sub, sub_value in self._as_dict(value).items():
+                    if sub_value is None:
+                        continue
+                    tag = f"server_content.{sub}"
+                    shape.append(tag)
+                    self._wire_counts[tag] += 1
+                    self._sample_wire(tag, {sub: sub_value})
+                    if sub in ("input_transcription",
+                               "interim_input_transcription"):
+                        self._transcript_family += 1
+            else:
+                shape.append(key)
+                self._wire_counts[key] += 1
+                self._sample_wire(key, {key: value})
+                if key == "voice_activity":
+                    activity = self._as_dict(value)
+                    kind = str(activity.get("voice_activity_type") or "")
+                    if kind.upper().endswith("ACTIVITY_END"):
+                        self._voice_end_seen = True
+        if shape:
+            self._sample_wire("message", {"shape": shape})
+        else:
+            # server_content present but nothing populated inside — the
+            # genuinely unidentified shape (model error/notice?). Names
+            # logged so the scene dump names it instead of guessing.
+            self._wire_counts["message.(no-populated-fields)"] += 1
+            self._sample_wire("message.(no-populated-fields)",
+                              {"keys": list(dumped)})
+            self._sample_wire("message", {"shape": ["(no-populated-fields)"]})
+
+    def wire_stats(self) -> dict:
+        """The F.1/F.3 sensors, flat and JSON-safe, for the close lines."""
+        return {
+            "types": dict(self._wire_counts),
+            "samples": list(self._wire_samples),
+            "setup_complete": self._setup_complete,
+            "setup_retries": self._setup_retries,
+            "wire_session_id": self._wire_session_id,
+            "voice_end": self._voice_end_seen,
+            "transcript_family": self._transcript_family,
+            "transcript_parts": self._transcript_parts,
+            "transcript_commits": self._transcript_commits,
+            "transcript_dupes": self._transcript_dupes,
+            "transcript_snapshots": self._transcript_snapshots,
+            "transcript_commit_reasons": dict(self._transcript_commit_reasons),
+            "audio_sent": {
+                "chunks": self._audio_chunks_sent,
+                "bytes": self._audio_bytes_sent,
+                "format": "audio/pcm",
+                "rate": 16000,
+                "mime": self._audio_mime,
+                "chunk_frames_max": self._audio_chunk_frames_max,
+            },
+            "signals": dict(self._signals_sent),
+        }
+
+    # -- G.7.1 transcript accumulation (2026-10-27) ------------------------
+    # The wire may deliver input_transcription as one-shot segments (the
+    # documented shape: one finalized envelope per speech turn) or as
+    # deltas accumulated client-side and finalized at the turn boundary
+    # (SDK Transcription.finished says the shape is type-legal; the
+    # third-party audit reports exactly this). Both land in one path:
+    # accumulate with hygiene, commit one final per segment on any
+    # completion trigger. The 6f contract survives: a standalone envelope
+    # commits on the debounce gap alone (finished is optional on
+    # transcribe-live and must never be required).
+    _TRANSCRIPT_DEBOUNCE_S = 0.4
+
+    def _push_transcript_part(self, part: str) -> None:
+        if not part:
+            return
+        if self._transcript_pending and part == self._transcript_pending[-1]:
+            self._transcript_dupes += 1          # consecutive identical
+            return
+        joined = "".join(self._transcript_pending)
+        if joined and part.startswith(joined):
+            self._transcript_snapshots += 1      # cumulative hypothesis
+            self._transcript_pending = [part]
+            return
+        if joined and joined.endswith(part):
+            self._transcript_dupes += 1          # re-delivered tail
+            return
+        self._transcript_pending.append(part)
+
+    @staticmethod
+    def _join_transcript_pending(parts: list[str]) -> str:
+        """Delta parts carry their own whitespace (raw concat at whitespace
+        boundaries); anything else is a word/segment boundary (space).
+        Known residual, pinned: sub-word deltas without whitespace join
+        with a space."""
+        out = ""
+        for part in parts:
+            if not out:
+                out = part
+            elif part[:1].isspace() or out[-1:].isspace():
+                out += part
+            else:
+                out += " " + part
+        return out.strip()
+
+    def _schedule_transcript_debounce(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._transcript_debounce is not None:
+            self._transcript_debounce.cancel()
+
+        def fire() -> None:
+            self._transcript_debounce = None
+            asyncio.ensure_future(self._commit_transcript("debounce"))
+
+        self._transcript_debounce = loop.call_later(
+            self._TRANSCRIPT_DEBOUNCE_S, fire)
+
+    async def _commit_transcript(self, reason: str) -> None:
+        if self._transcript_debounce is not None:
+            self._transcript_debounce.cancel()
+            self._transcript_debounce = None
+        if not self._transcript_pending:
+            return
+        text = self._join_transcript_pending(self._transcript_pending)
+        self._transcript_pending = []
+        if not text:
+            return
+        self._transcript_commits += 1
+        self._transcript_commit_reasons[reason] += 1
+        await self._queue.put(LiveEvent("final", text=text))
 
     async def _receive_content(self, content) -> None:
         # BUG6: output audio and output transcription are HER OWN speech.
@@ -666,7 +982,10 @@ class GenaiLiveTransport:
         interim = getattr(content, "interim_input_transcription", None)
         if interim is not None and getattr(interim, "text", None):
             self._receive_counts["interim_input_transcription"] += 1
-            await self._queue.put(LiveEvent("interim", text=interim.text))
+            cleaned_interim = _clean_transcript_text(interim.text)
+            if cleaned_interim and cleaned_interim != self._last_interim:
+                self._last_interim = cleaned_interim
+                await self._queue.put(LiveEvent("interim", text=cleaned_interim))
 
         transcription = getattr(content, "input_transcription", None)
         if transcription is not None:
@@ -676,11 +995,31 @@ class GenaiLiveTransport:
             if finished:
                 self._receive_counts["input_finished"] += 1
             if self._transcription_only:
-                # This envelope IS the committed segment on transcribe-live.
-                # Requiring its optional `finished` flag misclassified these
-                # finals as interims and forced saved-WAV batch fallback (6f).
-                if text.strip():
-                    await self._queue.put(LiveEvent("final", text=text))
+                # 6f's lesson keeps its teeth: `finished` is OPTIONAL on
+                # transcribe-live and must never gate a commit. G.7.1 adds
+                # shape tolerance on top — parts accumulate (hygiene,
+                # dedupe, snapshot-supersede) and one final per segment is
+                # committed on the earliest trigger: `finished`, the
+                # debounce gap (the standalone-envelope case), a
+                # turn_complete boundary, or receiver-loop exit.
+                part = _clean_transcript_text(text)
+                if part.strip():
+                    self._transcript_parts += 1
+                    self._push_transcript_part(part)
+                    self._schedule_transcript_debounce()
+                    # A segment that ends itself commits now — the 6f
+                    # contract (a committed envelope surfaces its final
+                    # immediately) and the documented one-shot shape.
+                    # Delta streams whose pieces carry sentence boundaries
+                    # split here into segments that the flush space-joins
+                    # intact; VERBATIM fragments fall through to the other
+                    # triggers.
+                    if _SEGMENT_END.search(
+                            self._join_transcript_pending(
+                                self._transcript_pending).rstrip()):
+                        await self._commit_transcript("segment")
+                if finished:
+                    await self._commit_transcript("finished")
             else:
                 # Conversational Live uses text deltas in this SAME field.
                 # Preserve whitespace between deltas and support an empty
@@ -697,6 +1036,8 @@ class GenaiLiveTransport:
             self._receive_counts["turn_complete"] += 1
             if not self._transcription_only:
                 await self._flush_input()
+            else:
+                await self._commit_transcript("turn_complete")
             # BH-K3: surface the boundary for BOTH model shapes (it was
             # swallowed for the transcription-only model, so neither the
             # diagnostics nor a recorded fixture could show where the
@@ -719,6 +1060,7 @@ class GenaiLiveTransport:
                 async for response in self._session.receive():
                     received = True
                     self._receive_counts["responses"] += 1
+                    self._note_wire(response)
                     if getattr(response, "go_away", None) is not None:
                         await self._queue.put(LiveEvent("go_away"))
                     update = getattr(response, "session_resumption_update", None)
@@ -734,6 +1076,10 @@ class GenaiLiveTransport:
                     raise LiveUnavailable("Live receive stream ended without a response")
                 await asyncio.sleep(0)
         except Exception as exc:
+            # A dead link must not eat an uncommitted segment (prime
+            # directive: the words are data too) — commit first, then
+            # report the failure.
+            await self._commit_transcript("loop_exit")
             await self._queue.put(LiveEvent("error", error=str(exc)))
 
     def diagnostics(self) -> dict:
@@ -749,18 +1095,45 @@ class GenaiLiveTransport:
     async def activity_start(self) -> None:
         from google.genai import types
 
+        self._signals_sent["activity_start"] += 1
         await self._session.send_realtime_input(activity_start=types.ActivityStart())
 
-    async def send_audio(self, pcm: bytes) -> None:
+    # Live-transcribe "Sending audio" (ai.google.dev/gemini-api/docs/live-api/
+    # live-transcribe): raw 16-bit PCM at 16kHz mono little-endian, sent in
+    # chunks of 100ms (1,024 to 2,048 frames). Capture yields 30ms frames
+    # (480 samples / 960 bytes) — undersized on the wire — so coalesce to the
+    # documented cadence here and flush the tail before ActivityEnd. This is
+    # the one wire deviation the F.2/F.3 docs cross-check found (2026-10-26).
+    _CHUNK_SAMPLES = 1600        # 100 ms @ 16 kHz, inside the 1,024–2,048 range
+    _SAMPLE_WIDTH = 2            # s16le mono
+
+    async def _send_pcm_chunk(self, chunk: bytes) -> None:
         from google.genai import types
 
         await self._session.send_realtime_input(
-            audio=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000"))
+            audio=types.Blob(data=chunk, mime_type=self._audio_mime))
+        self._audio_chunks_sent += 1
+        self._audio_bytes_sent += len(chunk)
+        self._audio_chunk_frames_max = max(
+            self._audio_chunk_frames_max, len(chunk) // self._SAMPLE_WIDTH)
+
+    async def send_audio(self, pcm: bytes) -> None:
         self._audio_frames_sent += 1
+        self._audio_pending += pcm
+        chunk_bytes = self._CHUNK_SAMPLES * self._SAMPLE_WIDTH
+        while len(self._audio_pending) >= chunk_bytes:
+            chunk, self._audio_pending = (
+                self._audio_pending[:chunk_bytes],
+                self._audio_pending[chunk_bytes:])
+            await self._send_pcm_chunk(chunk)
 
     async def activity_end(self) -> None:
         from google.genai import types
 
+        self._signals_sent["activity_end"] += 1
+        tail, self._audio_pending = self._audio_pending, b""
+        if tail:
+            await self._send_pcm_chunk(tail)   # tail BEFORE ActivityEnd
         await self._session.send_realtime_input(activity_end=types.ActivityEnd())
 
     async def events(self) -> AsyncIterator[LiveEvent]:

@@ -562,6 +562,18 @@ class InitiativeService:
         }
 
 
+# NOTIFICATION PRIVACY (owner order, 2026-10-26) — notifications are signals,
+# not carriers. These three strings are the ENTIRE visible content of every
+# knock notification: fixed at compile time, identical for every knock, with
+# no config knob (content must never be configurable). Topic, reason and any
+# dynamic fragment live in the console (owner-raised), the journal and the
+# inbox only. The identity keeps the knock's OWN channel name (§19.2) — also
+# frozen, also unconfigurable.
+NOTIFY_IDENTITY = "Elaria · knock"
+NOTIFY_TITLE = "Elaria wants to talk"
+NOTIFY_BODY = "Open the console when you're free."
+
+
 @dataclass
 class KnockSignal:
     """The dedicated knock signal: own identity, own short sound.
@@ -569,6 +581,13 @@ class KnockSignal:
     Only `InitiativeService.raise_knock` calls this. Errors, completions and
     system events have their own channels and must never borrow it. In class
     mode a knock is a silent visual pulse — no popup, no sound; Waybar alone.
+
+    NOTIFICATION PRIVACY (owner order, 2026-10-26): notifications are
+    signals, not carriers. Every knock notification is IDENTICAL in content —
+    one fixed title and one fixed static body — whatever the topic, reason,
+    urgency or mode. Content lives in the console (owner-raised), the journal
+    and the inbox only. A silent knock (class mode or `knock["silent"]`)
+    emits zero audio AND zero subprocess (BH-H9, owner-joined).
     """
 
     config: object
@@ -589,18 +608,24 @@ class KnockSignal:
 
     def emit(self, knock: dict, *, class_mode: bool) -> dict:
         settings = self._settings()
-        if class_mode:
+        # BH-H9 (owner-joined 2026-10-26): a silent knock emits zero audio
+        # AND zero subprocess. The signal is the knock row itself; the
+        # console carries the content when the owner raises it.
+        if class_mode or knock.get("silent"):
             return {"signal": "visual-pulse", "notification": False,
-                    "sound": False,
+                    "sound": False, "identity": NOTIFY_IDENTITY,
                     "note": "class mode: silent visual pulse, urgent-only"}
         delivered = {"signal": "knock", "notification": False, "sound": False,
-                     "identity": settings.get("notify_identity", "Elaria · knock")}
+                     "identity": NOTIFY_IDENTITY}
         if settings.get("notify", True) and shutil.which("notify-send"):
+            # Content rule: title and body are fixed strings compiled in —
+            # no topic, no reason, no fragment, no dynamic string ever
+            # reaches argv. Urgency is a FLAG, never content.
             error = self._run([
-                "notify-send", "-a", delivered["identity"],
+                "notify-send", "-a", NOTIFY_IDENTITY,
                 "-u", "urgent" if knock.get("urgency") == "urgent" else "normal",
                 "-i", "dialog-information",
-                "Elaria wants to talk", str(knock.get("reason", ""))])
+                NOTIFY_TITLE, NOTIFY_BODY])
             delivered["notification"] = error is None
             if error:
                 delivered["notification_error"] = error
