@@ -212,18 +212,22 @@ report]:
   `final.wait` / `final.received` / `final.timeout` naming the dead
   collector honestly. `final.wait` always fires at flush — its absence
   means we hung up before the flush arrived.
-- **Kept-audio backlog (WP5 owns the consumer — do NOT build it here):**
-  4 wavs sit with no retry consumer: `audio/20261026-120742-1beaea.wav`
-  (12:07 watchdog session), session `714a2a8f37e6`'s wav (path in its
-  `transcription.deferred` line; expected name form
-  `20261026-122117-714a2a.wav` [UNVERIFIED name — read the exact path
-  from the deferred line]), the 16:33 session `05698335f231`'s wav (also
-  a watchdog close; expected name form `20261026-163353-056983.wav`
-  [UNVERIFIED name]), and `audio/20261026-191330-d297f1.wav` (19:13
-  session `d297f1…`, scene 4, the release-bind cycle — the stream-F
-  DIAGNOSTIC one-shot transcribes it for housekeeping only and does NOT
-  discharge the contract). All four either eventually transcribe+answer
-  or are explicitly marked never-retried — no third state (§6.8).
+- **Kept-audio manifest (owner 2026-10-27: 6 wavs, 4 unresolved — WP5
+  owns the consumer, do NOT build it here):**
+  - `audio/20261026-120742-1beaea.wav` (12:07) — UNRESOLVED
+  - `audio/20261026-122117-714a2a.wav` (12:21, session 714a2a8f37e6) —
+    UNRESOLVED [path verified from the deferred line]
+  - `audio/20261026-163353-056983.wav` (16:33, session 05698335f231) —
+    UNRESOLVED [UNVERIFIED name — read the deferred line]
+  - `audio/20261027-064404-f03c11.wav` (06:44) — UNRESOLVED
+    [UNVERIFIED name — read the deferred line]
+  - `audio/20261026-191330-d297f1.wav` (19:13) — **RESOLVED = `<noise>`**
+    (the stream-F diagnostic found no intelligible speech)
+  - `audio/20261027-064450-77cc4efb.wav` (06:45, session 77cc4efb1886)
+    — **RESOLVED = replied** (fallback transcription answered the turn)
+    [UNVERIFIED name — read the deferred line]
+  The four unresolved either eventually transcribe+answer or are
+  explicitly marked never-retried — no third state (§6.8).
 
 ### Scene 4 (2026-10-26) — wall one falls; the final is on the wire
 
@@ -307,6 +311,30 @@ report]:
    **§7 separates EARS steps from TERMINAL steps strictly, and no
    physical action ever appears inside a paste-able block.**
 
+6. **MERGE HOLD + GATE v2 (owner override 2026-10-27).** PR #23 stays
+   OPEN. Session 77cc4efb1886 met the WRITTEN gate (full chain, first
+   user-turn, spoken reply heard) but the owner holds the merge on
+   latency: "that was so slow took like a minute." Journal: release
+   06:45:01 → synth complete 06:45:29 = 28 s (12 s dead final-wait + 7 s
+   fallback transcription + 9 s reply+TTS); playback-start was
+   UNMEASURED. **GATE v2 is the standing gate**: the previous chain +
+   the final from the PRIMARY route (`final.received`; the fallback path
+   is a degraded mode, never a gate-passer) + release→first-audible
+   ≤ 8 s + the owner's ear calls it conversational.
+7. **Stream G rulings (WP1 round 1, 2026-10-27).** Docs-first with
+   verbatim citations and the field-by-field diff BEFORE any fix; the
+   setup deviations get named before they get changed. Sensors commit
+   before fixes (kept). $0 — fakes only in the sandbox; no force-push;
+   suite green; ruff clean. G.4's early-abandon never fires without
+   wire sensors (no sensors, no abandon) and 12 s stays the ceiling.
+   The kept-audio manifest is §4's truth (6 wavs, 4 unresolved; a
+   resolved wav names HOW it resolved — `<noise>` is a resolution).
+   Streaming playback is evaluated, not implemented: the native-audio
+   path returns one PCM blob, so streamed first-audio is the named WP1
+   item sized from the scene-6 latency table. And the run-page format
+   rule stands twice over: §7 separates EARS from TERMINAL strictly and
+   no physical action ever appears inside a paste-able block.
+
 ## 6. Known open defects (logged, not fixed — see phase reports)
 
 1. `eventSnap` ReferenceErrors in `ui/quickshell/console/shell.qml` (~lines
@@ -343,16 +371,17 @@ report]:
    (WP3 trigger watches for 0.57), quickshell 0.2.1 frozen (do not upgrade),
    Mic1 capture node non-silent (doctor now checks; run it there).
 
-## 7. The next action — Scene 5: the merge-gate run (stream F sensors in)
+## 7. The next action — Scene 6: the merge-gate run (GATE v2)
 
 Read the format rule first: **every step below is EITHER a TERMINAL
 step (a paste-able block — nothing physical happens while it is on
 screen) OR an EARS step (hands and ears only — no terminal involved).**
 They are never mixed inside one block. Do the steps in order. Scene
 budget: 30 min, daylight, laptop+phone in earshot; both outcomes are
-decisions.
+decisions. GATE v2 (§5.6) is what this run feeds — it does NOT itself
+merge anything.
 
-### Step 0 — TERMINAL: get the stream-F work and restart on branch code
+### Step 0 — TERMINAL: get stream G and restart on branch code
 
 ```
 cd ~/assistant && git fetch origin && git checkout arena/c2a7085d-elaria && git pull && uv sync && systemctl --user daemon-reload && systemctl --user restart assistant && sleep 2 && assist doctor | tail -12
@@ -361,73 +390,75 @@ cd ~/assistant && git fetch origin && git checkout arena/c2a7085d-elaria && git 
 Expect: doctor green (or only known markers). If it is not, STOP and
 report — do not continue the run.
 
-### Step 1 — TERMINAL: DIAGNOSTIC housekeeping (one shot — not a feature)
+### Step 1 — EARS ONLY. One full sentence, NORMAL VOICE. No terminal.
 
-```
-assist transcribe ~/.local/share/assistant/audio/20261026-191330-d297f1.wav
-```
-
-This is the stream-F DIAGNOSTIC for the scene-4 kept wav (what was said
-at 19:13). One call only. It prints one line of plain text; paste that
-line back in the PR thread. WP5 owns the real retry consumer — this
-call does not create it and does not discharge the kept-wav contract.
-
-### Step 2 — EARS ONLY. The natural cycle. No terminal.
-
-1. Hold Win+F2. You should HEAR the press earcon the moment F2 lands.
-2. Speak one real sentence — a sentence you would actually say.
+1. Hold Win+F2. Hear the press earcon the moment F2 lands.
+2. Speak ONE full sentence at the voice you actually use with her —
+   not a shout, not a mumble. The model's VAD filters non-speech, so a
+   normal voice is part of the test, not a courtesy.
 3. Release F2 WHILE STILL HOLDING WIN.
-4. Wait and listen, at most the final-wait budget (12 s default). You
-   should HEAR her spoken reply at the end of the wait.
+4. Wait and listen. The turn should feel like a turn: her reply at the
+   end of a wait you did not have to count.
 5. Write down WHAT SHE SAID before touching the terminal.
 
-### Step 3 — TERMINAL: the cycle dump
+### Step 2 — TERMINAL: the cycle dump
 
 ```
-journalctl --user -u assistant --since -6min -o cat | grep -E "ptt.start|stop.requested|final.wait|final.received|final.timeout|ws.histogram|audio.sent|reply.invocation|quota.check|session.close|transcription.deferred" | tail -12
+journalctl --user -u assistant --since -6min -o cat | grep -E "ws.histogram|audio.sent|final.wait|final.received|final.timeout|audio.first_byte|reply.invocation|latency.table|quota.check|session.close|transcription.deferred" | tail -14
 ```
 
-Expected lines (either outcome is a decision):
+Expected lines (GATE v2's evidence — either outcome is a decision):
 
-- `ws.histogram session=… types={…}` — the wire. **transcript-family
-  counts must be nonzero** (`server_content.input_transcription` and/or
-  `server_content.interim_input_transcription`); zero of both = the
-  audio never reached the model (the other fork).
-- `audio.sent session=… chunks=N bytes=M format=audio/pcm rate=16000` —
-  N and M nonzero; `bytes/N` ≈ 3200 = the documented 100 ms chunks.
-- `final.wait …` then `final.received …` with text (not
-  `final.timeout … text_chars=0`).
-- `reply.invocation … reply.char.count=N` with N > 0.
+- `final.received … text_chars=N` with N > 0 — **from the PRIMARY
+  route** (`backend=gemini_live` on the ptt.result). `final.timeout` or
+  `transcription.deferred` means the fallback path answered: a degraded
+  mode, never a gate-passer — report it as red.
+- `ws.histogram … setup=ok retries=0 … transcript_family=N` with N > 0;
+  `samples=[…]` now show the message payloads themselves (text-only) —
+  quote them if anything is odd.
+- `audio.sent … chunks=N bytes=M format=audio/pcm rate=16000` with
+  `bytes/N ≈ 3200`.
+- `latency.table …` with every leg measured: release_to_final_s
+  (~1–3 s expected), final_to_reply_s, reply_to_synth_s,
+  synth_to_audible_s, and **release_to_audible_s ≤ 8.0** (GATE v2's
+  clock).
+- `audio.first_byte … since_synth_s=…` — the playback-start sensor that
+  makes the last leg measured, not inferred.
 - quota: `user-turns (schema.expected)` = 1.
-- `session.close … model_version=…` and a `transcription.deferred` line
-  ONLY if something failed (the wav is kept either way).
 
-A red run with these lines is a COMPLETE run for stream F: the
-histogram picks the fork. Report both the lines and what she said.
+### Step 3 — EARS ONLY. The verdict that only you can give. No terminal.
 
-### Step 4 — EARS ONLY. The double-stop proof. No terminal.
+Two words, both yours, written in the PR thread:
 
-1. Hold Win+F2. Hear the press earcon again.
-2. Speak a SHORT sentence (a few words is enough).
-3. Release WIN FIRST, then F2 (the opposite order from Step 2).
-4. Listen: there should be no jam, no second behaviour — the release
-   just ends it.
+1. WHAT SHE SAID (her exact words, if you did not write them in Step 1).
+2. **Did it feel conversational?** No number replaces this. The gate
+   says "≤ 8 s" but the ear says fast/slow, present/absent — you are the
+   instrument here.
+
+### Step 4 — EARS ONLY. The double-stop proof. LAST. No terminal.
+
+1. Hold Win+F2. Hear the press earcon.
+2. Speak a SHORT phrase (a few words is enough).
+3. Release WIN FIRST, then F2 (the opposite order from Step 1).
+4. Listen: exactly ONE reply for the one utterance — no second turn, no
+   jam.
 
 ### Step 5 — TERMINAL: the tail dump
 
 ```
-journalctl --user -u assistant --since -3min -o cat | grep -E "stop.requested|stop.noop|bind|STUCK" | tail -6
+journalctl --user -u assistant --since -3min -o cat | grep -E "stop.requested|stop.noop|reply.invocation|STUCK" | tail -6
 ```
 
 Expected: `stop.requested` (source=bind) and `stop.noop` where a second
-stop found nothing to do — one stop only, nothing jammed. Bare-F2
+stop found nothing to do — one stop, one reply, nothing jammed. Bare-F2
 strictness stays as scene 1 ruled: press/dispatch forbidden, release
 legacy-tolerated until WP3.
 
 ### After the run
 
-Report, in the PR thread, with tags: what the histogram showed
-(transcript-family counts or their absence), `audio.sent` N/M, which
-fork it picks, the two EARS outcomes (including WHAT SHE SAID), and the
-quota number. Both red and green are decisions. §5 order after the
-gate: WP1→WP2→WP4→WP5→WP3 (jump if rpm hyprland ≥ 0.57)→WP6.
+Report in the PR thread with tags: the `final.received` line (primary
+or not), the histogram (setup/retries/transcript_family + samples), the
+`latency.table` legs against the 8-second clock, the two EARS answers,
+and the double-stop tail. Both red and green are decisions — a red run
+with these sensors still names the next fix. §5 order after the gate:
+WP1→WP2→WP4→WP5→WP3 (jump if rpm hyprland ≥ 0.57)→WP6.
