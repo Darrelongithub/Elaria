@@ -785,3 +785,66 @@ laptop and must never leave it.
 On every base movement: re-run the drift check **and** re-measure the suite. A.1 proved
 a mainline fix can silently change my recorded baseline, so the drift check alone is not
 enough.
+
+---
+
+## 2026-10-27 — PROTOCOL REFINEMENT RULED + GATE 1e RE-DATED TO 018d109 + `capture.lifecycle` VERIFIED INERT
+
+Report 010 is the record. The tip moved again; the notice's SHA was right, but it was
+confirmed by fetch, not taken on trust.
+
+### RULING 19 — protocol refinement: re-verify against the ORIGIN TIP AT ACTIVATION TIME
+
+The standing re-verification targets the **origin tip at activation time**, never a fixed
+SHA from a notice. **Cross-lane notices are conveniences, never gates.** At the next
+activation (scene numbers arrival), diff the then-tip against the last verified baseline
+before authoring fixtures.
+
+**Discharged in full.** Fetched the real tip first (`018d109437bba4a779c3293aa801c9e17465ec14`,
+matching the notice — confirmed, not assumed), then ran everything below against it.
+
+### RULING 20 — the notice's own claim checked first, and it holds
+
+The notice said `journal_log.py` was "believed untouched". **It is untouched** — empty
+diff, byte-identical blob. The hedge was unnecessary, but the check was still run.
+
+### What `018d109` changed
+
+Three files, `+25/-4`. Only one in `src/`: **`transcribe.py` +13**, adding
+`capture.lifecycle` to the schema journal — aggregate-only mic numbers
+(`node`, `first_frame_latency_ms`, `first_speech_frame_s`, `frames`, `bytes`), verdicts
+`ok`/`no-frames`. Plus Stream H's own sensor tests and HANDOFF. **No journal machinery
+change, no phrasing change.**
+
+### Full drift table vs `018d109` — CLEAN
+
+| Check | Result |
+|---|---|
+| `journal_log.py` `462fa98..018d109` | **byte-identical** |
+| `audio kept at` sites | **4, character-identical, same line numbers** (transcribe.py 418/1451/1464, daemon.py 2405) |
+| All three WP7 event names | **still emitted** (daemon.py:2395, transcribe.py:1460/415/425/1448) |
+| Full §2 verification table vs 018d109's actual module | **ALL 12 CHECKS PASS** |
+
+### The new event, checked for the collision trap
+
+Every additive schema line is a fresh chance for another verdict collision, so the new
+shape was executed, not reasoned about:
+
+- `capture.lifecycle` verdicts are **`ok` / `no-frames`** — **NO collision** with the WP7
+  set (`landed`/`deferred`/`closed`/`rejected`).
+- Its detail carries **no content and no filesystem path** — the notice's
+  "aggregate-only, never content" claim verified in the string itself.
+- **The pre-existing collision is still present** (`fallback.outcome` and
+  `transcription.landed` both emit `landed`), so §2.1 remains load-bearing.
+
+`capture.lifecycle` is **inert to the watcher**: nothing to dispatch on, no path to
+extract, nothing to fence.
+
+### Baseline re-measured — UNCHANGED
+
+Throwaway worktree at `018d109` on CPython 3.11: **1925 passed / 6 skipped / 0 errors,
+ruff clean.** Same as `462fa98`. The corrected baseline holds.
+
+### Standing commitment re-armed, both clauses
+
+On every base movement: re-run the drift check **and** re-measure the suite.
