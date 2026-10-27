@@ -510,3 +510,62 @@ stayed `ed20344 → 2320e1d → b181712` and the push was a clean fast-forward.
 
 **Standing rule:** before every commit on `arena/storage`, verify
 `git merge-base --is-ancestor <origin tip of the PR base> HEAD`. Never `--force`.
+
+---
+
+## 2026-10-27 — CROSS-LANE CONTRACT DRIFT (Stream H addendum §A.2 answered)
+
+Report 006 is the answer. Summary for the log, because this is the entry a future
+turn will read first.
+
+**The addendum's statement of the journal contract is WRONG, and Stream H / WP1 may
+be coding against it.** It lists `ts · level · event · session · detail`. The real
+schema is **seven** fields:
+
+```
+ts · level · event · session_id · peak · verdict · detail(optional)
+```
+
+`peak` and `verdict` were omitted entirely. `parts[4]` is `peak`, `parts[5]` is
+`verdict`, `parts[6]` is `detail`. A parser built to the addendum's prose would read
+`0.42` or `closed` as the detail, find no `audio kept at …` phrase, look correct, and
+quietly never fire.
+
+**What is correct in the addendum and must not be "fixed":** the `split(" ", 6)`
+binding (maxsplit 6 → 7 parts, exactly right), RFC3339 `ts`, the
+`"audio kept at {path}"` phrasing, and the privacy fence.
+
+**Three further drifts found:**
+- Field count is **6..N, unbounded** — `detail` is free text and the real
+  `transcription.deferred` detail is a long sentence. Not "6, 7 or 8".
+- `detail` is **optional and absent**, not `-`. The `-` placeholder applies to
+  `session_id`, `peak`, `verdict` only. A line with no detail ends at `verdict`.
+- `session_id` is 12-hex on the PTT/dictation path (`daemon.py:1764`,
+  `transcribe.py:1406`) but **32-hex** at `daemon.py:2646` and `:2694`. Not a schema
+  invariant; a hard `^[0-9a-f]{12}$` check would drop every stream-F/G sensor line.
+
+**Correction to my own report 005:** §3.3 claimed `quota.counter` (all-empty) gives
+7 parts. It gives **6**. And its "6, 7 or 8 parts" framing should read "6..N".
+Corrected in report 006, not silently patched.
+
+**Privacy fence accepted verbatim and made operational** (five rules in report 006
+§6): the watcher extracts the kept-audio path only to address the artifact in the
+manifest, and never writes it to a log line, a sensor event, a phase report, a PR,
+or a chat message. `journalctl` output is never pasted anywhere.
+
+**A.1 conftest defect: STOOD DOWN, confirmed Stream H's.** The storage lane will not
+touch `tests/conftest.py`. Baseline WP7 must hold, unchanged: **1913 passed / 6
+skipped / 1 error (pre-existing, CPython 3.11 only), ruff clean.**
+
+**Time-sensitive consequence, recorded as GATE 1e:** because no watcher exists yet,
+Stream H / WP1 can still change the journal line shape or the `audio kept at {path}`
+phrasing at **zero** migration cost. Once the watcher's fixtures are authored, any
+shape change becomes a storage-lane migration. The window is open now.
+
+**Sandbox reset, third occurrence.** `.git` was reset to a single commit at
+`ed20344`, dropping local branch refs and `.venv` while leaving the working tree
+intact. Work was safe on origin (`arena/storage` @ `7fc190a`). Reconciled by
+re-fetching `arena/storage` and force-checking-out (safe: every local file was
+verified present in the target tree, and everything of mine was already pushed).
+Local `arena/e7a1cca5-elaria` was also re-pinned to origin's `b181712` so a stray
+push could not rewrite shared history.
