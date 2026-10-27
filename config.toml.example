@@ -323,6 +323,13 @@ checkin_grace_s = 8.0
 # session closes honestly with final.timeout naming what happened.
 final_wait_s = 12.0
 
+# Stream G.4 (2026-10-27): the adaptive early-abandon grace. When the
+# server's voice-activity END has arrived with zero transcript-family
+# messages, the documented prompt final is already overdue — wait only
+# this long more, never the full final_wait_s ceiling (which stays the
+# hard bound for the healthy case).
+final_abandon_grace_s = 3.0
+
 # VB-8: a command-mode transcript below this ASR confidence — or flagged by
 # cleanup as unreliable — is never routed to an intent, so a mumble that sounds
 # like "undo." cannot reverse files. Unknown confidence still allows read-only

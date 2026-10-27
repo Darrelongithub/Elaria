@@ -508,6 +508,11 @@ DEFAULTS: dict = {
         # transcript. Named and configurable — the budget shows up in every
         # final.wait schema line, so a silent lengthening can never hide.
         "final_wait_s": 12.0,
+        # Stream G.4 (2026-10-27): the adaptive early-abandon grace. When
+        # the server's voice-activity END has arrived with zero transcript
+        # family, the documented prompt final is already overdue — wait
+        # only this long more, never the full final_wait_s ceiling.
+        "final_abandon_grace_s": 3.0,
         # VB-8: a command transcript below this ASR confidence (or flagged by
         # cleanup) is never executed. Unknown confidence still allows read-only
         # intents, never a mutating one.

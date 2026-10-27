@@ -203,6 +203,31 @@ class SessionResult:
     final_mark: float | None = None
 
 
+async def wait_for_live_terminal(current_collector: asyncio.Task | None,
+                                 terminal_event: asyncio.Event | None) -> None:
+    """Wait until the collector finishes or its terminal event fires.
+
+    Stream G: extracted from dictate() to module level so the adaptive
+    early-abandon (_wait_final_adaptive) and the plain wait share one
+    implementation. No closure state — both arguments are explicit."""
+    if (terminal_event is None or terminal_event.is_set()
+            or current_collector is None or current_collector.done()):
+        if current_collector is not None and current_collector.done():
+            current_collector.result()
+        return
+    terminal_wait = asyncio.create_task(terminal_event.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {current_collector, terminal_wait},
+            return_when=asyncio.FIRST_COMPLETED)
+        if current_collector in done:
+            current_collector.result()
+    finally:
+        if not terminal_wait.done():
+            terminal_wait.cancel()
+            await asyncio.gather(terminal_wait, return_exceptions=True)
+
+
 def _final_texts(events) -> list[str]:
     """Final transcript segments in order, without the replayed tail's echoes.
 
@@ -294,7 +319,67 @@ class DictationService:
         # transcript is a budget, named and configurable — never a magic
         # constant (the 2.5 s wall the reply regression died behind).
         self.final_wait_s = float(settings.get("final_wait_s", 12.0))
+        # G.4: adaptive early-abandon grace (see _wait_final_adaptive).
+        self.final_abandon_grace_s = float(
+            settings.get("final_abandon_grace_s", 3.0))
         self.audio_dir = config.data_dir / "audio"
+
+    async def _voice_end_abandon(self, transport, grace_s: float) -> None:
+        """Resolves when the server's voice-activity END has been seen with
+        zero transcript-family messages for `grace_s` continuous seconds
+        (G.4). Without wire sensors this never resolves — no sensors, no
+        abandon."""
+        describe = getattr(transport, "wire_stats", None)
+        if not callable(describe):
+            await asyncio.Event().wait()
+            return
+        hold: float | None = None
+        while True:
+            try:
+                stats = describe() or {}
+            except Exception:   # a broken sensor never abandons the wait
+                stats = {}
+            family = int(stats.get("transcript_family") or 0)
+            if stats.get("voice_end") and family == 0:
+                now = time.monotonic()
+                hold = now if hold is None else hold
+                if now - hold >= grace_s:
+                    return
+            else:
+                hold = None   # a transcript-family message arrived: full budget
+            await asyncio.sleep(0.25)
+
+    async def _wait_final_adaptive(self, collector, collector_terminal_event,
+                                   transport):
+        """The post-release wait, with G.4 adaptive early-abandon.
+
+        The docs say the finalized transcript is emitted when the turn
+        completes — promptly at activityEnd for the Manual VAD idiom. So
+        when the server has already declared ACTIVITY_END and still no
+        transcript family exists, the remaining budget is cut to
+        `final_abandon_grace_s`; `final_wait_s` stays the ceiling.
+        Raises TimeoutError carrying the reason as its message."""
+        budget_s = self.final_wait_s
+        grace_s = self.final_abandon_grace_s
+        terminal = asyncio.ensure_future(
+            wait_for_live_terminal(collector, collector_terminal_event))
+        watcher = asyncio.ensure_future(
+            self._voice_end_abandon(transport, grace_s))
+        try:
+            done, _pending = await asyncio.wait(
+                {terminal, watcher}, timeout=budget_s,
+                return_when=asyncio.FIRST_COMPLETED)
+            if terminal in done:
+                return await terminal
+            if watcher in done:
+                raise TimeoutError(
+                    f"adaptive abandon after voice_end grace {grace_s}s "
+                    f"(voice end seen, no transcript family)")
+            raise TimeoutError(f"budget expired after {budget_s}s")
+        finally:
+            for task in (terminal, watcher):
+                task.cancel()
+            await asyncio.gather(terminal, watcher, return_exceptions=True)
 
     def _connectivity(self):
         """Mode snapshot for one session. A switch requested mid-session is
@@ -598,25 +683,6 @@ class DictationService:
                 # EOF/error is terminal too, even if no final text was emitted.
                 terminal_event.set()
 
-        async def wait_for_live_terminal(current_collector: asyncio.Task | None,
-                                         terminal_event: asyncio.Event | None) -> None:
-            if (terminal_event is None or terminal_event.is_set()
-                    or current_collector is None or current_collector.done()):
-                if current_collector is not None and current_collector.done():
-                    current_collector.result()
-                return
-            terminal_wait = asyncio.create_task(terminal_event.wait())
-            try:
-                done, _pending = await asyncio.wait(
-                    {current_collector, terminal_wait},
-                    return_when=asyncio.FIRST_COMPLETED)
-                if current_collector in done:
-                    current_collector.result()
-            finally:
-                if not terminal_wait.done():
-                    terminal_wait.cancel()
-                    await asyncio.gather(terminal_wait, return_exceptions=True)
-
         def wrap_duplex(current: LiveTransport) -> LiveTransport:
             """One door for both the real and the fake transport (§12.9)."""
             if isinstance(current, DuplexLiveTransport):
@@ -859,20 +925,23 @@ class DictationService:
                 log_event("final.wait", session_id=session_id,
                           verdict="waiting",
                           detail=(f"budget_s={self.final_wait_s}; "
+                                  f"abandon_grace_s={self.final_abandon_grace_s}; "
                                   f"collector={collector_state}; "
                                   f"activity_end_ok={activity_end_ok}"))
                 if activity_end_ok and collector is not None:
                     try:
                         await self._await_lifecycle(
                             "dictate.transcript_final_wait",
-                            wait_for_live_terminal(collector,
-                                                   collector_terminal_event),
+                            self._wait_final_adaptive(
+                                collector, collector_terminal_event,
+                                transport),
                             timeout_s=self.final_wait_s,
                             session_id=session_id)
-                    except TimeoutError:
+                    except TimeoutError as exc:
                         live_terminal_missing = True
-                        final_wait_note = (f"budget expired after "
-                                           f"{self.final_wait_s}s")
+                        final_wait_note = (
+                            str(exc).strip()
+                            or f"budget expired after {self.final_wait_s}s")
                         notes.append(
                             "Live final transcript timed out after activity_end; "
                             "will use committed text or saved-WAV fallback")
@@ -949,6 +1018,7 @@ class DictationService:
                     log_event("ws.histogram", session_id=session_id,
                               verdict="wire",
                               detail=(f"setup={'ok' if setup_ok else 'missing'}"
+                                      f" retries={int(wire.get('setup_retries') or 0)}"
                                       f"; voice_end={str(bool(wire.get('voice_end'))).lower()}"
                                       f"; transcript_family={int(wire.get('transcript_family') or 0)}"
                                       f"; types={json.dumps(types, sort_keys=True)}"

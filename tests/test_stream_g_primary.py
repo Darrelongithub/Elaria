@@ -234,3 +234,187 @@ def test_final_mark_rides_the_dictation_result(config, journal_stream,
     assert result.final_mark is not None
     assert before <= result.final_mark <= after
     store.close()
+
+
+# ============================================================ G.3 (fix)
+def test_build_config_matches_documented_manual_vad_shape():
+    """G.1 named two setup deviations; G.3 removed them. The config is
+    now field-for-field the docs' Manual VAD example (plus the optional
+    rotation handle the docs' base example omits entirely)."""
+    config = GenaiLiveTransport._build_config()
+    assert [getattr(m, "value", m)
+            for m in config.response_modalities] == ["TEXT"]
+    aad = config.realtime_input_config.automatic_activity_detection
+    assert aad.disabled is True
+    assert config.input_audio_transcription.language_codes == []
+    assert config.input_audio_transcription.mode is None   # VERBATIM default
+    assert config.session_resumption is None               # was always-on {}
+    # a rotation handle rides ONLY when one exists
+    config2 = GenaiLiveTransport._build_config("handle-7")
+    assert config2.session_resumption.handle == "handle-7"
+
+
+def test_missing_setup_complete_takes_one_fresh_session():
+    """The SDK proceeds when its first message is not setup_complete;
+    the Enterprise docs say audio-before-setup yields empty
+    transcriptions. Missing setup -> ONE retry, then proceed with the
+    evidence recorded honestly."""
+    class _Session:
+        def __init__(self, setup):
+            self.setup_complete = setup
+
+    class _Ctx:
+        def __init__(self, session):
+            self._session = session
+            self.entered = 0
+            self.exited = False
+
+        async def __aenter__(self):
+            self.entered += 1
+            return self._session
+
+        async def __aexit__(self, *exc):
+            self.exited = True
+
+    class _Live:
+        def __init__(self, ctxs):
+            self._ctxs = list(ctxs)
+            self.calls = 0
+
+        def connect(self, model=None, config=None):
+            self.calls += 1
+            return self._ctxs.pop(0)
+
+    def scenario(ctxs):
+        tr = _transport()
+        live = _Live(ctxs)
+        aio = pytypes.SimpleNamespace(live=live)
+        tr._client = pytypes.SimpleNamespace(aio=aio)
+
+        async def drive():
+            await tr.connect()
+            stats = tr.wire_stats()
+            await tr.close()
+            return stats
+
+        return asyncio.run(drive()), live
+
+    good = _Ctx(_Session(pytypes.SimpleNamespace(session_id="ok1")))
+    bad = _Ctx(_Session(None))
+    stats, live = scenario([bad, good])
+    assert stats["setup_complete"] is True
+    assert stats["setup_retries"] == 1
+    assert bad.entered == 1 and bad.exited is True
+    assert good.entered == 1
+    assert live.calls == 2
+
+    # both sessions missing setup -> proceed on the retry, evidence says so
+    first, second = _Ctx(_Session(None)), _Ctx(_Session(None))
+    stats2, live2 = scenario([first, second])
+    assert stats2["setup_complete"] is False
+    assert stats2["setup_retries"] == 1
+    assert live2.calls == 2
+
+
+# ============================================================ G.4 (fix)
+class _WireTransportDouble:
+    def __init__(self, voice_end=True, family=0):
+        self._stats = {"voice_end": voice_end, "transcript_family": family}
+
+    def wire_stats(self):
+        return dict(self._stats)
+
+
+def _service(tmp_path, *, final_wait_s, grace_s):
+    from assistant.config import load_config
+    from assistant.store import Store
+    from assistant.transcribe import DictationService
+
+    config = load_config()
+    config.raw["transcribe"] = {
+        **config.raw.get("transcribe", {}),
+        "inbox_dir": str(tmp_path / "inbox"),
+        "final_wait_s": final_wait_s,
+        "final_abandon_grace_s": grace_s,
+    }
+    store = Store(tmp_path / "g4.db")
+    return DictationService(config, store, None), store
+
+
+def test_adaptive_abandon_cuts_the_dead_wait(tmp_path):
+    service, store = _service(tmp_path, final_wait_s=5.0, grace_s=0.3)
+    try:
+        async def drive():
+            collector = asyncio.create_task(asyncio.sleep(999))
+            terminal = asyncio.Event()   # never fires
+            started = time.monotonic()
+            try:
+                await service._wait_final_adaptive(
+                    collector, terminal, _WireTransportDouble())
+            except TimeoutError as exc:
+                return time.monotonic() - started, str(exc)
+            finally:
+                collector.cancel()
+            raise AssertionError("expected TimeoutError")
+
+        elapsed, message = asyncio.run(drive())
+        assert "adaptive abandon" in message, message
+        assert "no transcript family" in message, message
+        assert elapsed < 2.0, f"grace 0.3s must not burn the 5s budget ({elapsed})"
+    finally:
+        store.close()
+
+
+def test_adaptive_abandon_spared_while_transcripts_flow(tmp_path):
+    service, store = _service(tmp_path, final_wait_s=0.6, grace_s=0.1)
+    try:
+        async def drive():
+            collector = asyncio.create_task(asyncio.sleep(999))
+            terminal = asyncio.Event()   # never fires
+            started = time.monotonic()
+            try:
+                await service._wait_final_adaptive(
+                    collector, terminal,
+                    _WireTransportDouble(voice_end=True, family=2))
+            except TimeoutError as exc:
+                return time.monotonic() - started, str(exc)
+            finally:
+                collector.cancel()
+            raise AssertionError("expected TimeoutError")
+
+        elapsed, message = asyncio.run(drive())
+        assert "budget expired after 0.6s" in message, message
+        assert "adaptive" not in message
+        assert elapsed >= 0.5, f"transcripts flowing keeps the budget ({elapsed})"
+    finally:
+        store.close()
+
+
+def test_adaptive_wait_returns_when_the_final_arrives(tmp_path):
+    service, store = _service(tmp_path, final_wait_s=5.0, grace_s=0.2)
+    try:
+        async def drive():
+            collector = asyncio.create_task(asyncio.sleep(999))
+            terminal = asyncio.Event()
+
+            async def later():
+                await asyncio.sleep(0.3)
+                terminal.set()
+
+            ticker = asyncio.create_task(later())
+            started = time.monotonic()
+            try:
+                # transcripts are flowing (family>0) — the watcher stays
+                # quiet and the arriving final returns the wait promptly.
+                await service._wait_final_adaptive(
+                    collector, terminal,
+                    _WireTransportDouble(voice_end=True, family=1))
+            finally:
+                collector.cancel()
+                ticker.cancel()
+            return time.monotonic() - started
+
+        elapsed = asyncio.run(drive())
+        assert elapsed < 2.0, "a real final returns promptly, not after the budget"
+    finally:
+        store.close()

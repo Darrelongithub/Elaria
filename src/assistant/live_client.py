@@ -631,26 +631,76 @@ class GenaiLiveTransport:
         self._transcript_family = 0
         self._setup_complete = False
         self._wire_session_id: str | None = None
+        self._setup_retries = 0
 
-    async def connect(self, resumption_handle: str | None = None) -> None:
+    @staticmethod
+    def _build_config(resumption_handle: str | None = None):
+        """The Live session setup, field-for-field the docs' Manual VAD
+        (push-to-talk) example for realtime transcription (G.1, 2026-10-27,
+        ai.google.dev/gemini-api/docs/live-api/live-transcribe §Manual VAD):
+
+            config = types.LiveConnectConfig(
+                response_modalities=["TEXT"],
+                realtime_input_config=types.RealtimeInputConfig(
+                    automatic_activity_detection=types.AutomaticActivityDetection(
+                        disabled=True)
+                ),
+                input_audio_transcription=types.AudioTranscriptionConfig(),
+            )
+
+        Two deviations the G.1 diff named are GONE:
+        - `language_codes` was `["en"]` (bare ISO-639, not the documented
+          BCP-47 shape and not in the model's supported table). The
+          canonical form is `[]` = automatic detection — which is also the
+          documented mode for bilingual, code-switching speech.
+        - `session_resumption` was ALWAYS sent (`handle=None` → wire
+          `sessionResumption: {}`); the docs omit it. It now rides only
+          when a rotation handle actually exists.
+        """
         from google.genai import types
 
         config = types.LiveConnectConfig(
             # ONE-VOICE RULE: Gemini Live is ears + text only. Native audio
             # output is never Elaria's voice; local TTS speaks returned text.
             response_modalities=[types.Modality.TEXT],
-            input_audio_transcription=types.AudioTranscriptionConfig(),
+            input_audio_transcription=types.AudioTranscriptionConfig(
+                language_codes=[],   # documented auto-detect form
+            ),
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
             ),
-            session_resumption=types.SessionResumptionConfig(handle=resumption_handle),
         )
+        if resumption_handle:
+            config.session_resumption = types.SessionResumptionConfig(
+                handle=resumption_handle)
+        return config
+
+    async def connect(self, resumption_handle: str | None = None) -> None:
+        config = self._build_config(resumption_handle)
         self._context = self._client.aio.live.connect(model=self._model, config=config)
-        try:
-            self._session = await self._context.__aenter__()
-        except Exception as exc:
-            raise LiveUnavailable(f"Live connect failed: {exc}") from exc
-        self._note_setup(self._session)
+        # The google-genai SDK reads exactly ONE message in connect() and
+        # proceeds even when it is not setup_complete (live.py ~1217). The
+        # Enterprise model page is explicit: streaming audio before
+        # setup_complete "can cause the session to cancel unexpectedly and
+        # may result in empty transcriptions". So: prove the setup, and on
+        # a missing setup_complete take ONE fresh session before trusting
+        # this link (G.3, 2026-10-27).
+        for attempt in (1, 2):
+            try:
+                self._session = await self._context.__aenter__()
+            except Exception as exc:
+                raise LiveUnavailable(f"Live connect failed: {exc}") from exc
+            self._note_setup(self._session)
+            if self._setup_complete or attempt == 2:
+                break
+            self._setup_retries += 1
+            context, self._context = self._context, None
+            try:
+                await context.__aexit__(None, None, None)
+            except Exception:  # noqa: S110 - a failed exit never blocks the retry
+                pass
+            self._context = self._client.aio.live.connect(
+                model=self._model, config=config)
         self._receiver = asyncio.create_task(self._receive_loop())
 
     def _note_setup(self, session) -> None:
@@ -766,6 +816,7 @@ class GenaiLiveTransport:
             "types": dict(self._wire_counts),
             "samples": list(self._wire_samples),
             "setup_complete": self._setup_complete,
+            "setup_retries": self._setup_retries,
             "wire_session_id": self._wire_session_id,
             "voice_end": self._voice_end_seen,
             "transcript_family": self._transcript_family,
