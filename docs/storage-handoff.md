@@ -198,3 +198,156 @@ dependency change, and zero edits to `daemon.py`, `transcribe.py`,
 `live_client.py` or `HANDOFF.md`. The only additions are three documents under
 `docs/phase-reports/`, one log under `docs/`, and one paste-safe shell script
 under `scripts/`.
+
+---
+
+## 2026-10-27 — RULINGS RECEIVED (design chat). Four rulings, recorded in substance.
+
+Appended as required. Rulings bind. None implemented yet; one is blocked on the
+branch question in Q8.
+
+### RULING 1 — BRANCH (supersedes all three options I offered)
+
+> "none of the three options as written. Diagnose first, then a corrected option
+> 2. Option 1 is REJECTED with reasons: main @ ed20344 predates PR #23 — the
+> schema-event journal the watcher must tail (stop.requested, ack.played,
+> final.*, ws.histogram, audio.sent, latency.table), the current ladder, the
+> trash/manifest-era machinery the storage manifest generalizes, and the
+> 1,901-test suite all live only on arena/c2a7085d-elaria. WP7 built on ed20344
+> cannot implement its own spec and its PR could never merge cleanly. A stalled
+> WP7 (option 3) is recoverable; a stale-base PR is wasted days."
+
+**STEP 1 — DIAGNOSE.** Done; verbatim outputs in report 003.
+**STEP 2 — the PR branch IS visible.** Live tip `f915d8e396d3fed0b3c77af7b21b2031c09ede5b`
+(PR #23 head, open). The ruling expected `3509818` or newer; actual is four
+commits newer (Stream G.7 landed). `0c08cb5` is confirmed a genuine ancestor, so
+the brief's SHA is stale exactly as the ruling said.
+**STEP 2 — ordered actions.** Fetch the branch, cut `arena/storage` from
+FETCH_HEAD, build there with the additive-only firewall unchanged, push
+`arena/storage` as a NEW branch, never touch or force-push
+`arena/e7a1cca5-elaria`, open the PR with BASE = `arena/c2a7085d-elaria`
+(stacked; retarget to `main` after PR #23 merges), note the harness session
+branch in the PR description, record the exact base SHA in the first phase report.
+
+**STATUS: DIAGNOSED, NOT EXECUTED.** The ordered action collides with the Arena
+harness constraint that pins this session to `arena/e7a1cca5-elaria` and forbids
+creating or pushing any other branch. Not resolved unilaterally in either
+direction — raised as Q8 in report 003 for a ruling.
+
+**Base SHA recorded, as ordered: `f915d8e396d3fed0b3c77af7b21b2031c09ede5b`.**
+
+### RULING 2 — MISSING FOUNDATIONS (the question is void; the fetch succeeded)
+
+> "the question is premature — the diagnosis ordered in the previous ruling was
+> not reported. Run it and paste outputs FIRST … IF THE FETCH SUCCEEDS: this
+> multiple-choice is void."
+
+The fetch succeeded, so the contingency (amended option 1, self-contained build
+against evidenced seams) is **correctly declined and recorded as available but
+not invoked**. Defect D2 from report 000 is RESOLVED: `ladder.py`,
+`journal_log.py`, the schema events, the trash manifest and the 1,901-test suite
+are all present on the real base.
+
+The ruling's four binding amendments are retained for the contingency case, and
+the first is already satisfied by evidence:
+
+1. *"The verbatim journal-line contract is below … Your journal-line reader must
+   be contract-tested against these exact shapes. Whether the tail mechanism is
+   journald (`journalctl --user -u assistant -f`) or a file journal is CONFIRMED
+   IN THE INTEGRATION ROUND, not guessed."*
+   **CONFIRMED FROM CODE, NOT GUESSED: the mechanism is journald.**
+   `journal_log.py` writes `ts level event session_id peak verdict detail` lines
+   to **stdout**, and the unit's `StandardOutput=journal` captures them. There is
+   no append-only file to `tail`; journald itself is the append-only record, and
+   `journalctl` is a pure read — so the trigger ruling's "must NOT touch the
+   daemon" holds literally. See report 003 §2.2.
+2. *"Watcher is a correct no-op when no journal exists."* — stands.
+3. *"Grace-then-purge: executor.trash() move+manifest exists … the purge policy is
+   additive there (executor is not on the forbidden list)."* — stands.
+4. *"Ladder chain #5 ships as a standalone module +…"* — truncated in the ruling as
+   received. Retained verbatim; the remainder is not guessed.
+
+### RULING 3 — RUNWAY: OPTION 1 ENDORSED
+
+> "OPTION 1 — endorsed as recommended. Options 2 and 3 rejected for the reason
+> you named yourselves: the spec says DOCUMENTED-NOT-BUILT until the real
+> aggregates fire the decision; pre-building either lever is the silent
+> workaround the capacity clause exists to prevent. The model's job was to tell
+> us to ask. Scene Sheet 2's numbers decide."
+
+Three binding amendments to the capacity report, all implemented in report 004:
+
+1. **TWO USAGE PROFILES.** (a) CURRENT — avg kept-audio min/day over the last 30
+   days from existing kept-wav sizes + mtimes, aggregates only. (b) WP5-ERA —
+   hours-long flight recordings, with the flood math shown explicitly.
+2. **COMPRESSION IS A MULTIPLIER, NOT A FOOTNOTE.** zstd on 16-bit speech PCM
+   commonly lands ~1.5–2× [UNVERIFIED-MODEL]. Every runway number reported twice:
+   pessimistic floor and measured.
+3. **THE OWNER MENU IS FOUR LEVERS**, presented with numbers, never chosen
+   silently: (a) FLAC cold-only; (b) second target; (c) retention-class prune;
+   (d) truncated in the ruling as received.
+
+**Headline from the amended model:** one 8-hour event day = 921.6 MB =
+**~16.8 days of the entire 12-month budget consumed in one afternoon**. At the
+compression floor, even *monthly* 8-hour events barely clear 12 months (21.7
+months). At 2.0×, fortnightly clears (20.1 months) and **weekly never clears at
+any ratio in the 1.5–2.0× band (10.0 months)**. That last number decides whether
+a second target is optional or mandatory.
+
+### RULING 4 — WATCHER WAKE: OPTION 1, AND THE SPEC IS FORMALLY AMENDED
+
+> "OPTION 1 — poll on the same seam as watcher.py (stdlib snapshot-diff,
+> headless-testable) — AND the spec text is hereby formally amended (the
+> substance of option 3), so the record stays honestly"
+
+**SPEC AMENDMENT (binding, recorded here as required):** every occurrence of
+*"inotify wake on the data dirs"* in the WP7 spec and rulings reads from now on:
+
+> **"prompt wake via stdlib polling snapshot-diff, interval `[backup]
+> watcher_poll_s` (default 30 s, configurable)"**
+
+Rationale in the ruling: *"The requirement was never inotify; it was promptness —
+'a flight recording does not wait 24 h' — which a 30 s poll satisfies completely,
+with the nightly timer as the belt behind it."*
+
+**OPTION 2 REJECTED for the record:** inotifywait adds a binary dependency and a
+second code path to test, and there is no consumer of sub-second promptness
+anywhere in WP7. Revisitable ONLY if a real requirement appears, as an
+owner-visible decision — never as builder convenience.
+
+**IMPLEMENTATION NOTES (binding):**
+- Poll must be cheap: directory listing + mtime/size per pass. **NO hashing during
+  polls** — hash only new/changed candidates once, then hand to the manifest
+  pipeline.
+- The journal tail uses the same polling seam, read incrementally from a
+  **persisted offset, never re-read whole**. For journald that offset is
+  journald's own cursor.
+- Pattern reuse, not file capture: follow `watcher.py`'s architecture in the new
+  module; if sharing its base requires touching `watcher.py` at all,
+  **additive-only**, and say so in the report. The firewall list is unchanged.
+- Headless pins: tests drive the poller with fake directories and a fake clock —
+  no sleeps, no real inotify, no timing flake. The watcher's correct-no-op
+  behaviour (absent journal, empty dirs) is pinned too.
+
+---
+
+## 2026-10-27 — Correction to the Turn 1 entry (append-only discipline)
+
+The Turn 1 entry reported, as [HW-PROVEN], that "`origin` carries only `main` @
+`ed20344`" and that `arena/c2a7085d-elaria` "does not exist". **That was wrong**,
+and the error was mine, not the repository's: `remote.origin.fetch` in this
+checkout is refspec-restricted to `main` plus this session's own branch, so
+`git fetch origin --prune` could never see the mainline PR branches.
+`git ls-remote origin` proves `arena/c2a7085d-elaria` exists at
+`f915d8e396d3fed0b3c77af7b21b2031c09ede5b` and is PR #23's open head.
+
+Consequences recorded so they are not re-derived:
+- The WP7 brief's base is real and reachable. Defect D1 in report 000 was an
+  artefact of my method and is corrected in report 003.
+- **Every future fetch of mainline work must use the explicit-URL form**
+  `git fetch https://github.com/Darrelongithub/Elaria.git <branch>`, or the owner
+  must widen the refspec. Widening it is an owner decision, not a builder
+  convenience, so the explicit-URL form is used and the restriction is documented.
+- The 1780-passed suite baseline I measured is the **stale** number from
+  `ed20344`. The real base has 98 test files (vs 87) and the ruling cites a
+  1,901-test suite. The baseline WP7 must hold is measured on `f915d8e`.
