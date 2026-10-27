@@ -212,7 +212,7 @@ report]:
   `final.wait` / `final.received` / `final.timeout` naming the dead
   collector honestly. `final.wait` always fires at flush — its absence
   means we hung up before the flush arrived.
-- **Kept-audio manifest (owner 2026-10-27: 6 wavs, 4 unresolved — WP5
+- **Kept-audio manifest (owner 2026-10-27: 8 wavs, 6 unresolved — WP5
   owns the consumer, do NOT build it here):**
   - `audio/20261026-120742-1beaea.wav` (12:07) — UNRESOLVED
   - `audio/20261026-122117-714a2a.wav` (12:21, session 714a2a8f37e6) —
@@ -221,12 +221,17 @@ report]:
     UNRESOLVED [UNVERIFIED name — read the deferred line]
   - `audio/20261027-064404-f03c11.wav` (06:44) — UNRESOLVED
     [UNVERIFIED name — read the deferred line]
+  - `audio/20261027-085158-c9665b.wav` (08:51, session c9665bed27fc) —
+    UNRESOLVED (scene 6: adaptive-abandon cycle; fallback outcome was
+    invisible then — scene 7's `fallback.outcome` line answers)
+  - `audio/20261027-085254-27c8ea.wav` (08:52, session 27c8ea99e82c) —
+    UNRESOLVED (scene 6: second cycle, same shape)
   - `audio/20261026-191330-d297f1.wav` (19:13) — **RESOLVED = `<noise>`**
     (the stream-F diagnostic found no intelligible speech)
   - `audio/20261027-064450-77cc4efb.wav` (06:45, session 77cc4efb1886)
     — **RESOLVED = replied** (fallback transcription answered the turn)
     [UNVERIFIED name — read the deferred line]
-  The four unresolved either eventually transcribe+answer or are
+  The six unresolved either eventually transcribe+answer or are
   explicitly marked never-retried — no third state (§6.8).
 
 ### Scene 4 (2026-10-26) — wall one falls; the final is on the wire
@@ -243,6 +248,28 @@ report]:
 - Owner ruling (this order): stream F asks why the Live API withholds
   the final — sensors before fixes, protocol citations before any fix,
   $0 spend except F.4's single diagnostic file call.
+
+### Scene 5 + Scene 6 (2026-10-26/27) — the wire is healthy; the MODEL is silent
+
+- **Scene 5** (session 77cc4efb1886, stream-F code): release 06:45:01 →
+  synth 06:45:29 = 28 s, recovered by the flash-lite file fallback +
+  spoken reply. Decomposition (estimates from journal stamps): 12 s
+  dead wait + ~7 s fallback + ~9 s reply/TTS. `types={"message":2,
+  "voice_activity":2}` — zero transcript messages, and the fallback
+  answered anyway. Gate red on the 8 s bar, but the user got words.
+- **Scene 6** (sessions c9665bed27fc + 27c8ea99e82c, 2026-10-27
+  08:51–08:53, stream G.7 code): `transcript_family=0 commits=0` in
+  BOTH cycles — zero transcript messages on the wire, **not missed
+  deltas** (the G.7 shape sensors did exactly their job). Everything we
+  control exonerated by its own sensors: `setup=ok retries=0`; server
+  VAD timestamps match `audio.sent` bytes exactly (3.900 s ↔ 124,800 B;
+  6.810 s ↔ 217,920 B); adaptive abandon worked (3.5 s, not 12 s);
+  first real `latency.table` rows (release_to_final 3.575/3.828,
+  `missing=reply,synth,audible`). **Verdict: wire healthy, model
+  silent** — and a fallback regression candidate (both cycles ended in
+  `transcription.deferred` with, per the owner, no fallback attempt,
+  where scene 5's timeout landed via fallback + reply). Stream H.1
+  traces it; the trace verdict is §5.9.
 
 ## 5. Lessons and watch items
 
@@ -365,6 +392,38 @@ report]:
    flight/reconnect reference (G.1's handle-only sending stays);
    bounded queues + TaskGroup/BaseExceptionGroup → the WP1 1.4 GB
    profiled run.
+9. **Stream H rulings (scene-6 verdict + H.1 trace, 2026-10-27).**
+   Scene-6 verdict stands as §4 records it: wire healthy, model silent,
+   `transcript_family=0 commits=0` both cycles. Defect candidate #1
+   (the fallback regression) is TRACED AND PINNED: both timeout kinds
+   share one post-timeout path and the saved-WAV file-transcription leg
+   FIRES after an adaptive abandon — four fake-driven scenario pins
+   prove it on unmodified behavior (abandon→fallback→landed-or-deferred
+   with wav kept, budget→fallback→landed-or-deferred, with
+   commit-reason assertions). The route decision and fallback outcome
+   are now SCHEMA lines (`post_timeout_route … timeout_kind=…` /
+   `fallback.outcome …`) — the scene-6 "no fallback attempt" reading is
+   consistent with the attempt living only in persona lifecycle rows
+   (`dictate.saved_wav_fallback_start`), which the schema journal never
+   carried. **Contradiction surfaced, not resolved silently** (standing
+   rule): if the scene-6 persona rows show `dictate.saved_wav_fallback_
+   start`, the leg attempted and its OUTCOME (empty/error/5s-timeout) is
+   the real delta vs scene 5; if those rows are ALSO absent, the code
+   that ran was not this branch. Scene 7's `fallback.outcome` line
+   answers in one read either way. H.2: the generic "message" payloads
+   are the per-response TOTAL counter, not a type — sampling now covers
+   every counted type incl. "message" (fields named), and genuinely
+   unnamed shapes get `message.(no-populated-fields)`. H.4 sensors
+   landed (press→first-frame ms, first-non-silent offset, `stream.
+   closed`, `capture.node_state` mic-release probe ~5 s after close).
+   H.3 is the owner-run repro (`scripts/live_repro.py`, arm A =
+   gemini-3.5-transcribe-live with the docs' Manual-VAD verbatim, arm B
+   = gemini-3.8-live side-channel) — it runs FIRST-HAND outside the
+   daemon and its outcome picks the H.5 option. H.5 options are sized
+   in the stream-H phase report; **Gate v2's 8 s bar stands unless the
+   owner re-rules with those numbers in hand**. The double-stop proof
+   is scene 7's FIRST physical step — it has been missed twice (scene 5
+   and scene 6 both ran natural cycles only).
 
 ## 6. Known open defects (logged, not fixed — see phase reports)
 
@@ -402,17 +461,22 @@ report]:
    (WP3 trigger watches for 0.57), quickshell 0.2.1 frozen (do not upgrade),
    Mic1 capture node non-silent (doctor now checks; run it there).
 
-## 7. The next action — Scene 6: the merge-gate run (GATE v2)
+## 7. The next action — Scene 7: the repro + verdict run
 
 Read the format rule first: **every step below is EITHER a TERMINAL
 step (a paste-able block — nothing physical happens while it is on
 screen) OR an EARS step (hands and ears only — no terminal involved).**
 They are never mixed inside one block. Do the steps in order. Scene
 budget: 30 min, daylight, laptop+phone in earshot; both outcomes are
-decisions. GATE v2 (§5.6) is what this run feeds — it does NOT itself
-merge anything.
+decisions. This run feeds the H.1 evidence question and the H.5
+ruling; GATE v2 (§5.6) stands and is NOT merged by anything here.
 
-### Step 0 — TERMINAL: get stream G and restart on branch code
+**The double-stop proof is FIRST this time.** It has been missed twice
+(scene 5 and scene 6 both drifted straight into natural cycles). It is
+a thirty-second step and the run does not continue until it has been
+done.
+
+### Step 0 — TERMINAL: get stream H and restart on branch code
 
 ```
 cd ~/assistant && git fetch origin && git checkout arena/c2a7085d-elaria && git pull && uv sync && systemctl --user daemon-reload && systemctl --user restart assistant && sleep 2 && assist doctor | tail -12
@@ -421,78 +485,113 @@ cd ~/assistant && git fetch origin && git checkout arena/c2a7085d-elaria && git 
 Expect: doctor green (or only known markers). If it is not, STOP and
 report — do not continue the run.
 
-### Step 1 — EARS ONLY. One full sentence, NORMAL VOICE. No terminal.
-
-1. Hold Win+F2. Hear the press earcon the moment F2 lands.
-2. Speak ONE full sentence at the voice you actually use with her —
-   not a shout, not a mumble. The model's VAD filters non-speech, so a
-   normal voice is part of the test, not a courtesy.
-3. Release F2 WHILE STILL HOLDING WIN.
-4. Wait and listen. The turn should feel like a turn: her reply at the
-   end of a wait you did not have to count.
-5. Write down WHAT SHE SAID before touching the terminal.
-
-### Step 2 — TERMINAL: the cycle dump
-
-```
-journalctl --user -u assistant --since -6min -o cat | grep -E "ws.histogram|audio.sent|final.wait|final.received|final.timeout|audio.first_byte|reply.invocation|latency.table|quota.check|session.close|transcription.deferred" | tail -14
-```
-
-Expected lines (GATE v2's evidence — either outcome is a decision):
-
-- `final.received … text_chars=N` with N > 0 — **from the PRIMARY
-  route** (`backend=gemini_live` on the ptt.result). `final.timeout` or
-  `transcription.deferred` means the fallback path answered: a degraded
-  mode, never a gate-passer — report it as red.
-- `ws.histogram … setup=ok retries=0 … transcript_family=N commits=M
-  dupes=D snapshots=S` with N > 0 — and M tells the wire shape:
-  `M < N` proves delta accumulation happened (third-party shape),
-  `M == N` proves one-shot segments (documented shape). `samples=[…]`
-  show the message payloads themselves (text-only) — quote them if
-  anything is odd.
-- `audio.sent … chunks=N bytes=M format=audio/pcm rate=16000` with
-  `bytes/N ≈ 3200`.
-- `latency.table …` with every leg measured: release_to_final_s
-  (~1–3 s expected), final_to_reply_s, reply_to_synth_s,
-  synth_to_audible_s, and **release_to_audible_s ≤ 8.0** (GATE v2's
-  clock).
-- `audio.first_byte … since_synth_s=…` — the playback-start sensor that
-  makes the last leg measured, not inferred.
-- quota: `user-turns (schema.expected)` = 1.
-
-### Step 3 — EARS ONLY. The verdict that only you can give. No terminal.
-
-Two words, both yours, written in the PR thread:
-
-1. WHAT SHE SAID (her exact words, if you did not write them in Step 1).
-2. **Did it feel conversational?** No number replaces this. The gate
-   says "≤ 8 s" but the ear says fast/slow, present/absent — you are the
-   instrument here.
-
-### Step 4 — EARS ONLY. The double-stop proof. LAST. No terminal.
+### Step 1 — EARS ONLY: the double-stop proof. FIRST. No terminal.
 
 1. Hold Win+F2. Hear the press earcon.
-2. Speak a SHORT phrase (a few words is enough).
-3. Release WIN FIRST, then F2 (the opposite order from Step 1).
-4. Listen: exactly ONE reply for the one utterance — no second turn, no
-   jam.
+2. Speak one short sentence at normal voice.
+3. Release WIN first — while F2 is still down.
+4. Then release F2.
+5. Listen: there must be exactly ONE reply. The second release found
+   nothing to stop. Write down what she said (or that nothing came).
 
-### Step 5 — TERMINAL: the tail dump
+### Step 2 — TERMINAL: the double-stop tail
 
 ```
-journalctl --user -u assistant --since -3min -o cat | grep -E "stop.requested|stop.noop|reply.invocation|STUCK" | tail -6
+journalctl --user -u assistant --since "2 minutes ago" -o cat | grep -E "stop\.|ptt.result|latency.table" | tail -8
 ```
 
-Expected: `stop.requested` (source=bind) and `stop.noop` where a second
-stop found nothing to do — one stop, one reply, nothing jammed. Bare-F2
-strictness stays as scene 1 ruled: press/dispatch forbidden, release
-legacy-tolerated until WP3.
+Expect exactly: one `stop.requested` (source=bind), one `stop.noop`
+(the second stop finding nothing), one `ptt.result`, and one
+`latency.table` whose reply/synth/audible legs are present. One stop,
+one reply, nothing jammed. Bare-F2 strictness stays as scene 1 ruled:
+press/dispatch forbidden, release legacy-tolerated until WP3. If the
+tail shows a second `stop.requested` with no `stop.noop`, the proof is
+still missing — report it and continue anyway (the repro arms do not
+depend on it).
+
+### Step 3 — TERMINAL: H.3 repro arm A — the pin itself
+
+The script needs the key from your notes (never paste it anywhere —
+export it in the shell only):
+
+```
+export GEMINI_API_KEY=…   # from your notes; the script never prints it
+cd ~/assistant && uv run python scripts/live_repro.py --arm A
+```
+
+This is one short housekeeping Live session, outside the daemon, the
+docs' Manual-VAD setup verbatim, streaming `audio/20261027-064450-
+77cc4e.wav` (the proven speech) in 100 ms chunks. It prints every raw
+message unfiltered. Paste the final `=== arm A summary ===` block plus
+any `MSG` lines that carried `input_transcription` or
+`interim_input_transcription`.
+
+### Step 4 — TERMINAL: H.3 repro arm B — the side-channel comparison
+
+```
+cd ~/assistant && uv run python scripts/live_repro.py --arm B
+```
+
+Same script, same wav, same Manual-VAD config — only the model changes
+(`gemini-3.8-live`, the docs' example conversational model). Paste the
+same summary block. Now read the ruling tree (it is in the script
+header):
+
+- transcripts in A AND B → live route works outside our stack →
+  deep-dive the parse path with these transcripts as ground truth;
+- zero in A, transcripts in B → the transcribe-live pin/transport
+  combination is the deviation → design-chat ruling on re-pinning;
+- zero in both → account/model gating (unknown #5) → AI Studio
+  entitlement check + the bug-report evidence pack for Google (these
+  two summaries ARE the evidence pack core).
+
+### Step 5 — EARS ONLY: one natural cycle. Normal voice. No terminal.
+
+1. Hold Win+F2, hear the earcon.
+2. Speak ONE full sentence the way you actually talk to her.
+3. Release F2 WHILE STILL HOLDING WIN (the ordinary shape — this cycle
+   is for the sensors, not the stop proof).
+4. Wait and listen. Reply or silence — both are data.
+5. Write down what you heard AND how the start and stop FELT (the
+   "microphone takes a minute" impression — was start slow? did the
+   in-use indicator linger after the turn?).
+
+### Step 6 — TERMINAL: the cycle dump — the stream-H sensors answer now
+
+```
+journalctl --user -u assistant --since "3 minutes ago" -o cat | grep -E "ws.histogram|audio.sent|final\.|transcription\.|post_timeout_route|fallback.outcome|latency.table|capture.stats|stream.closed|capture.node_state" | tail -20
+```
+
+Quote the lot. What each line settles:
+
+- `ws.histogram … transcript_family=N commits=M …` — N>0? the model
+  spoke (gate question). M vs N tells the shape if it did.
+- `post_timeout_route … needs_fallback=… timeout_kind=…` — **the H.1
+  verdict in one line**: which route ran, and was it an adaptive
+  abandon or a budget expiry.
+- `fallback.outcome …` — **the regression question in one line**: the
+  file-transcription leg's result (landed / empty / error). Scene 5
+  recovered here; scene 6 could not say why it did not.
+- `latency.table …` — the 8 s clock: release_to_final / reply_to_synth
+  / synth_to_audible against GATE v2.
+- `capture.stats … first_frame_latency_ms=… first_speech_frame_s=…` —
+  the mic-start numbers.
+- `stream.closed …` + `capture.node_state …` (~5 s after close) — the
+  mic-stop numbers; `state suspended/idle` = actually released,
+  `running` = the indicator was telling the truth.
+
+### Step 7 — EARS ONLY: the mic-lifecycle verdict
+
+Compare the step-5 impressions against step-6's numbers. Which is
+right: the felt minute or the measured milliseconds? This is an
+observation, not a fix — the fix lands in WP1 with the playback work.
 
 ### After the run
 
-Report in the PR thread with tags: the `final.received` line (primary
-or not), the histogram (setup/retries/transcript_family + samples), the
-`latency.table` legs against the 8-second clock, the two EARS answers,
-and the double-stop tail. Both red and green are decisions — a red run
-with these sensors still names the next fix. §5 order after the gate:
+Report in the PR thread with tags: the double-stop tail, both H.3
+summaries and which ruling-tree branch they pick, the cycle dump lines
+above, and the two EARS answers. Then the H.5 ruling (options and
+numbers are in the stream-H phase report) — **Gate v2's 8 s bar stands
+unless you re-rule with those numbers in hand**. Both red and green are
+decisions. §5 order after the gate:
 WP1→WP2→WP4→WP5→WP3 (jump if rpm hyprland ≥ 0.57)→WP6.
