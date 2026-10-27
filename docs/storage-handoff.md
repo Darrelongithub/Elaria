@@ -616,3 +616,92 @@ the authoritative path source. Recorded so nobody "optimises" the poll away late
 **Standing commitment:** every time the PR base moves, the §1 verification table is
 re-run and the §2 contract re-issued or drift reported. That is the mechanism that
 keeps GATE 1e honest without anyone having to remember to ask.
+
+---
+
+## 2026-10-27 — DESIGN-CHAT RULINGS ACKNOWLEDGED (round 4) + GATE 1e RE-VERIFICATION: BASE MOVED
+
+Report 008 is the record. Five rulings received, all confirming the storage lane's
+position, plus one standing commitment that fired.
+
+### RULING 9 — report 007 §2 is CANONICAL, in both lanes
+
+> "Report 007 §2 is CANONICAL for the journal contract in both lanes. It supersedes
+> A.2-R, the original evidence-carrier contract, and any relay prose — including this
+> chat's own prior statements. Future consumers cite 007 §2's reference lines, never a
+> summary."
+
+**RECORDED.** §2's heading now carries the canonical designation. Consequence: §2 is the
+single source of truth; no relay — not even the design chat's own — overrides it. Any
+future consumer that cites a summary instead of the reference lines is wrong.
+
+### RULING 10 — negative drift result accepted; window open; closing event dated to baseline
+
+> "The negative drift result is accepted as recorded: contract stands as verified at
+> f915d8e; GATE 1e window open; the window's closing event (fixture authorship) will be
+> dated against that baseline."
+
+**RECORDED.** Canonical baseline = `f915d8e396d3fed0b3c77af7b21b2031c09ede5b`. Fixture
+authorship is dated against it.
+
+### RULING 11 — belt/suspenders is a RULING, not a comment
+
+> "Belt/suspenders restatement in 007 endorsed — directory poll is truth, journal
+> corroborates. That ordering is a ruling, not a comment; it may not be inverted or
+> 'optimised' without a design-chat entry."
+
+**RECORDED AS BINDING.** Directory poll = **truth**. Journal tail = **corroboration**.
+This may **not** be inverted or "optimised" away without a design-chat entry. This is
+the ruling that makes report 006 DRIFT 6's mitigation mandatory rather than advisory.
+
+### RULING 12 — A.1 stand-down and baseline confirmed
+
+`tests/conftest.py:108` remains Stream H's. Baseline to hold, unchanged: **1913 passed
+/ 6 skipped / 1 error (pre-existing, CPython 3.11 only), ruff clean.**
+
+### RULING 13 — posture unchanged
+
+> "STOPPED AT GATE 1. Nothing to build until the owner's Sheet 1 + Sheet 2 numbers
+> arrive and the design chat rules go/no-go on the MEGA target and the compression
+> multiplier."
+
+**RECORDED.** Nothing built this turn. No module, no parser, no fixtures, no config, no
+CLI, no systemd unit.
+
+### GATE 1e RE-VERIFICATION — THE BASE MOVED (standing commitment fired)
+
+Two Stream H commits landed: `8a72939` and `eae1d01`. New tip
+`eae1d01b402dc2cef9d788956c0851ea1d38c14e`.
+
+**Result: NO schema drift, NO phrasing drift.**
+
+- `git diff f915d8e..eae1d01 -- src/assistant/journal_log.py` → **empty** (byte-identical).
+- The four `audio kept at` sites are **character-identical** on both bases; only line
+  numbers shifted (`daemon.py` 2327→2404, `transcribe.py` 1381→1438 and 1394→1451,
+  `transcribe.py:418` unchanged).
+- All three WP7 event names still emitted; all §2 invariants re-verified by running
+  `journal_log.py`.
+
+**Self-correction:** report 007 said `audio kept at` went "from 2 to 4 occurrences". My
+miscount — it is **4 on both bases**. Corrected in report 008.
+
+**What DID change, and the trap it creates:** Stream H added four new events
+(`capture.node_state`, `stream.closed`, `post_timeout_route`, `fallback.outcome`). Two of
+them emit `verdict` values that **collide** with WP7's:
+
+| event | verdict | WP7-relevant? |
+|---|---|---|
+| `transcription.landed` | `landed` | YES |
+| `fallback.outcome` **(new)** | `landed`/`empty`/`error` | no |
+| `transcription.deferred` | `deferred` | YES |
+| `post_timeout_route` **(new)** | `fallback`/`deferred` | no |
+
+`parts[5] == "landed"` matches **both** `transcription.landed` and `fallback.outcome`.
+Proven by running the module on both shapes.
+
+**BINDING ADDITION TO THE CANONICAL CONTRACT (report 007 §2.1):** the watcher dispatches
+on the **event name** (`parts[2]`) and nothing else. A watcher keyed on verdict would
+treat a fallback file-transcription leg as a WP7 cold-storage candidate — a **silent
+misfire**. Verdict is corroborating state after a match, never the dispatch key.
+
+**Standing commitment re-armed:** the next base movement triggers another full re-run.

@@ -30,7 +30,13 @@ its claims by running `journal_log.py` rather than trusting the relay:
 the first relay in this exchange that survived verification unchanged, and it is
 recorded as such rather than assumed.
 
-### 2. THE VERIFIED BINDING CONTRACT (recorded for the integration round)
+### 2. THE VERIFIED BINDING CONTRACT (CANONICAL — designated by design-chat ruling, 2026-10-27)
+
+> **CANONICAL.** This section is the single source of truth for the journal line
+> contract in **both** lanes. It supersedes A.2-R, the original evidence-carrier
+> contract, and all relay prose — including the design chat's own prior statements.
+> Future consumers cite the reference lines below, never a summary of them.
+> Designated canonical by design-chat ruling, 2026-10-27 (see report 008).
 
 This is the contract the watcher's fixtures will be built against when the window
 closes. Recorded here so it is never re-derived from a relay:
@@ -45,7 +51,30 @@ peak       float | "-"
 verdict    one plain word | "-"
 detail     free text, may contain spaces, may be ABSENT
 PARSE  ::= line.split(" ", 6)   ->  6 parts (no detail) | 7 parts (detail in parts[6])
+DISPATCH ::= key on parts[2] (event) ONLY. NEVER key on parts[5] (verdict).
 ```
+
+### 2.1 DISPATCH RULE — verdict is NOT a discriminator (added after re-verification on the moved base, report 008)
+
+Stream H landed two new events on `eae1d01` whose `verdict` values **collide** with the
+WP7 events. Proven by running `journal_log.py`:
+
+| event (parts[2]) | verdict (parts[5]) | WP7-relevant? |
+|---|---|---|
+| `transcription.landed` | `landed` | **YES** |
+| `fallback.outcome` (NEW) | `landed` / `empty` / `error` | no |
+| `transcription.deferred` | `deferred` | **YES** |
+| `post_timeout_route` (NEW) | `fallback` / `deferred` | no |
+
+`parts[5] == "landed"` matches **both** `transcription.landed` and
+`fallback.outcome`. `parts[5] == "deferred"` matches **both**
+`transcription.deferred` and `post_timeout_route`.
+
+**Binding consequence:** the watcher dispatches on the **event name** (`parts[2]`)
+and nothing else. A watcher keyed on verdict would treat a fallback
+file-transcription leg as a WP7 cold-storage candidate — a silent misfire, the exact
+failure class this design fences against. Verdict may be read as *corroborating
+state* once the event has already matched, never as the dispatch key.
 
 Verified reference outputs, straight from `journal_log.py`:
 
