@@ -705,3 +705,83 @@ treat a fallback file-transcription leg as a WP7 cold-storage candidate — a **
 misfire**. Verdict is corroborating state after a match, never the dispatch key.
 
 **Standing commitment re-armed:** the next base movement triggers another full re-run.
+
+---
+
+## 2026-10-27 — RULINGS ROUND 5 + GATE 1e RE-DATED TO 462fa98 + A.1 FIXED, BASELINE CORRECTED
+
+Report 009 is the record. Five rulings received, the tip moved again, and one of my own
+recorded baselines turned out to be stale.
+
+### RULING 14 — dispatch rule ADOPTED as canonical amendment (007 §2.1)
+
+Consumers key on event name (`parts[2]`), **never** on verdict; verdict is corroborating
+state after a match only. Baseline, not window-contingent. Recorded as the contract
+mechanic's **second pre-code save**. The collision was created by Stream H's new
+visibility sensors and fenced the same day by the standing commitment.
+
+### RULING 15 — rename option DECLINED on the merits
+
+Mainline code is correct, verdict values are event-local semantics, the fence is
+consumer-side and costs nothing. **Recorded as declined-with-reasons, and it must not
+drift into a mainline work queue.** Flagged explicitly so a future turn does not
+"helpfully" re-raise it as a mainline TODO.
+
+### RULING 16 — report 008 self-correction endorsed (canonical-document propagation
+awareness).
+
+### RULING 17 — tip note: re-verify against `462fa98`, do not trust the relay. DISCHARGED.
+
+Ran `diff eae1d01..462fa98` and the full verification table against `462fa98`'s **actual
+`journal_log.py`**, extracted and executed — not inferred from a diff:
+
+| Check | Result |
+|---|---|
+| `git diff eae1d01..462fa98 -- src/assistant/journal_log.py` | **EMPTY — byte-identical** |
+| `audio kept at` sites | **4, character-identical** (only line numbers shifted) |
+| All three WP7 event names emitted | **YES** |
+| Full §2 verification table vs 462fa98's real module | **ALL 12 CHECKS PASS** |
+| Verdict collision | **STILL PRESENT** → dispatch rule still required |
+
+`462fa98` changed only `scripts/live_repro.py` (default `--wav` resolves the daemon's XDG
+audio dir first), `HANDOFF.md` §4 (manifest wav name corrected to the session-id-prefix
+form), and `daemon._mic_release_probe` (capture target read at spawn time). **No journal
+touch.**
+
+**GATE 1e window re-dated to `462fa98fba34e3939ad0ba896df95bf69b7977cf`**, drift-free.
+
+### RULING 18 — posture confirmed: STOPPED AT GATE 1. Sheets 1+2 numbers gate everything.
+
+### A.1 IS FIXED — MY BASELINE WAS STALE, CORRECTED
+
+Stream H adopted the one-liner from report 005. `tests/conftest.py` now reads
+`getattr(task.get_coro(), "__qualname__", "")`. It landed in `8a72939`, after my report
+008 measurement.
+
+**I did not trust the commit message's "1,925 passed / 6 skipped" — I measured it
+myself** in a throwaway worktree at `462fa98` on this sandbox's CPython 3.11:
+
+```
+1925 passed, 6 skipped in 167.84s
+ruff: All checks passed!
+```
+
+**CORRECTED BASELINE TO HOLD: 1925 passed / 6 skipped / 0 errors, ruff clean.**
+The earlier "1913 passed / 6 skipped / 1 error (pre-existing, CPython 3.11 only)" is
+**superseded** — there is no open pre-existing defect any more. Every earlier report
+quoting 1913/1-error is historical, not current.
+
+### Cross-lane fact recorded for the manifest
+
+Kept wavs live at `~/.local/share/assistant/audio/{when}-{session_id[:6]}.wav`
+(e.g. `20261027-064450-77cc4e.wav` for session `77cc4efb1886…`). This is the shape the
+kept-audio path in the journal's `detail` field will follow, so the manifest's path
+handling is designed against the real convention rather than an assumption. It also
+sharpens the privacy fence: that path is a real filesystem location on the owner's
+laptop and must never leave it.
+
+### Standing commitment re-armed, with one new clause
+
+On every base movement: re-run the drift check **and** re-measure the suite. A.1 proved
+a mainline fix can silently change my recorded baseline, so the drift check alone is not
+enough.
