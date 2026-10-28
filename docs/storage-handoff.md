@@ -923,3 +923,54 @@ collide on verdict.
 
 On every base movement: re-run the drift check **and** re-measure the suite, against the
 **origin tip at activation time**.
+
+---
+
+## 2026-10-27 — DOCTRINE RE-TIMED: POLLING ENDS, CONSUMPTION-TIME BEGINS. LANE SLEEPS UNTIL OWNER NUMBERS
+
+Report 011 was accepted and the verification doctrine is **re-timed**. This activation
+recorded the ruling and did nothing else, by instruction. No phase report was written for
+this activation — there was no phase work to report, and manufacturing one would be
+exactly the thing the ruling forbids. The next report is at consumption time or when the
+owner's numbers arrive.
+
+### RULING 26 — the two-clause check is re-timed to CONSUMPTION TIME
+
+- The two-clause check (drift + suite) now runs **ONCE at fixture authorship / any
+  code-consumption event**, against the origin tip at that moment. That is the only
+  load-bearing check — **no consumer of the contract exists before fixtures, so late
+  discovery costs zero.**
+- **Bare base movements trigger NOTHING.** No activation is spent re-dating.
+  **`b3db316` is the last per-movement re-dating; GATE 1e re-dates once, at closing.**
+- **Sole early trigger:** a **NAMED shape/phrasing change flag from mainline** (their
+  A.2-R phase-report obligation) — never a bare SHA move.
+
+**Standing reason this re-timing is safe (recorded):** `log_event` is generic, no
+allowlist, so new schema events are **inert by construction** absent a verdict collision.
+The structural fact from report 011 is now the load-bearing justification, not a
+footnote.
+
+### RULING 27 — the stale-notice catch is recorded as the protocol's first real catch
+
+It caught the design chat's own freshest relay. The notice was accurate when written and
+overtaken by the commit that recorded its verification. **Fetch-not-read paid for itself
+against the best-case source. Relays are claims; the relay was treated as one. Correct.**
+
+### RULING 28 — LANE POSTURE: SLEEP UNTIL OWNER NUMBERS
+
+**No manufactured work.** The contract-shaped design is already canonical (007 §2/§2.1);
+tiers/windows wait on Sheet 2, backend details on Sheet 1, fixtures on Q13 plus the
+consumption-time check. Drafting them now would be **unverified assumptions in
+design-document clothes. Waiting is the gate working.**
+
+**If activated before numbers arrive: acknowledge, do nothing.**
+
+### RULING 29 — baseline unchanged: 1925/6/0, ruff clean. PR #24 stands as the durable
+record. Posture: STOPPED AT GATE 1 — the real gate, the owner's hands.
+
+### What this entry exists to prevent
+
+A future activation, seeing "the base moved", re-running the two-clause check and
+re-dating GATE 1e. **That is now forbidden.** The check fires once, at consumption time.
+The only thing that can wake this lane early is a **named** shape/phrasing change flag
+from mainline — never a bare SHA move, and never an inference from a relay's silence.
