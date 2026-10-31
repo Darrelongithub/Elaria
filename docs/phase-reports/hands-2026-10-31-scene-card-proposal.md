@@ -1,21 +1,37 @@
-# Proposed hands-gate scene card — NOT SCHEDULED / OWNER GATE NOT RUN
+# Canonical SC-H1 scene card — ACCEPTED / SCHEDULED / OWNER GATE NOT RUN
 
 ## DONE
+
+**[TESTED-ONLY] Design acceptance and scheduling, 2026-10-31:** this card is
+accepted as the canonical SC-H1 checklist; the scene is **SCHEDULED** as a
+**daylight, ≤30-minute owner session**. Bridge report
+`hands-2026-10-31-bridge-001.md` at `10354aa` is accepted readiness evidence.
+Precondition 1 is satisfied with the explicit adaptation: design's chat has no
+repo and did not run the suite; acceptance rests on the lane's reported
+**2,103/6/0 + Ruff clean**, the owner-verified tip and ability to rerun. This is
+not a hardware pass. Design rules green/red only after owner evidence returns.
+
+**[TESTED-ONLY] Appendix B:** runnable commands, live read-only aggregate and
+journal-row manifest inspection, teardown and the fillable return are in
+`hands-2026-10-31-sc-h1-appendix-b.md`. This status update does not change the
+checklist or settled rules. A real desktop notification is a DEFECT, the console
+preview must be byte-exact, the manifest renders journal rows only, and an
+earlier legitimate read stays in the trace without counting as trap execution.
 
 **[TESTED-ONLY] Readiness update, 2026-10-31:** standalone synthetic bridge
 preflight is green: **2,103 passed / 6 skipped / 0 errors**, Ruff clean.
 See `hands-2026-10-31-bridge-001.md`. Shipped JS drove the actual Unix socket,
 parked queue and tmp library for typed/button Yes/No, mocked R8 and trap checks.
-This closes the missing-bridge blocker, **not** the owner gate. The scene is
-still unscheduled; no hardware action is requested by this card.
+This closed the missing-bridge blocker, **not** the owner gate. Design has now
+accepted readiness and scheduled the scene as recorded above.
 
 **[TESTED-ONLY]** Sandbox core pre-gates pass (core increment 001). The composite
 pytest proves real synthetic file moves, an explicit-path collision ask, durable
 Yes, re-read hashes/counts, preserved occupied target and byte-identical undo.
 The trap tests exercise all four required outcomes against six synthetic origins.
 
-**[UNVERIFIED]** This is a proposal for design review, not an owner instruction,
-calendar booking, runnable command sheet or hardware acceptance claim. Nothing
+**[UNVERIFIED]** Hardware execution and acceptance remain unmeasured. This is
+now the accepted checklist; Appendix B supplies the owner commands. Nothing
 is `[HW-PROVEN]` yet. The owner supplies only aggregate scene results, never
 real files, filenames, content, credentials, database dumps or raw journal lines.
 
@@ -24,8 +40,9 @@ real files, filenames, content, credentials, database dumps or raw journal lines
 - **[TESTED-ONLY] CLOSED:** the standalone synthetic bridge is shipped and
   pre-gated through the actual JS controller and Unix IPC. No local preview
   button or static image is counted as a persisted decision.
-- **[UNVERIFIED] HOLD:** design has not scheduled the daylight owner scene or
-  ruled its hardware evidence. Preflight green is not permission to self-schedule.
+- **[TESTED-ONLY] SCHEDULED BY DESIGN:** the daylight owner scene is authorized
+  by the explicit 2026-10-31 ruling, not self-scheduled from preflight green.
+  **[UNVERIFIED]** Design has not yet ruled the owner's hardware evidence.
 - **[UNVERIFIED] OWNER GATE:** Quickshell 0.2.1 branch load, focus and actual
   private-card visibility have not been tested on Fedora 44 / Hyprland 0.57 /
   Wayland. The scheduled scene must stop as STUCK if these fail.
@@ -33,10 +50,10 @@ real files, filenames, content, credentials, database dumps or raw journal lines
   this synthetic scene. No live Gemini key/model traffic, real subprocess task
   runner, desktop notification dispatch or owner-content mutation may be enabled.
 
-## NEXT GATE — proposed checklist, only after design schedules it
+## NEXT GATE — accepted checklist for the design-scheduled scene
 
-**[UNVERIFIED] Proposed budget:** one daylight session, at most 30 minutes.
-The design chat must approve readiness, schedule it and rule the evidence.
+**[UNVERIFIED] Scheduled budget:** one daylight session, at most 30 minutes.
+Design has approved readiness and scheduled it; design must still rule evidence.
 A failed prerequisite or scene check stops the scene; no retry loop.
 
 ### Preconditions (stop if any fail)
@@ -89,7 +106,7 @@ A failed prerequisite or scene check stops the scene; no retry loop.
   CLI deletes its scratch lab on graceful exit: inspect/journal-check synthetic
   state while it remains running, before teardown; return aggregates only.
 
-### Proposed aggregate return sheet
+### Aggregate return sheet (fillable version in Appendix B)
 
 **[UNVERIFIED] Fields only; not populated results:** branch/commit, QML load
 REACHED/STUCK, focus preserved yes/no, plan-before-exec yes/no, T1 move count,
@@ -105,6 +122,6 @@ information are requested.
 
 ## OPEN QUESTIONS
 
-**[UNVERIFIED]** Design scheduling/acceptance is next now that the synthetic
-bridge blocker is closed; rendering/focus remain scene checks. No settled tier, grammar, privacy or queue rule is reopened. No hardware
-session is requested by this proposal itself.
+**[UNVERIFIED]** Await the scheduled owner's aggregates and four human-sensor
+answers, then design's explicit green/red ruling. Rendering/focus remain scene
+checks. No settled tier, grammar, privacy or queue rule is reopened.

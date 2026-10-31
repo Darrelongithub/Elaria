@@ -295,3 +295,75 @@ is being scheduled by this lane.
 
 [TESTED-ONLY] None new; R1–R8 unchanged. Await design scheduling/evidence ruling,
 not another policy-choice round. Final status must record the actual pushed SHA.
+
+## 2026-10-31 — design accepts canonical card; SC-H1 scheduled; Appendix B
+
+### DONE
+
+[TESTED-ONLY] Explicit design ruling: card ACCEPTED as the canonical SC-H1
+checklist; scene SCHEDULED as a daylight owner session of at most 30 minutes.
+Readiness report `hands-2026-10-31-bridge-001.md` at **10354aa** is ACCEPTED.
+Precondition 1 is satisfied with the honest adaptation: design's chat has no
+repo and did not run the suite; acceptance relies on the reported **2,103/6/0 +
+Ruff clean**, the owner-verified tip, and the owner's ability to rerun. This
+supersedes the earlier unscheduled status; it does not assert a hardware pass.
+
+[TESTED-ONLY] Appendix B ordered and supplied as a docs-only owner sheet:
+`docs/phase-reports/hands-2026-10-31-sc-h1-appendix-b.md`. It pins runtime to
+10354aa on this branch, uses the actual `assistant.hands.bridge --socket` and
+Quickshell `--path` invocations, and gives a read-only terminal counter display
+and journal-row manifest while the ephemeral lab remains running. No fake UI
+controls/flags: optional undo is NOT RUN because the pinned bridge exposes no
+undo action. It preserves the inspect → start → T1 → collision → typed yes →
+completion → optional undo → trap sequence, then checks R8/No/reconnect and
+provides every card field plus four beats-sheet human-answer slots.
+
+[TESTED-ONLY] Embedded design rulings carried forward unchanged: any real
+desktop notification is a DEFECT (not a test); the in-console preview must be
+exactly `elaria needs a yes`; manifest entries render existing journal rows
+only; earlier legitimate reads remain in the trace and are not trap execution.
+No owner content, raw journal lines, dumps or screenshots in the appendix or
+return flow. Return aggregates only; the sanitized local manifest is not sent.
+
+[TESTED-ONLY] Checkout provenance this activation: local metadata again began
+at ed20344 with retained lane files untracked. The remote still resolved to the
+exact **10354aaea5bb97b0fd6d224c23a82bad976fcfae**. Fetched that commit, verified
+the retained/indexed tree equals it exactly, and advanced only the current
+branch ref to that exact existing commit. No recreated ancestry, new recovery
+commit, branch switch, reset, lost-file replacement or code changes.
+
+### DEFECTS FOUND
+
+[UNVERIFIED] Owner Qt load/rendering/focus and scene outcomes remain unmeasured.
+The pinned QML has no numeric counter panel or manifest/undo control. Appendix B
+honestly supplies a read-only counter/journal observer rather than claiming
+those controls; optional undo is explicitly skipped, not claimed passed.
+The CLI gracefully deletes scratch journals, so observations precede teardown.
+
+### NEXT GATE
+
+[UNVERIFIED] After the docs-only commit is pushed, owner pulls Appendix B,
+executes the scheduled daylight ≤30-minute scene with design's beats sheet,
+and returns the filled aggregate form plus four human-sensor answers here.
+Design alone rules green or red. Any failed prerequisite/check stops the scene;
+no silent retries, new permissions, integration, real task runner, live traffic,
+real-tree mutation, desktop dispatch, mounting or merge is authorized.
+
+### OPEN QUESTIONS
+
+[TESTED-ONLY] None new. The beats sheet supplies the four human-sensor questions;
+Appendix B does not invent or replace them. R1–R8 and the canonical checklist
+stand. Acceptance/scheduling is recorded; hardware green is not inferred.
+
+[TESTED-ONLY] Appendix validation before its docs-only commit: full suite
+**2,103 passed / 6 skipped / 0 errors**, **96.79s**, Ruff clean. Extracted the
+exact Appendix B observer and exercised 12 boundaries over the real Unix bridge:
+startup zeros, ready, parked, company, class, locked, unknown, normal, complete,
+trap prepared, trap refused and terminal No. All passed; private paths/content
+and raw journal lines were not printed. The synthetic plan hash is displayed
+locally for pre-Start version inspection, never included in the return form.
+Observer uses snapshot + read-only SQLite; no runtime code or committed tests
+changed. Backend `--help` confirms the actual `--socket` flag; Quickshell 0.2.1
+upstream `src/launch/parsecommand.cpp` confirms `--path`/`--version`. This API
+review is not a QML load/focus claim. Remote push SHA is verified after commit
+and reported in final status rather than predicted inside its own commit.
