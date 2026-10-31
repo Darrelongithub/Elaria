@@ -22,15 +22,18 @@ from assistant.asr import Transcript
 from assistant.capture import SimulatedCapture
 from assistant.journal_log import (
     STUMP_MAX_CHARS,
-    bind as bind_journal,
     log_transcription_stump,
-    reset as reset_journal,
     stump_verdict,
+)
+from assistant.journal_log import (
+    bind as bind_journal,
+)
+from assistant.journal_log import (
+    reset as reset_journal,
 )
 from assistant.live_client import ScriptedLiveTransport
 from assistant.store import Store
 from assistant.transcribe import DictationService
-
 
 # -- the detector -----------------------------------------------------------
 
@@ -152,7 +155,7 @@ def test_dictate_landing_a_stump_logs_the_sensor(config, tmp_path,
 
 def test_dictate_landing_a_real_sentence_logs_no_stump(config, tmp_path,
                                                        monkeypatch):
-    result, lines = _dictate(
+    _result, lines = _dictate(
         config, tmp_path, monkeypatch,
         "Recovered words from the saved audio.")
     assert "transcription.landed" in lines

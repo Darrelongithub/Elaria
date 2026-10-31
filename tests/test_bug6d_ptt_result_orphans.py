@@ -85,7 +85,7 @@ class SlowDictation:
 
     async def dictate(self, source, *, mode="narration", sink=None,
                       stop_event=None, is_playback_active=None,
-                      session_id=None):
+                      session_id=None, on_final_text=None):
         await stop_event.wait()
         await asyncio.sleep(self.delay_s)
         return _result(session_id or "slow", self.text)
@@ -96,7 +96,7 @@ class SelfFinishingDictation:
 
     async def dictate(self, source, *, mode="narration", sink=None,
                       stop_event=None, is_playback_active=None,
-                      session_id=None):
+                      session_id=None, on_final_text=None):
         return _result(session_id or "done", "lost transcript")
 
 

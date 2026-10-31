@@ -537,7 +537,8 @@ class DictationService:
                       stop_event: asyncio.Event | None = None,
                       is_playback_active: Callable[[], bool] | None = None,
                       session_id: str | None = None,
-                      clock: Callable[[], float] | None = None) -> SessionResult:
+                      clock: Callable[[], float] | None = None,
+                      on_final_text: Callable[[str], None] | None = None) -> SessionResult:
         session_id = session_id or uuid.uuid4().hex[:12]
         emit = sink or _noop_sink
         self._log("dictate.enter", session_id=session_id, mode=mode, source_target=str(getattr(source, "target", None) or "default"))
@@ -1468,6 +1469,17 @@ class DictationService:
                       live_final_missing=live_terminal_missing,
                       audio_path=str(audio_path) if audio_path else None,
                       bytes=captured_bytes, duration_s=round(duration_s, 3))
+        elif on_final_text is not None and final_text:
+            # M-4 early dispatch (G.7.3(ii)): chat starts the moment the
+            # leg lands — before the cleanup model call and persist, which
+            # are the serial work between final text and reply generation
+            # (final_to_reply on 94129e was 4.93 s). The daemon's gate
+            # owns every veto; a callback failure never breaks the flow.
+            try:
+                on_final_text(final_text)
+            except Exception as exc:
+                self._log("dictate.early_dispatch_failed", session_id=session_id,
+                          error=f"{type(exc).__name__}: {exc}"[:200])
 
         cloud_status = self._cloud_status(
             backend=backend, confidence=confidence, raw=final_text,

@@ -281,6 +281,11 @@ class Daemon:
         # synth → audible, each a monotonic mark, emitted as latency.table.
         self._stage_marks: dict[str, dict[str, float]] = {}
         self._latency_emitted: set[str] = set()
+        # M-4 early dispatch (G.7.3(ii)): chat starts the moment the
+        # transcription leg lands — before cleanup/persist. session_id ->
+        # (reply task, true dispatch mark). The late gate REUSES the task
+        # (exactly one reply per session) or cancels it (echo/veto paths).
+        self._early_reply_tasks: dict[str, tuple[asyncio.Task, float]] = {}
         # BUG F / Bug 8 (2026-10-20): the single 4 s total-turn bound is gone.
         # Two deadlines from [gemini]: a streaming first-token deadline (a
         # transport with no first token is dead) and a generous total bound (a
@@ -369,7 +374,11 @@ class Daemon:
 
     def _collect_speech_marks(self, session_id, task: asyncio.Task) -> None:
         """Fold the speech result's synth/play marks into the stage table
-        and emit latency.table once the last leg lands (G.6)."""
+        and emit latency.table once the last leg lands (G.6).
+
+        M-4: a streamed result also carries `first_slice_mark` — the
+        first-audible-at-slice stage (G.7.3(i)); for streamed playback the
+        `audible` mark rides it (sound starts at the first slice)."""
         try:
             result = task.result()
         except Exception:
@@ -377,10 +386,13 @@ class Daemon:
             return
         synth = getattr(result, "synth_mark", None)
         play = getattr(result, "play_mark", None)
+        first = getattr(result, "first_slice_mark", None)
         if synth is not None:
             self._stage(session_id, "synth", synth)
         if play is not None:
             self._stage(session_id, "audible", play)
+        if first is not None:
+            self._stage(session_id, "first_slice", first)
         self._emit_latency_table(session_id, final=True)
 
     def _emit_latency_table(self, session_id, *, final: bool = False) -> None:
@@ -395,10 +407,24 @@ class Daemon:
                 and "synth" not in marks and "audible" not in marks):
             return   # reply speech still pending — the callback emits
         self._latency_emitted.add(sid)
-        order = [m for m in required if m in marks]
+        # M-4: legs run over every stage present in CHRONOLOGICAL order —
+        # streaming breaks the old synth-before-audible assumption (the
+        # first slice is audible WHILE synthesis continues). Zero-length
+        # legs (coincident marks: streamed audible == first_slice) are
+        # skipped; the canonical five keep their names and `missing=`.
+        tie = {"release": 0, "final": 1, "reply": 2, "audible": 3,
+               "first_slice": 4, "synth": 5}
+        order = sorted((m for m in marks if m in tie),
+                       key=lambda name: (marks[name], tie[name]))
         legs = []
         for a, b in itertools.pairwise(order):
-            legs.append(f"{a}_to_{b}_s={round(marks[b] - marks[a], 3)}")
+            delta = round(marks[b] - marks[a], 3)
+            if delta == 0:
+                continue
+            legs.append(f"{a}_to_{b}_s={delta}")
+        if "release" in marks and "first_slice" in marks:
+            legs.append(f"release_to_first_slice_s="
+                        f"{round(marks['first_slice'] - marks['release'], 3)}")
         if "release" in marks and "audible" in marks:
             legs.append(f"release_to_audible_s="
                         f"{round(marks['audible'] - marks['release'], 3)}")
@@ -407,6 +433,47 @@ class Daemon:
                   detail="; ".join(legs)
                          + (f"; missing={','.join(missing)}" if missing else ""))
         self._stage_marks.pop(sid, None)
+
+    # -- M-4 early dispatch (G.7.3(ii)): chat at leg-landing ---------------
+    def _early_dispatch_reply(self, session_id: str, text: str,
+                              params: dict) -> bool:
+        """Chat starts the moment the leg lands (mini order M-4).
+
+        Conversation/narration only: the command gate needs cleanup's
+        `flagged` verdict, which does not exist at leg-landing. The other
+        vetoes the late gate applies (silence, empty, echo-to-empty) are
+        checked here identically; the late path REUSES this task (exactly
+        one reply per session) and re-checks the echo veto on the cleaned
+        text (a late strip-to-empty cancels it).
+        """
+        sid = str(session_id or "")
+        if not sid or sid in self._early_reply_tasks:
+            return False
+        if self._dictation_session_mode not in ("conversation", "narration"):
+            return False
+        stripped = self._strip_self_echo(text)
+        if not stripped:
+            return False
+        started = time.monotonic()
+        self._dictate_log("dictate.reply_generation_start", session_id=sid,
+                          early=True)
+        log_event("reply.invocation", session_id=sid, verdict="invoked",
+                  detail=(f"mode={self._dictation_session_mode}; "
+                          f"text_chars={len(stripped)}; "
+                          f"speak={bool(params.get('speak', True))}; "
+                          f"early=true"))
+        self._stage(sid, "reply", started)
+        task = asyncio.create_task(self._ask({
+            "text": stripped,
+            "speak": bool(params.get("speak", True)),
+            "session_id": sid,
+        }))
+        self._early_reply_tasks[sid] = (task, started)
+        return True
+
+    def _claim_early_reply(self, session_id: str):
+        """Pop this session's early reply (single-fire: one claim wins)."""
+        return self._early_reply_tasks.pop(str(session_id or ""), None)
 
     def is_speaking(self) -> bool:
         return bool(self._ack_playbacks or self._speech_playbacks) or (
@@ -1040,8 +1107,18 @@ class Daemon:
     async def _halt(self, params: dict) -> dict:
         set_halt(self.config.socket_path.parent)
         self.mode = "halted"
+        # G.7.3(i)/M-4 interrupt: drain any streamed playback queue + flag
+        # (cutoff < 100 ms contract) and reset the turn state — halt must
+        # stop mid-reply, not just stop the executor (G.7.2's gap).
+        try:
+            cutoff = await asyncio.to_thread(self.speech.interrupt_speech)
+        except Exception as exc:  # halt never fails on speech
+            cutoff = {"interrupted": False,
+                      "error": f"{type(exc).__name__}: {exc}"[:120]}
+        self._set_speaking(False)
         await self.broadcast({"event": "status.changed", "mode": self.mode, "halted": True})
-        return {"halted": True, "note": "executor checks this flag between every op (§4.4)"}
+        return {"halted": True, "note": "executor checks this flag between every op (§4.4)",
+                "speech_interrupted": cutoff}
 
     async def _resume(self, params: dict) -> dict:
         clear_halt(self.config.socket_path.parent)
@@ -1821,12 +1898,18 @@ class Daemon:
                   detail=(f"{self._dictation_session_mode} session open — "
                           f"capture target {self._ptt_capture_target}"))
         try:
+            def early_dispatch(text: str) -> None:
+                # M-4: the leg landed — hand the text to the gate NOW; the
+                # turn's tail work (cleanup, persist) continues after.
+                self._early_dispatch_reply(session_id, text, params)
+
             self._dictation_task = self._track_task(asyncio.create_task(
                 self.dictation.dictate(
                     muted_source, mode=self._dictation_session_mode,
                     sink=dictation_sink, stop_event=self._stop_event,
                     is_playback_active=self.is_speaking,
-                    session_id=session_id)))
+                    session_id=session_id,
+                    on_final_text=early_dispatch)))
             self._ptt_log("ptt.start.dictate_spawned", session_id=session_id)
             # Stream H.4 (2026-10-27): the owner sees the mic in-use
             # indicator linger after a session ("takes a minute to …
@@ -2256,6 +2339,13 @@ class Daemon:
                     result["narration"] = "echo suppressed — own TTS captured as input"
                     if session_mode == "command":
                         result["command"] = None
+                    # M-4: an early-dispatched reply for text that later
+                    # strips to empty (the cleaned transcript matched her
+                    # spoken words) must not speak — cancel it here.
+                    early_echo = self._claim_early_reply(session_id)
+                    if early_echo is not None:
+                        early_echo[0].cancel()
+                        early_echo[0].add_done_callback(self._consume_task_result)
             # The mode is captured at release time: a new dictation started
             # while this one is finishing must not reroute these words.
             # SILENCE HOTFIX rule 4: a silence-verdict session never reaches
@@ -2282,37 +2372,49 @@ class Daemon:
                     # above (BH-K2); what remains is the user's and may route.
                     reply_timeout_s = max(
                         0.1, min(10.0, float(self._chat_timeout_s)))
-                    self._dictate_log(
-                        "dictate.reply_generation_start",
-                        session_id=str(session_id or ""),
-                        timeout_s=reply_timeout_s)
-                    # Schema line for the gate: the reply invocation is a
-                    # journal fact, not only a persona-event whisper.
-                    log_event("reply.invocation", session_id=str(session_id or ""),
-                              verdict="invoked",
-                              detail=(f"mode={session_mode}; "
-                                      f"text_chars={len(result['text'])}; "
-                                      f"speak={params.get('speak', True)}"))
-                    reply_started = time.monotonic()
-                    self._stage(str(session_id or ""), "reply", reply_started)
-                    from .intents import route as route_intent
+                    early = self._claim_early_reply(session_id)
+                    if early is not None:
+                        # M-4 early dispatch: chat started the moment the
+                        # leg landed — reuse the SAME task (exactly one
+                        # reply per session) with its true start mark.
+                        reply_task, reply_started = early
+                        self._stage(str(session_id or ""), "reply", reply_started)
+                        self._dictate_log(
+                            "dictate.reply_generation_reused",
+                            session_id=str(session_id or ""),
+                            elapsed_s=round(time.monotonic() - reply_started, 3))
+                    else:
+                        self._dictate_log(
+                            "dictate.reply_generation_start",
+                            session_id=str(session_id or ""),
+                            timeout_s=reply_timeout_s)
+                        # Schema line for the gate: the reply invocation is a
+                        # journal fact, not only a persona-event whisper.
+                        log_event("reply.invocation", session_id=str(session_id or ""),
+                                  verdict="invoked",
+                                  detail=(f"mode={session_mode}; "
+                                          f"text_chars={len(result['text'])}; "
+                                          f"speak={params.get('speak', True)}"))
+                        reply_started = time.monotonic()
+                        self._stage(str(session_id or ""), "reply", reply_started)
+                        from .intents import route as route_intent
 
-                    try:
-                        parsed_intent = route_intent(result["text"])
-                    except Exception:
-                        parsed_intent = None
-                    ask_params = {
-                        "text": result["text"],
-                        "speak": params.get("speak", True),
-                        "session_id": str(session_id or ""),
-                    }
-                    if session_mode == "command":
-                        # Known local commands keep their existing grammar
-                        # path. Real, above-floor speech with no recognized
-                        # task goes to a generated clarification, never a
-                        # stock ack/greeting.
-                        ask_params["unparsed_command"] = parsed_intent is None
-                    reply_task = asyncio.create_task(self._ask(ask_params))
+                        try:
+                            parsed_intent = route_intent(result["text"])
+                        except Exception:
+                            parsed_intent = None
+                        ask_params = {
+                            "text": result["text"],
+                            "speak": params.get("speak", True),
+                            "session_id": str(session_id or ""),
+                        }
+                        if session_mode == "command":
+                            # Known local commands keep their existing grammar
+                            # path. Real, above-floor speech with no recognized
+                            # task goes to a generated clarification, never a
+                            # stock ack/greeting.
+                            ask_params["unparsed_command"] = parsed_intent is None
+                        reply_task = asyncio.create_task(self._ask(ask_params))
                     try:
                         done, _pending = await asyncio.wait(
                             {reply_task}, timeout=reply_timeout_s,
@@ -2377,6 +2479,13 @@ class Daemon:
                       "narration": "no speech captured"}
         finally:
             self._ptt_log("ptt.finish.finally", session_id=str(session_id or ""), has_result=str(result is not None))
+            # M-4: an early reply the gate never claimed (veto, silence,
+            # echo, or a session that errored out) must not speak for a
+            # turn that never completed — cancel it, exactly-one-reply.
+            orphan = self._claim_early_reply(session_id)
+            if orphan is not None:
+                orphan[0].cancel()
+                orphan[0].add_done_callback(self._consume_task_result)
             if session_id is not None:
                 self._ptt_last_result = result
                 self._ptt_last_session_id = session_id

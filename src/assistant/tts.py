@@ -140,9 +140,210 @@ class SpeechResult:
     # so reply→synth and synth→audible are measured, never inferred.
     synth_mark: float | None = None
     play_mark: float | None = None
+    # M-4 (G.7.3(i), mini order M): streamed playback — the first ~50 ms
+    # slice written to the raw player is the first-audible-at-slice mark,
+    # and `audible` rides it (sound starts at the first slice, while
+    # synthesis continues).
+    first_slice_mark: float | None = None
+    streamed: bool = False
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+# -- G.7.3(i) chunked playback queue (mini order M-4, 2026-10-31) ----------
+#
+# PCM sliced ~50 ms (2,400 B at 24 kHz s16le mono) into a raw-PCM player's
+# stdin; playback starts at the FIRST slice instead of the finished wav —
+# the W6 whale (reply_to_synth 11.77 s) is synthesized-but-unheard time.
+# Interrupt = drain the queue + flag + close: the G.7.2 fix pattern, a
+# drained queue stops mid-reply, cutoff < 100 ms by design contract (the
+# latency scene card measures it on hardware).
+
+SLICE_SECONDS = 0.05
+
+
+def raw_stream_candidates(rate: int) -> list[list[str]]:
+    """Raw-PCM stdin player argvs, in preference order.
+
+    These are the RAW-stdin contracts of the same players the file path
+    uses (`[tts] player = auto`): paplay's --raw mode reads stdin, pw-cat
+    reads `-`, aplay reads stdin with `-t raw`. A custom `[tts] player`
+    string is honoured for FILE playback only — its argv contract for raw
+    stdin is unknown, so streaming stays off there (whole-wav path).
+    [UNVERIFIED-argv] until the latency scene: spawn failures fall back to
+    whole-wav playback by construction (the wav is always written).
+    """
+    return [
+        ["paplay", "--raw", "--format=s16le", f"--rate={rate}",
+         "--channels=1"],
+        ["pw-cat", "--rate", str(rate), "--channels", "1",
+         "--format", "s16", "-"],
+        ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(rate),
+         "-c", "1"],
+    ]
+
+
+class ChunkedPlayback:
+    """One streamed playback: a slice queue over a raw-PCM player process.
+
+    `feed()` is the synthesis sink — it NEVER raises (a dead player drops
+    the stream and the caller falls back to whole-wav playback; audio is
+    never lost because the full wav is written regardless). First slice
+    written = first audible = `first_slice_mark` + `audio.first_byte`.
+    `interrupt()` drains the queue, flags, and cuts the player off — the
+    measured cutoff is returned (`cutoff_ms`).
+    """
+
+    def __init__(self, candidates: list[list[str]], *, rate: int = 24000,
+                 session_id: str | None = None, popen_factory=None):
+        self._candidates = [list(c) for c in candidates]
+        self._rate = int(rate)
+        self._session_id = session_id
+        self._popen = popen_factory or subprocess.Popen
+        self._slice_bytes = max(2, int(self._rate * SLICE_SECONDS)) * 2
+        self._buffer = bytearray()
+        self._proc = None
+        self._argv: list[str] | None = None
+        self._spawn_error = ""
+        self._error = ""
+        self._drained = False
+        self._interrupted = False
+        self.first_slice_mark: float | None = None
+
+    @property
+    def slice_bytes(self) -> int:
+        return self._slice_bytes
+
+    @property
+    def interrupted(self) -> bool:
+        return self._interrupted
+
+    def _spawn(self) -> bool:
+        if self._proc is not None:
+            return True
+        for argv in self._candidates:
+            try:
+                self._proc = self._popen(
+                    argv, stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    bufsize=0, **child_kwargs())
+                self._argv = argv
+                return True
+            except Exception as exc:
+                self._spawn_error = f"{argv[0]}: {type(exc).__name__}: {exc}"
+                self._proc = None
+        return False
+
+    def feed(self, pcm: bytes) -> None:
+        if self._drained or self._interrupted:
+            return
+        try:
+            self._buffer.extend(pcm)
+            while len(self._buffer) >= self._slice_bytes:
+                if not self._spawn():
+                    self._drained = True
+                    return
+                chunk = bytes(self._buffer[:self._slice_bytes])
+                del self._buffer[:self._slice_bytes]
+                first = self.first_slice_mark is None
+                self._proc.stdin.write(chunk)
+                self._proc.stdin.flush()
+                if first:
+                    self.first_slice_mark = time.monotonic()
+                    self._log_first_byte()
+        except Exception as exc:  # the sink contract: never raises
+            self._error = f"{type(exc).__name__}: {exc}"[:200]
+            self._drained = True
+
+    def _log_first_byte(self) -> None:
+        if self._session_id is None:
+            return
+        log_event("audio.first_byte", session_id=str(self._session_id),
+                  verdict="audible",
+                  detail=(f"at=slice; slice_ms={SLICE_SECONDS * 1000:.0f}; "
+                          f"player={self._argv[0] if self._argv else '?'}; "
+                          f"first-audible-at-slice"))
+
+    def _kill(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+        except Exception:  # noqa: S110
+            pass
+        try:
+            proc.wait(timeout=0.05)
+        except Exception:  # a stuck player still gets killed
+            try:
+                proc.kill()
+                proc.wait(timeout=0.05)
+            except Exception:  # noqa: S110
+                pass
+
+    def close(self, *, timeout_s: float = 30.0) -> dict:
+        """Flush the tail slice, close the queue, wait for the player.
+
+        played=True only when the player consumed the stream and exited 0 —
+        anything else is a named failure the caller answers with the
+        whole-wav fallback (audio is never lost).
+        """
+        played = False
+        if (self._buffer and self.first_slice_mark is not None
+                and not self._drained and not self._interrupted):
+            try:
+                if self._spawn():
+                    self._proc.stdin.write(bytes(self._buffer))
+                    self._proc.stdin.flush()
+            except Exception as exc:  # a tail-flush failure is recorded
+                self._error = f"{type(exc).__name__}: {exc}"[:200]
+                self._drained = True
+        self._buffer.clear()
+        if self._proc is not None:
+            try:
+                self._proc.stdin.close()
+            except Exception:  # noqa: S110
+                pass
+            try:
+                returncode = self._proc.wait(timeout=timeout_s)
+                # a stream that errored is never claimed as played, even if
+                # the player exited 0 (the ear may have missed part of it)
+                played = returncode == 0 and not self._error
+                if returncode != 0:
+                    self._error = self._error or f"player exited {returncode}"
+            except Exception as exc:  # an un-exiting player is killed
+                self._error = self._error or \
+                    f"player did not exit: {type(exc).__name__}: {exc}"
+                self._kill()
+        elif self.first_slice_mark is not None:
+            self._error = self._error or "player died mid-stream"
+        else:
+            self._error = (self._error or self._spawn_error
+                           or "no raw-PCM player available")
+        return {"played": played,
+                "player": self._argv[0] if self._argv else None,
+                "argv": self._argv, "error": self._error,
+                "interrupted": self._interrupted,
+                "first_slice_mark": self.first_slice_mark}
+
+    def interrupt(self) -> dict:
+        """G.7.3(i): drain queue + flag + cut off. Returns the measured
+        cutoff in ms — the design contract is < 100 ms."""
+        started = time.monotonic()
+        self._interrupted = True
+        self._drained = True
+        self._buffer.clear()
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.stdin.close()
+            except Exception:  # noqa: S110
+                pass
+            self._kill()
+        cutoff_ms = (time.monotonic() - started) * 1000
+        return {"interrupted": True, "cutoff_ms": cutoff_ms,
+                "player": self._argv[0] if self._argv else None}
 
 
 class TtsBackend(Protocol):
@@ -259,7 +460,7 @@ class SpeechService:
 
     def __init__(self, config, store=None, *, backend: TtsBackend | None = None,
                  runner=None, player_runner=None, client=None, is_online=None,
-                 presence=None):
+                 presence=None, popen_factory=None):
         self.config = config
         self.store = store
         self._client = client
@@ -273,6 +474,11 @@ class SpeechService:
         self._backend_override = backend
         self._runner = runner
         self._player_runner = player_runner or subprocess.run
+        # M-4 (G.7.3(i)): streamed playback spawns a raw-PCM player per
+        # synthesis; the active queues are tracked so interrupt_speech()
+        # can drain them (cutoff < 100 ms contract).
+        self._popen_factory = popen_factory or subprocess.Popen
+        self._active_players: set = set()
         settings = config.section("tts") if config else {}
         cache_setting = settings.get("cache_dir")
         self.cache_dir = (Path(cache_setting).expanduser() if cache_setting
@@ -620,15 +826,24 @@ class SpeechService:
             raise
         return dest
 
-    def _speak_with_gemini(self, text: str, path: Path) -> SpeechResult:
+    def _speak_with_gemini(self, text: str, path: Path, *,
+                           on_chunk=None) -> SpeechResult:
         """Native audio for `text`. A failure is a reported silence - the dormant
-        local voice is never used to paper over a missing cloud voice."""
+        local voice is never used to paper over a missing cloud voice.
+
+        M-4: when `on_chunk` is given, synthesis STREAMS — each PCM chunk
+        reaches the sink as the Live model emits it (the slice queue plays
+        it while synthesis continues), while the full wav is still written
+        for the cache and the evidence record."""
         client = self._gemini_client()
         if client is None:
             raise TtsUnavailable("no Gemini client available and the local voice is dormant")
         request = client.voice_request(text)
         try:
-            audio = client.generate_voice(text, correlation_id="voice")
+            voice_kwargs = {"correlation_id": "voice"}
+            if on_chunk is not None:
+                voice_kwargs["on_chunk"] = on_chunk
+            audio = client.generate_voice(text, **voice_kwargs)
         except Exception as exc:
             self.last_voice_error = f"gemini native audio failed: {exc}"
             # §4.8: a synthesis failure is a visible marker — reported silence,
@@ -651,7 +866,7 @@ class SpeechService:
                             cached=False, local=False, cloud_voice=True)
 
     def synthesize(self, text: str, dest: Path | None = None, *,
-                   use_cache: bool = True) -> SpeechResult:
+                   use_cache: bool = True, on_chunk=None) -> SpeechResult:
         text = text.strip()
         if not text:
             raise ValueError("speech text is empty")
@@ -685,7 +900,7 @@ class SpeechService:
                                 audio_path=str(path), cached=True,
                                 local=route != "gemini", cloud_voice=route == "gemini")
         if route == "gemini":
-            return self._speak_with_gemini(text, path)
+            return self._speak_with_gemini(text, path, on_chunk=on_chunk)
         try:
             backend.synthesize(text, path)
         except Exception as exc:
@@ -793,6 +1008,52 @@ class SpeechService:
     def play_audio(self, path: Path) -> bool:
         return bool(self._play_with_detail(path).get("played"))
 
+    def _stream_player(self, session_id):
+        """The M-4 slice queue for a FRESH cloud synthesis, or None.
+
+        Streaming needs all three: the switch on, the FILE player untouched
+        (a custom `[tts] player` has no known raw-stdin contract), and one
+        of the raw-PCM players present. Anything less falls back to the
+        whole-wav path unchanged.
+        """
+        settings = self.config.section("tts") if self.config else {}
+        if not settings.get("stream_playback", True):
+            return None
+        if str(settings.get("player", "auto")) != "auto":
+            return None
+        rate = (int(self.config.section("gemini").get("voice_sample_rate", 24000))
+                if self.config else 24000)
+        candidates = [argv for argv in raw_stream_candidates(rate)
+                      if shutil.which(argv[0])]
+        if not candidates:
+            return None
+        player = ChunkedPlayback(candidates, rate=rate, session_id=session_id,
+                                 popen_factory=self._popen_factory)
+        self._active_players.add(player)
+        return player
+
+    def interrupt_speech(self) -> dict:
+        """G.7.3(i) interrupt: drain queue + flag + cutoff, for every active
+        streamed playback. `cutoff_ms` < 100 ms is the design contract; the
+        latency scene card measures it on hardware. The turn-state reset
+        (duplex gate, task bookkeeping) is the daemon caller's job."""
+        results = []
+        for player in list(self._active_players):
+            self._active_players.discard(player)   # an interrupted queue is dead
+            try:
+                results.append(player.interrupt())
+            except Exception:  # noqa: S110 - interrupt is best-effort
+                pass
+        if not results:
+            return {"interrupted": False, "cutoff_ms": 0.0, "players": 0}
+        cutoff = max(float(r.get("cutoff_ms") or 0.0) for r in results)
+        log_event("tts.interrupted", level="warn", verdict="interrupted",
+                  detail=(f"cutoff_ms={cutoff:.1f}; "
+                          f"queues_drained={len(results)}; "
+                          f"a drained queue stops mid-reply (G.7.2 pattern)"))
+        return {"interrupted": True, "cutoff_ms": cutoff,
+                "players": len(results)}
+
     def speak(self, text: str, *, play: bool = True,
               session_id: str | None = None) -> SpeechResult:
         route, why = self.voice_route()
@@ -803,17 +1064,51 @@ class SpeechService:
             return SpeechResult(text=text.strip(), backend="none", voice_id="none",
                                 audio_path=None, local=False, cloud_voice=False,
                                 muted=True, error=why)
+        # M-4: streamed playback for a fresh cloud synthesis — the first
+        # ~50 ms slice reaches the ear while the render continues (the W6
+        # whale was synthesized-but-unheard time). A cache hit feeds
+        # nothing: the queue is retired and the wav plays whole.
+        player = (self._stream_player(session_id)
+                  if (play and route == "gemini") else None)
         try:
-            result = self.synthesize(text)
+            result = self.synthesize(
+                text, on_chunk=(player.feed if player is not None else None))
         except TtsUnavailable as exc:
+            if player is not None:
+                player.interrupt()
+                self._active_players.discard(player)
             # Spoken failure is never fatal and never faked: the caller gets a muted
             # result carrying the reason, and the daemon broadcasts it as an event.
             self.last_voice_error = str(exc)
             return SpeechResult(text=text.strip(), backend="none", voice_id="none",
                                 local=False, muted=True, error=str(exc))
+        except BaseException:
+            if player is not None:
+                player.interrupt()
+                self._active_players.discard(player)
+            raise
         # G.6 marks: synthesize() has returned = synth complete (cache hits
         # included); the player spawn mark lands in _play_with_detail.
         result.synth_mark = time.monotonic()
+        if player is not None:
+            self._active_players.discard(player)
+            if player.first_slice_mark is not None:
+                detail = player.close(
+                    timeout_s=(self._playback_timeout_s(Path(result.audio_path))
+                               if result.audio_path else 30.0))
+                result.streamed = True
+                result.first_slice_mark = player.first_slice_mark
+                if detail.get("played"):
+                    # first audible rode the first slice; never replay the
+                    # file over what the ear already heard
+                    result.played = True
+                    result.play_mark = player.first_slice_mark
+                    return result
+                # Mid-stream failure: the wav is written — fall through to
+                # the whole-wav player so the audio still reaches the ear.
+                result.error = detail.get("error") or None
+            else:
+                player.close(timeout_s=1.0)   # nothing arrived (cache hit)
         if play and result.audio_path:
             route_after, why_after = self.voice_route()
             if route_after == "silent":

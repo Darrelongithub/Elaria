@@ -101,13 +101,19 @@ class Transport(Protocol):
         """
         ...
 
-    def generate_audio(self, model: str, text: str, voice_name: str) -> dict:
+    def generate_audio(self, model: str, text: str, voice_name: str, *,
+                       on_chunk=None) -> dict:
         """Optional: native-audio speech for `text`.
 
         Returns {"pcm": bytes (s16le mono), "sample_rate": int, "voice_name": str,
         "usage": {...}}. A transport that cannot produce audio omits this method;
         the caller then reports silence with the reason (amendment 2026-10-20: the
         dormant local voice is NOT a fallback), never a bare absence.
+
+        M-4 streaming: when `on_chunk` is given, every PCM chunk is handed
+        to it AS IT ARRIVES (the slice queue plays it while synthesis
+        continues); the full pcm is still assembled and returned. The sink
+        must not raise (the tts slice queue honors that).
         """
         raise NotImplementedError
 
@@ -261,7 +267,8 @@ class _SdkTransport:
             },
         }
 
-    def generate_audio(self, model: str, text: str, voice_name: str) -> dict:
+    def generate_audio(self, model: str, text: str, voice_name: str, *,
+                       on_chunk=None) -> dict:
         """Native audio from a LIVE model (Stage A fix).
 
         The previous implementation used `models.generate_content` with a
@@ -270,6 +277,10 @@ class _SdkTransport:
         the text is sent as one user turn, and the returned 24 kHz PCM parts are
         concatenated. The voice name is exactly the configured one — never a
         substitute.
+
+        M-4 streaming: `on_chunk` receives each PCM part as the session
+        emits it — the ear hears the first slice while the render continues
+        (the W6 whale was synthesized-but-unheard time).
         """
         from google.genai import types
 
@@ -318,6 +329,11 @@ class _SdkTransport:
                         data = getattr(inline, "data", None) if inline is not None else None
                         if data:
                             pcm.extend(data)
+                            if on_chunk is not None:
+                                try:
+                                    on_chunk(data)
+                                except Exception:  # noqa: S110 - the sink must not fail synthesis
+                                    pass
                             mime = str(getattr(inline, "mime_type", "") or "")
                             match = re.search(r"rate=(\d+)", mime)
                             if match:
@@ -777,8 +793,12 @@ class GeminiClient:
         }, "voice": validation}
 
     def generate_voice(self, text: str, *, voice: str | None = None,
-                       correlation_id: str = "-") -> dict:
-        """One rate-limited, ledgered native-audio call. Interim online voice."""
+                       correlation_id: str = "-",
+                       on_chunk=None) -> dict:
+        """One rate-limited, ledgered native-audio call. Interim online voice.
+
+        M-4 streaming: `on_chunk` rides to the transport ONLY when given —
+        older transport fakes with strict signatures stay valid."""
         request = self.voice_request(text, voice=voice)
         if not request["voice_allowed"]:
             # The pin, enforced at the last moment: no transport will ever be told
@@ -809,9 +829,11 @@ class GeminiClient:
             self._check_daily_cap(model)
             self._limiter.acquire(model, sleep=self._sleep)
             delay = 1.0
+            audio_kwargs = {"on_chunk": on_chunk} if on_chunk is not None else {}
             for try_no in range(4):
                 try:
-                    response = self._transport.generate_audio(model, text, request["voice_name"])
+                    response = self._transport.generate_audio(
+                        model, text, request["voice_name"], **audio_kwargs)
                     break
                 except Exception as exc:  # same backoff posture as text calls
                     if try_no == 3 or not _is_retryable(exc):
