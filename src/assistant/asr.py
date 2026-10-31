@@ -132,6 +132,63 @@ def _segment_confidence(segments: list) -> float | None:
     return round(weighted / weights, 4) if weights else None
 
 
+class LocalAsrDegraded(RuntimeError):
+    """Named, logged, non-traceback degradation for the local ASR leg.
+
+    Scene-7 work order W3 (2026-10-31): on the owner's Fedora 44 /
+    Python 3.14.8 every local attempt died with a raw
+    `open() got an unexpected keyword argument 'metadata_errors'`.
+    faster-whisper 1.2.1's decode_audio calls
+    `av.open(file, metadata_errors=...)`; PyAV v11–v14 all accept that
+    kwarg, so a resolved `av` that rejects it is not conforming PyAV.
+    The leg must degrade BY NAME — and the diagnostic names the exact
+    `av` on the failing runtime so one run pins the dependency issue.
+    """
+
+
+def _faster_whisper_compat() -> tuple[bool, str, str]:
+    """(ok, reason, diagnostic) for the faster-whisper engine's `av` seam.
+
+    Pure introspection — no model load, no network. The diagnostic
+    carries `av.__file__`/version/open-params so a broken resolution is
+    named rather than guessed.
+    """
+    try:
+        import av
+    except Exception as exc:
+        return False, f"PyAV unavailable: {type(exc).__name__}: {exc}", ""
+    diag = (f"av_file={getattr(av, '__file__', '?')} "
+            f"av_version={getattr(av, '__version__', '?')}")
+    open_fn = getattr(av, "open", None)
+    if open_fn is None:
+        return False, "this 'av' module has no open() — not PyAV", diag
+    try:
+        import inspect
+        params = sorted(inspect.signature(open_fn).parameters)
+    except (TypeError, ValueError):
+        params = []
+    if params and "metadata_errors" not in params:
+        return (False,
+                ("av.open lacks metadata_errors — faster-whisper 1.2.1 calls "
+                 "it in audio.decode_audio and raises TypeError"),
+                f"{diag} open_params={params}")
+    return True, "", diag
+
+
+def _raise_local_degraded(reason: str, diag: str) -> None:
+    """Schema-log the degradation, then raise the named error."""
+    try:
+        from .journal_log import log_event
+        log_event("local_asr.degraded", level="warn", session_id="",
+                  verdict="degraded",
+                  detail=f"engine=faster-whisper; reason={reason}; {diag}")
+    except Exception:  # noqa: S110 - a log failure must not mask the name
+        pass
+    raise LocalAsrDegraded(
+        f"local ASR degraded: {reason} — remote fallback continues"
+        + (f"; {diag}" if diag else ""))
+
+
 class LocalWhisperBackend:
     """Local Whisper behind the existing BatchBackend seam.
 
@@ -182,10 +239,26 @@ class LocalWhisperBackend:
                 confidence=float(self._settings.get("offline_mock_confidence", 0.5)))
         if self.engine in ("whisper.cpp", "whisper-cpp", "whisper_cpp"):
             return self._transcribe_whisper_cpp(audio_path, pinned)
-        model = self._load_model()
-        segments_iter, _info = model.transcribe(
-            audio_path, language=pinned, task="transcribe", vad_filter=True)
-        segments = list(segments_iter)
+        # W3 (2026-10-31): pre-check the real faster-whisper/av seam — a
+        # non-conforming `av` degrades BY NAME before any model load. An
+        # injected model_loader is a test seam (no faster-whisper decode),
+        # so the pre-check is for the real resolution only; the TypeError
+        # belt below covers every path.
+        if self._model_loader is None:
+            ok, reason, diag = _faster_whisper_compat()
+            if not ok:
+                _raise_local_degraded(reason, diag)
+        try:
+            model = self._load_model()
+            segments_iter, _info = model.transcribe(
+                audio_path, language=pinned, task="transcribe", vad_filter=True)
+            segments = list(segments_iter)
+        except TypeError as exc:
+            if "metadata_errors" in str(exc) or "unexpected keyword" in str(exc):
+                _raise_local_degraded(
+                    f"faster-whisper decode raised: {exc}",
+                    _faster_whisper_compat()[2])
+            raise
         text = " ".join(
             str(getattr(s, "text", "") if not isinstance(s, dict) else s.get("text", "")).strip()
             for s in segments).strip()
@@ -312,6 +385,11 @@ def local_asr_status(config) -> dict:
         available = importlib.util.find_spec("faster_whisper") is not None
         reason = ("faster-whisper installed; model loads locally on first use"
                   if available else "install with `uv sync --extra offline`")
+        if available:
+            ok, compat_reason, diag = _faster_whisper_compat()
+            if not ok:
+                available = False
+                reason = f"installed but degraded: {compat_reason} ({diag})"
     return {
         "backend": "local",
         "engine": engine,
