@@ -124,6 +124,131 @@ def test_raw_pass_prints_finish_reason_and_usage(config, tmp_path,
     assert "raw model text (2 chars): 'He'" in out
 
 
+# -- mini order M-2: arm C (registry files model, same wire) ---------------
+
+def _armc_client(calls: list, texts: dict):
+    """Fake SDK transport recording (model, path) per generate_content call."""
+
+    class _Cand:
+        finish_reason = "STOP"
+        content = type("C", (), {"parts": []})()
+
+    class _Resp:
+        def __init__(self, text):
+            self.text = text
+            self.candidates = [_Cand()]
+            self.usage_metadata = type("U", (), {
+                "prompt_token_count": 300,
+                "candidates_token_count": 20})()
+
+    class _Models:
+        def generate_content(self, *, model, contents):
+            calls.append(model)
+            return _Resp(texts.get(model, "a whole sentence of transcript"))
+
+    class _Files:
+        def upload(self, *, file):
+            return object()
+
+    class _Sdk:
+        files = _Files()
+        models = _Models()
+
+    class _Transport:
+        _client = _Sdk()
+
+    class _Client:
+        _transport = _Transport()
+
+    return _Client()
+
+
+def test_arm_c_uses_the_arm_c_model_while_section4_keeps_production(
+        config, tmp_path, monkeypatch):
+    """M-2: the causal discriminator — same wav, same wire, only the model
+    differs. Section 4 (production) and section 5 (arm C) both run, in that
+    order, each against its own model."""
+    path = _write_wav(tmp_path / "armc.wav", frames=1600)
+    monkeypatch.setattr(asr, "transcribe_file",
+                        lambda *a, **k: Transcript("He", "en", "gemini_batch"))
+    calls: list = []
+    client = _armc_client(calls, {"gemini-3.5-transcribe":
+                                  "the whole sentence came back fine"})
+    lines = []
+    rc = probe.run(config, client, [str(path)], printer=lines.append,
+                   raw_pass=True, arm_c_model="gemini-3.5-transcribe")
+    out = "\n".join(lines)
+    assert rc == 0
+    production_model = config.model_for_role("transcribe_batch")
+    assert calls == [production_model, "gemini-3.5-transcribe"], \
+        "section 4 must use production's resolved model; section 5 the arm C model"
+    assert "section 5 — arm C" in out
+    assert "the whole sentence came back fine" in out
+    # same paste-safe shape as section 4: model, text+chars, finish_reason, usage
+    armc_tail = out.split("section 5 — arm C", 1)[1]
+    assert "model: gemini-3.5-transcribe" in armc_tail
+    assert "raw model text (33 chars):" in armc_tail
+    assert "finish_reason=STOP" in armc_tail
+    assert "usage_metadata" in armc_tail
+
+
+def test_arm_c_override_model_is_honoured(config, tmp_path, monkeypatch):
+    path = _write_wav(tmp_path / "armc2.wav", frames=1600)
+    monkeypatch.setattr(asr, "transcribe_file",
+                        lambda *a, **k: Transcript("He", "en", "gemini_batch"))
+    calls: list = []
+    client = _armc_client(calls, {})
+    probe.run(config, client, [str(path)], printer=lambda *_: None,
+              raw_pass=True, arm_c_model="gemini-3.5-flash-lite")
+    assert calls[-1] == "gemini-3.5-flash-lite"
+
+
+def test_main_defaults_arm_c_to_the_registry_files_model(monkeypatch):
+    """The arm C default is the REGISTRY pin (model_registry.EVENT_TRANSCRIPTION),
+    never whatever production's config resolved — that is the whole point."""
+    import assistant.config as config_mod
+    import assistant.gemini_client as client_mod
+    import assistant.store as store_mod
+
+    monkeypatch.setenv("GEMINI_API_KEY", "SECRET-ARM-C-KEY")
+    try:
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(config_mod, "load_config",
+                            lambda: SimpleNamespace(state_dir=Path("/tmp")))
+        monkeypatch.setattr(store_mod, "Store",
+                            lambda *_: type("S", (), {"close": lambda self: None})())
+        monkeypatch.setattr(client_mod, "GeminiClient", lambda *_: object())
+        captured = {}
+
+        def fake_run(config, client, wavs, **kwargs):
+            captured.update(kwargs)
+            return 0
+
+        monkeypatch.setattr(probe, "run", fake_run)
+        assert probe.main(["--no-raw"]) == 0
+    finally:
+        os.environ.pop("GEMINI_API_KEY", None)
+    assert captured["arm_c_model"] == "gemini-3.5-transcribe"
+    assert captured["raw_pass"] is False
+
+
+def test_arm_c_never_leaks_the_key(config, tmp_path, monkeypatch):
+    os.environ["GEMINI_API_KEY"] = "SECRET-ARM-C-KEY-456"
+    try:
+        path = _write_wav(tmp_path / "leak2.wav", frames=1600)
+        monkeypatch.setattr(asr, "transcribe_file",
+                            lambda *a, **k: Transcript("ok", "en",
+                                                       "gemini_batch"))
+        lines = []
+        probe.run(config, _armc_client([], {}), [str(path)],
+                  printer=lines.append, raw_pass=True,
+                  arm_c_model="gemini-3.5-transcribe")
+    finally:
+        os.environ.pop("GEMINI_API_KEY", None)
+    assert "SECRET-ARM-C-KEY-456" not in "\n".join(lines)
+
+
 def test_the_key_never_leaks(config, tmp_path, monkeypatch):
     # Set by hand (not monkeypatch): the suite's autouse guard asserts the
     # env carries no key at teardown, before monkeypatch would undo.

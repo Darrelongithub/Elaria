@@ -28,9 +28,21 @@ Sections printed per wav:
 Paste-safe by construction: the API key is never printed, logged, or
 interpolated anywhere in this file. Paste the whole output back.
 
+MINI ORDER M-2 (2026-10-31) — arm C: the same production wire
+(`files.upload` + `generate_content([prompt, file])`) retried on the
+REGISTRY files model (`gemini-3.5-transcribe`, `--model` overrides),
+printed in the SAME shape as section 4 (raw text + char count,
+finish_reason, usage_metadata). The W1 root-cause record named registry
+drift as the suspect: production's leg ran `gemini-3.5-flash-lite` (a
+chat model) while the registry pins the files route to
+`gemini-3.5-transcribe`. Arm C is the causal discriminator — same wav,
+same wire, only the model differs. Section 3/4 stay on PRODUCTION's
+resolved model (the root-cause record); section 5 is arm C.
+
 Usage (owner runtime, GEMINI_API_KEY exported):
   uv run python scripts/file_leg_probe.py
   uv run python scripts/file_leg_probe.py --wav /path/to/one.wav
+  uv run python scripts/file_leg_probe.py --model gemini-3.5-transcribe
 
 Default wavs (resolved under ~/.local/share/assistant/audio then ./audio):
   20261031-145603-94129e.wav   (W1's stump capture)
@@ -121,8 +133,36 @@ def production_facts(config, client) -> dict:
     }
 
 
+def raw_sdk_pass(sdk, model: str, prompt: str, path: str, *, printer=print) -> None:
+    """One raw wire pass: `files.upload` + `generate_content([prompt, file])`,
+    printing the response metadata production discards (finish_reason,
+    usage_metadata, candidate parts, raw text + char count). This is the
+    output shape sections 4 (production model) and 5 (arm C) share —
+    same wire, same fields, only the model differs."""
+    try:
+        uploaded = sdk.files.upload(file=str(path))
+        response = sdk.models.generate_content(
+            model=model, contents=[prompt, uploaded])
+        text = response.text or ""
+        printer(f"  model: {model}")
+        printer(f"  raw model text ({len(text)} chars): {text!r}")
+        candidates = getattr(response, "candidates", None) or []
+        for i, cand in enumerate(candidates):
+            printer(f"  candidate[{i}] finish_reason="
+                    f"{getattr(cand, 'finish_reason', None)}")
+            content = getattr(cand, "content", None)
+            for j, part in enumerate(getattr(content, "parts", None) or []):
+                printer(f"    part[{j}]: {repr(part)[:400]}")
+        usage = getattr(response, "usage_metadata", None)
+        printer(f"  usage_metadata: {usage}")
+        printer("  reading: finish_reason=MAX_TOKENS -> truncation; "
+                "STOP with a stump -> the model heard a stump")
+    except Exception as exc:
+        printer(f"  raw pass raised: {type(exc).__name__}: {exc}")
+
+
 def run(config, client, wav_paths: list[str], *, printer=print,
-        raw_pass: bool = True) -> int:
+        raw_pass: bool = True, arm_c_model: str | None = None) -> int:
     from assistant import asr
 
     printer("=== W1 file-leg probe (paste-safe; the key is never printed) ===")
@@ -132,6 +172,8 @@ def run(config, client, wav_paths: list[str], *, printer=print,
     printer(f"production chain: {facts['chain']}")
     printer(f"production languages: {facts['languages']}")
     printer(f"production prompt (verbatim): {facts['prompt']!r}")
+    if arm_c_model:
+        printer(f"arm C model (section 5): {arm_c_model}")
 
     sdk = getattr(getattr(client, "_transport", None), "_client", None)
     for path in wav_paths:
@@ -156,31 +198,22 @@ def run(config, client, wav_paths: list[str], *, printer=print,
         if raw_pass and sdk is not None:
             printer("section 4 — raw SDK pass (production wire shape; "
                     "response metadata production discards):")
-            try:
-                uploaded = sdk.files.upload(file=str(path))
-                response = sdk.models.generate_content(
-                    model=facts["model"],
-                    contents=[facts["prompt"], uploaded])
-                text = response.text or ""
-                printer(f"  raw model text ({len(text)} chars): {text!r}")
-                candidates = getattr(response, "candidates", None) or []
-                for i, cand in enumerate(candidates):
-                    printer(f"  candidate[{i}] finish_reason="
-                            f"{getattr(cand, 'finish_reason', None)}")
-                    content = getattr(cand, "content", None)
-                    for j, part in enumerate(getattr(content, "parts", None) or []):
-                        printer(f"    part[{j}]: {repr(part)[:400]}")
-                usage = getattr(response, "usage_metadata", None)
-                printer(f"  usage_metadata: {usage}")
-                printer("  reading: finish_reason=MAX_TOKENS -> truncation; "
-                        "STOP with a stump -> the model heard a stump")
-            except Exception as exc:
-                printer(f"  raw pass raised: {type(exc).__name__}: {exc}")
+            raw_sdk_pass(sdk, facts["model"], facts["prompt"], path,
+                         printer=printer)
         elif raw_pass:
             printer("section 4 — raw SDK pass skipped: no SDK transport "
                     "(mock/fixture mode — the raw pass needs the live client)")
         else:
             printer("section 4 — raw SDK pass skipped (--no-raw)")
+        if raw_pass and sdk is not None and arm_c_model:
+            printer("section 5 — arm C (registry files model; M-2 causal "
+                    "discriminator — same wav, same wire, only the model "
+                    "differs):")
+            raw_sdk_pass(sdk, arm_c_model, facts["prompt"], path,
+                         printer=printer)
+        elif raw_pass and arm_c_model:
+            printer("section 5 — arm C skipped: no SDK transport "
+                    "(mock/fixture mode — the raw pass needs the live client)")
     return 0
 
 
@@ -191,7 +224,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="wav to replay (repeatable; default: the two "
                              "known kept wavs)")
     parser.add_argument("--no-raw", action="store_true",
-                        help="skip the raw SDK pass (file-leg call only)")
+                        help="skip the raw SDK passes (file-leg call only)")
+    parser.add_argument("--model", default=None,
+                        help="arm C model (section 5; default: the registry "
+                             "files model gemini-3.5-transcribe)")
     args = parser.parse_args(argv)
 
     if not os.environ.get("GEMINI_API_KEY"):
@@ -206,10 +242,13 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config()
     store = Store(config.state_dir / "file-leg-probe.db")
     try:
+        from assistant.model_registry import EVENT_TRANSCRIPTION
+
         client = GeminiClient(config, store)
         return run(config, client,
                    args.wav or _find_default_wavs(),
-                   raw_pass=not args.no_raw)
+                   raw_pass=not args.no_raw,
+                   arm_c_model=args.model or EVENT_TRANSCRIPTION)
     finally:
         store.close()
 
