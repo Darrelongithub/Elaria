@@ -1,6 +1,13 @@
-# Proposed hands-gate scene card — NOT SCHEDULED / NOT READY TO RUN
+# Proposed hands-gate scene card — NOT SCHEDULED / OWNER GATE NOT RUN
 
 ## DONE
+
+**[TESTED-ONLY] Readiness update, 2026-10-31:** standalone synthetic bridge
+preflight is green: **2,103 passed / 6 skipped / 0 errors**, Ruff clean.
+See `hands-2026-10-31-bridge-001.md`. Shipped JS drove the actual Unix socket,
+parked queue and tmp library for typed/button Yes/No, mocked R8 and trap checks.
+This closes the missing-bridge blocker, **not** the owner gate. The scene is
+still unscheduled; no hardware action is requested by this card.
 
 **[TESTED-ONLY]** Sandbox core pre-gates pass (core increment 001). The composite
 pytest proves real synthetic file moves, an explicit-path collision ask, durable
@@ -14,11 +21,14 @@ real files, filenames, content, credentials, database dumps or raw journal lines
 
 ## DEFECTS FOUND / READINESS BLOCKERS
 
-- **[UNVERIFIED] BLOCKED:** the standalone QML harness has no actual IPC bridge
-  to the synthetic core/parked queue. Local preview buttons are **not** approvals.
-  This card cannot run until that bridge is shipped and pre-gated.
-- **[UNVERIFIED] BLOCKED:** Quickshell 0.2.1 branch load, focus and actual private
-  card visibility have not been tested on Fedora 44 / Hyprland 0.57 / Wayland.
+- **[TESTED-ONLY] CLOSED:** the standalone synthetic bridge is shipped and
+  pre-gated through the actual JS controller and Unix IPC. No local preview
+  button or static image is counted as a persisted decision.
+- **[UNVERIFIED] HOLD:** design has not scheduled the daylight owner scene or
+  ruled its hardware evidence. Preflight green is not permission to self-schedule.
+- **[UNVERIFIED] OWNER GATE:** Quickshell 0.2.1 branch load, focus and actual
+  private-card visibility have not been tested on Fedora 44 / Hyprland 0.57 /
+  Wayland. The scheduled scene must stop as STUCK if these fail.
 - **[UNVERIFIED]** Production posture source and shared brokers are not part of
   this synthetic scene. No live Gemini key/model traffic, real subprocess task
   runner, desktop notification dispatch or owner-content mutation may be enabled.
@@ -75,7 +85,9 @@ A failed prerequisite or scene check stops the scene; no retry loop.
   explicitly rules green. Pytest alone cannot issue this ruling.
 - **[UNVERIFIED] Red/STUCK:** record the failed check identifier and aggregate
   mismatch, stop execution and preserve synthetic local artifacts for diagnosis.
-  No rescheduling or expanded permissions inferred from failure.
+  No rescheduling or expanded permissions inferred from failure. The ephemeral
+  CLI deletes its scratch lab on graceful exit: inspect/journal-check synthetic
+  state while it remains running, before teardown; return aggregates only.
 
 ### Proposed aggregate return sheet
 
@@ -85,12 +97,14 @@ ask count, decision via real console yes/no, stale-decision rejection count,
 verified destination count, occupied-target-preserved yes/no, undo match count
 (if checked), trap event count, trap-directed subsequent runner count, trap
 mutation count, console-warning-visible yes/no, live API call count (must be 0),
-real task-spawn count (must be 0), owner eye verdict, elapsed minutes, failed
+real task-spawn count (must be 0), real desktop-notification count (must be 0),
+mock R8 table verdict, No-terminal verdict, reconnect-without-replay verdict,
+owner eye verdict, elapsed minutes, failed
 check ID if any. No paths, content, full logs or screenshots containing owner
 information are requested.
 
 ## OPEN QUESTIONS
 
-**[UNVERIFIED]** Design scheduling/acceptance only after readiness blockers
-close. No settled tier, grammar, privacy or queue rule is reopened. No hardware
+**[UNVERIFIED]** Design scheduling/acceptance is next now that the synthetic
+bridge blocker is closed; rendering/focus remain scene checks. No settled tier, grammar, privacy or queue rule is reopened. No hardware
 session is requested by this proposal itself.

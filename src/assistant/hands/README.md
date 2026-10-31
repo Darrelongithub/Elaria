@@ -50,7 +50,20 @@ journal output. The R4 sink accepts only metadata and fixed diagnostics, emits
 six/seven fields, and records failures without changing authority. File-operation
 write-ahead logging is still the existing safety Journal, not this telemetry.
 
-[UNVERIFIED] Standalone QML-to-core IPC remains unshipped. R7 DTOs are tested
-against the queue in the sandbox; QML itself still captures local preview input.
-There is no approval by screenshot, no actual desktop notification, and no
-hardware gate result. See the current core report and proposed scene card.
+[TESTED-ONLY] `bridge.BridgeApp` + `BridgeServer` provide the additive standalone
+synthetic Unix IPC adapter. They reuse `assistant.ipc.serve`, kernel peer identity
+and existing locking. `bridge_state` stores bounded request receipts and small
+UI state in the existing synthetic hands.db; it does not replace the ask queue
+or operation Journal. Only fixed synthetic fixtures are accepted, not arbitrary
+plans, roots or processes. Prepare/disclose and hash-bound Start are distinct.
+
+[TESTED-ONLY] The shipped QML JS controller is tested over a real Unix socket:
+typed/button Yes/No, mocked R8, lost replies, fresh snapshots on reconnect,
+stale identities, the actual repository file trap and independent tmp rereads.
+The CLI mints an ephemeral lab and cleans it on graceful exit. Same-minted-space
+reopen is a separate test boundary, not a production restart/recovery claim.
+No live model, real task subprocess or desktop notification adapter exists.
+
+[UNVERIFIED] QML loading/rendering/focus, production posture and hardware gate
+remain unproven. See `ui/quickshell/hands/README.md`, the bridge report and the
+unscheduled scene card. A screenshot is never an approval or execution proof.

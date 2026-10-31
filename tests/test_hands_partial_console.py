@@ -92,16 +92,19 @@ def test_injection_preview_is_not_claimed_as_detector_proof():
     assert "does not prove the trap gate" in sample["lines"][1]
 
 
-def test_new_harness_has_no_integration_bridge_or_registry():
+def test_standalone_bridge_allows_unix_ipc_but_no_task_spawn_or_notification():
     qml = (UI / "shell.qml").read_text()
-    javascript = (UI / "harness.js").read_text()
-    for forbidden in ("Process {", "Socket {", "FileView {", "XMLHttpRequest", "fetch(",
-                      "openUrlExternally", "import Quickshell.Io", "LocalStorage",
+    javascript = (UI / "harness.js").read_text() + (UI / "bridge.js").read_text()
+    for forbidden in ("Process {", "FileView {", "XMLHttpRequest", "fetch(",
+                      "openUrlExternally", "execDetached", "LocalStorage",
                       "notify-send", "subprocess"):
         # Comments may explain that no notify-send is used; executable text
         # is checked separately from prose.
         code = re.sub(r"//[^\n]*", "", qml + "\n" + javascript)
         assert forbidden not in code
+    assert "Socket {" in qml and "SplitParser {" in qml
+    assert "transport.flush()" in qml
+    assert 'import "bridge.js" as Bridge' in qml
     assert 'import "harness.js" as Harness' in qml
     assert "FloatingWindow {" in qml
     assert "TextEdit.PlainText" in qml

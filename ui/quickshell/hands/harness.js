@@ -105,7 +105,9 @@ function buttonPreview(label, snapshot) {
 // DTO only: production authority and persistence belong to the service, not QML.
 function routeInput(text, focusedAsk) {
     var raw = String(text);
-    var word = raw.trim().toLowerCase();
+    // For the exact yes/no vocabulary, U+017F is the only extra Unicode
+    // casefold mapping beyond lowercasing that can produce an accepted token.
+    var word = raw.trim().toLowerCase().replace(/\u017f/g, "s");
     if (word === "yes" || word === "no") {
         if (!focusedAsk || focusedAsk.state !== "pending") {
             return {kind: "none", notice: "no ask is selected"};

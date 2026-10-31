@@ -246,3 +246,52 @@ new bridge work. Remote confirmation, not the worktree alone, is the record.
 [UNVERIFIED] Next authorized preflight: standalone synthetic GUI-to-queue bridge,
 console typed/button yes/no, mocked R8 posture, zero desktop notification
 dispatch. Hardware scene remains unscheduled until design rules preflight green.
+
+## 2026-10-31 — standalone synthetic bridge preflight 001
+
+### DONE
+
+[TESTED-ONLY] Activation-open recovery checkpoint
+**b1ae05b53d8a7849f26d3f7170c120547d5211da** was pushed to this own branch and
+remote SHA verified before bridge work. Lost 1b2a79b/e86c9b1 objects were not
+invented or claimed pushed. New standing discipline remains commit → own-branch
+push → remote verification at each committing activation's end.
+
+[TESTED-ONLY] Standalone bridge preflight GREEN. Full **2,103 passed / 6 skipped /
+0 errors**, 104.77s; **2,042 + 61** added bridge cases; Ruff/diff clean. Shipped
+JS now drives actual Unix IPC → parked queue → synthetic core/library. Tests
+cover typed/button Yes/No, complete disclosure before Start, hash/ask/epoch
+binding, R8 mock posture/redaction/age, actual file trap, lost acknowledgements,
+read-only reconnect and no replay. Zero live model traffic, real task-runner
+spawns or desktop notification dispatch. Whole baseline tracked tree is unchanged;
+all edits are lane-local additions/assets/tests/docs.
+
+[TESTED-ONLY] Report: `docs/phase-reports/hands-2026-10-31-bridge-001.md`.
+Service/console scope and sandbox reproduction: `ui/quickshell/hands/README.md`.
+The CLI is an ephemeral minted lab, not production persistence. Same-minted-space
+reopen and actual CLI fresh-lab restart are deliberately separate evidence claims.
+No service remains running. No new dependency, unit install, mount or merge.
+
+### DEFECTS FOUND
+
+[TESTED-ONLY] Closed the preview-only bridge gap and exact-token Unicode
+casefold mismatch. Regression coverage includes private-snapshot caching,
+unknown-outcome banner loss, endpoint cleanup ownership, full-budget redaction,
+pre-budget fixture writes and constructor lease cleanup. No new policy residuals.
+
+[UNVERIFIED] Actual Qt/Quickshell load, focus/rendering and trusted real posture
+remain unmeasured. qmllint unavailable/N/A; pinned 0.2.1 API review is not runtime
+proof. Process-tree cleanup, live traffic/mutation and shared brokers remain held.
+
+### NEXT GATE
+
+[UNVERIFIED] Design accepts/reviews preflight and alone schedules the daylight
+≤30-minute owner scene. The updated scene card remains **NOT SCHEDULED**; it
+closes only the synthetic bridge blocker. Owner eye and journal, synthetic
+messy folder, trap included, aggregate results only. No hardware or merge action
+is being scheduled by this lane.
+
+### OPEN QUESTIONS
+
+[TESTED-ONLY] None new; R1–R8 unchanged. Await design scheduling/evidence ruling,
+not another policy-choice round. Final status must record the actual pushed SHA.
