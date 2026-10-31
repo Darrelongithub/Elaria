@@ -974,3 +974,54 @@ A future activation, seeing "the base moved", re-running the two-clause check an
 re-dating GATE 1e. **That is now forbidden.** The check fires once, at consumption time.
 The only thing that can wake this lane early is a **named** shape/phrasing change flag
 from mainline — never a bare SHA move, and never an inference from a relay's silence.
+
+---
+
+## 2026-10-31 — RECORD-ONLY ACTIVATION APPROVED; SAFETY ADDENDUM; IDLE CADENCE; LANE ASLEEP
+
+Report 011's re-timing is in force. This entry records three rulings received on
+2026-10-31. No phase report was written — no phase work occurred, and "no phase report
+without phase work" is standing doctrine from the previous activation forward.
+
+### RULING 30 — the record-only activation is approved as-is
+
+Recording the re-timing ruling plus the prevention note was the entire correct output.
+**Skipping the two-clause check was compliance with the ruling, not an omission.**
+"No phase report without phase work" is standing doctrine from this point forward.
+
+### RULING 31 — FLAG 1: the harness branch line is a STATUS NOTE, not an instruction
+
+`arena/e7a1cca5-elaria` **remains frozen at `b181712` with zero new commits, forever.**
+All storage commits land on `arena/storage`.
+
+**SAFETY ADDENDUM (binding, new):** if the harness ever stops **reporting** the frozen
+branch and starts **enforcing** it — a forced checkout, or a push aimed at it — **STOP and
+report to the design chat BEFORE pushing.** A misread status line is cheap; a push into
+frozen history is not.
+
+### RULING 32 — FLAG 2: idle cadence approved
+
+Woken with no new input = one line, *"stopped at Gate 1, waiting on owner numbers"*, then
+sleep. **Wake triggers are exactly three and exhaustive:**
+
+1. The owner's Sheets numbers.
+2. A named shape change flagged by mainline.
+3. A design-chat wake.
+
+**No polling, no re-dating, no reporting nothing.**
+
+### Posture
+
+**ASLEEP AT GATE 1.** Next expected wake carries the owner's **Sheet 2** numbers — `du`
+aggregates, kept-wav census (**now 35+ wavs, including the 9.6 MB watchdog capture**), and
+one measured zstd ratio — then **Sheet 1** (MEGA in browser, owner-run rclone config,
+benchmark).
+
+**Until then, silence is the correct output.**
+
+### What this entry exists to prevent
+
+A future activation treating a bare harness status line as a reason to switch branches,
+or treating silence from mainline as a wake trigger. The frozen branch is frozen **by
+ruling**, the only exception path is the enforcement contingency in Ruling 31, and idle
+means idle.
