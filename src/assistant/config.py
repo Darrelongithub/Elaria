@@ -647,6 +647,64 @@ DEFAULTS: dict = {
         "keyword_threshold": 0.5,
         "save_near_miss_clips": False,
     },
+    # WP7 cold storage & backup. ONE CONFIG LINE selects the provider: the
+    # `rclone:` remote name below. restic is the engine, rclone is the
+    # transport, MEGA is the free-tier target — none of that is hard-coded, so
+    # changing target is a config edit, never a code edit.
+    #
+    # EVERY value that depends on the owner's scene-sheet measurements is
+    # marked INTERIM-PENDING-SHEETS. Those numbers are placeholders that let
+    # the machinery run and be tested against synthetic fixtures NOW; they are
+    # NOT decisions. Sheet 2 (kept-wav census, du aggregates, one measured
+    # zstd ratio) replaces the tiering/capacity numbers; Sheet 1 (MEGA
+    # benchmark) confirms the transport pins. Until then nothing here may be
+    # quoted as a tuned default, and no live MEGA traffic may run.
+    "backup": {
+        # The provider, as one line. `rclone <remote>:<path>` — the owner runs
+        # `rclone config` himself and the password never transits this repo,
+        # a log, or a chat message. Empty = not configured yet; every command
+        # that needs a remote refuses rather than guessing.
+        "rclone_remote": "",
+        "rclone_path": "elaria-restic",
+        # restic-over-rclone pins (report 000, T0 citations). MEGA repo-open
+        # routinely exceeds restic's 1m default rclone timeout, so the timeout
+        # is set EXPLICITLY here rather than inherited. This is a documented
+        # pin, not a tuned measurement — [TESTED-ONLY] against stubs.
+        "restic_timeout": "5m",
+        # Pack size: 16 MiB is restic's default; larger packs reduce the
+        # many-tiny-objects worst case on object stores. INTERIM-PENDING-SHEETS
+        # — Sheet 1's benchmark measures this against MEGA, not a stub.
+        "restic_pack_size_mib": 16,  # INTERIM-PENDING-SHEETS
+        # Tiering: the HOT window for resolved kept audio, whichever comes
+        # first. INTERIM-PENDING-SHEETS — the 14-day figure is the spec's
+        # stated default, the 2 GB figure is the spec's stated cap; Sheet 2's
+        # census decides the real pair.
+        "hot_window_days": 14,  # INTERIM-PENDING-SHEETS
+        "hot_window_gb": 2,  # INTERIM-PENDING-SHEETS
+        # Trim: move to local trash, then purge after the grace period. The
+        # grace is what guarantees no artifact ever has exactly one copy the
+        # instant a flip lands.
+        "trim_grace_days": 14,  # INTERIM-PENDING-SHEETS
+        # Deferral: uploads above this size wait for AC/unmetered power.
+        "defer_above_mb": 100,
+        # Watcher: prompt wake via stdlib polling snapshot-diff (ruled
+        # 2026-10-27 — inotify was REJECTED for the record).
+        "watcher_poll_s": 30,
+        # Nightly systemd USER timer. `Persistent=true` means a calendar elapse
+        # that happens while the machine is asleep is caught up on resume
+        # (multiple elapses in one continuous sleep collapse to a SINGLE
+        # activation — T0 citation, systemd.timer(5)).
+        "nightly_oncalendar": "03:17",
+        # Capacity floor: `remote_free` below this raises exactly one knock
+        # reading "Elaria wants to talk" with ZERO content. It is the designed
+        # pressure gauge — never a silent auto-delete, which does not exist.
+        "capacity_floor_gb": 2,  # INTERIM-PENDING-SHEETS
+        # Monthly integrity drill: restore a random artifact to tmp, hash it,
+        # `restic check`. Quarterly adds `--read-data-subset` capped at 5% /
+        # 500 MB so a drill never reads the whole repository.
+        "drill_read_data_subset_pct": 5,
+        "drill_read_data_subset_mb": 500,
+    },
 }
 
 

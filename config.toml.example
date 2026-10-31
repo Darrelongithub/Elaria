@@ -434,3 +434,51 @@ embedding_dim = 192
 speaker_threshold = 0.75
 keyword_threshold = 0.5
 save_near_miss_clips = false        # privacy: off by default (§13.10)
+
+# -- WP7 cold storage & backup ----------------------------------------------
+# ONE CONFIG LINE selects the provider: the rclone remote below. restic is the
+# engine, rclone the transport, MEGA the free-tier target. Changing target is a
+# config edit, never a code edit.
+#
+# The owner runs `rclone config` himself — the MEGA password is obfuscated in
+# rclone.conf (obfuscated, NOT encrypted) and lives at 0600 OUTSIDE this repo.
+# The restic passphrase is a 0600 file plus a paper escrow off-machine. No
+# credential ever transits this file, a log, or a chat message.
+[backup]
+# Empty = not configured. Every command that needs a remote refuses rather
+# than guessing. Fill this in on the owner's machine after Sheet 1's benchmark
+# returns a go/no-go — it is the only line that must change to switch target.
+rclone_remote = ""
+rclone_path = "elaria-restic"
+# restic-over-rclone pins. MEGA repo-open routinely exceeds restic's 1m default
+# rclone timeout, so this is set EXPLICITLY rather than inherited. [TESTED-ONLY]
+# against stubs — Sheet 1 confirms it against MEGA.
+restic_timeout = "5m"
+# 16 MiB is restic's default. Larger packs reduce the many-tiny-objects worst
+# case on object stores. INTERIM-PENDING-SHEETS — Sheet 1 measures this.
+restic_pack_size_mib = 16
+# Tiering: the HOT window for resolved kept audio, whichever comes first.
+# INTERIM-PENDING-SHEETS — Sheet 2's kept-wav census decides the real pair.
+hot_window_days = 14
+hot_window_gb = 2
+# Trim moves to local trash, then purges after the grace period. The grace is
+# what guarantees no artifact ever has exactly one copy the instant a flip lands.
+# INTERIM-PENDING-SHEETS.
+trim_grace_days = 14
+# Uploads above this size defer to AC/unmetered power (battery/metered policy).
+defer_above_mb = 100
+# Prompt wake via stdlib polling snapshot-diff (inotify was REJECTED 2026-10-27).
+watcher_poll_s = 30
+# Nightly systemd USER timer. Persistent=true catches up a calendar elapse that
+# happened while the machine was asleep (multiple elapses in one continuous
+# sleep collapse to a SINGLE activation).
+nightly_oncalendar = "03:17"
+# Capacity floor: remote_free below this raises exactly one knock reading
+# "Elaria wants to talk" with ZERO content. It is the designed pressure gauge —
+# never a silent auto-delete, which does not exist. INTERIM-PENDING-SHEETS.
+capacity_floor_gb = 2
+# Monthly integrity drill: restore a random artifact to tmp, hash-verify,
+# `restic check`. Quarterly adds --read-data-subset capped at 5% / 500 MB so a
+# drill never reads the whole repository.
+drill_read_data_subset_pct = 5
+drill_read_data_subset_mb = 500
