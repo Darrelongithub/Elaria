@@ -290,6 +290,35 @@ storage-lane design item that WP5's deferred-retry consumer inherits**
 Scene cards (W3/W4/W5 owner proofs + W1/W2 run instructions):
 `docs/scene-cards/2026-10-31-scene7-followups.md`.
 
+### Scene 7 mini order M (2026-10-31) — fallback-as-primary build
+
+Rulings that govern everything below: **H.5 = FALLBACK-AS-PRIMARY**
+(arms A+B SILENT on a valid key — account-side output suppression spans
+model families; side-channel re-pin is DEAD, never reopen) and **gate
+v2-AMENDED**: previous chain proofs + fallback-as-primary final proven
+whole-sentence + release→first-audible ≤ 8 s with streamed TTS on a
+hardware scene + owner's ear conversational; sunrise clause restores
+Live primary by config pin if Google fixes the account. **W1 root cause
+named:** the 7 chars = literal `<noise>` on both wavs,
+`finish_reason=STOP` (no truncation); production's leg ran
+`gemini-3.5-flash-lite` (a chat model improvising sympathy at "&lt;noise&gt;")
+while the registry pins the files route to `gemini-3.5-transcribe` —
+registry drift closed by M-3.
+
+Mini order M built (report:
+`docs/phase-reports/2026-10-31-scene7-mini-order-m.md`; commits
+M-2 `e19e78f` · M-3 `b1b7c5c` · M-5 `6b09d54` · M-4 `86d7e7c` + docs):
+M-2 probe arm C (registry model on the production wire); M-3 re-pin
+(config registry-pin resolution + doctor `registry role pins` hard-fail
++ pins); M-5 `transcription.stump` (class + chars + sha16, never the
+text); M-4 G.7.3 streaming TTS (~50 ms slices, first-audible-at-slice,
+interrupt cutoff < 100 ms wired to halt) + early dispatch (chat at leg
+landing; exactly-one-reply pinned) + the `latency.table`
+first-audible-at-slice stage (`release_to_first_slice_s` = the clause-3
+metric); M-6 exhibit 2 in the Google bug draft. Suite **1,982/6**,
+ruff clean. **LATENCY SCENE proposed** (owner schedules, never
+self-certified): `docs/scene-cards/2026-10-31-latency-scene.md`.
+
 ## 5. Lessons and watch items
 
 1. **Daemon-was-stale lesson (scene 1):** the scene ran status-dependent
@@ -668,3 +697,14 @@ SC-W5 (ready-earcon ≤ 50 ms, after WP1 builds it), plus the W1 probe
 run and the W2 arm A/B runs (paste-safe scripts, outputs feed the H.5
 ruling and the Google bug report draft in
 `docs/bug-reports/2026-10-31-gemini-live-transcribe-zero-output.md`).
+
+Mini-order M adds the **LATENCY SCENE**
+(`docs/scene-cards/2026-10-31-latency-scene.md`, proposed via design
+chat): gate v2-AMENDED clause 3's instrument — `release→first-audible
+≤ 8 s` with streamed TTS on the fallback-as-primary chain, owner's ear
+as the instrument, `latency.table`'s `release_to_first_slice_s` as the
+number. Same window doubles as the M-2/M-3 acceptance (probe arm C:
+whole sentences on both standing wavs; `assist doctor` first — the
+`registry role pins` check names any config drift). The M-2 quota note
+rides the scene: transcribe-batch free tier 25 RPD vs one file-leg call
+per silent-primary turn.

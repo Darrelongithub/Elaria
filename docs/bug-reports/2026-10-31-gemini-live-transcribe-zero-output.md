@@ -1,9 +1,9 @@
 # Draft — Google bug report: Live transcribe models emit zero transcription output on a valid key (owner files this)
 
-Status: **DRAFT for the owner to file** (work order W7c, 2026-10-31).
-The builder drafted; the owner files. Attach the arm A transcript (the
-script's output IS the evidence pack core) and dashboard screenshots
-before filing.
+Status: **DRAFT for the owner to file** (work order W7c, 2026-10-31;
+mini-order M-6 added exhibit 2, 2026-10-31). The builder drafted; the
+owner files. Attach the arm A and arm B transcripts (the script outputs
+ARE the evidence pack core) and dashboard screenshots before filing.
 
 ## Title
 
@@ -67,6 +67,34 @@ Observed (arm A transcript attached):
 or a documented reason they are withheld (quota gate, model
 entitlement, region restriction).
 
+## Exhibits
+
+**Exhibit 1 — arm A (transcription models, Manual-VAD TEXT, verbatim
+docs config).** As in the repro above: healthy session, audio heard
+(voice-activity at exact speech offsets), input tokens billed, ZERO
+transcription-family messages in a 30 s post-audio listen.
+
+**Exhibit 2 — arm B (`gemini-3.8-live` side-channel, capabilities-guide
+config VERBATIM; owner-run 2026-10-31, mini order M).** The Live API
+capabilities guide's own "Audio transcriptions" input shape —
+`config = {"response_modalities": ["AUDIO"], "input_audio_transcription": {}}`
+on `gemini-3.8-live` — is the documented route for input transcription
+on the flagship Live model. Observed on the same valid key:
+
+- connect + `setup_complete`: OK; the session's resumption handle was
+  issued (server-side session healthy);
+- 98/98 100-ms audio chunks (16 kHz PCM) sent and acked — the server
+  received the full utterance;
+- 30 s listen window after `activity_end`;
+- `server_content.input_transcription` / `interim_input_transcription`:
+  **ZERO messages — the side-channel is SILENT too.**
+
+Verdict shape: **SILENT** (not SPOKE, not NO-RUN — the wire is healthy,
+the server heard the audio, the transcription output never came). The
+suppression therefore spans model families (transcription models AND the
+flagship Live model's side-channel) under one account — consistent with
+account-side output suppression rather than a model-specific defect.
+
 ## Asks
 
 1. Is `gemini-3.5-transcribe-live` (and the -preview id) entitled/
@@ -81,8 +109,9 @@ entitlement, region restriction).
 
 - arm A raw transcript (verbatim messages, timestamps) —
   `scripts/live_repro.py --arm A` output.
+- arm B raw transcript (verbatim messages, timestamps) —
+  `scripts/live_repro.py --arm B` output (exhibit 2: 98/98 chunks acked,
+  resumption handle issued, zero transcription-family messages).
 - wire histograms per session (message types, setup_complete, activity
   offsets).
 - dashboard screenshots showing billed input audio tokens (Oct 24–27).
-- [after arm B] the `gemini-3.8-live` side-channel result (SPOKE or
-  SILENT) as the comparison data point.
