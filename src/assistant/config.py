@@ -17,6 +17,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .model_registry import PINNED_ROLES
+
 VALID_MODES = ("live", "record", "mock")
 
 
@@ -681,7 +683,16 @@ class Config:
         gemini = self.section("gemini")
         if role == "voice":
             return voice_model(self)
+        # M-3 re-pin (mini order M, 2026-10-31): a registry role whose
+        # config key is missing or empty resolves to the REGISTRY pin, not
+        # to `model_default`. The W1 root cause: the production file leg ran
+        # gemini-3.5-flash-lite (a chat model) on the files route while the
+        # registry pins that route to gemini-3.5-transcribe — an unset key
+        # silently fell through to the chat default. Explicit config still
+        # wins (owner experimentation is never blocked at runtime); doctor's
+        # role-pin assert names the drift by key.
         return str(gemini.get(f"model_{role}")
+                   or PINNED_ROLES.get(role)
                    or gemini.get("model_default") or "")
 
     def voice_model(self) -> str:

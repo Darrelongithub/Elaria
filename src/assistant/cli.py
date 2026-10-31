@@ -394,6 +394,28 @@ def run_doctor(config) -> dict:
             "model registry", True,
             "every configured id is in the §4.1 pinned registry "
             "(pinned ids live in src/assistant/model_registry.py)"))
+    # M-3 role-pin assert (mini order M, 2026-10-31): a registered id in a
+    # WRONG role is its own defect class — the W1 file-leg stump ran on this
+    # exact gap (files route configured at a chat model). Named by key, with
+    # the pinned value the key should carry.
+    role_drift = reg.get("role_drift") or []
+    if role_drift:
+        checks.append(_check(
+            "registry role pins", False,
+            "DEFECT — configured for the wrong role: "
+            + "; ".join(f"[gemini] {d['key']} = {d['configured']} "
+                        f"(pinned to {d['pinned']} for role {d['role']})"
+                        for d in role_drift)
+            + " — set the key to its pinned id or remove the line (an "
+              "unset key resolves to the registry pin). The files route "
+              "pointed at a chat model is the W1 <noise> stump's named "
+              "suspect.",
+            warn_only=False))
+    else:
+        checks.append(_check(
+            "registry role pins", True,
+            "every configured model_<role> key names its own role's pinned id "
+            "(unset keys resolve to the registry pin)"))
 
     hypr = hyprland_info()
     checks.append(_check(

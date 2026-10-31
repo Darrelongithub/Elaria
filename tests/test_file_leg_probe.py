@@ -71,6 +71,11 @@ def test_run_calls_the_production_leg_and_prints_text_with_char_count(
 def test_production_facts_report_model_chain_and_prompt(config):
     facts = probe.production_facts(config, object())
     assert facts["model"] == config.model_for_role("transcribe_batch")
+    # M-3 pin: the leg's model IS the registry files pin, not a chat default
+    from assistant.model_registry import PINNED_ROLES
+
+    assert facts["model"] == PINNED_ROLES["transcribe_batch"] \
+        == "gemini-3.5-transcribe"
     assert facts["chain"], "the fallback chain must be enumerated"
     assert facts["prompt"] == batch_transcription_prompt(
         asr.configured_languages(config)[0])

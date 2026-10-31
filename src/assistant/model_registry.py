@@ -134,6 +134,34 @@ def scan_config_values(config) -> list[dict]:
     return findings
 
 
+def role_drift_rows(config) -> list[dict]:
+    """Role-fit drift: a configured `model_<role>` naming a REGISTERED id
+    that is pinned to a DIFFERENT role (mini order M-3, 2026-10-31).
+
+    The W1 root cause ran through this gap: `gemini-3.5-flash-lite` is a
+    registered id (chat), so a config pointing the files route at it passed
+    the membership scan while the leg transcribed with a chat model. A
+    missing/empty key is NOT drift — `model_for_role` resolves those to the
+    registry pin; only an explicitly configured wrong-for-role value rows
+    here. Voice is excluded: it resolves through `voice_model()` legacy
+    precedence and doctor's voice checks own it.
+    """
+    gemini = config.section("gemini")
+    rows: list[dict] = []
+    for role, pinned in sorted(PINNED_ROLES.items()):
+        if role == "voice":
+            continue
+        key = f"model_{role}"
+        raw = gemini.get(key)
+        if raw is None or not str(raw).strip():
+            continue
+        configured = str(raw).strip()
+        if normalise_model_id(configured) != normalise_model_id(pinned):
+            rows.append({"role": role, "key": key,
+                         "configured": configured, "pinned": pinned})
+    return rows
+
+
 def registry_report(config) -> dict:
     """Doctor-facing summary of the registry state of the configuration."""
     findings = scan_config_values(config)
@@ -143,10 +171,13 @@ def registry_report(config) -> dict:
     ladder_unregistered = [
         str(m) for m in ladder
         if not is_registered(str(m))]
+    role_drift = role_drift_rows(config)
     return {
         "forbidden": forbidden,
         "unregistered": unregistered,
         "ladder_unregistered": ladder_unregistered,
+        "role_drift": role_drift,
         "registered": [f for f in findings if f["verdict"] == "registered"],
-        "ok": not forbidden and not unregistered and not ladder_unregistered,
+        "ok": (not forbidden and not unregistered
+               and not ladder_unregistered and not role_drift),
     }

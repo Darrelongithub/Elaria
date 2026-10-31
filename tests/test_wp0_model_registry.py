@@ -88,6 +88,68 @@ def test_ladder_entries_are_registry_checked(config):
     assert report["ok"] is False
 
 
+# -- M-3 re-pin (mini order M, 2026-10-31): the files route ---------------
+
+def test_unset_transcribe_batch_resolves_to_the_registry_pin(config):
+    """A missing/empty role key resolves to the REGISTRY pin, never to the
+    chat default — the W1 <noise> stump ran on exactly this fallthrough
+    (files route served by gemini-3.5-flash-lite)."""
+    config.raw["gemini"].pop("model_transcribe_batch", None)
+    assert config.model_for_role("transcribe_batch") == "gemini-3.5-transcribe"
+    config.raw["gemini"]["model_transcribe_batch"] = ""
+    assert config.model_for_role("transcribe_batch") == "gemini-3.5-transcribe"
+    assert config.model_for_role("transcribe_batch") == \
+        PINNED_ROLES["transcribe_batch"]
+
+
+def test_role_drift_is_reported_and_named(config):
+    """An explicit wrong-for-role value is never blocked at runtime
+    (experimentation doctrine) but doctor rows it by key with the pinned
+    value — the membership scan alone called this 'registered'."""
+    config.raw["gemini"]["model_transcribe_batch"] = "gemini-3.5-flash-lite"
+    assert config.model_for_role("transcribe_batch") == "gemini-3.5-flash-lite"
+    report = registry_report(config)
+    assert report["role_drift"] == [{
+        "role": "transcribe_batch", "key": "model_transcribe_batch",
+        "configured": "gemini-3.5-flash-lite", "pinned": "gemini-3.5-transcribe"}]
+    assert report["ok"] is False
+    # the id itself is registered (it IS the chat pin) — membership is not
+    # the failing check; role fit is
+    assert report["unregistered"] == []
+    assert report["forbidden"] == []
+
+
+def test_defaults_have_no_role_drift(config):
+    report = registry_report(config)
+    assert report["role_drift"] == []
+    assert report["ok"] is True
+    assert config.model_for_role("transcribe_batch") == "gemini-3.5-transcribe"
+
+
+def test_file_leg_resolves_its_model_through_the_registry():
+    """The production leg seam (GeminiBatchBackend → client.transcribe_batch)
+    passes NO model override: resolution stays with model_for_role, which the
+    two pins above put on the registry value."""
+    import inspect
+
+    from assistant import asr
+
+    sig = inspect.signature(asr.GeminiBatchBackend.transcribe)
+    assert "model" not in sig.parameters
+    backend = asr.GeminiBatchBackend(object(), None)
+
+    class _FakeClient:
+        def transcribe_batch(self, path, language, **kwargs):
+            assert "model" not in kwargs, \
+                "the leg must never hard-code a model — resolution is " \
+                "model_for_role('transcribe_batch') = the registry pin"
+            return {"text": "whole sentence", "model": "resolved-inside"}
+
+    backend._client = _FakeClient()
+    result = backend.transcribe("/tmp/x.wav", "en")
+    assert result.text == "whole sentence"
+
+
 def test_forbidden_guard_refuses_the_wire(config, tmp_path):
     store = Store(tmp_path / "g.db")
     try:
