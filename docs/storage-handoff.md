@@ -1279,3 +1279,168 @@ The frozen branch, the three wake triggers, the §2 canonical journal contract a
 dispatch rule, the privacy fence, and the two-clause consumption-time check. The lane is no
 longer *idle*, but it is still **STOPPED AT GATE 1** for live traffic and merge — only the
 build blocker has been lifted.
+
+---
+
+## 2026-10-31 — Q26 RULED (b) THEN (a); "DECADES" FORMALLY RETRACTED; CENSUS WINDOW SUPPLIED; TABLE SPLIT
+
+Report 015 is the record. **This entry is appended at the true end of the file** — see the
+ordering defect recorded first, because two earlier entries are physically in the wrong
+place and a reader needs to know that before anything else.
+
+### DEFECT IN MY OWN APPEND DISCIPLINE — recorded, not hidden
+
+`docs/storage-handoff.md` is append-only with newest at bottom. Reports **013 and 014 are
+physically mid-file**, not at the bottom: report 013 sits at ~line 929 (immediately after
+report 011's "Standing commitment re-armed" block) and report 014 at ~line 1017. The true
+chronological order of the last six entries is:
+
+```
+011 (report 011, base b3db316)
+  -> DOCTRINE RE-TIMED (record-only activation)
+  -> RECORD-ONLY ACTIVATION APPROVED (safety addendum, idle cadence)
+  -> GATE 1 AMENDED / RULING 33 (owner order: build now)
+  -> 012 (build plan + increment 1 landed)
+  -> 013 (measured compression band)
+  -> 014 (census, defaults FINAL, capacity recomputed)
+  -> THIS ENTRY
+```
+
+**Root cause, recorded so it cannot recur:** I appended with a text anchor rather than at
+the file's end, and `edit_file` replaces the **first** match. The anchor
+"Standing commitment re-armed (two clauses, now doctrine)" appears twice — once ending
+report 011 mid-file and once later — so the first match won and the entry landed mid-file.
+Report 014 then anchored on report 013's tail and inherited the same position.
+
+**Nothing was deleted, moved or rewritten** — the append-only rule is intact, and the two
+entries are complete and correct in content. Only their physical position is wrong.
+**Corrective habit from this activation forward: append with a shell append (`cat >>`),
+never with a text anchor.** A text anchor can match mid-file; a shell append cannot.
+
+### RULING 38 — Q26 = (b) then (a); the lane's lean adopted
+
+**The honest statement is YEARS, and it is now the lane's canonical number:**
+
+| Scenario | 10 GB knock | 20 GB full tier |
+|---|---|---|
+| Daily audio only | **3.45–5.00 yr** | **6.91–10.00 yr** |
+| Daily audio **+ ruled monthly events** | **1.07–1.38 yr** | **2.14–2.76 yr** |
+
+**The design chat's "decades" wording is FORMALLY RETRACTED.** It was a months-versus-years
+conflation — **60 months read as 60 years**. Recorded here beside the ruling so no future
+activation inherits the word. Any later figure quoting "decades" for this lane is wrong by
+construction and should be treated as a **corrupted relay, not a datum**.
+
+**The GO ruling stands unchanged:** the knock is a **designed pressure gauge**, and its
+levers are enumerated for the owner:
+1. **event frequency** — the owner's number, under Q24 doctrine;
+2. **`trim_grace_days`** — the last unmeasured `[backup]` value, interim until an owner
+   word or the WP5 event shape lands;
+3. **cold retention policy** — lever (c) from the original four-lever menu.
+
+### RULING 39 — the census window, discharging "the period wasn't given"
+
+Kept-wav filenames span **2026-10-25 → 2026-10-31, six days** — oldest
+`20261025-181730-4d90bf`, newest `20261031-145603-94129e`.
+
+| Quantity | Computed | Ruling's figure |
+|---|---|---|
+| Observed total rate | 76.96 MiB / 6 d = **12.83 MiB/day** | 11–13 MiB/day |
+| Outlier (9,637,484 B) | 9.19 MiB / 6 d = **1.53 MiB/day** | ≈1.6 MiB/day |
+| **Steady state** | **11.29 MiB/day** | ≈9.5–11.5 MiB/day |
+| Outlier share of volume | **11.9%** | — |
+
+**CAVEAT, carried verbatim in force:** the span is observed from filenames in this census
+only. Wavs older than 10-25 may have existed and been trimmed before the census, so the
+window is a **lower bound on the observation period**, not a claim about history.
+
+### THE CAPACITY TABLE, SPLIT BY COLUMN — and what the split settles
+
+| Scenario | Column A: total, outlier **included** (11–13 MiB/d) | Column B: **steady-state** (9.5–11.5 MiB/d) |
+|---|---|---|
+| Cold growth | 5.48–7.93 MB/day | 4.73–7.02 MB/day |
+| 10 GB knock, daily only | 3.45–5.00 yr | **3.90–5.79 yr** |
+| 20 GB full, daily only | 6.91–10.00 yr | **7.81–11.58 yr** |
+| 10 GB knock, + monthly events | 1.07–1.38 yr | **1.11–1.43 yr** |
+| 20 GB full, + monthly events | 2.14–2.76 yr | **2.22–2.87 yr** |
+
+**What the split settles, and it is the real answer to Q26:** separating the outlier moves
+the projections by **+13%** and changes nothing. The outlier is 11.9% of volume — it was
+**never** the explanation for a decades/years gap. The gap was the conflation, and the
+conflation is retracted. Q26 option (b) was the right instinct and the right order, but its
+effect is a 13% improvement, not an order of magnitude.
+
+**Column A is the conservative planning column** and stays canonical; Column B is recorded
+because the ruling asked for the separation and because it is the honest steady-state
+figure.
+
+### RULING 40 — structural findings recorded as ruling-grade
+
+1. **Monthly events dominate daily audio 2–3×** — the event calendar is the capacity driver.
+2. **Actual usage is 16–25% of the WP5 daily allowance** — event headroom is real and large.
+
+### RULING 41 — Ruling 36 defaults ratified, including the evolved label test
+
+The FINAL/INTERIM split enforcement stands as built.
+
+### Cadence constraints carried forward
+
+No re-proposal of frequency absent an owner word. No promotion of `trim_grace_days` absent
+measurement or owner ruling.
+
+---
+
+## 2026-10-31 — INCREMENT 2 LANDED: reconcile-on-start + crash-point tests
+
+Report 015 is the record. Appended with a shell append, per the corrective habit recorded
+in the previous entry.
+
+### What landed
+
+`src/assistant/backup.py` (new) + 20 tests. All three spec crash points pinned:
+
+1. **Killed between upload and flip** → reconcile re-verifies (local file must exist and
+   hash to the recorded sha256; the remote must confirm) **then** flips. A verification
+   failure defers and records a problem; it never guesses.
+2. **Killed between flip and trim** → trim is planned and **idempotency is structural** —
+   the state machine has no `trashed -> trashed` edge, so once trashed no further trim is
+   ever planned. A test runs reconcile twice and asserts the mover fired exactly once.
+3. **Flip fsync'd before any trim** → `append()` fsyncs before returning, and `reconcile()`
+   appends the flip *before* calling the trim mover. A test has the mover record what the
+   manifest says at the moment it runs; it must see `flipped`, not `uploaded`.
+
+**The refusals are the important half.** Five tests assert reconcile *declines*: local hash
+drifted, remote does not confirm, **no verifier configured**, local artifact vanished, trim
+mover absent. The no-verifier case is the posture increment 2 must hold before increment 4
+supplies a real remote — without one, an `uploaded` artifact is left exactly where the crash
+left it rather than flipped on trust.
+
+### Design decision recorded: ONE STATE PER PASS
+
+A single reconcile pass advances each artifact by **at most one state**, so
+`uploaded -> trashed` takes two passes, driven by `reconcile_all()` looping to quiescence.
+
+**This is deliberate and it is the safer semantics.** Advancing several states in one pass
+would mean a single crash could skip a verification step. With one step per pass, a crash
+mid-reconcile leaves every artifact at most one step further on, each step separately
+verified before the next is attempted. A test pins this explicitly
+(`test_one_pass_advances_at_most_one_state`).
+
+If the owner prefers a single advancing pass, that is a design-chat entry, not a lane change
+(Q27).
+
+### Privacy fence held
+
+`ReconcilePlan.summary()` is path-blind; a test asserts no path fragment appears in it.
+
+### Verification
+
+Full suite **1948 passed / 6 skipped / 0 errors** (branch baseline 1928 + 20 new), ruff
+clean. Firewall clean — no edits to `daemon.py`, `transcribe.py`, `live_client.py`,
+`HANDOFF.md`, `tests/conftest.py`.
+
+### Increment 3 is now unblocked in a specific way
+
+Increment 2 supplied the `trim_mover` seam, so increment 3 implements the real mover (grace
+clock, trash dir; idempotency already structural). It must honour the census's **permanent
+exclusions**: voice-cache and test-assets are never tiered or trimmed, forever.
