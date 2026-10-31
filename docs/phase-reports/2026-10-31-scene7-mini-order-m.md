@@ -10,8 +10,9 @@ tagged otherwise. Merge hold on PR #23 stands; nothing merged.
 Order executed: M-2 → (M-3 + M-5) → M-4 → latency scene card proposal.
 Verification per order: full suite + ruff + new pins per item.
 
-Suite after the order: **1,982 passed / 6 skipped** (baseline
-1,954/6) · ruff clean · plain `uv sync` unchanged (google-genai base).
+Suite after the order: **1,982 passed / 6 skipped** (last work-order
+baseline 1,945/6; +37 = M-2 ×4, M-3 ×5, M-5 ×8, M-4 ×20) · ruff clean
+· plain `uv sync` unchanged (google-genai base).
 
 ---
 
