@@ -277,7 +277,13 @@ class DictationService:
     TRANSPORT_CLOSE_TIMEOUT_S = 1.5
     SOURCE_CLOSE_TIMEOUT_S = 1.5
     EVENT_EMIT_TIMEOUT_S = 1.0
-    FALLBACK_TIMEOUT_S = 5.0
+    # W6 (2026-10-31, scene-7 evidence): the leg landed at the 5.0 s
+    # boundary on a good day (latency.table 94129e: final_to_reply 4.93 s
+    # under a 5.0 s cap) — a slower day times out a working leg. The
+    # budget is measured from VOICE-END (the speculative start), not from
+    # the gate, so the raise hides under the final wait on the healthy
+    # path.
+    FALLBACK_TIMEOUT_S = 8.0
     CLEANUP_TIMEOUT_S = 3.0
     PERSIST_TIMEOUT_S = 6.0
 
@@ -543,6 +549,12 @@ class DictationService:
         when = datetime.now().astimezone()
         wav_sink = None
         audio_path = None
+        # W6 (2026-10-31): the speculative file-leg state is read at the
+        # BH-K3 gate and in the finally — initialize at entry (the
+        # final_wait_note lesson: gate-level reads of flush-local state
+        # must be initialized at entry).
+        wav_pre_closed = False
+        speculative_fallback = None
         if self.save_audio:
             audio_path = self.audio_dir / f"{when:%Y%m%d-%H%M%S}-{session_id[:6]}.wav"
             wav_sink = WavSink(audio_path)
@@ -908,6 +920,52 @@ class DictationService:
                       frames_seen=frames_seen, bytes=captured_bytes,
                       duration_s=round(duration_s, 3))
 
+            # W6 (2026-10-31, scene-7 latency evidence): finalize the WAV
+            # at VOICE-END and start the saved-file transcription leg now
+            # — overlapped with the post-release final wait instead of
+            # stacked after the adaptive abandon (latency.table 94129e:
+            # release_to_final 3.59 s + final_to_reply 4.93 s stacked).
+            # The leg is speculative: when the Live primary delivers a
+            # final, the BH-K3 gate discards it unawaited and never
+            # substitutes it (the scene-3b substitution contract stands).
+            if wav_sink is not None:
+                self._log("dictate.wav_close_start", session_id=session_id)
+                try:
+                    duration_s = wav_sink.close() or duration_s
+                    wav_pre_closed = True
+                    self._log("dictate.wav_closed", session_id=session_id,
+                              duration_s=round(duration_s, 3))
+                except Exception as exc:
+                    self._log("dictate.wav_close_failed", session_id=session_id,
+                              error=str(exc)[:120])
+            prelim_no_speech = (captured_bytes == 0 or peak_rms < 0.003
+                                or session_peak < self.silence_floor)
+            # W6 cost guard (the scene-3b/BH-K1 contract): never spend the
+            # speculative call when the Live primary ALREADY covers the
+            # audio — a committed final with no speech after it. The gate
+            # below still runs the inline leg if the picture changes.
+            committed_now = " ".join(_final_texts(collected)).strip()
+            uncommitted_now = (sent_speech_s - speech_s_at_last_final
+                               if speech_s_at_last_final is not None else 0.0)
+            primary_covered = bool(committed_now) and uncommitted_now <= 0
+            if (wav_pre_closed and audio_path is not None
+                    and not prelim_no_speech and not primary_covered):
+                self._log("dictate.fallback_speculative_start",
+                          session_id=session_id, audio_path=str(audio_path))
+                log_event("fallback.speculative_start", session_id=session_id,
+                          verdict="started",
+                          detail=(f"at=voice-end; "
+                                  f"budget_s={self.FALLBACK_TIMEOUT_S:g}; "
+                                  f"file={Path(audio_path).name}"))
+                speculative_fallback = asyncio.create_task(
+                    asyncio.wait_for(
+                        asyncio.to_thread(
+                            asr.transcribe_file, self.config, self.client,
+                            str(audio_path),
+                            offline=offline_at_start or network_drop,
+                            local_backend=self.local_backend),
+                        timeout=self.FALLBACK_TIMEOUT_S))
+
             # PTT released / source exhausted: close the utterance. A Live
             # server may omit its final/turn_complete after activity_end, so
             # both the signal and the receive-loop wait are explicitly bounded.
@@ -1084,7 +1142,7 @@ class DictationService:
             if not frame_loop_completed:
                 self._log("dictate.frame_loop_incomplete", session_id=session_id,
                           frames_seen=frames_seen, bytes=captured_bytes)
-            if wav_sink:
+            if wav_sink and not wav_pre_closed:
                 self._log("dictate.wav_close_start", session_id=session_id)
                 try:
                     duration_s = wav_sink.close() or duration_s
@@ -1317,15 +1375,25 @@ class DictationService:
         if needs_fallback:
             if audio_path is not None:
                 try:
-                    fallback = await self._await_lifecycle(
-                        "dictate.saved_wav_fallback",
-                        asyncio.to_thread(
-                            asr.transcribe_file, self.config, self.client,
-                            str(audio_path), offline=use_offline_chain,
-                            local_backend=self.local_backend),
-                        timeout_s=self.FALLBACK_TIMEOUT_S,
-                        session_id=session_id, audio_path=str(audio_path),
-                        offline=use_offline_chain)
+                    if speculative_fallback is not None:
+                        # W6: the leg already started at voice-end — await
+                        # it (its own budget runs from there).
+                        fallback = await self._await_lifecycle(
+                            "dictate.saved_wav_fallback",
+                            speculative_fallback,
+                            timeout_s=self.FALLBACK_TIMEOUT_S,
+                            session_id=session_id, audio_path=str(audio_path),
+                            offline=use_offline_chain)
+                    else:
+                        fallback = await self._await_lifecycle(
+                            "dictate.saved_wav_fallback",
+                            asyncio.to_thread(
+                                asr.transcribe_file, self.config, self.client,
+                                str(audio_path), offline=use_offline_chain,
+                                local_backend=self.local_backend),
+                            timeout_s=self.FALLBACK_TIMEOUT_S,
+                            session_id=session_id, audio_path=str(audio_path),
+                            offline=use_offline_chain)
                     fallback_text = str(getattr(fallback, "text", "") or "").strip()
                     outcome_detail = ("returned no transcript" if not fallback_text
                                       else f"returned {len(fallback_text)} chars")
@@ -1345,6 +1413,23 @@ class DictationService:
                                 "transcript may be silently translated (§12.4)")
                     else:
                         notes.append("saved-WAV fallback returned no transcript")
+                except TimeoutError:
+                    log_event("fallback.outcome", level="warn",
+                              session_id=session_id, verdict="timeout",
+                              detail=(f"file-transcription leg exceeded "
+                                      f"{self.FALLBACK_TIMEOUT_S:g}s "
+                                      "(budget runs from voice-end)"))
+                    await emit_lifecycle_event(
+                        "dictate.fallback_error_emit",
+                        {"event": "error",
+                         "error": f"saved-WAV fallback timed out after "
+                                  f"{self.FALLBACK_TIMEOUT_S:g}s",
+                         "session_id": session_id})
+                    if not final_text:
+                        backend = "local" if use_offline_chain else backend
+                    notes.append(
+                        f"saved-WAV fallback timed out after "
+                        f"{self.FALLBACK_TIMEOUT_S:g}s")
                 except Exception as exc:
                     log_event("fallback.outcome", level="warn",
                               session_id=session_id, verdict="error",
@@ -1360,6 +1445,20 @@ class DictationService:
                 notes.append("saved-WAV fallback unavailable: no audio file was saved")
             if backend == "gemini_live" and live_failed and not final_text:
                 backend = "local" if use_offline_chain else "gemini_batch"
+        if speculative_fallback is not None and not needs_fallback:
+            # W6: good Live text won the race — the speculative leg's
+            # result is discarded unawaited and never substituted (the
+            # BH-K3 contract). The worker thread may still finish and
+            # bill; that quota tradeoff is named in the stream report.
+            speculative_fallback.cancel()
+            await asyncio.gather(speculative_fallback, return_exceptions=True)
+            self._log("dictate.fallback_speculative_discarded",
+                      session_id=session_id)
+            log_event("fallback.discarded", session_id=session_id,
+                      verdict="discarded",
+                      detail=("primary final landed; speculative leg result "
+                              "discarded (never substituted)"))
+            speculative_fallback = None
 
         no_final = bool(not final_text and not no_speech)
         if no_final:

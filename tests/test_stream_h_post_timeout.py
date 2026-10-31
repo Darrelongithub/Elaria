@@ -79,13 +79,19 @@ def _service(config, tmp_path):
     return svc, store
 
 
-def _run(config, tmp_path, monkeypatch, *, voice_end, fallback_text):
+def _run(config, tmp_path, monkeypatch, *, voice_end, fallback_text,
+         fallback_delay_s=0.0, fallback_timeout_s=None):
     svc, store = _service(config, tmp_path)
+    if fallback_timeout_s is not None:
+        svc.FALLBACK_TIMEOUT_S = fallback_timeout_s
     transport = SilentTransport(voice_end=voice_end)
     fallback_calls = []
 
     def fallback(*args, **kwargs):
         fallback_calls.append((args, kwargs))
+        if fallback_delay_s:
+            import time
+            time.sleep(fallback_delay_s)
         return Transcript(fallback_text, "en", "gemini_batch")
 
     monkeypatch.setattr(asr, "transcribe_file", fallback)
@@ -164,3 +170,36 @@ def test_the_route_decision_is_journal_visible(config, tmp_path, monkeypatch):
     assert "timeout_kind=adaptive_abandon" in route_line, \
         "the route line must carry the commit reason"
     assert "fallback.outcome" in lines
+
+
+# --------------------------------------------- W6 (2026-10-31) contract
+def test_the_leg_starts_at_voice_end_not_at_abandon(config, tmp_path,
+                                                    monkeypatch):
+    """W6: the file leg starts speculatively at voice-end — its start
+    line must precede the post-timeout route decision (the old flow
+    stacked leg-after-abandon: release_to_final 3.59 s wasted)."""
+    _result, lines, _calls = _run(config, tmp_path, monkeypatch,
+                                  voice_end=True, fallback_text=RECOVERED)
+    start = lines.find("fallback.speculative_start")
+    route = lines.find("post_timeout_route")
+    assert start != -1, "the speculative start must be journal-visible"
+    assert route != -1
+    assert start < route, "the leg must start at voice-end, before the route"
+    assert "fallback.outcome" in lines
+
+
+def test_a_slow_leg_names_the_timeout_budget_from_voice_end(config, tmp_path,
+                                                            monkeypatch):
+    """W6 review of FALLBACK_TIMEOUT_S: a leg exceeding its budget names
+    the timeout (verdict=timeout) — never a generic error — and the
+    budget is documented as running from voice-end."""
+    result, lines, calls = _run(
+        config, tmp_path, monkeypatch,
+        voice_end=True, fallback_text=RECOVERED,
+        fallback_delay_s=0.5, fallback_timeout_s=0.1)
+    assert len(calls) == 1
+    outcome = next(ln for ln in lines.splitlines() if "fallback.outcome" in ln)
+    assert "timeout" in outcome.split(), \
+        "the outcome line's verdict token must name the timeout"
+    assert "budget runs from voice-end" in outcome
+    assert "saved-WAV fallback timed out after 0.1s" in " ".join(result.notes)

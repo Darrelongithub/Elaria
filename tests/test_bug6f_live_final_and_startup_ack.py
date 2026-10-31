@@ -157,7 +157,13 @@ def test_transcribe_live_committed_envelope_finishes_without_model_turn(
         result = asyncio.run(svc.dictate(
             SimulatedCapture(speech_frames=356, silent_frames=0),
             transport_factory=lambda: transport, sink=sink))
-        assert fallback_calls == [], "a committed input envelope is already a Live final"
+        # W6 (2026-10-31): the file leg now starts speculatively at
+        # voice-end and is DISCARDED when the Live final wins — the call
+        # may occur (named quota tradeoff in the stream report) but it is
+        # never consumed (saved_wav_fallback_start below) and never
+        # substituted (backend/raw_text below).
+        assert len(fallback_calls) <= 1, \
+            "at most the one speculative voice-end call, never a gate retry"
         assert result.backend == "gemini_live"
         assert result.raw_text == USER_TEXT
         assert not result.no_final and not result.no_speech
@@ -180,6 +186,9 @@ def test_transcribe_live_committed_envelope_finishes_without_model_turn(
         assert "dictate.transcript_final_wait_timeout" not in steps
         assert "dictate.live_no_final" not in steps
         assert "dictate.saved_wav_fallback_start" not in steps
+        if fallback_calls:
+            assert "dictate.fallback_speculative_discarded" in steps, \
+                "a speculative call on the good-final path must be discarded"
         summary = next(row for row in lifecycle(store)
                        if row["step"] == "dictate.live_receive_summary")
         assert summary["event_counts"]["final"] == 1
@@ -379,7 +388,10 @@ def test_an_earlier_segment_does_not_skip_waiting_for_the_released_activity(
     try:
         result = asyncio.run(svc.dictate(Source(), transport_factory=Transport))
         if tail_outcome == "final":
-            assert not fallback_calls
+            # W6 (2026-10-31): at most the one speculative voice-end call —
+            # discarded when the tail final lands; substitution contract
+            # proven by raw_text/backend below.
+            assert len(fallback_calls) <= 1
             assert result.raw_text == "The first segment. The final segment."
             assert result.backend == "gemini_live"
         else:
@@ -555,7 +567,13 @@ def test_startup_ack_and_its_tail_reach_neither_live_nor_saved_wav(
             with wave.open(result["audio_path"], "rb") as wav:
                 assert wav.readframes(wav.getnframes()) == USER_FRAME * 4, (
                     "the saved WAV must not reintroduce the ack through batch ASR")
-            assert fallbacks == ([USER_FRAME * 4] if batch_fallback else [])
+            if batch_fallback:
+                assert fallbacks == [USER_FRAME * 4]
+            else:
+                # W6 (2026-10-31): at most the one speculative voice-end
+                # call — discarded; raw_text/backend above prove no
+                # substitution over the Live final.
+                assert len(fallbacks) <= 1
             assert clipboard == [USER_TEXT]
             assert USER_TEXT in Path(result["inbox_path"]).read_text()
             status = await daemon._status({})
