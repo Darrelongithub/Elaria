@@ -859,7 +859,16 @@ class Daemon:
             "outstanding_intents": len(self.store.outstanding_intents()),
             "dictation_active": bool(self._dictation_task and not self._dictation_task.done()),
             "dictation_processing": self._ptt_processing,
-            "ptt_session_id": self._ptt_session_id,
+            # W7a (2026-10-31): `ptt_session_id` names a LIVE session only
+            # — exactly while a holder row exists (the scene-7 evidence:
+            # a closed session's id kept being advertised 14 s later with
+            # holders empty). History lives in `last_session_id`.
+            "ptt_session_id": (self._ptt_session_id
+                               if self._ptt_session_id is not None
+                               and (self._dictation_task is not None
+                                    or self._ptt_session_id in self._ptt_finishing)
+                               else None),
+            "last_session_id": self._ptt_last_session_id,
             # §4.2: the honest enumeration of mic/Live holders (free tier: 3
             # concurrent Live sessions). The ladder's wake chain reads this.
             "session_holders": self._session_holders(),

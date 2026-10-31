@@ -83,8 +83,13 @@ def _wait_for_dictation_endpoint(config, session_id: str | None,
         except (DaemonUnavailable, DaemonError, OSError, RuntimeError):
             return "unavailable"
         current = status.get("ptt_session_id")
+        last = status.get("last_session_id", current)
         if current not in (None, session_id):
             return "superseded"         # never release another process's PTT
+        if current is None and last == session_id:
+            return "closed"             # W7a: holder gone — our session ended
+        if current is None and last not in (None, session_id):
+            return "superseded"         # replaced, and that session closed too
         if (current == session_id
                 and not status.get("dictation_active", True)):
             return "closed"
