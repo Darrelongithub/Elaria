@@ -926,6 +926,94 @@ On every base movement: re-run the drift check **and** re-measure the suite, aga
 
 ---
 
+## 2026-10-31 — MEASURED COMPRESSION BAND (design-chat ratio addendum); CAPACITY TABLE RECOMPUTED
+
+Report 013 is the record. The zero-compression floor that every WP7 number was built on
+has been replaced by a **measured** band. The direction is favorable and the ruling raises
+no retune flag — but it moves three thresholds, and one of them moves enough to matter.
+
+### RULING 34 — measured real-voice zstd -19 ratios are the FINAL band
+
+| Measurement | Ratio | Source artifact |
+|---|---|---|
+| Watchdog capture | **0.475** | 9,637,484 B |
+| Session wav | **0.582** | 330,284 B |
+
+**Cold weighs 48–58% of hot.** This **supersedes the expected 0.6–0.9**, which was
+conservative; the direction is favorable and raises no retune flag. All else per the
+config-finalization block stands.
+
+### What this replaces
+
+Report 004's capacity model carried an explicit standing assumption:
+*"compression gain = 0 until Scene Sheet 2 measures one real restic/zstd ratio on a real
+kept wav."* **That line is now discharged** — Sheet 2's "one measured zstd ratio"
+obligation is met, and met with two measurements rather than one. The census (`du`
+aggregates, kept-wav count) is still owed and still gates the final numeric defaults.
+
+### Evidence class — recorded, not glossed
+
+These are **zstd -19 ratios measured on real voice wavs**: [TESTED-ONLY], measured on real
+audio, but **not** an end-to-end restic-over-MEGA round trip. restic's own compression is
+zstd, so the ratio is the right shape — but restic adds pack overhead, dedup metadata and
+the rclone/MEGA transport, none of which is in these numbers. **The end-to-end cold weight
+will therefore be ≥48% of hot, probably somewhat more.** Capacity planning uses the
+conservative end of the band (0.582) as the working figure; the favourable end (0.475) is
+headroom, not a plan. Only Sheet 1's benchmark can close the gap.
+
+### A size observation worth carrying
+
+The 9.6 MB watchdog capture compressed **better** (0.475) than the 330 KB session wav
+(0.582). zstd's window means larger inputs compress better, so **the band is
+size-dependent, not a single constant**. Any future measurement should record the artifact
+size alongside the ratio, and the band should be re-derived if the kept-wav census shows a
+very different size mix than these two samples.
+
+### The three thresholds that moved
+
+1. **WP5 daily allowance (the headline):** `~10 kept-min/day at the floor, ~20 at 2x`
+   becomes **28.4–38.3 kept-min/day** — **2.9x–3.9x the floor**. The owner's practical
+   daily budget is roughly three times what the conservative floor implied.
+2. **12-month bar:** `28.5 kept-min/day` at the floor becomes **49.0–60.1 kept-min/day**
+   (**1.7x–2.1x**).
+3. **Flood math:** one 8-hour event day consumed **16.8 days** of the 12-month budget at
+   the floor; it now consumes **8.0–9.8 days**. Still a heavy day, but no longer
+   catastrophic.
+
+### The event-frequency verdict table, recomputed
+
+Months to fill 20 GB with 8-hour events alone (raw 921.6 MB each):
+
+| Frequency | raw GB/yr | cold @0.475 | cold @0.582 | **months @0.475** | **months @0.582** | old floor |
+|---|---|---|---|---|---|---|
+| daily | 336.38 | 159.78 | 195.78 | 1.5 | 1.2 | 0.7 |
+| 2x/week | 95.85 | 45.53 | 55.78 | 5.3 | 4.3 | 2.5 |
+| weekly | 47.92 | 22.76 | 27.89 | 10.5 | 8.6 | 5.0 |
+| fortnightly | 23.96 | 11.38 | 13.95 | **21.1** | **17.2** | 10.0 |
+| **monthly (ruled target)** | 11.06 | 5.25 | 6.44 | **45.7** | **37.3** | 21.7 |
+| quarterly | 3.69 | 1.75 | 2.15 | 137.1 | 111.9 | 65.1 |
+
+**The ruled design target stands: MONTHLY.** It now has **37.3–45.7 months** of headroom
+against a 12-month requirement — roughly double the floor's 21.7 — so the target is
+comfortable rather than marginal.
+
+**But one threshold genuinely moved, and it is recorded rather than smoothed over:**
+**fortnightly now clears 12 months (17.2–21.1) where the floor said it did not (10.0).**
+Weekly still does not clear (8.6–10.5). So the "highest frequency that survives" line has
+shifted from monthly to fortnightly. Monthly remains the ruled target — the ruling says
+compression is headroom, not a requirement — but the owner now has a measured basis to
+choose fortnightly if a denser event calendar is wanted. **That is a design-chat decision,
+not a lane decision, and it is raised as Q24 rather than acted on.**
+
+### Config impact
+
+No `[backup]` default changes. The measured band informs the capacity model and the
+capacity-floor knock threshold, which are `INTERIM-PENDING-SHEETS` pending the census. The
+`hot_window_days` / `hot_window_gb` pair governs how long audio stays HOT before going
+cold and is unaffected by the compression ratio.
+
+---
+
 ## 2026-10-27 — DOCTRINE RE-TIMED: POLLING ENDS, CONSUMPTION-TIME BEGINS. LANE SLEEPS UNTIL OWNER NUMBERS
 
 Report 011 was accepted and the verification doctrine is **re-timed**. This activation
