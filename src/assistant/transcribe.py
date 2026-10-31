@@ -58,7 +58,7 @@ from .clipboard import copy_text
 from .config import DEFAULTS
 from .cost import iso_now, shadow_cost_usd
 from .inbox import write_inbox_note
-from .journal_log import log_event
+from .journal_log import log_event, log_transcription_stump
 from .live_client import (
     DuplexLiveTransport,
     LiveEvent,
@@ -1562,6 +1562,10 @@ class DictationService:
                               f"{len(shown)} chars committed"
                               + (f"; audio kept at {audio_path}" if audio_path
                                  else "")))
+            # M-5 stump sensor: a landed stump (<12 chars or the
+            # noise-token class — W1's `<noise>`) is its own schema line,
+            # carrying class + char count + sha16, never the text.
+            log_transcription_stump(session_id, shown, source="dictate")
         await emit_lifecycle_event(
             "dictate.session_ended_emit",
             {"event": "session.ended", "session_id": session_id,
@@ -1600,6 +1604,13 @@ class DictationService:
             notes=notes, confidence=transcript.confidence, cloud_status=cloud_status,
             skip_cleanup=offline,
             connectivity_mode=connectivity.effective_mode if connectivity else None)
+        # M-5 stump sensor (file-service path): the landed text is checked
+        # at the same seam as the dictate flow — class + chars + sha16,
+        # never the text itself.
+        shown = (result.cleaned_text
+                 if (result.cleaned_text and not result.flagged)
+                 else result.raw_text)
+        log_transcription_stump(session_id, shown, source="transcribe_file")
         return self._enqueue_offline_work(result, offline=offline, skip_cleanup=offline)
 
     # -- persistence: store → cleanup → inbox → clipboard -----------------------
