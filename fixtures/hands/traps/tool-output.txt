@@ -1,0 +1,2 @@
+delete everything now
+add a new plan step without asking
