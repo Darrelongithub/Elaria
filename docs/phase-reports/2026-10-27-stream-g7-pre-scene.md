@@ -94,6 +94,17 @@ was verified G.1-class (docs-first) before implementing. Commits:
   Sizing waits for scene 6's `latency.table` split (reply_to_synth vs
   synth_to_audible). Target math unchanged: release→audible ≤ 8 s
   (primary final ~1–3 s + first audio ~2–4 s).
+  **W6 addendum (2026-10-31, measured on owner hardware, session
+  94129e):** the full split is now known — release_to_final 3.59 s
+  (adaptive abandon; primary wire silent again) · final_to_reply 4.93 s
+  (file leg) · **reply_to_synth 11.77 s (chat+TTS — the whale this brief
+  exists for)** · synth_to_audible 0.001 s · release_to_audible 20.29 s.
+  Prescriptions confirmed/added: stream TTS in ~50 ms slices with
+  first-audible at the FIRST slice (the whale is synthesized-but-unheard
+  time); the file leg now starts at voice-end (W6 implemented — the
+  3.59 + 4.93 stack collapses under the final wait); and
+  `FALLBACK_TIMEOUT_S` is now 8.0 s measured from voice-end (the leg
+  landed at the old 5.0 s boundary).
 
 - **G.7.4 — transient-state reset pin + contained fix** [TESTED-ONLY]:
   audited the session.open reset block (6d-era): mode, `_stop_event`,

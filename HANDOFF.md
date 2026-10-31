@@ -271,6 +271,25 @@ report]:
   where scene 5's timeout landed via fallback + reply). Stream H.1
   traces it; the trace verdict is §5.9.
 
+### Scene 7 evidence bundle (2026-10-31) — work order W1–W7
+
+Owner hardware evidence landed as a mainline work order (item verdicts:
+`docs/phase-reports/2026-10-31-scene7-work-order.md`): W1 file-leg stump
+(7 of 29 chars, session 94129e); W2 arm B rebuild ordered; W3 Python
+3.14.8 local-ASR breakage; W4 the two release-bind incidents (dossier:
+`docs/dossiers/2026-10-31-hyprland-057-release-binds.md`); W5 mic
+warm-up ×4; W6 the measured end-to-end budget (release_to_audible
+20.29 s); W7 cosmetics/paperwork. **Manifest reconciliation (W7b):**
+the manifest above is a scene-record of kept wavs (8 entries / 6
+unresolved — the deferred-audio contract governs those); the owner's
+disk now holds 35+ wavs including `20261031-140217-3b5227.wav` (the
+9.6 MB / 301 s watchdog capture) and `20261031-145603-94129e.wav`
+(W1's stump). It is NOT a disk inventory; **reconcile-on-start is a
+storage-lane design item that WP5's deferred-retry consumer inherits**
+(storage lane untouched this round — the additive-only firewall held).
+Scene cards (W3/W4/W5 owner proofs + W1/W2 run instructions):
+`docs/scene-cards/2026-10-31-scene7-followups.md`.
+
 ## 5. Lessons and watch items
 
 1. **Daemon-was-stale lesson (scene 1):** the scene ran status-dependent
@@ -434,10 +453,39 @@ report]:
     verified by direct read: origin tip = `018d109` = last verified
     baseline (empty diff, `main` still at `ed20344`); `journal_log.py`
     untouched by scene-readiness (last touch `30abf30`, stream G);
-    `log_event` is generic — "event is the caller's naming", no
-    allowlist — so `capture.lifecycle` needed no journal-side change.
-    The moving baseline SHA is carried in the lane's session memory,
-    updated at the end of every activation.
+   `log_event` is generic — "event is the caller's naming", no
+   allowlist — so `capture.lifecycle` needed no journal-side change.
+   The moving baseline SHA is carried in the lane's session memory,
+   updated at the end of every activation.
+11. **Scene-7 work-order rulings and outcomes (2026-10-31).** W5
+   addendum (RULED): the always-active mic is rejected as a latency
+   measure — it makes the 14:02 hot-mic class permanent, falsifies the
+   `capture.node_state` suspended-after-close privacy proof,
+   desensitizes the mic-in-use indicator, and contradicts settled
+   hold-to-talk. WP1 scope named instead: (i) READY-EARCON, a distinct
+   second cue at first audio frame (owner speaks on the blip; acceptance
+   = audible within 50 ms of first frame, distinguishable from the
+   session-open cue by ear), (ii) PRE-ROLL DISCARD, frames before
+   first-frame dropped by construction. Always-on listening remains
+   exclusively a WP4 wake-word-mode property; **no lane implements node
+   pinning, manual PipeWire keep-warm, or any always-on capture outside
+   WP4's future design**. W6 (implemented): the file leg now starts
+   speculatively at voice-end (wav finalized at voice-end; budget
+   `FALLBACK_TIMEOUT_S = 8.0` s measured from there — 5.0 s was landing
+   at the boundary), overlapped with the final wait; the BH-K3 gate
+   consumes it only when `needs_fallback` and DISCARDS it otherwise
+   (never substituted — the scene-3b contract, now pinned). The
+   speculative call is skipped when the primary already covers the
+   audio (committed final, no trailing speech — the BH-K1 cost
+   contract). **Open tradeoff for the design chat:** a discarded leg may
+   still bill its tokens (the worker thread runs to completion); on the
+   silent-wire reality (4/4 sessions) the leg is the de-facto primary,
+   but if the primary recovers, every utterance pays one wasted
+   file-transcription call. W7a: `assist status` `ptt_session_id` now
+   names a live session only (holder's truth); history is
+   `last_session_id`. W3: the local leg degrades BY NAME
+   (`LocalAsrDegraded` + `local_asr.degraded` schema line + the exact
+   `av` named in the diagnostic) instead of a raw TypeError on 3.14.8.
 
 ## 6. Known open defects (logged, not fixed — see phase reports)
 
@@ -609,3 +657,14 @@ numbers are in the stream-H phase report) — **Gate v2's 8 s bar stands
 unless you re-rule with those numbers in hand**. Both red and green are
 decisions. §5 order after the gate:
 WP1→WP2→WP4→WP5→WP3 (jump if rpm hyprland ≥ 0.57)→WP6.
+
+### After that — the 2026-10-31 scene cards
+
+The work order's owner proofs are scheduled in
+`docs/scene-cards/2026-10-31-scene7-followups.md`: SC-W3 (local ASR on
+3.14.8 — transcribes OR named degradation, both results), SC-W4
+(double-stop both release directions — the WP3 jump discriminator),
+SC-W5 (ready-earcon ≤ 50 ms, after WP1 builds it), plus the W1 probe
+run and the W2 arm A/B runs (paste-safe scripts, outputs feed the H.5
+ruling and the Google bug report draft in
+`docs/bug-reports/2026-10-31-gemini-live-transcribe-zero-output.md`).
