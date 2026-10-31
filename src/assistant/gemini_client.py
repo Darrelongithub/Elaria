@@ -446,6 +446,28 @@ class PerModelLimiter:
             waited += wait
 
 
+def batch_transcription_prompt(language: str,
+                               also_languages: list[str] | None = None,
+                               *, preserve_code_switching: bool = False) -> str:
+    """The exact transcription prompt the batch/file leg sends (§12.4/§12.5).
+
+    Module-level so the W1 file-leg probe (scripts/file_leg_probe.py) can
+    print what production sends without reimplementing the f-strings —
+    one construction, one truth (scene-7 work order, 2026-10-31).
+    """
+    others = [lang for lang in (also_languages or []) if lang != language]
+    if others and preserve_code_switching:
+        return (
+            f"Transcribe this audio verbatim. The speaker's primary language "
+            f"is {language} and they code-switch with {', '.join(others)}. "
+            "Transcribe EVERY passage in the language actually spoken in it. "
+            "Do NOT translate. Do NOT normalise mixed speech into one "
+            "language. Return only the transcript.")
+    return (f"Transcribe this audio verbatim. The language is {language}; "
+            "transcribe in that language exactly as spoken. Do NOT "
+            "translate. Return only the transcript.")
+
+
 class GeminiClient:
     def __init__(self, config, store, *, transport: Transport | None = None,
                  sleep: Callable[[float], None] = time.sleep):
@@ -1116,17 +1138,8 @@ class GeminiClient:
         # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
         assert_model_permitted(model)
         others = [lang for lang in (also_languages or []) if lang != language]
-        if others and preserve_code_switching:
-            prompt = (
-                f"Transcribe this audio verbatim. The speaker's primary language "
-                f"is {language} and they code-switch with {', '.join(others)}. "
-                "Transcribe EVERY passage in the language actually spoken in it. "
-                "Do NOT translate. Do NOT normalise mixed speech into one "
-                "language. Return only the transcript.")
-        else:
-            prompt = (f"Transcribe this audio verbatim. The language is {language}; "
-                      "transcribe in that language exactly as spoken. Do NOT "
-                      "translate. Return only the transcript.")
+        prompt = batch_transcription_prompt(
+            language, others, preserve_code_switching=preserve_code_switching)
         contents = {"audio_sha256": digest, "language": language,
                     "languages": [language, *others], "prompt": prompt}
         correlation_id = uuid.uuid4().hex[:12]
@@ -1170,17 +1183,8 @@ class GeminiClient:
         # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
         assert_model_permitted(model)
         others = [lang for lang in (also_languages or []) if lang != language]
-        if others and preserve_code_switching:
-            prompt = (
-                f"Transcribe this audio verbatim. The speaker's primary language "
-                f"is {language} and they code-switch with {', '.join(others)}. "
-                "Transcribe EVERY passage in the language actually spoken in it. "
-                "Do NOT translate. Do NOT normalise mixed speech into one "
-                "language. Return only the transcript.")
-        else:
-            prompt = (f"Transcribe this audio verbatim. The language is {language}; "
-                      "transcribe in that language exactly as spoken. Do NOT "
-                      "translate. Return only the transcript.")
+        prompt = batch_transcription_prompt(
+            language, others, preserve_code_switching=preserve_code_switching)
         correlation_id = uuid.uuid4().hex[:12]
         started = time.monotonic()
 
