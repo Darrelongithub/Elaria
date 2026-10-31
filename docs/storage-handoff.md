@@ -1014,6 +1014,121 @@ cold and is unaffected by the compression ratio.
 
 ---
 
+## 2026-10-31 — CENSUS DELIVERED; DEFAULTS FINAL; Q24 RULED; CAPACITY RECOMPUTED
+
+Report 014 is the record. The owed Sheet-2 census line has been discharged, four
+`[backup]` values have moved from interim to FINAL, and the capacity table has been
+recomputed with census and band together.
+
+### RULING 35 — THE CENSUS (discharges the owed line)
+
+| Fact | Value |
+|---|---|
+| Files in `audio/` | **37** = 35 session wavs + 2 artifacts |
+| Kept-session bytes | **80,698,682 B** (80.70 MB / 76.96 MiB) |
+| `du -sb audio/` | **138,298,770 B** |
+| Assistant tree | 372 M |
+| `event-spike.wav` | 57,600,044 B — synthetic 30-min test tone, **relocated by owner order** to `~/.local/share/assistant/test-assets/`; WP5 spike-path paperwork = **M-1, mainline's** |
+| `20261025-181730-4d90bf.wav` | **44 bytes**, header-only, **never-retry mark under the deferred-audio contract, counts zero forever** |
+| Growth | **≈11–13 MiB/day**, including one 9.6 MB runaway outlier |
+
+**Census arithmetic self-checks exactly:** 80,698,682 + 57,600,044 + 44 = 138,298,770 =
+`du -sb audio/`. Tierable = **80.70 MB**; excluded = 57.60 MB.
+
+**Average kept session wav = 2.306 MB = 1.20 kept-minutes** (raw, at 1.92 MB/min). The
+typical kept session is about a minute and a quarter — a fact worth having when reading
+every capacity number below.
+
+**PERMANENT EXCLUSIONS from tiering and trim (ruled, forever):** voice-cache and
+test-assets. The reasons are contracts, not tidiness — **0 ms recall** for the voice cache
+and **offline-voice** for test-assets. Neither may ever be trimmed to reclaim space.
+
+### RULING 36 — DEFAULTS FINAL (INTERIM tags removed for these four)
+
+| Key | Was (interim) | **Now (FINAL-CENSUS)** |
+|---|---|---|
+| `hot_window_days` | 14 | **14** — value unchanged, status final |
+| `hot_window_gb` | 2 | **2** — value unchanged, status final |
+| `restic_pack_size_mib` | 16 | **128** — fewer MEGA objects/requests; temp-space cost accepted |
+| `capacity_floor_gb` | 2 | **10** — 50% of the free tier |
+
+`trim_grace_days` **stays `INTERIM-PENDING-SHEETS`** — the grace period was not part of
+the census and no measurement bounds it. It is the last interim value in `[backup]`.
+
+**HOT window confirmed: the 14-day WINDOW binds, not the 2 GB cap.** At measured growth,
+14 days of hot audio is 154–182 MiB ≈ 0.15–0.18 GiB, about **11x under** the cap. The cap
+is a backstop, not the operative limit — the ruling's parenthetical is confirmed by
+arithmetic.
+
+**Capacity-floor semantic note, recorded so it cannot be misread:** the key is expressed
+as `remote_free` (knock when free < 10 GB), which on a 20 GB tier is **equivalent to
+"10 GB consumed"** — the ruling's phrasing. Same threshold, two spellings.
+
+**Capacity ruling: GO** — the machinery is built and the numbers below are the basis.
+
+### RULING 37 — Q24 RULED = (c) then (a)
+
+- Event frequency stays **MONTHLY** until Sheet 1 measures the end-to-end
+  restic-over-MEGA ratio.
+- **Fortnightly is recorded as a measured, owner-available option (17.2–21.1 months) that
+  ONLY the owner may pick, by number, on their own initiative.**
+- **Weekly remains ruled out** (8.6–10.5 months).
+- **The lane does not re-propose frequency absent an owner word.**
+- Sheet 1's added job is ratified: measure the end-to-end ratio so the overhead between
+  the zstd band and the true cold weight closes. Until then the conservative end plans.
+
+### THE RECOMPUTED CAPACITY TABLE (census + band; old-floor column RETIRED to history)
+
+**Cold growth:** hot 11.53–13.63 MB/day (6.0–7.1 kept-min/day) → **cold 5.48–7.93 MB/day**.
+**Monthly 8-hour events cold:** 5.25–6.44 GB/yr = **14.39–17.64 MB/day**.
+
+| Scenario | 10 GB knock | 20 GB full tier |
+|---|---|---|
+| Daily audio only, best (0.475) | **5.00 yr** | **10.00 yr** |
+| Daily audio only, worst (0.582) | **3.45 yr** | **6.91 yr** |
+| Daily audio **+ monthly events**, best | **1.38 yr** | **2.76 yr** |
+| Daily audio **+ monthly events**, worst | **1.07 yr** | **2.14 yr** |
+
+**The old-floor column is retired to history per the ruling.** Report 004's zero-compression
+figures remain as the historical record of what was assumed before measurement.
+
+### TWO STRUCTURAL FINDINGS THE CENSUS PRODUCED
+
+1. **Monthly events dominate daily audio by 2–3x** (14.39–17.64 vs 5.48–7.93 MB/day cold).
+   The event calendar is the dominant capacity driver, not daily usage — consistent with
+   the whole flood-math thread, and the reason frequency is an owner decision rather than
+   a lane one.
+2. **Actual usage is well under plan:** the census implies 6.0–7.1 kept-min/day against the
+   WP5 allowance of 28.4–38.3 — **16–25% of budget**. The owner is not near the allowance,
+   which is the favourable reading.
+
+### AN HONEST DISAGREEMENT, RECORDED RATHER THAN SMOOTHED OVER
+
+The ruling states *"at the measured band the floor clears in decades."* **My arithmetic
+does not reproduce that**, and the gap is large enough that it must be surfaced rather
+than absorbed:
+
+- daily audio alone reaches the 10 GB knock in **3.45–5.00 years**, and fills the tier in
+  **6.91–10.00 years**;
+- adding the ruled monthly events brings the knock to **1.07–1.38 years** and a full tier
+  to **2.14–2.76 years**.
+
+**None of those is decades.** The GO ruling stands — the machinery is built either way, and
+the knock is a *designed pressure gauge* that is supposed to fire so the owner can act on a
+lever. But the owner should know the gauge will fire in **roughly one to five years**, not
+in decades, and that the monthly event calendar is what pulls it forward from ~4 years to
+~1 year. Raised as **Q26**.
+
+### Config applied
+
+`src/assistant/config.py` `DEFAULTS["backup"]` and `config.toml.example` both updated;
+parity verified. The label test was **evolved rather than deleted**: it now enforces the
+two-marker split (`INTERIM-PENDING-SHEETS` vs `FINAL-CENSUS`) so an unmeasured value cannot
+be quietly promoted, and a census-backed value must say so. A second test pins the FINAL
+numbers. Full suite **1928 passed / 6 skipped / 0 errors**, ruff clean.
+
+---
+
 ## 2026-10-27 — DOCTRINE RE-TIMED: POLLING ENDS, CONSUMPTION-TIME BEGINS. LANE SLEEPS UNTIL OWNER NUMBERS
 
 Report 011 was accepted and the verification doctrine is **re-timed**. This activation

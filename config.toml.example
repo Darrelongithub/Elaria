@@ -451,19 +451,22 @@ save_near_miss_clips = false        # privacy: off by default (§13.10)
 rclone_remote = ""
 rclone_path = "elaria-restic"
 # restic-over-rclone pins. MEGA repo-open routinely exceeds restic's 1m default
-# rclone timeout, so this is set EXPLICITLY rather than inherited. [TESTED-ONLY]
-# against stubs — Sheet 1 confirms it against MEGA.
+# rclone timeout, so this is set EXPLICITLY rather than inherited.
 restic_timeout = "5m"
-# 16 MiB is restic's default. Larger packs reduce the many-tiny-objects worst
-# case on object stores. INTERIM-PENDING-SHEETS — Sheet 1 measures this.
-restic_pack_size_mib = 16
-# Tiering: the HOT window for resolved kept audio, whichever comes first.
-# INTERIM-PENDING-SHEETS — Sheet 2's kept-wav census decides the real pair.
+# 128 MiB is FINAL (census 2026-10-31): fewer, larger objects means fewer MEGA
+# requests against the per-IP rolling quota window, and the temp-space cost
+# (pack size x (backend connections + 1)) is accepted by ruling.
+restic_pack_size_mib = 128
+# Tiering: the HOT window for resolved kept audio, whichever binds first.
+# FINAL (census 2026-10-31). At the measured growth of 11-13 MiB/day the
+# 14-day WINDOW binds long before the 2 GB cap (~11x away), so the cap is a
+# backstop rather than the operative limit.
 hot_window_days = 14
 hot_window_gb = 2
 # Trim moves to local trash, then purges after the grace period. The grace is
 # what guarantees no artifact ever has exactly one copy the instant a flip lands.
-# INTERIM-PENDING-SHEETS.
+# Still INTERIM-PENDING-SHEETS: the grace period was not part of the census and
+# no measurement bounds it.
 trim_grace_days = 14
 # Uploads above this size defer to AC/unmetered power (battery/metered policy).
 defer_above_mb = 100
@@ -475,8 +478,10 @@ watcher_poll_s = 30
 nightly_oncalendar = "03:17"
 # Capacity floor: remote_free below this raises exactly one knock reading
 # "Elaria wants to talk" with ZERO content. It is the designed pressure gauge —
-# never a silent auto-delete, which does not exist. INTERIM-PENDING-SHEETS.
-capacity_floor_gb = 2
+# never a silent auto-delete, which does not exist.
+# FINAL (census 2026-10-31) = 10 GB, i.e. 50% of the 20 GB free tier. Expressed
+# as remote_free, which on a 20 GB tier is equivalent to "10 GB consumed".
+capacity_floor_gb = 10
 # Monthly integrity drill: restore a random artifact to tmp, hash-verify,
 # `restic check`. Quarterly adds --read-data-subset capped at 5% / 500 MB so a
 # drill never reads the whole repository.

@@ -193,35 +193,66 @@ def test_summary_carries_no_paths(tmp_path):
 # -- config registration ----------------------------------------------------
 
 def test_backup_section_is_registered_in_defaults(config):
-    """doctor must not warn 'unknown section [backup]' on a real config."""
+    """doctor must not warn 'unknown section [backup]' on a real config.
+
+    The FINAL values are asserted in `test_final_defaults_carry_the_census_values`
+    so the numbers live in exactly one place.
+    """
     backup = config.section("backup")
-    assert backup["rclone_remote"] == ""
-    assert backup["hot_window_days"] == 14
-    assert backup["hot_window_gb"] == 2
-    assert backup["trim_grace_days"] == 14
+    assert backup["rclone_remote"] == "", (
+        "an unset remote must stay empty so commands refuse rather than guess")
     assert backup["restic_timeout"] == "5m"
-    assert backup["capacity_floor_gb"] == 2
     assert backup["watcher_poll_s"] == 30
     assert backup["nightly_oncalendar"] == "03:17"
+    assert backup["rclone_path"] == "elaria-restic"
 
 
-def test_every_sheet_dependent_value_is_labelled_interim():
+def test_every_sheet_dependent_value_is_labelled():
     """A Sheet-dependent default must never be mistaken for a tuned one.
 
-    The label lives in a source comment, so this reads config.py and asserts
-    the marker sits on the same line as each key. Removing a label is a defect
-    this test catches, not a cleanup.
+    Two markers, two meanings, and the split is enforced rather than assumed:
+
+      INTERIM-PENDING-SHEETS  not measured yet; may not be quoted as tuned.
+      FINAL-CENSUS            measured and ruled (census 2026-10-31).
+
+    The labels live in source comments, so this reads config.py and asserts the
+    marker sits on the same line as each key. Removing a label is a defect this
+    test catches, not a cleanup — and so is quietly promoting an interim value
+    to final without a census behind it.
     """
-    labelled = {"restic_pack_size_mib", "hot_window_days", "hot_window_gb",
-                "trim_grace_days", "capacity_floor_gb"}
+    interim = {"trim_grace_days"}
+    final = {"restic_pack_size_mib", "hot_window_days", "hot_window_gb",
+             "capacity_floor_gb"}
     text = SRC.read_text(encoding="utf-8")
     start = text.index('"backup": {')
     block = text[start:text.index("\n    },", start)]
-    for key in labelled:
+
+    def marker_for(key):
         for line in block.splitlines():
             if f'"{key}"' in line:
-                assert "INTERIM-PENDING-SHEETS" in line, (
-                    f"[backup] {key} lost its INTERIM-PENDING-SHEETS label")
-                break
-        else:
-            raise AssertionError(f"[backup] {key} not found in DEFAULTS")
+                if "INTERIM-PENDING-SHEETS" in line:
+                    return "INTERIM-PENDING-SHEETS"
+                if "FINAL-CENSUS" in line:
+                    return "FINAL-CENSUS"
+                return None
+        raise AssertionError(f"[backup] {key} not found in DEFAULTS")
+
+    for key in interim:
+        assert marker_for(key) == "INTERIM-PENDING-SHEETS", (
+            f"[backup] {key} lost its INTERIM-PENDING-SHEETS label")
+    for key in final:
+        assert marker_for(key) == "FINAL-CENSUS", (
+            f"[backup] {key} is not marked FINAL-CENSUS — a census-backed value "
+            f"must say so, and an unmeasured one must not")
+
+
+def test_final_defaults_carry_the_census_values(config):
+    """The FINAL numbers are the census-ruled ones, not the interim placeholders."""
+    backup = config.section("backup")
+    assert backup["restic_pack_size_mib"] == 128, "pack size is FINAL at 128 MiB"
+    assert backup["hot_window_days"] == 14
+    assert backup["hot_window_gb"] == 2
+    assert backup["capacity_floor_gb"] == 10, (
+        "capacity floor is FINAL at 10 GB (50% of the 20 GB free tier)")
+    # expressed as remote_free, which on a 20 GB tier equals "10 GB consumed"
+    assert backup["capacity_floor_gb"] * 2 == 20
