@@ -1025,3 +1025,54 @@ A future activation treating a bare harness status line as a reason to switch br
 or treating silence from mainline as a wake trigger. The frozen branch is frozen **by
 ruling**, the only exception path is the enforcement contingency in Ruling 31, and idle
 means idle.
+
+---
+
+## 2026-10-31 — GATE 1 AMENDED: MACHINERY CONSTRUCTION BEGINS NOW (owner order)
+
+**Owner, verbatim: "lets start building the storage."**
+
+Recorded **before any other work this activation**, per the owner's explicit instruction.
+
+### RULING 33 — Gate 1 is AMENDED
+
+The owner's Sheet numbers are **re-scoped from build-blocker to config-finalization and
+live-traffic gate.** Machinery construction begins **now**.
+
+- **Unblocked for construction (synthetic fixtures only, sandbox):** storage manifest;
+  reconcile-on-start; crash-point tests; tiering engine with HOT window/GB in config under
+  interim defaults (**HOT=14d/2GB**, every such value labeled `INTERIM-PENDING-SHEETS`);
+  event-sized post-close hook + nightly timer unit; WP5 monthly trigger shape; cold read
+  path written against the **rclone remote abstraction** and tested with a **local rclone
+  backend fixture** — never MEGA in sandbox; `assist backup fetch`; sensors `backup.*` /
+  `storage.gauge` per the additive schema contract (report 007 §2: seven fields,
+  `split(" ", 6)`, session_id rules); ladder chain #5; monthly restore-drill scaffolding;
+  restic-over-rclone wiring per §2.12 including the documented MEGA config pins
+  (`timeout = 5m` et al) as a **config template, not live usage**.
+- **STILL GATED, unchanged:**
+  - ANY live MEGA traffic until Sheet 1 benchmark output pastes to design and a go/no-go
+    returns.
+  - Final numeric defaults (HOT window/GB, pack size, capacity-floor knock thresholds)
+    until Sheet 2 census pastes.
+  - Merge until gate v2 passes on mainline.
+  - The additive-only firewall in full: `cli.py` / `config.py` / `ladder.py` /
+    `pyproject.toml` registration points only; **zero edits to `daemon.py`,
+    `transcribe.py`, `live_client.py`, `HANDOFF.md`.**
+  - The owner's real wavs and content never enter this sandbox.
+
+### Cadence for construction activations
+
+DONE / DEFECTS FOUND / NEXT GATE / OPEN QUESTIONS per activation; ambiguities as
+multiple-choice via owner relay; **evidence tags on every claim**; suite + ruff clean per
+commit at the recorded branch baseline; **no reports about nothing**.
+
+**First report owed:** build plan (machinery increment order, synthetic fixture inventory,
+interim-defaults table with labels) **plus the first landed increment.** No hardware scene
+requests until design schedules them.
+
+### What this amendment does NOT change
+
+The frozen branch, the three wake triggers, the §2 canonical journal contract and its §2.1
+dispatch rule, the privacy fence, and the two-clause consumption-time check. The lane is no
+longer *idle*, but it is still **STOPPED AT GATE 1** for live traffic and merge — only the
+build blocker has been lifted.
