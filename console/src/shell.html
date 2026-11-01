@@ -1,0 +1,106 @@
+<main class="app" id="app">
+
+  <!-- ============ LEFT SIDEBAR: sessions, then transcript · memory · audio ============ -->
+  <aside class="sb" id="sb" aria-label="Sessions and panels">
+    <div class="sb-top">
+      <h2>sessions</h2>
+      <button class="tbtn" id="bNew" type="button" title="new session (alt+N)">+ new</button>
+    </div>
+
+    <div class="sec grow open" id="sec-sessions">
+      <div class="sec-b" id="sList"></div>
+    </div>
+
+    <div class="sec" id="sec-transcript">
+      <button class="sec-h" type="button" data-pane="transcript" aria-expanded="false" aria-controls="body-transcript">
+        <span class="car" aria-hidden="true">&#9656;</span>
+        <span class="nm">transcript</span>
+        <span class="badge st" id="badge-transcript">pending</span>
+      </button>
+      <div class="sec-b" id="body-transcript" role="region" aria-label="Transcript preview"></div>
+    </div>
+
+    <div class="sec" id="sec-memory">
+      <button class="sec-h" type="button" data-pane="memory" aria-expanded="false" aria-controls="body-memory">
+        <span class="car" aria-hidden="true">&#9656;</span>
+        <span class="nm">memory</span>
+        <span class="badge cp" id="badge-memory">shell copy</span>
+      </button>
+      <div class="sec-b" id="body-memory" role="region" aria-label="Memory preview"></div>
+    </div>
+
+    <div class="sec" id="sec-audio">
+      <button class="sec-h" type="button" data-pane="audio" aria-expanded="false" aria-controls="body-audio">
+        <span class="car" aria-hidden="true">&#9656;</span>
+        <span class="nm">audio</span>
+        <span class="badge st" id="badge-audio">pending</span>
+      </button>
+      <div class="sec-b" id="body-audio" role="region" aria-label="Audio preview"></div>
+    </div>
+  </aside>
+
+  <!-- ============ CENTRE: the chat. always the widest column. ============ -->
+  <section class="term" id="term" aria-label="Elaria terminal">
+    <header class="th">
+      <span class="spath" id="sname">~/sessions/boot</span>
+      <ul class="lamps" aria-label="Connection status">
+        <li data-lamp="console" title="console — this window, running, local"><i></i></li>
+        <li data-lamp="daemon" title="daemon — exists on your laptop, unreachable from here"><i></i></li>
+        <li data-lamp="voice"  title="voice — no audio path from this window"><i></i></li>
+        <li data-lamp="wire"   title="wire — the bridge does not exist yet"><i></i></li>
+      </ul>
+      <div class="tools">
+        <button class="tbtn" id="tgSb" type="button" aria-expanded="true" title="sidebar (alt+K)" aria-label="toggle sidebar">&#9776;</button>
+        <button class="tbtn" id="tgOrb" type="button" aria-expanded="true" title="her panel (alt+B)" aria-label="toggle her panel">&#9673;</button>
+        <button class="tbtn acc" id="tgFull" type="button" title="transcript, full screen (alt+1)"><span id="tbWhich">transcript</span></button>
+      </div>
+    </header>
+
+    <div class="log" id="log" role="log" aria-live="polite" tabindex="0"><div class="pad" id="logpad"></div></div>
+    <button class="jump" id="jump" type="button" hidden>jump to latest</button>
+
+    <div class="cwrap">
+      <form class="cbox" id="form" autocomplete="off">
+        <div class="chead">
+          <b>message elaria</b>
+          <span>type here, press enter</span>
+          <kbd>enter</kbd>
+        </div>
+        <div class="in">
+          <span class="ps"><b class="u">you</b>@<b class="h">elaria</b>:~<b class="d">$</b></span>
+          <textarea id="input" rows="1" placeholder="say something to her&#8230;" aria-label="Message Elaria" spellcheck="false"></textarea>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <!-- ============ RIGHT PANEL: her, big. readout only — no buttons, every state happens in real time ============ -->
+  <aside class="orb" id="orb" data-state="idle" aria-label="Elaria visualizer">
+    <span class="wants" id="wants" hidden title="she wants to talk to you"></span>
+    <header class="orb-top">
+      <h2 class="mark">Elaria</h2>
+      <div class="readout">
+        <b id="rs">Idle</b>
+        <span id="rsrc">no signal</span>
+        <span class="meter" aria-hidden="true"><i id="rm"></i></span>
+      </div>
+    </header>
+    <div class="stage-box"><div id="stage" role="img" aria-label="Elaria visualizer, idle"></div></div>
+    <p class="orbnote" id="orbnote">no wire yet &#183; her shape, not her voice</p>
+  </aside>
+</main>
+
+<!-- ============ FULL-SCREEN PANE: transcript / memory / audio ============ -->
+<div id="full" role="dialog" aria-label="Panel, full screen">
+  <div class="fh">
+    <h2 id="ftitle">transcript</h2>
+    <span class="pill st" id="fbadge">pending</span>
+    <span class="sub" id="fsub"></span>
+    <input id="fsearch" type="search" placeholder="filter&#8230;" aria-label="Filter rows">
+    <button class="fbtn" id="fdemo" type="button">/demo</button>
+    <button class="fbtn x" id="fclose" type="button" title="close (esc)">close &#215;</button>
+  </div>
+  <div class="fb"><div class="inner" id="fbody"></div></div>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
