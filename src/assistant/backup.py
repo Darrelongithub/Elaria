@@ -123,13 +123,17 @@ def plan_reconcile(manifest: StorageManifest, *, now,
                     f"{state}: no remote verifier configured; flip deferred "
                     f"rather than asserted")
                 continue
-            if not verify_remote(artifact):
+            verdict = verify_remote(artifact)
+            backend, ok, method = _read_verdict(verdict)
+            if not ok:
                 plan.problems.append(
-                    f"{state}: remote does not confirm the artifact; flip deferred")
+                    f"{state}: {backend} does not confirm the artifact "
+                    f"({method}); flip deferred")
                 continue
             plan.actions.append(ReconcileAction(
                 artifact, UPLOADED, FLIPPED,
-                "re-verified local hash and remote copy; completing the flip"))
+                f"re-verified local hash and remote copy ({backend}, {method}); "
+                f"completing the flip"))
 
         elif state == FLIPPED:
             # Crash point 2: the flip landed, the trim never ran.
@@ -139,6 +143,14 @@ def plan_reconcile(manifest: StorageManifest, *, now,
 
         elif state == TRASHED:
             # Grace elapsed: the only path to a single copy, and only after the grace.
+            if now is None:
+                # Distinguish an absent clock from a bad timestamp. Reporting the latter
+                # when the real fault is the former sends whoever reads the problem
+                # hunting a parsing bug that does not exist.
+                plan.problems.append(
+                    f"{state}: no clock supplied; the grace cannot be measured, "
+                    f"purge deferred")
+                continue
             try:
                 elapsed = (now - _parse_ts(record.ts)).days
             except (TypeError, ValueError):
@@ -245,6 +257,29 @@ def _record_for(manifest: StorageManifest, action: ReconcileAction, *, now=None)
         tier=current.tier if current else None,
         detail=action.reason,
     )
+
+
+def _read_verdict(verdict) -> tuple[str, bool, str]:
+    """(backend, confirmed, method) from whatever the verifier returned.
+
+    A `Verification` (from `assistant.remote`) carries the backend that produced it, and
+    that name is the whole point: it travels into the action reason and so into the
+    manifest detail, which is what stops a `LocalPathBackend` confirmation from ever being
+    readable as real remote confirmation. A plain bool still works — for callers that
+    predate the remote module — but it reports `opaque-verifier`, because a bool genuinely
+    cannot say who answered.
+    """
+
+    # Imported lazily: backup.py must not depend on remote.py to be importable.
+    try:
+        from .remote import Verification
+    except ImportError:  # pragma: no cover - remote.py is part of this package
+        Verification = ()  # type: ignore[assignment]
+    if Verification and isinstance(verdict, Verification):
+        return verdict.backend, bool(verdict.confirmed), verdict.method
+    if verdict is None:
+        return "opaque-verifier", False, "none"
+    return "opaque-verifier", bool(verdict), "bool"
 
 
 def _trashed_as(detail: str) -> str:

@@ -93,8 +93,10 @@ def test_flip_is_refused_when_remote_does_not_confirm(tmp_path):
     man.append(ManifestRecord(artifact=str(art), state=UPLOADED, sha256=sha, size=5))
 
     plan = plan_reconcile(man, now=NOW, verify_remote=lambda p: False)
-    assert plan.actions == []
-    assert "remote" in plan.problems[0]
+    assert plan.actions == [], "no flip may be planned without confirmation"
+    assert "opaque-verifier" in plan.problems[0], (
+        "a bool-returning verifier is named as such, because a bool cannot say "
+        "who answered")
     assert man.state_of(art) == UPLOADED
 
 
@@ -112,6 +114,7 @@ def test_flip_is_refused_when_no_verifier_is_configured(tmp_path):
     plan = plan_reconcile(man, now=NOW)
     assert plan.actions == []
     assert "no remote verifier" in plan.problems[0]
+    assert plan.actions == [], "no verifier, no flip"
     assert man.state_of(art) == UPLOADED
 
 

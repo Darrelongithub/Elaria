@@ -1527,3 +1527,110 @@ increment 1–3 seams are intact. **No re-dating, no re-measure** — the bare-m
 applies. `arena/storage` is now 12 commits behind the new base; expected for a long-lived
 stacked PR, and increment 3 consumes no journal code, so no increment-3 result changes.
 Full detail in report 016 §10.
+
+**CLARIFICATION OWED, CLOSED (same day, report 016 §11):** "24 new tests" vs a suite
+that moved +27 is **not** a discrepancy and **not** parametrization. `grep -c parametrize`
+= **0** in both files; 24 defs → 24 collected, 23 defs → 23 collected, 24 + 23 = 47
+confirmed by `--collect-only`. The +27 decomposes as **24 + 3**: 24 in the new
+`test_wp7_tiering_trim.py`, and crash points 20 → 23 from the three new purge tests. The
+rewritten `test_grace_elapsed_purges` is a rewrite, contributing 0 to the delta. Recorded
+as an exact count so the two numbers can never be read as conflicting again.
+
+---
+
+## 2026-11-02 — INCREMENT 4 LANDED: remote abstraction + verifier (report 017)
+
+**SHA:** `d77eeee` + this entry's commit. Branch `arena/storage`, PR #24 head.
+
+**GATES:** full suite **2017 passed / 6 skipped / 0 errors**, `ruff check .` → **All
+checks passed!** (baseline 1975/6/0 → +42, the new file in full, no parametrize).
+CPython 3.11.2, sandbox `.venv`.
+
+**DELIVERED — `src/assistant/remote.py`**
+
+The three requirements from the design chat, each enforced structurally rather than by prose:
+
+1. **COMMAND SURFACE PINNED.** `RCLONE_COMMAND_SURFACE` — four frozen `CommandPin`
+   records, dumped machine-readably by `surface_json()`. Pinned version **1.75.2**
+   (latest stable, 2026-10-09); floor **1.41.0** (rclone added MEGA in 1.41, Tier 2).
+   Verbs: `version` (storage), `about` (storage), `lsjson` (storage), `serve restic`
+   (**restic** — this lane never spawns it). `RcloneBackend.argv()` builds every command
+   from that table and nowhere else; an unpinned verb **raises** rather than improvising.
+   A test tries `delete`/`purge`/`rm`/`moveto`/`sync`/`copyto` and asserts all six refuse.
+   The 1 m `rclone.timeout` MEGA problem (restic #3511/#3514) is recorded on the transport
+   pin where it belongs.
+2. **rclone ABSENT = A DECLARED SKIP.** `probe_rclone()` always populates `reason`.
+   `verify()` with no binary on PATH returns `confirmed=False, method="declared-skip"` with
+   the reason — and a test asserts it can **never** return `confirmed=True`. Four skip
+   paths pinned: absent, below the 1.41 floor, nonzero `lsjson` exit (code recorded),
+   unparsable output. rclone is genuinely absent here (D4), so the rclone-backed paths run
+   against a **stub shell script** on `tmp_path` — a stub of the *binary*, exercising the
+   real subprocess plumbing and argv construction, not a re-implementation of the logic.
+3. **PROVENANCE.** `Verification.backend` is the requirement made structural. The fixture
+   is named **`local-path-fixture`** (a test asserts it contains neither `mega` nor
+   `rclone`); the real one is `rclone:<remote>`. `plan_reconcile` writes the backend name
+   into the action reason, `reconcile()` writes that into the manifest detail — so a
+   fixture flip lands in the journal as `(local-path-fixture, hash)` and a real one as
+   `(rclone:mega-elaria, presence)`. **A fixture confirmation can no longer masquerade as
+   real remote confirmation, because the journal says which it was.**
+
+**HONEST LIMITATION, RECORDED NOT PAPERED OVER:** `RcloneBackend.verify()` accepts
+`expected_sha256` for interface parity and **deliberately ignores it** — MEGA reports no
+hashes, so a content check there would be a claim this backend cannot make. The method is
+recorded as `presence`, never `hash`, and the detail says content is not comparable. A flip
+against MEGA rests on presence alone, and the record now says so.
+
+**WHAT THIS RETIRES:** increment 2 refused `uploaded → flipped` without remote
+confirmation, which with no verifier was permanent. `make_verifier(backend)` closes it; the
+full transition completes against the fixture.
+
+**DEFECTS SURFACED AND FIXED (all mine, all in my own new code except D15)**
+- **D13** — `LocalPathBackend.store()` made the fixture "remote" **0755**. A directory
+  holding copies of the owner's audio must be as private as the real remote. `mkdir(mode=)`
+  only applies the mode when it *creates* the dir, so the fix is an explicit
+  `chmod(0o700)`. Test pins `mode & 0o077 == 0`.
+- **D14** — `probe_rclone()` left rclone's leading `v` in the recorded version
+  (`v1.75.2`). Masked by defensive stripping in `version_at_least()`, which is exactly why
+  it could have sat unnoticed. Fixed at the source.
+- **D15** — `plan_reconcile(now=None)` raised `TypeError` inside the same handler as a
+  malformed timestamp and reported `unreadable timestamp` when the timestamp was fine and
+  the clock was absent. A diagnostic that sends the reader hunting a bug that does not
+  exist. Now `no clock supplied; the grace cannot be measured`.
+- **D16** — three of my own test expectations were wrong: `reconcile()` does not take
+  `verify_remote` (verification happens at plan time); `reconcile_all` correctly continues
+  past `flipped` to `trashed`; and a **fourth** expectation — that `reconcile_all` with no
+  trim mover settles quietly — was also wrong, and the code was right: it re-plans, hits
+  the 8-pass ceiling, and records `did not reach quiescence in 8 passes; stopping rather
+  than looping`. That safety property is now pinned by its own test.
+
+**FIREWALL:** zero edits to `daemon.py`, `transcribe.py`, `live_client.py`, `HANDOFF.md`,
+`tests/conftest.py`; zero edits to `cli.py`, `config.py`, `ladder.py`, `pyproject.toml`.
+Increment 4 needed no registration point — the new module plugs into `backup.py`'s
+already-injected `verify_remote` seam. No new dependency; a test asserts `requests`,
+`boto3`, `mega`, `restic` are not imported.
+
+**NOT CLAIMED:** no live MEGA traffic, no remote contacted. `[TESTED-ONLY]` throughout;
+against a real rclone 1.75.2 or a real MEGA account `[UNVERIFIED]`. restic still absent
+from the sandbox. No credentials anywhere. Gate 1 unchanged.
+
+**NEXT:** increment 5 — `assist backup` CLI + sensors (`backup.started/done/failed/verify/
+check`, `storage.gauge`). First increment to touch a registration point, so the
+additive-only firewall is exercised for real.
+
+**SECOND BASE MOVEMENT (same day, before the push — the design chat predicted it):**
+ancestry guard fired again — PR base moved `0320c11` → **`fdcdb47`**, 5 commits (F1 PyAV
+pin, F2 gemini-3.5-transcribe 3 RPM, F3 empty-leg semantics, voice-chain resilience pins).
+`journal_log.py` gained 52 lines, so the **sole early trigger** was checked immediately.
+**IT DID NOT FIRE — second time.** Purely additive: `log_event()` signature and the line
+format untouched; two new event names, `transcription.backend` and
+`transcription.starvation`, through the same emitter. The §2 canonical contract — `split(
+" ", 6)`, 6-or-7 parts, `parts[2]` dispatch — is unchanged. `audio kept at` still **4**
+(1 daemon / 3 transcribe); Drift 2 does not recur. `cost.iso_now` present. **No re-dating,
+no re-measure** — bare-movement clause, second application. Full detail in report 017 §10.
+
+**CORROBORATION, NOT DRIFT:** both new mainline helpers (`stump_verdict`'s sha16,
+`backend_mark_detail`'s `chars=…; sha16=…`) independently adopt the privacy pattern this
+lane's fence established — class, count, hash prefix, never the raw text. Mainline is
+converging on report 006 §6's shape. Mainline's `error_text(exc)` convention (failure text
+never empty; a message-less TimeoutError still names its class) matches what this lane's
+skip details already did by recording `type(exc).__name__`.

@@ -325,3 +325,42 @@ since increment 3 consumes no journal code at all.
 
 No owner action is owed. Recorded per the standing commitment to re-run the drift check
 on every base movement.
+
+---
+
+## 11. CLARIFICATION OWED — exact test count, and why +27 is not 24
+
+Reported as "24 new tests" against a suite that moved +27. The design chat's
+presumption was parametrized cases counted individually. **It was not — there is no
+`parametrize` in either file.** The exact accounting:
+
+```
+$ ./.venv/bin/python -m pytest tests/test_wp7_tiering_trim.py \
+      tests/test_wp7_reconcile_crash_points.py --collect-only -q
+47 tests collected in 0.04s
+
+$ grep -c '^def test_' tests/test_wp7_tiering_trim.py
+24
+$ grep -c '^def test_' tests/test_wp7_reconcile_crash_points.py
+23
+
+$ grep -c 'parametrize' tests/test_wp7_tiering_trim.py tests/test_wp7_reconcile_crash_points.py
+tests/test_wp7_tiering_trim.py:0
+tests/test_wp7_reconcile_crash_points.py:0
+```
+
+24 defs → 24 collected. 23 defs → 23 collected. 24 + 23 = 47. No expansion anywhere.
+
+**The +27 decomposes as 24 + 3:**
+
+- `test_wp7_tiering_trim.py` — **24**, an entirely new file. All 24 are new.
+- `test_wp7_reconcile_crash_points.py` — **20 → 23, i.e. +3**. The three new purge tests
+  (`test_purge_requires_a_mover_and_never_claims_a_false_success`,
+  `test_purge_removes_the_file_then_records_the_state`,
+  `test_purge_failure_keeps_the_trashed_state`). The rewritten
+  `test_grace_elapsed_purges` is a *rewrite*, not an addition — it contributes 0 to the
+  delta, which is why the file's own count only moved by three.
+
+24 + 3 = **27**. This is the same accounting §2 already gave; it is restated here as an
+exact count rather than a summary, so the two numbers in this report can never be read as
+a discrepancy again.
