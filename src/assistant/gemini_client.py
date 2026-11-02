@@ -33,8 +33,8 @@ from .config import quota_rows
 from .config import voice_model as configured_voice_model
 from .cost import estimate_tokens, iso_now, shadow_cost_usd
 from .fixtures import FixtureStore, fixture_key
-from .journal_log import log_event
-from .model_registry import assert_model_permitted
+from .journal_log import error_text, log_event
+from .model_registry import assert_model_permitted, verified_free_tier_rpm
 from .voice_catalogue import (
     live_catalogue,
     resolve_catalogue,
@@ -386,6 +386,30 @@ def _is_retryable(exc: Exception) -> bool:
     return any(marker in text for marker in ("429", "rate", "quota", "resource_exhausted", "503"))
 
 
+# F2 (window findings order v1, 2026-11-02): the file leg paces itself
+# under the model's verified free-tier RPM (the registry is the knowledge
+# of record — gemini-3.5-transcribe = 3 RPM from the verbatim 429
+# quotaValue). A pacing wait beyond PACE_MAX_WAIT_S would eat the leg's
+# 8 s fallback window, so the leg refuses instead of waiting and the
+# chain falls through to local (F3b: empty = failure = next backend).
+PACE_MAX_WAIT_S = 2.0
+# A 429 without a parseable retry-after still holds one slot spacing
+# (60 s / 3 RPM = 20 s) before the next send.
+PACE_HOLD_DEFAULT_S = 20.0
+
+_RETRY_AFTER_RE = re.compile(
+    r"retry[_ -]?[Dd]elay[\"':=\s]+(\d+)|retry[_ -]?[Aa]fter[\"':=\s]+(\d+)",
+    re.IGNORECASE)
+
+
+def _retry_after_s(text: str) -> float | None:
+    """Seconds from a 429's retryDelay/retry-after, or None."""
+    match = _RETRY_AFTER_RE.search(text or "")
+    if match is None:
+        return None
+    return float(match.group(1) or match.group(2))
+
+
 def quota_family(model: str) -> str | None:
     """Map a model id to its [quota.models.*] row label (BH-K18).
 
@@ -411,7 +435,28 @@ class PerModelLimiter:
         self._rpm = rpm_by_model
         self._window = window_s
         self._stamps: dict[str, deque[float]] = {}
+        self._hold_until: dict[str, float] = {}
         self._lock = threading.Lock()
+
+    def hold(self, model: str, seconds: float, *,
+             now: Callable[[], float] = time.monotonic) -> None:
+        """F2 retry-after honoring: a server 429 holds every send to
+        `model` until its retryDelay expires (the stricter of overlapping
+        holds wins)."""
+        with self._lock:
+            until = float(now()) + max(0.0, float(seconds))
+            self._hold_until[model] = max(
+                self._hold_until.get(model, 0.0), until)
+
+    def _waits(self, model: str, limit: int, current: float,
+               stamps: deque) -> float:
+        """Seconds until this model may be sent: the server hold (429
+        retry-after) and the RPM window take the stricter wait. A window
+        with free slots never waits."""
+        hold_wait = self._hold_until.get(model, 0.0) - current
+        window_wait = (self._window - (current - stamps[0]) + 0.01
+                       if len(stamps) >= limit and stamps else 0.0)
+        return max(hold_wait, window_wait, 0.0)
 
     def acquire(self, model: str, *, sleep: Callable[[float], None] = time.sleep,
                 now: Callable[[], float] = time.monotonic, max_wait_s: float = 65.0) -> None:
@@ -425,10 +470,10 @@ class PerModelLimiter:
                 stamps = self._stamps.setdefault(model, deque())
                 while stamps and current - stamps[0] > self._window:
                     stamps.popleft()
-                if len(stamps) < limit:
+                wait = self._waits(model, limit, current, stamps)
+                if len(stamps) < limit and wait <= 0:
                     stamps.append(current)
                     return
-                wait = self._window - (current - stamps[0]) + 0.01
             if waited + wait > max_wait_s:
                 raise RateLimitError(f"local RPM limiter: {model} at {limit}/min — queued, not sent")
             sleep(wait)
@@ -447,10 +492,10 @@ class PerModelLimiter:
                 stamps = self._stamps.setdefault(model, deque())
                 while stamps and current - stamps[0] > self._window:
                     stamps.popleft()
-                if len(stamps) < limit:
+                wait = self._waits(model, limit, current, stamps)
+                if len(stamps) < limit and wait <= 0:
                     stamps.append(current)
                     return
-                wait = self._window - (current - stamps[0]) + 0.01
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -525,6 +570,14 @@ class GeminiClient:
             rpm = row.get("rpm")
             if isinstance(rpm, (int, float)) and rpm > 0:
                 return min(int(rpm), flat) if flat > 0 else int(rpm)
+            # F2: an rpm-less config row (the frozen transcribe-batch row
+            # carries rpm=None) resolves to the REGISTRY's verified figure
+            # — the 429 quotaValue is the knowledge of record — before the
+            # flash-derived alias default, which knows nothing about the
+            # transcribe model.
+            verified = verified_free_tier_rpm(model)
+            if verified is not None:
+                return min(verified, flat) if flat > 0 else verified
             return flat
 
         self._limiter = PerModelLimiter(rpm_for)
@@ -1208,6 +1261,10 @@ class GeminiClient:
         prompt = batch_transcription_prompt(
             language, others, preserve_code_switching=preserve_code_switching)
         correlation_id = uuid.uuid4().hex[:12]
+        # F2: the meeting path shares the transcribe model's quota with the
+        # file leg — pace it too (cancellable by the meeting deadline).
+        await self._limiter.acquire_async(
+            model, deadline=deadline, max_wait_s=PACE_MAX_WAIT_S)
         started = time.monotonic()
 
         def request_config():
@@ -1240,10 +1297,10 @@ class GeminiClient:
             error = None
         except asyncio.CancelledError as exc:
             error_exc = cancelled_exc = exc
-            text, error = "", f"{type(exc).__name__}: {exc}"
+            text, error = "", error_text(exc)
         except Exception as exc:
             error_exc = exc
-            text, error = "", f"{type(exc).__name__}: {exc}"
+            text, error = "", error_text(exc)
         self.store.log_llm_call(
             ts=iso_now(), correlation_id=correlation_id, role="transcribe_batch",
             model=model, mode=self.mode, tokens_in=0, tokens_out=estimate_tokens(text),
@@ -1258,12 +1315,21 @@ class GeminiClient:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
                     "meeting transcription deadline expired") from error_exc
+            if _is_retryable(error_exc):
+                hold_s = _retry_after_s(error) or PACE_HOLD_DEFAULT_S
+                self._limiter.hold(model, hold_s)
+                raise RateLimitError(
+                    f"{error} (retry-after: held {hold_s:g}s)") from error_exc
             raise RuntimeError(error) from error_exc
         return {"text": text, "model": model, "duration_s": duration,
                 "backend": "gemini_batch"}
 
     def _sdk_transcribe(self, path, model, prompt, correlation_id, duration,
                         *, deadline: float | None = None):  # pragma: no cover
+        # F2: pace under the model's verified RPM BEFORE the wire call —
+        # this seam was the un-paced one (4 calls reached gemini-3.5-
+        # transcribe within 19 s on 2026-11-02 and drew the 429).
+        self._limiter.acquire(model, max_wait_s=PACE_MAX_WAIT_S)
         started = time.monotonic()
 
         def request_config():
@@ -1295,7 +1361,7 @@ class GeminiClient:
             error = None
         except Exception as exc:
             error_exc = exc
-            text, error = "", f"{type(exc).__name__}: {exc}"
+            text, error = "", error_text(exc)
         self.store.log_llm_call(
             ts=iso_now(), correlation_id=correlation_id, role="transcribe_batch",
             model=model, mode=self.mode, tokens_in=0, tokens_out=estimate_tokens(text),
@@ -1308,6 +1374,14 @@ class GeminiClient:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
                     "meeting transcription deadline expired") from error_exc
+            if _is_retryable(error_exc):
+                # F2 retry-after honoring: hold every later send past the
+                # 429's retryDelay (the verbatim 2026-11-02 one said 36s)
+                # and surface the rate error with its real text.
+                hold_s = _retry_after_s(error) or PACE_HOLD_DEFAULT_S
+                self._limiter.hold(model, hold_s)
+                raise RateLimitError(
+                    f"{error} (retry-after: held {hold_s:g}s)") from error_exc
             raise RuntimeError(error) from error_exc
         return text
 
