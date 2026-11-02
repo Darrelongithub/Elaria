@@ -280,6 +280,16 @@ class RemoteBackend:
                expected_sha256: str | None = None) -> Verification:
         raise NotImplementedError
 
+    def pin_status(self) -> Verification:
+        """Is this backend ready, and which one is it?
+
+        Part of the seam so a caller can ask ANY backend whether it stands ready and get
+        a provenance-bearing answer back. A backend that cannot answer says so rather
+        than being assumed ready.
+        """
+
+        raise NotImplementedError
+
     def describe(self) -> dict:
         return {"backend": self.name, "kind": type(self).__name__}
 
@@ -327,6 +337,19 @@ class LocalPathBackend(RemoteBackend):
             return False
         target.unlink()
         return True
+
+    def pin_status(self) -> Verification:
+        """The fixture is always ready — it is a local directory, not a binary.
+
+        It still reports itself BY NAME. A fixture readiness that did not say "fixture"
+        would be exactly the masquerade provenance exists to prevent, so the method is
+        `fixture` and the detail says it is never a remote.
+        """
+
+        return Verification(
+            backend=self.name, confirmed=True, method="fixture",
+            detail="local-path fixture; always ready, and never a remote",
+        )
 
     def verify(self, artifact: Path, *,
                expected_sha256: str | None = None) -> Verification:

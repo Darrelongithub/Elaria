@@ -1786,3 +1786,84 @@ does not trigger.
 **NOT DONE:** increment 4 not re-run (already landed); increment 6 not started (no ruling
 in this relay); no mainline file touched — `transcribe.py` read only, to verify the
 heads-up; nothing committed to `arena/e7a1cca5-elaria`.
+
+---
+
+## 2026-11-02 - Report 021: increments 5 and 6 delivered; refusal-posture audit answered
+
+**Branch:** `arena/storage`. **Frozen branch (condition 3):** `origin
+arena/e7a1cca5-elaria = b181712563c1577f5faea4e59fe5f7e104a89ed1`, verified before and
+after. Untouched.
+
+**Landed this activation:** ladder chain #5 "backup chain" (`backup_chain()`, five rungs
+A-E, ending in the integrity rung the WP7 gate names). Tri-state throughout; N/A is the
+honest answer for a thing not configured yet. Rung C is deliberately LOCAL-ONLY
+(`pin_status()` = `rclone version`, no network) so a truth ladder never silently reaches
+MEGA. Provenance rides in every rung's evidence.
+
+**The refusal-posture audit - the design chat's question, answered from the code.**
+Thirteen refusal paths in `backup.py`, not five. **SATISFIABLE (4):** L122 no remote
+verifier (formally RETIRED by increment 4 - a fixture flip now lands as
+`(local-path-fixture, hash)`, a real one as `(rclone:mega-elaria, presence)`; that
+provenance threading is what retired it), L129 verifier does not confirm, L200 no trim
+mover, L221 no purge mover. **STRUCTURAL (9):** L111 local missing, L117 hash drift,
+L150 no clock, L157 unreadable timestamp, L195 flip refused by the state machine, L206
+trim failed, L228 purge failed, L236 purge already absent (informational - goal met),
+L330 quiescence cap. **The load-bearing distinction, pinned as a test: a verifier does
+NOT rescue L111 or L117.** Retiring the absence of a verifier does not retire the
+data-loss guards. A table-completeness test fails if any refusal path is added or removed.
+
+**DEFECT FOUND AND FIXED - the content assumption the design chat asked about.**
+`WAV_HEADER_BYTES = 44` rested on an unverified assumption and was wrong for a real case:
+a WAV carrying a LIST/INFO chunk with ZERO frames is 62 bytes and the old
+`is_header_only_wav()` returned False, so a real never-retry mark would have been tiered,
+trimmed and purged as audio and counted against the capacity model. Proven empirically,
+then fixed by walking the RIFF chunks and reading the `data` chunk's declared size (one
+bounded 4096-byte read, no full parse, no hashing). Three regression tests pin it.
+**This exposed the fourth quietly-wrong fixture in this lane:**
+`test_wp7_backup_cli_sensors.py`'s `_WAV = b"RIFFfakeWAVEdata" + b"\x00"*64` parses as a
+real RIFF with a zero-length `data` chunk, so it read as a mark, not a recording. Now
+built with the `wave` module.
+
+**Honest answer to the content question:** no storage-lane module parses audio content at
+all (no `wave` read, `readframes` or `struct.unpack` in tiering/storage/remote/sensors/
+backup), so no test rests on a fixture containing intelligible speech. But the 44-byte
+constant WAS load-bearing and wrong. Tiering fixtures are still synthetic blobs, not
+valid WAVs, containing no speech; the census numbers come from real wavs nobody has
+listened to; the 0.475/0.582 band is [TESTED-ONLY], not an end-to-end restic round trip.
+
+**D7 HAS FIRED - pre-existing, intermittent, not mine to fix.**
+`tests/conftest.py:108`: `task.get_coro().__qualname__` is unguarded and raises
+`AttributeError: 'async_generator_athrow' object has no attribute '__qualname__'` when an
+async-generator fixture tears down concurrently with the daemon-shutdown coroutine.
+Measured 1/20 runs with my changes, **3/20 at `60f0060` with my changes stashed** -
+statistically indistinguishable. The full suite ran clean at 2101/6/0 twice and 2104/6/0
+now. `tests/conftest.py` is forbidden to this lane; the fix is one line
+(`getattr(task.get_coro(), "__qualname__", None)`) and belongs to mainline. **MAINLINE
+ACTION ITEM.**
+
+**Boundary census (increment 6):** 8 files, 259 insertions / 20 deletions. The 20 removed
+lines are exhaustively: `cli.py` 2 (argparse `choices` + `help`), `ladder.py` 2 (argparse
+`description` + `choices`), `backup_cli.py` 1 (hardcoded `grace_days` default, now from
+config), `tiering.py` 6 (the old size-comparison body), `test_wp7_backup_cli_sensors.py`
+7 (my own fixture + a redundant line), `test_wp0_ladder.py` 2 (the `20 # 4 chains x 5
+rungs` assertion and the chain tuple - a designed extension point, not forbidden).
+`remote.py` and `test_wp7_tiering_trim.py` are purely additive. **The additive-only rule
+cannot be honoured literally at argparse registration - a new chain must appear in
+`choices=` or the command does not work; that is 4 of the 20 lines.**
+`run_chain()`/`run()` were restructured to genuinely additive (append after the literal,
+never splice). Forbidden files verified untouched against `60f0060`: `daemon.py`,
+`transcribe.py`, `live_client.py`, `HANDOFF.md`, `tests/conftest.py` - zero changes.
+
+**Suite:** 2062/6/0 (increment 5, committed baseline) -> **2104/6/0, ruff clean** (+42:
++39 the new ladder test file, +3 the chunk-walk regression tests). Report 005's 1913/6/1
+is superseded.
+
+**NEXT GATE:** the design chat verifies increments 5 and 6. Gate 1 unchanged - no live
+MEGA traffic, no merge. Remaining after that: increments 7 (post-close hook + nightly
+timer + WP5 monthly trigger shape) and 8 (monthly restore-drill scaffolding).
+
+**OPEN:** (1) who owns the D7 fix - it is forbidden to this lane; (2) does the owner's
+pipeline ever emit chunked WAVs - the fix is correct either way but the risk was
+theoretical if not; (3) report 020's §9 obligations remain open pending the design chat's
+ruling on the harness incident - no recurrence this activation.

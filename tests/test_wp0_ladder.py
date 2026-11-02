@@ -365,11 +365,12 @@ def test_every_rung_prints_reached_stuck_or_na_with_evidence(config):
     text, _ok = render(_ladder(config, _console_responses()).run("all"))
     rung_lines = [line for line in text.splitlines()
                   if line[:2] in ("A ", "B ", "C ", "D ", "E ")]
-    assert len(rung_lines) == 20, text   # 4 chains x 5 rungs
+    assert len(rung_lines) == 25, text   # 5 chains x 5 rungs
     for line in rung_lines:
         assert ("REACHED" in line) or ("STUCK" in line) or ("N/A" in line), line
         assert ": " in line, line
-    for chain in ("console chain", "wake chain", "voice chain", "event chain"):
+    for chain in ("console chain", "wake chain", "voice chain", "event chain",
+                  "backup chain"):
         assert chain in text
 
 

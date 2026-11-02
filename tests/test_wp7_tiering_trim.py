@@ -17,6 +17,7 @@ from assistant.tiering import (
     DEFAULT_WINDOW_DAYS,
     DEFAULT_WINDOW_GB,
     PERMANENT_EXCLUSIONS,
+    WAV_HEADER_BYTES,
     Candidate,
     TrashMover,
     classify,
@@ -172,6 +173,42 @@ def test_header_only_wav_is_a_never_retry_mark(tmp_path):
 def test_a_real_wav_is_not_a_mark(tmp_path):
     real = _wav(tmp_path / "real.wav", seconds=0.5)
     assert is_excluded(real, data_dir=tmp_path) is None
+
+
+def test_a_chunked_wav_with_zero_frames_is_still_a_mark(tmp_path):
+    """A never-retry mark carrying a LIST/INFO chunk is LONGER than 44 bytes.
+
+    The canonical PCM header is 44 bytes, so a total-size comparison reads a chunked
+    mark as a recording — and it would then be tiered, trimmed and purged as if it were
+    audio. The `data` chunk's declared size is what actually says whether there are
+    frames, so that is what the classifier reads. Pinned so this cannot drift back.
+    """
+    body = _header_only(tmp_path / "chunked.wav").read_bytes()
+    payload = b"INFO" + b"INAM" + (2).to_bytes(4, "little") + b"x\x00"
+    chunked = body[:12] + b"LIST" + len(payload).to_bytes(4, "little") + payload + body[12:]
+    assert len(chunked) > WAV_HEADER_BYTES, "the whole point: longer than 44 bytes"
+
+    mark = tmp_path / "20261025-181730-4d90bf.wav"
+    mark.write_bytes(chunked)
+    reason = is_excluded(mark, data_dir=tmp_path)
+    assert reason is not None and "never-retry mark" in reason
+
+
+def test_a_chunked_wav_with_frames_is_not_a_mark(tmp_path):
+    """The same walk must not over-correct: a chunked recording is still a recording."""
+    body = _wav(tmp_path / "rec.wav", seconds=0.5).read_bytes()
+    payload = b"INFO" + b"INAM" + (2).to_bytes(4, "little") + b"x\x00"
+    chunked = body[:12] + b"LIST" + len(payload).to_bytes(4, "little") + payload + body[12:]
+    real = tmp_path / "real_chunked.wav"
+    real.write_bytes(chunked)
+    assert is_excluded(real, data_dir=tmp_path) is None
+
+
+def test_a_non_wav_file_is_not_a_mark(tmp_path):
+    """A classifier, not a validator: unreadable input falls through to size and mtime."""
+    other = tmp_path / "notaudio.bin"
+    other.write_bytes(b"PK\x03\x04not a riff file")
+    assert is_excluded(other, data_dir=tmp_path) is None
 
 
 def test_scan_excludes_and_classifies_together(tmp_path):

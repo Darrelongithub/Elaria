@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import json
 import random
+import wave
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -40,15 +41,23 @@ NOW = datetime(2026, 11, 2, 9, 0, 0, tzinfo=UTC)
 NOW_ISO = "2026-11-02T09:00:00+00:00"
 
 
-#: A payload comfortably over WAV_HEADER_BYTES (44). An 18-byte stub is a header-only
-#: never-retry mark and is CORRECTLY excluded from tiering — which would make any test
-#: that needs something to go cold silently assert nothing.
-_WAV = b"RIFFfakeWAVEdata" + b"\x00" * 64
+#: A real, valid PCM WAV. The payload must carry audio frames: a header-only file is a
+#: never-retry mark and is CORRECTLY excluded from tiering, which would make any test that
+#: needs something to go cold silently assert nothing. This is a *fourth* time a fixture
+#: has been quietly wrong in this lane — an 18-byte stub, then a 64-byte blob, both of
+#: which the classifier handled for the wrong reason. Building it with the `wave` module
+#: means the fixture cannot accidentally look like something it is not.
+WAV_FRAMES = b"\x00\x00" * 4000  # 0.25 s at 16 kHz, mono, 16-bit — 8000 bytes
 
 
-def _wav(path: Path, payload: bytes = _WAV) -> Path:
+def _wav(path: Path) -> Path:
+    """Write a valid mono 16-bit 16 kHz WAV that a tiering scan will call a recording."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(WAV_FRAMES)
     return path
 
 
@@ -96,7 +105,6 @@ def _fixture_ctx(tmp_path, *, state=FLIPPED, now=NOW, **kw):
     man, art = _manifest_with(tmp_path, state=state)
     ctx = BackupContext.fixture(tmp_path, data_dir=tmp_path, now=now)
     ctx.manifest = man
-    ctx.backend = ctx.restorer.backend
     for key, value in kw.items():
         setattr(ctx, key, value)
     return ctx, art

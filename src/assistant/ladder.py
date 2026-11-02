@@ -745,13 +745,122 @@ class Ladder:
             Rung("E", "does the live document exist on disk?", rung_e),
         ])
 
+    # -- WP7 chain #5: the backup chain -------------------------------------------
+    #
+    # Additive. No existing chain is touched, and the chain names it "backup" so it
+    # cannot be confused with the hardware chains it sits beside.
+    #
+    # Five rungs, the last of which is the integrity rung the WP7 gate names. Every
+    # rung is tri-state, and **N/A is the honest answer for a thing that is not
+    # configured yet**: an unconfigured remote is not a failure, and reporting it as
+    # STUCK would make an unbuilt lane look broken. Only a real fault is STUCK.
+    #
+    # Rung C is deliberately LOCAL-ONLY — it reads the backend's pin status, which is
+    # `rclone version` on the local binary and touches no network. Probing a real
+    # artifact against MEGA is the integrity rung's job and is an owner-initiated act,
+    # never something a truth ladder does silently. In this lane's sandbox no remote is
+    # configured, so the chain reaches N/A there rather than reaching for a network.
+
+    def backup_chain(self, *, ctx=None) -> ChainResult:
+
+        def rung_a():
+            # The manifest is the single record of intent and state. No manifest is
+            # N/A — the lane has not run yet — but an UNREADABLE one is STUCK, because
+            # an audit trail that cannot be read is not an audit trail.
+            path = ctx.manifest.path
+            if not path.exists():
+                return None, "no manifest yet at the configured location"
+            try:
+                records = ctx.manifest.records()
+            except OSError as exc:
+                return False, f"manifest unreadable ({type(exc).__name__})"
+            states = {}
+            for record in records:
+                states[record.state] = states.get(record.state, 0) + 1
+            return True, f"manifest readable; {len(records)} records; states={states}"
+
+        def rung_b():
+            # Is a remote configured at all? Not configured is N/A, not a fault.
+            remote = (ctx.section.get("rclone_remote") or "").strip()
+            if not remote:
+                return None, ("no rclone_remote configured; the local-path fixture is "
+                              "the only backend, and a fixture is not a remote")
+            return True, f"rclone_remote configured ({remote})"
+
+        def rung_c():
+            # Does a backend stand ready, and WHICH ONE? Provenance is the rung's
+            # whole point: the evidence names the backend that would confirm, so a
+            # fixture can never read as a remote.
+            if ctx.verifier is None:
+                return None, ("no remote verifier configured; plan_reconcile refuses "
+                              "to flip rather than asserting an unconfirmed copy")
+            backend = ctx.verifier_backend()
+            if backend is None:
+                return None, "a verifier is configured but names no backend"
+            status = backend.pin_status()
+            if not status.confirmed:
+                return False, f"{status.backend} is not ready: {status.detail}"
+            return True, f"{status.backend} ready; method={status.method}"
+
+        def rung_d():
+            # Is the trim path sound — a trash location and a grace period?
+            if ctx.trim_mover is None:
+                return None, ("no trim mover configured; the grace-then-purge trim "
+                              "cannot run")
+            grace = ctx.grace_days
+            if grace < 1:
+                return False, f"trim_grace_days={grace} is not a grace period"
+            return True, f"trim mover configured; grace={grace}d"
+
+        def rung_e():
+            # The integrity rung the WP7 gate names: restore a cold artifact to a
+            # temp dir and hash-verify it. No cold artifacts is N/A. A restore that
+            # cannot happen, or one whose hash does not match, is STUCK — a restore
+            # that does not verify is not a restore.
+            if ctx.restorer is None:
+                return None, "no restorer configured; nothing can be drilled"
+            cold = [r for r in ctx.manifest.current().values()
+                    if r.state in ("flipped", "trashed", "purged")]
+            if not cold:
+                return None, "nothing cold to drill yet"
+            import tempfile
+
+            record = cold[0]
+            target = Path(tempfile.mkdtemp(prefix="elaria-ladder-")) / Path(
+                record.artifact).name
+            try:
+                restored = ctx.restorer.restore(Path(record.artifact), target)
+            except (OSError, FileNotFoundError) as exc:
+                return False, f"restore failed ({type(exc).__name__})"
+            from .safety import try_sha256_file
+
+            actual = try_sha256_file(restored)
+            if record.sha256 and actual != record.sha256:
+                return False, "restored hash does not match the manifest record"
+            return True, (f"restored and hash-verified via {ctx.restorer.name}; "
+                          f"method=hash")
+
+        return _evaluate("backup", [
+            Rung("A", "is the storage manifest present and readable?", rung_a),
+            Rung("B", "is a remote configured?", rung_b),
+            Rung("C", "does a backend stand ready, and which one?", rung_c),
+            Rung("D", "is the trim path sound (mover + grace)?", rung_d),
+            Rung("E", "does the integrity drill restore and hash-verify?", rung_e),
+        ])
+
     def run_chain(self, name: str) -> ChainResult:
         chains = {"console": self.console_chain, "wake": self.wake_chain,
                   "voice": self.voice_chain, "event": self.event_chain}
+        # WP7 chain #5 is APPENDED after the literal rather than spliced into it, so the
+        # existing dict stays byte-identical and the firewall's additive-only rule is
+        # honoured in the code itself, not merely in intent.
+        chains["backup"] = self.backup_chain
         return chains[name]()
 
     def run(self, name: str = "all") -> list[ChainResult]:
         names = ("console", "wake", "voice", "event") if name == "all" else (name,)
+        if name == "all":
+            names += ("backup",)   # appended; the literal above is untouched
         return [self.run_chain(n) for n in names]
 
 
@@ -786,9 +895,9 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="elaria-ladder",
-        description="hardware truth ladder (chains: console, wake, voice, event)")
+        description="hardware truth ladder (chains: console, wake, voice, event, backup)")
     parser.add_argument("chain", nargs="?", default="all",
-                        choices=("console", "wake", "voice", "event", "all"))
+                        choices=("console", "wake", "voice", "event", "backup", "all"))
     args = parser.parse_args(argv)
     ladder = Ladder(load_config())
     text, ok = render(ladder.run(args.chain))

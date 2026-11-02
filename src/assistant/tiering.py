@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -82,21 +83,48 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
+#: How much of a WAV to read when deciding whether it carries frames. The `data` chunk
+#: header of a header-only mark sits at offset 12, so 4 KiB is generous; a file whose
+#: `data` chunk is further in is a recording by any reasonable reading.
+_PROBE_BYTES = 4096
+
+
 def is_header_only_wav(path: Path) -> bool:
     """True when a WAV carries no audio frames — a mark, not a recording.
 
-    Cheap by design: a stat and a 12-byte read, never a full parse. The tiering engine runs
-    over every candidate, so this must not become the expensive part of a poll.
+    **This walks the RIFF chunk structure rather than comparing a total size.** The
+    canonical PCM header is `WAV_HEADER_BYTES` (44) bytes and a size comparison is right
+    for it, but a WAV carrying a LIST/INFO or fact chunk has a header *longer* than 44
+    bytes while still declaring zero frames. The original size comparison read such a
+    file as a recording — so a real never-retry mark written by a tool that emits chunks
+    would have been tiered, trimmed and purged as if it were audio, and counted against
+    the capacity model. The `data` chunk's declared size is what actually says whether
+    there are frames, so that is what this reads.
+
+    Still cheap: one bounded read of `_PROBE_BYTES`, no full parse, no hashing. The
+    tiering engine runs over every candidate and this must not become the expensive part
+    of a poll.
+
+    Unreadable or non-RIFF input is False. This is a classifier, not a validator: a file
+    it cannot read is left to the size and mtime rules rather than silently dropped.
     """
 
     try:
-        if path.stat().st_size > WAV_HEADER_BYTES:
-            return False
         with path.open("rb") as handle:
-            magic = handle.read(12)
+            head = handle.read(_PROBE_BYTES)
     except OSError:
         return False
-    return magic[:4] == b"RIFF" and magic[8:12] == b"WAVE"
+    if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return False
+    offset = 12
+    while offset + 8 <= len(head):
+        chunk_id = head[offset:offset + 4]
+        (declared,) = struct.unpack_from("<I", head, offset + 4)
+        if chunk_id == b"data":
+            return declared == 0
+        # Chunks are word-aligned; an odd-sized chunk carries one pad byte.
+        offset += 8 + declared + (declared & 1)
+    return False
 
 
 def is_excluded(path: Path, *, data_dir: Path,

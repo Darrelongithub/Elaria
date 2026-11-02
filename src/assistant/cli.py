@@ -1981,8 +1981,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="hardware truth ladder — chains console/wake/voice/event (§4.8)")
     ladder_p.add_argument(
         "chain", nargs="?", default="all",
-        choices=("console", "wake", "voice", "event", "all"),
-        help="one chain, or all four")
+        choices=("console", "wake", "voice", "event", "backup", "all"),
+        help="one chain, or all five")
     ptt_p = sub.add_parser("ptt", help="push-to-talk (bind press/release in Hyprland)")
     hotword_p = sub.add_parser(
         "hotword", help="wake-knock model (armed state, buffers, clips, watchdog)")

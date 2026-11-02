@@ -102,7 +102,8 @@ class BackupContext:
                  now=None, window_days: int = DEFAULT_WINDOW_DAYS,
                  window_gb: int = DEFAULT_WINDOW_GB,
                  floor_bytes: int = 10 * 1000 ** 3,
-                 grace_days: int = 14):
+                 grace_days: int = 14,
+                 section: dict | None = None, backend=None):
         self.manifest = manifest
         self.data_dir = Path(data_dir) if data_dir else Path(".")
         self.verifier = verifier
@@ -115,6 +116,31 @@ class BackupContext:
         self.window_gb = window_gb
         self.floor_bytes = floor_bytes
         self.grace_days = grace_days
+        # The `[backup]` section this context was built from, and the backend standing
+        # behind `verifier`. The ladder chain needs both: one to say whether a remote
+        # is configured, the other to name WHICH backend would confirm. A context that
+        # cannot say which backend it trusts cannot be probed for provenance.
+        self.section = dict(section) if section else {}
+        self._backend = backend
+
+    @property
+    def remote_configured(self) -> bool:
+        return bool((self.section.get("rclone_remote") or "").strip())
+
+    @property
+    def backend(self):
+        """The backend behind `verifier`, or None when there is none to name.
+
+        Public because a caller probing provenance has every right to ask which backend
+        a context trusts without reaching into a private attribute.
+        """
+
+        return self._backend
+
+    def verifier_backend(self):
+        """The backend behind `verifier`. Retained as a method for the ladder's call."""
+
+        return self._backend
 
     # -- construction -------------------------------------------------------------------
 
@@ -128,6 +154,10 @@ class BackupContext:
             StorageManifest(root / "backup" / "manifest.jsonl"),
             data_dir=data_dir or root,
             verifier=make_verifier(backend),
+            # The backend is passed explicitly, not just the verifier built from it.
+            # Without it the ladder's rung C cannot say WHICH backend would confirm,
+            # and provenance — the thing increment 4 exists for — silently vanishes.
+            backend=backend,
             restorer=LocalPathRestorer(backend),
             now=now,
         )
@@ -157,6 +187,7 @@ def build_context(config, *, now=None) -> BackupContext:
     manifest = StorageManifest(config.data_dir / "backup" / "manifest.jsonl")
     remote = (section.get("rclone_remote") or "").strip()
     verifier = None
+    backend = None
     if remote:
         from .remote import RcloneBackend
 
@@ -166,6 +197,8 @@ def build_context(config, *, now=None) -> BackupContext:
         manifest,
         data_dir=config.data_dir,
         verifier=verifier,
+        backend=backend,
+        section=section,
         now=now,
         window_days=int(section.get("hot_window_days", DEFAULT_WINDOW_DAYS)),
         window_gb=int(section.get("hot_window_gb", DEFAULT_WINDOW_GB)),
