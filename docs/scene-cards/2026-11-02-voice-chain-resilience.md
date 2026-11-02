@@ -11,13 +11,18 @@ semantics — the chain falls through to local and the journal is legible
 when nothing lands). The turn that starved (session 61258b3b343a) must
 become a local-whisper answer.
 
-Run on the mainline branch code, daemon restarted on it, after
-`uv sync` (the lock now resolves `av 18.1.x` — `uv pip list | grep ^av`
-must show < 19).
+Run on the mainline branch code, daemon restarted on it, after the
+environment step: `uv pip install 'av==18.1.0'` (the narrow
+single-package install — plain `uv sync` is the [UNVERIFIED] whole-venv
+reconciliation and is NOT part of this scene) — `uv pip list | grep ^av`
+must show 18.1.x. RULE (2026-11-02): every `uv run` in this card runs
+with `--no-sync` — `uv run` auto-syncs the venv to the lock by default,
+and no step inside a hardware window may change the environment
+implicitly.
 
 ## S1 — TERMINAL: the file leg lives again (F1 + F3b)
 
-1. `uv run python scripts/file_leg_probe.py` — expect per wav:
+1. `uv run --no-sync python scripts/file_leg_probe.py` — expect per wav:
    section 3 lands WHOLE SENTENCES with `backend=local` (Gemini may
    still return empty or refuse under 3 RPM — the fall-through carries
    the turn to whisper; a `leg raised: RuntimeError: all ASR backends
@@ -48,8 +53,9 @@ TERMINAL (no listening/pressing in this block):
    → (if nothing landed) `transcription.starvation` with `outcome=…`;
    `latency.table` carries `release_to_first_slice_s` (clause-3
    re-run candidate — measure, do not promise).
-2. `grep -E "audio.first_byte|transcription.stump"` — `at=slice` for
-   streamed TTS; stump/short marks per M-5 if a stump lands.
+2. `assist events --recent 60 | grep -E "audio.first_byte|transcription.stump"` —
+   `at=slice` for streamed TTS; stump/short marks per M-5 if a stump
+   lands.
 3. Any line with `error=` must carry non-empty text (F3a). An empty
    error string anywhere in the paste is a RED result.
 
@@ -62,12 +68,19 @@ TERMINAL (no listening/pressing in this block):
    the F2 evidence surface, not a leg-pacing failure (the S1 note
    applies).
 3. Optional owner config line (makes doctor's quota shape show the
-   figure; the enforcement already knows it from the registry):
+   figure; the enforcement already knows it from the registry). The
+   owner's file has a FLAT `[quota]` table — add this sub-table
+   immediately after the flat keys (before any next `[…]` header):
 
    ```toml
    [quota.models.transcribe-batch]
    rpm = 3
    ```
+
+   The nested form is the current schema (validated, enforced); the
+   flat keys stay as they are (aliases; the stricter of the two is
+   enforced — the design-chat relay carries the full failure-mode
+   notes).
 
 ## Outcomes (both are decisions)
 
