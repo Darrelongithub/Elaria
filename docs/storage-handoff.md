@@ -1728,3 +1728,61 @@ drift check, no re-dating, no re-measure.
 
 **NEXT:** increment 6 — ladder chain #5 "backup chain", additive, per the WP5 monthly
 trigger shape.
+
+---
+
+## 2026-11-02 — STATE CONFIRMATION + stale-relay finding + third base movement (report 019)
+
+**The design chat relayed report 011 out of order and issued a GO-AHEAD for increment 4.**
+Both increments 4 (`dcb33d4`) and 5 (`cb8d636`) were already landed, verified and pushed.
+**The GO-AHEAD is already discharged and was NOT re-processed** — re-running increment 4
+against a branch that already contains it would duplicate code and require rewriting
+shared history, both forbidden here. Recorded plainly rather than silently skipped.
+
+**STATE CONFIRMED, measured not recalled:** head **`cb8d636`** on `arena/storage`, tree
+clean, origin identical. Suite **2062 passed / 6 skipped / 0 errors**, `ruff check .` →
+**All checks passed!** PR #24 OPEN at **36 files / 10,929 insertions / 0 deletions**,
+19 commits, base `arena/c2a7085d-elaria`. Frozen branch `arena/e7a1cca5-elaria` @
+**`b181712`**, identical on local and origin, zero new commits. **I am NOT at `d77eeee`
+with 1,975/6/0 — I am two increments past it. Nothing lost, no re-clone, no reset.**
+
+**THE FINDING, NAMED:** the duplicate is the **relay**, not my output. Report 011 remains
+a historical file at its original date; reports 016/017/018 are fresh work, each against
+an activation that actually happened. The relay channel delivered report 011's content out
+of order and the design chat caught it by checking its own books instead of trusting the
+relay. **The symmetry is the lesson and is now recorded in this lane's log:** the design
+chat caught a stale report by refusing to trust a relay and checking the real books — the
+same failure mode and the same cure this lane used on a stale SHA in a notice, one level
+up. **The relay channel is a named staleness surface on both sides; every relay is a claim
+to verify, never an instruction to obey.** Adopted permanently: fetch the origin tip at
+activation instead of trusting a relayed SHA; run the suite re-measure unconditionally
+even when a commit is obviously inert. Both exercised this activation.
+
+**CROSS-LANE HEADS-UP — VERIFIED, BITES NOTHING.** `error_text(exc)` is a new additive
+function in `journal_log.py` (+52 / **0 deletions** across `0320c11..fdcdb47`), call sites
+in `asr.py` and `gemini_client.py`; `fallback.outcome` is emitted from `transcribe.py:1411,
+:1430, :1451` and `transcribe.py` changed 38/11 there. The relay's claim is accurate and
+the §2 contract is unchanged. **No storage-lane file or test references `fallback.outcome`
+and none asserts on an error detail string** — grep across the whole lane returns nothing,
+so there is nothing to update. Mainline files stay frozen.
+
+**THIRD BASE MOVEMENT — the relay did not mention it.** Ancestry guard found
+`fdcdb47` → **`bf5ef2b`** (1 commit, "scene card: uv run --no-sync rule + two spotted
+command defects"). **Docs-only** — one phase-report file, 20/7, its own message says
+"Suite unchanged (docs-only)". `journal_log.py` **byte-identical**; no journal/event/sensor
+file touched. **Early trigger did NOT fire; bare-movement clause applies; no re-dating.**
+The §2 canonical reference shapes were re-derived against `bf5ef2b` rather than assumed:
+all five match report 007 §2 exactly, `split(" ", 6)` → 6 or 7 parts, dispatch on `parts[2]`
+never `parts[5]`.
+
+**SUITE RE-MEASURED UNCONDITIONALLY** — per the doctrine adopted in this very relay, run
+it even when the commit is obviously inert. **2062 / 6 / 0, ruff clean**, identical to the
+increment-5 landing number. The baseline is confirmed current, not assumed.
+
+**HARNESS BRANCH LINE re-checked:** still **reporting, not enforcing**. HEAD on
+`arena/storage`, frozen branch byte-identical local and origin, tree clean. Safety addendum
+does not trigger.
+
+**NOT DONE:** increment 4 not re-run (already landed); increment 6 not started (no ruling
+in this relay); no mainline file touched — `transcribe.py` read only, to verify the
+heads-up; nothing committed to `arena/e7a1cca5-elaria`.
