@@ -1,8 +1,10 @@
 # Kitty hands — owner setup draft (2026-11-02)
 
 **HELD / TESTED-ONLY.** This is a setup reference, not permission to activate a live
-adapter. The additive library has no daemon/console registration and no default
-independent checker. Complete the integration and drift gates before the owner scene.
+adapter. The narrow granted daemon mount is now present, inert until explicit owner
+attach, with a conservative native-state checker. Opaque process/program effect adapters,
+full target/effect coverage and owner reconciliation remain incomplete. Complete those
+integration and drift gates before the owner scene. No console registration was added.
 Nothing here has been applied to kitty, Hyprland, system services or owner files.
 
 Authority: owner sequencing-only addendum > builder block v1.1 > unchanged clause v2.
@@ -175,12 +177,13 @@ currently has a one-shot 1 MiB bound. Timeout/crash means **effect unknown, no r
 
 ## 6. Trusted-host contract and outstanding integration gate
 
-**Protected-file wall identified at the next checkpoint:** the existing daemon has a
-fixed `Daemon._handlers()` table and no plugin registration hook. Its authenticated IPC
-boundary is in protected `src/assistant/daemon.py`. The frozen hands bridge/core are
-synthetic-only, not an alternate production host. A real host mount needs a specific
-ruling; a copied/replacement daemon, monkey-patch or second daemon is not a workaround.
-No protected file has been changed. Other additive module work remains possible.
+**Option B granted and mounted:** design's 2026-11-02 ruling opens only kitty lifecycle
+state, owner-authenticated bound-method registration/delegation and shutdown cleanup in
+`daemon.py`. The implementation adds 8 lines in those surfaces; the substantive host
+is `hands/kitty/host.py`. There is no monkey-patch, replacement daemon or second service.
+`kitty.request` uses the existing daemon socket and `_require_ipc_owner()` boundary.
+See `docs/kitty-host.md` for its exact contract, recovery and unfinished adapter coverage.
+The owner scene is still NOT READY; mounting is not full capability completion.
 
 The additive API is `Bridge(transport, checker, journal, verifier=...)`. Its `Act.plan()`
 uses the existing immutable `Plan/Step` canonical hash; `Authorizer` calls existing
@@ -204,12 +207,21 @@ legacy T2 still needs exact Yes; legacy T3 is refused even with a K3 approval.
   foreground-process hash, not raw arguments: raw command lines can contain passwords.
   The private consent disclosure may use the transient exact command line. This avoids
   violating the secret-free event requirement; no terminal text is journaled.
-- Journal sink must be durable. `EventJournal` fsyncs private JSONL; `kitty.act` records are
-  console-renderable, but delivery into the frozen console/registry is **not implemented**.
-- The library intentionally has no CLI that could bypass the trusted host. Production
-  checker, owner-input binding, durable restart/replay reconciliation, cancellation, broad
-  selector/effect coverage and live registration remain integration work. Stop for an
-  explicit ruling before touching any protected/frozen integration file.
+- The mounted host uses `RecoveryLedger`: private 0600 fsynced JSONL with a lifetime
+  single-writer lease, 32 MiB stop bound, no truncation/repair, and explicit probe/act phases.
+  Spent/unknown intents, terminal No, cancellation intents and mismatch counters survive
+  restart. Unspent exact Yes restores only for the same endpoint; session hand-open never
+  restores. Explicit close-hand durably revokes pending approvals. Never discard the ledger
+  to clear a refusal; reviewed archival/compaction is still an outstanding maintenance gate.
+- Cancellation before dispatch is terminal. After dispatch it is best effort, not undo;
+  async cancellation uses the original request ID and a separately preflighted connection.
+  Disconnect does not release an in-flight worker or permit replay. HER ownership restores
+  only from durable successful creation records for the same socket/public-key identity.
+- `kitty.act` records are console-renderable; frozen console/registry delivery is still
+  not implemented. The mounted native assessor refuses unresolved opaque effects rather
+  than accepting caller-supplied checker evidence. Full process/program effect adapters,
+  broad selector normalization and complete per-verb effect observations remain unfinished.
+  No other protected file is opened by the narrow daemon grant.
 
 ## 7. Upgrade drift
 

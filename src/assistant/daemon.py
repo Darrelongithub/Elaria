@@ -114,6 +114,9 @@ def _int_param(params: dict, name: str) -> int:
 class Daemon:
     def __init__(self, config: Config):
         self.config = config
+        # Kitty mount: inert lifecycle state; no settings/password/socket I/O at startup.
+        from .hands.kitty.host import KittyMount
+        self._kitty_mount = KittyMount(config.socket_path.parent)
         # Request identity is task-local: concurrent IPC clients must never
         # inherit one another's principal or method. Peer credentials are
         # installed by handle() from SO_PEERCRED, not request params (I5).
@@ -608,6 +611,7 @@ class Daemon:
         """
         return {
             "ping": self._ping,
+            "kitty.request": self._kitty_request,
             "status": self._status,
             "cost": self._cost,
             "ack": self._ack,
@@ -680,6 +684,9 @@ class Daemon:
             "class.toggle": self._class_toggle,
             "ask": self._ask,
         }
+
+    async def _kitty_request(self, params: dict) -> dict:
+        return await self._kitty_mount.handle(self._require_ipc_owner(), params)
 
     def _require_ipc_owner(self) -> IpcPrincipal:
         """Return this request's kernel-authenticated local owner principal (I5)."""
@@ -3261,6 +3268,7 @@ class Daemon:
             await asyncio.gather(*tasks, return_exceptions=True)
         if meeting is not None:
             self.mode = self._meeting_mode()
+        await self._kitty_mount.aclose()
         self.store.close()
         if capture_error is not None:
             print(f"[assistd] meeting capture cleanup failed: "

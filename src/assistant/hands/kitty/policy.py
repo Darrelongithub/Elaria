@@ -102,10 +102,11 @@ def tier_for(act: Act, assessment: Assessment, targets, owned, catalogue) -> str
 
 
 class Authorizer:
-    def __init__(self, checker):
+    def __init__(self, checker, *, audit=None):
         if not callable(checker):
             raise TypeError("independent checker is required")
         self.checker = checker
+        self.audit = audit
         self.hand_ref = None
         self.denied = set()
         self.consumed = set()
@@ -140,6 +141,8 @@ class Authorizer:
         tier = 3 if result.nature == "credential-access" else result.legacy_tier
         verdict = adjudicate(plan.steps[0].tier, tier, self.mismatches.get(plan.digest, 0))
         self.mismatches[plan.digest] = verdict.mismatches
+        if self.audit is not None:
+            self.audit(plan.digest, verdict.mismatches)
         if result.denied or verdict.verdict == "refused" or plan.digest in self.denied:
             raise PermissionError("existing hands denial beats kitty consent")
         return result, verdict

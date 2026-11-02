@@ -94,3 +94,18 @@ secrecy; stub-only tests; local runner only, never automated-CI claims. PR23, co
 cherry-pick and SC-H1 are independent, not prerequisites for additive build work.
 `docs/kitty-owner-scene.md` remains **NOT READY TO RUN**. No owner version/drift/hardware
 result has been received, and no extra owner hardware session is scheduled here.
+
+## Subsequent owner grant — Option B accepted (2026-11-02)
+
+The owner carried design's acceptance of `26d8734f65e8a252db66bec27e7dfca7e729e15a`
+and explicitly granted **B**, limited to `daemon.py` lifecycle state, authenticated
+bound-method delegates and shutdown cleanup. This supersedes the open A/B question
+above; it does not open any other protected/frozen file. Monkey-patching, replacement
+daemons and second services are explicitly forbidden. Existing K2/K3 and legacy T3
+consent rules remain unchanged. The mainline window-findings F3a/b/c grant is separate;
+this lane neither spends that grant nor performs overlap reconciliation.
+
+The mount checkpoint adds only 8 daemon lines across those named surfaces. All host,
+checker, selector, ledger and cancellation logic resides in additive kitty modules.
+The module is not complete v1.1: unresolved opaque program effects are fail-closed and
+the owner scene remains NOT READY. See `docs/kitty-host.md` and the mount phase report.

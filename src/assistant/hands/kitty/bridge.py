@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import threading
 from datetime import UTC, datetime
 
 from .policy import Act, Authorizer, canonical, digest, fingerprint, inventory, tier_for
@@ -55,8 +56,9 @@ def windows_from_ls(data):
                         or any(not isinstance(x, str) for x in window["cmdline"])):
                     raise ValueError("invalid window identity")
                 # Environment, cwd, scrollback and other unneeded content never enter our snapshot.
-                result.append({k: window.get(k) for k in ("id", "pid", "cmdline", "title", "is_active", "foreground_processes", "created_at")}
-                              | {"tab_id": tab["id"], "os_id": osw["id"]})
+                result.append({k: window.get(k) for k in ("id", "pid", "cmdline", "title", "is_active", "is_focused", "foreground_processes", "created_at")}
+                              | {"tab_id": tab["id"], "os_id": osw["id"], "tab_title": tab.get("title"),
+                                 "tab_is_focused": tab.get("is_focused"), "layout": tab.get("layout")})
     if len({w["id"] for w in result}) != len(result):
         raise ValueError("ambiguous window IDs")
     return result
@@ -72,10 +74,13 @@ def target_metadata(targets):
 
 
 class Bridge:
-    def __init__(self, transport, checker, journal, *, verifier=None):
+    def __init__(self, transport, checker, journal, *, verifier=None, resolver=None, endpoint_ref=None):
         if not callable(journal):
             raise TypeError("durable kitty.act event sink is required")
         self.transport, self.journal, self.verifier = transport, journal, verifier
+        self.resolver, self.endpoint_ref = resolver, endpoint_ref
+        self.boundary = threading.RLock()
+        self.active = None
         self.authorizer = Authorizer(checker)
         self.catalogue = inventory()
         self.owned = set()  # journal-backed, this service session only; never infer from title
@@ -84,11 +89,12 @@ class Bridge:
     def event(self, *, verb, tier, plan_hash, targets, consent_ref, verification, **extra):
         self.journal({"kind": "kitty.act", "timestamp": datetime.now(UTC).isoformat(),
                       "session": self.session, "verb": verb, "tier": tier,
+                      "operation": "act", "endpoint_ref": self.endpoint_ref,
                       "target": target_metadata(targets), "plan_hash": plan_hash,
                       "consent_ref": consent_ref, "verification": verification, **extra})
 
     def probe(self, verb, payload, plan, targets=()):
-        common = {"verb": verb, "tier": "K1", "plan_hash": plan.digest, "targets": targets, "consent_ref": None}
+        common = {"verb": verb, "tier": "K1", "plan_hash": plan.digest, "targets": targets, "consent_ref": None, "operation": "probe"}
         self.event(**common, verification="pending", phase="intent")
         try:
             result = self.transport.request(verb, payload, "K1")
@@ -104,6 +110,8 @@ class Bridge:
         return windows_from_ls(self.probe("ls", {"all_env_vars": False}, plan))
 
     def targets(self, act, snapshot):
+        if self.resolver is not None:
+            return self.resolver(act, snapshot)
         by_id = {w["id"]: w for w in snapshot}
         if any(i not in by_id for i in act.target_ids):
             raise PermissionError("target disappeared")
@@ -144,17 +152,23 @@ class Bridge:
 
     def inspect(self, act, plan):
         """Plan-time assessment, then target observation for an exact private owner disclosure."""
-        self.authorizer.assess(act, plan, "plan", ())  # reject forbidden plans before any I/O
-        before = self.snapshot(plan)
-        targets = self.targets(act, before)
-        self.guards(act, targets)
-        return targets
+        try:
+            self.authorizer.assess(act, plan, "plan", ())  # reject forbidden plans before any I/O
+            before = self.snapshot(plan)
+            targets = self.targets(act, before)
+            self.guards(act, targets)
+            return targets
+        except Exception:
+            self.event(verb=act.verb, tier="K3", plan_hash=plan.digest, targets=[], consent_ref=None,
+                       verification="refused", phase="result", requested_ids=list(act.target_ids))
+            raise PermissionError("kitty plan refused before disclosure") from None
 
     def execute(self, act, plan):
         targets, tier, consent_ref = [], "K3", None
         common = lambda: {"verb": act.verb, "tier": tier, "plan_hash": plan.digest,
                               "targets": targets, "consent_ref": consent_ref}
         dispatched = False
+        owns_active = False
         try:
             if plan.digest in self.authorizer.consumed:
                 raise PermissionError("outcome already dispatched; no replay")
@@ -181,15 +195,22 @@ class Bridge:
                 tier = tier_for(act, assessment, latest, self.owned, self.catalogue)
                 consent_ref = self.authorizer.authorize(act, plan, tier, assessment, verdict, latest)
             silent = act.verb == "run" or act.payload.get("type") == "background"
-            self.event(**common(), verification="pending", phase="intent", silent=silent)
-            # Consumed before dispatch: timeout, crash or journal failure must NEVER auto-replay.
-            self.authorizer.consumed.add(plan.digest)
             entry = self.catalogue["verbs"].get(act.verb, {})
+            async_id = secrets.token_urlsafe(24) if entry.get("async") else None
+            cancel_event = threading.Event()
+            with self.boundary:
+                if self.active is not None:
+                    raise PermissionError("another act is in flight")
+                self.authorizer.authorize(act, plan, tier, assessment, verdict, targets)
+                self.event(**common(), verification="pending", phase="intent", silent=silent,
+                           async_id=async_id)
+                self.authorizer.consumed.add(plan.digest)
+                self.active = (plan.digest, act.verb, tier, async_id, cancel_event)
+                owns_active = True
             dispatched = True
             response = self.transport.request(act.verb, act.payload, tier,
-                no_response=entry.get("no_response", False),
-                async_id=secrets.token_urlsafe(24) if entry.get("async") else None,
-                stream=entry.get("stream", False))
+                no_response=entry.get("no_response", False), async_id=async_id,
+                stream=entry.get("stream", False), cancel_event=cancel_event)
             after = self.snapshot(plan)
             verification = "unverified"
             if act.verb in CREATORS:
@@ -200,7 +221,7 @@ class Bridge:
                     verification = "created-id-and-stamp-observed"
                     # Publish successful attribution durably BEFORE granting HER-ID status.
                     self.event(**common(), verification=verification, phase="result",
-                               created=target_metadata(created), silent=silent)
+                               created=target_metadata(created), ownership=[fingerprint([w]) for w in created], silent=silent)
                     self.owned.update(fingerprint([w]) for w in created)
                     return {"verification": verification, "data": response}
             elif act.verb == "send-text":
@@ -230,3 +251,32 @@ class Bridge:
             self.event(**common(), verification="effect-unknown" if dispatched else "refused",
                        phase="result")
             raise RuntimeError("kitty act refused or effect unknown; inspect journal, never replay") from None
+        finally:
+            with self.boundary:
+                if owns_active and self.active is not None and self.active[0] == plan.digest:
+                    self.active = None
+
+    def cancel(self, plan_hash):
+        # Before write-ahead dispatch, denial stops the act. After dispatch it is best effort,
+        # never an undo claim. Both stages are durable before the caller receives a reply.
+        with self.boundary:
+            active = self.active if self.active is not None and self.active[0] == plan_hash else None
+            common = {"verb": active[1] if active else "cancel", "tier": active[2] if active else "K3",
+                      "plan_hash": plan_hash, "targets": [], "consent_ref": None}
+            try:
+                self.event(**common, phase="cancel-intent", verification="requested")
+            finally:
+                self.authorizer.denied.add(plan_hash)
+                self.authorizer.consent.pop(plan_hash, None)
+                if active:
+                    active[4].set()
+        verification = "effect-unknown" if active or plan_hash in self.authorizer.consumed else "stopped-before-dispatch"
+        if active and active[3]:
+            try:
+                self.transport.request(active[1], {}, active[2], async_id=active[3],
+                                       cancel=True, no_response=True)
+                verification = "async-cancel-sent-effect-unknown"
+            except Exception:
+                verification = "cancel-transport-failed-effect-unknown"
+        self.event(**common, phase="cancel-result", verification=verification)
+        return {"verification": verification}

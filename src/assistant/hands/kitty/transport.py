@@ -121,7 +121,7 @@ class Transport:
         self.public_key, self.timeout, self.max_response_bytes = public_key, timeout, max_response_bytes
 
     def request(self, verb: str, payload: dict, tier: str, *, no_response: bool = False,
-                async_id: str | None = None, cancel: bool = False, stream: bool = False):
+                async_id: str | None = None, cancel: bool = False, stream: bool = False, cancel_event=None):
         try:
             command = {"cmd": verb, "version": VERSION, "payload": payload, "no_response": no_response}
             if async_id:
@@ -140,6 +140,8 @@ class Transport:
                     payloads = [dict(payload, data=base64.b64encode(raw[i:i + 512]).decode("ascii"))
                                 for i in range(0, len(raw), 512)] + [dict(payload, data="")]
             frames = [encrypt(dict(command, payload=p), password, self.public_key) for p in payloads]
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransportError("cancel requested before connect")
             # This context is entered for EVERY request, including verification and async cancel.
             with endpoint(self.path, self.runtime) as (fd, info), socket.socket(socket.AF_UNIX) as conn:
                 deadline = time.monotonic() + self.timeout
@@ -150,6 +152,8 @@ class Transport:
                 if uid != os.getuid() or (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
                     raise PermissionError("endpoint identity changed")
                 for frame in frames:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise TransportError("cancel requested; effect unknown")
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError
@@ -161,6 +165,8 @@ class Transport:
                 data = bytearray()
                 received = 0
                 while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise TransportError("cancel requested; effect unknown")
                     while SUFFIX in data:
                         end = data.index(SUFFIX)
                         frame = bytes(data[:end])
@@ -175,8 +181,13 @@ class Transport:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError
-                    conn.settimeout(remaining)
-                    part = conn.recv(min(65536, self.max_response_bytes + 1 - received))
+                    conn.settimeout(min(remaining, 0.1) if cancel_event is not None else remaining)
+                    try:
+                        part = conn.recv(min(65536, self.max_response_bytes + 1 - received))
+                    except TimeoutError:
+                        if cancel_event is None:
+                            raise
+                        continue
                     if not part:
                         raise TransportError("incomplete response")
                     data.extend(part)
