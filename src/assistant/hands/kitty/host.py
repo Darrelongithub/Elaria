@@ -98,7 +98,7 @@ class Session:
         if plan.digest in self.bridge.authorizer.consumed or plan.digest in self.bridge.authorizer.denied:
             raise PermissionError('spent or terminally denied plan')
         targets = self.bridge.inspect(act, plan)
-        assessment = self.bridge.authorizer.checker(act, 'disclose', tuple(targets))
+        assessment = self.bridge.authorizer.evaluate(act, plan, 'disclose', targets)
         verdict = adjudicate(plan.steps[0].tier, assessment.legacy_tier)
         if assessment.denied or verdict.verdict == 'refused':
             raise PermissionError('disclosure refused')

@@ -10,6 +10,7 @@ import secrets
 import threading
 from datetime import UTC, datetime
 
+from .attribution import trace
 from .policy import Act, Authorizer, canonical, digest, fingerprint, inventory, tier_for
 
 TAB_VERBS = frozenset({"close-tab", "focus-tab", "set-tab-title", "set-tab-color", "goto-layout",
@@ -81,7 +82,7 @@ class Bridge:
         self.resolver, self.endpoint_ref = resolver, endpoint_ref
         self.boundary = threading.RLock()
         self.active = None
-        self.authorizer = Authorizer(checker)
+        self.authorizer = Authorizer(checker, assessment_audit=self.record_assessment)
         self.catalogue = inventory()
         self.owned = set()  # journal-backed, this service session only; never infer from title
         self.session = secrets.token_hex(6)
@@ -92,6 +93,13 @@ class Bridge:
                       "operation": "act", "endpoint_ref": self.endpoint_ref,
                       "target": target_metadata(targets), "plan_hash": plan_hash,
                       "consent_ref": consent_ref, "verification": verification, **extra})
+
+    def record_assessment(self, act, plan, phase, targets, result):
+        receipt = trace(result, phase)
+        self.event(verb=act.verb, tier=tier_for(act, result, targets, self.owned, self.catalogue),
+                   plan_hash=plan.digest, targets=targets, consent_ref=None, phase="assessment",
+                   verification="refused" if result.denied else "assessed-not-authorized",
+                   assessment=receipt, silent=act.verb == "run" or act.payload.get("type") == "background")
 
     def probe(self, verb, payload, plan, targets=()):
         common = {"verb": verb, "tier": "K1", "plan_hash": plan.digest, "targets": targets, "consent_ref": None, "operation": "probe"}

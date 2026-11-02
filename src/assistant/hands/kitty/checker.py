@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import math
 
-from .policy import Assessment, inventory
+from .adapters.marker import CreateMarkerAdapter
+from .attribution import attribute
+from .policy import Assessment, digest, inventory
 
 OPAQUE = frozenset({'action', 'kitten', 'launch', 'new-window', 'run', 'load-config',
                     'env', 'send-text', 'send-key', 'signal-child', 'create-marker'})
@@ -51,22 +53,35 @@ class NativeChecker:
     def __init__(self, *, halted=lambda: False):
         self.catalogue = inventory()
         self.halted = halted
+        self.marker = CreateMarkerAdapter()
 
     def coverage(self):
-        return {verb: 'needs-trusted-effect-adapter' if verb in OPAQUE else 'native-state'
+        return {verb: ('partial-create-marker-adapter' if verb == 'create-marker' else
+                       'needs-trusted-effect-adapter' if verb in OPAQUE else 'native-state')
                 for verb in self.catalogue['verbs']}
 
     def __call__(self, act, phase, targets):
+        def verdict(tier, nature, reason, *, denied=False):
+            return attribute(Assessment(tier, nature, denied=denied), assessor='kitty.native/v1',
+                             reason=reason, act=act, phase=phase, targets=targets,
+                             basis={'catalogue_sha256': digest(self.catalogue)})
+
         try:
             validate_payload(act, self.catalogue)
         except (ValueError, TypeError, PermissionError):
-            return Assessment(None, 'unknown', denied=True)
-        if self.halted() or act.verb in OPAQUE:
-            return Assessment(None, 'unknown', denied=True)
+            return verdict(None, 'unknown', 'wire-schema-evidence-invalid', denied=True)
+        if self.halted():
+            return verdict(None, 'unknown', 'hands-halted', denied=True)
+        if act.verb == 'create-marker':
+            return self.marker(act, phase, targets, self.catalogue)
+        if act.verb in OPAQUE:
+            # NOT an implemented adapter. Name the missing family; never turn the
+            # absence of an assessor into a generic approved effect classification.
+            return verdict(None, 'unknown', act.verb + '-adapter-not-implemented', denied=True)
         entry = self.catalogue['verbs'][act.verb]
         if entry['tier'] == 'K1':
-            return Assessment(0, 'observational')
+            return verdict(0, 'observational', 'native-observational')
         # Persistent/global configuration changes cannot be authorized by session hand-open.
         if act.payload.get('configured') or act.payload.get('reset'):
-            return Assessment(2, 'irreversible')
-        return Assessment(1, 'reversible')
+            return verdict(2, 'irreversible', 'native-persistent-change')
+        return verdict(1, 'reversible', 'native-state-change')

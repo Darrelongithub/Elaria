@@ -69,6 +69,10 @@ class Assessment:
     nature: str  # observational / reversible / irreversible / credential-access / unknown
     denied: bool = False
     bracketed_paste: bool = False  # positive observed evidence only; never infer from program name
+    assessor: str | None = None
+    reason: str | None = None
+    evidence_ref: str | None = None
+    evidence: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -102,11 +106,12 @@ def tier_for(act: Act, assessment: Assessment, targets, owned, catalogue) -> str
 
 
 class Authorizer:
-    def __init__(self, checker, *, audit=None):
+    def __init__(self, checker, *, audit=None, assessment_audit=None):
         if not callable(checker):
             raise TypeError("independent checker is required")
         self.checker = checker
         self.audit = audit
+        self.assessment_audit = assessment_audit
         self.hand_ref = None
         self.denied = set()
         self.consumed = set()
@@ -132,12 +137,31 @@ class Authorizer:
         else:
             raise PermissionError("exact yes/no required; no is terminal")
 
+    def evaluate(self, act, plan, phase, targets):
+        """Record checker attribution even on denial, before consent can be considered."""
+        if plan != act.plan(plan.steps[0].tier):
+            raise PermissionError("act does not match whole plan")
+        # Do not expose checker exception text: it can contain the requested content.
+        # The boundary is NOT an effect adapter; it can only attest a refusal.
+        from .attribution import attribute, trace
+        reason = None
+        try:
+            result = self.checker(act, phase, tuple(targets))
+            trace(result, phase)
+        except Exception:
+            reason = "checker-failed-or-invalid-evidence"
+        if reason is not None:
+            result = attribute(Assessment(None, "unknown", denied=True),
+                               assessor="kitty.assessment-boundary/v1", reason=reason,
+                               act=act, phase=phase, targets=targets, basis={})
+        if self.assessment_audit is not None:
+            self.assessment_audit(act, plan, phase, targets, result)
+        return result
+
     def assess(self, act, plan, phase, targets):
         if plan != act.plan(plan.steps[0].tier):
             raise PermissionError("act does not match whole plan")
-        result = self.checker(act, phase, tuple(targets))
-        if not isinstance(result, Assessment):
-            raise PermissionError("invalid checker evidence")
+        result = self.evaluate(act, plan, phase, targets)
         tier = 3 if result.nature == "credential-access" else result.legacy_tier
         verdict = adjudicate(plan.steps[0].tier, tier, self.mismatches.get(plan.digest, 0))
         self.mismatches[plan.digest] = verdict.mismatches

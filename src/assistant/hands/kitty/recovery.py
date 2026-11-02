@@ -13,6 +13,7 @@ import stat
 import threading
 from pathlib import Path
 
+from .attribution import validate_trace
 from .policy import Consent
 from .transport import directory_fd
 
@@ -56,8 +57,10 @@ class RecoveryLedger:
         if (type(event) is not dict or event.get('kind') != 'kitty.act'
                 or not HASH.fullmatch(event.get('plan_hash', ''))):
             raise ValueError('invalid ledger record')
-        if event.get('phase') not in {'intent', 'result', 'decision', 'cancel-intent', 'cancel-result', 'gate'}:
+        if event.get('phase') not in {'intent', 'result', 'decision', 'cancel-intent', 'cancel-result', 'gate', 'assessment'}:
             raise ValueError('invalid ledger phase')
+        if event.get('phase') == 'assessment':
+            validate_trace(event.get('assessment'))
         if event.get('phase') == 'gate' and (type(event.get('mismatches')) is not int
                 or event['mismatches'] not in range(3)):
             raise ValueError('invalid gate counter')

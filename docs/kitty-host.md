@@ -65,8 +65,11 @@ receives T2 plus an irreversible K3 classification. Target-attribution K3 escala
 still happens independently in Bridge (for example HIS or mixed-tab closes).
 
 The mounted default **refuses unresolved opaque effects**: `action`, `kitten`, `launch`,
-`new-window`, `run`, `load-config`, `env`, `send-text`, `send-key`, `signal-child`, and
-`create-marker`. This is an explicit unfinished independent-effect-adapter gate, **not**
+`new-window`, `run`, `load-config`, `env`, `send-text`, `send-key`, and `signal-child`.
+`create-marker` now has a **partial per-family adapter** for reviewed literal highlighting;
+function/regex/unknown or missing-evidence forms remain refused. See `docs/kitty-adapters.md`
+for exact coverage and assessor/evidence receipts. Missing evidence is **blocked, not
+bypassed**. This is an explicit unfinished independent-effect-adapter gate, **not**
 a new task whitelist or a claim that v1.1's total capability has been delivered. The
 underlying Bridge paths remain available to trusted injected stub assessors in tests;
 a model-supplied “safe” flag or owner Yes does not invent missing independent evidence.
@@ -94,6 +97,9 @@ file creation and parent metadata, then fsyncs each record before acknowledging 
 All metadata is secret-free: hashes, IDs, phases, counters, consent booleans/references;
 no payload, terminal text, raw argv or passwords are persisted. No new database schema.
 
+- `phase=assessment` retains the assessor/verdict/reason/evidence reference before R3 and
+  consent gates; refusal is recorded too. Recovery validates receipts without turning
+  assessments into consent or spending an act that was never dispatched.
 - `operation=probe` distinguishes observations from write-ahead dispatch intents.
 - Any dispatched act intent is spent after restart, including missing/unknown results.
   Old intent records lacking this discriminator are conservatively spent, not guessed safe.
@@ -118,8 +124,8 @@ not cancel-proven. A completed/spent act is never relabeled “stopped before di
 
 ## Next completion gate
 
-Complete the opaque effect adapters and full target/effect matrix; exercise encrypted
-stream/cancel/recovery fault boundaries more broadly; reconcile owner Fedora/OpenSSH
-metadata and drift; then review/finalize the scene card. The existing drift script and
+Complete per-family opaque effect adapters first, then the full target/effect matrix,
+then broader stream/cancel fault tests, then resource bounds. Owner Fedora/OpenSSH and
+version-drift reconciliation runs alongside, not after adapters. Scene card comes last. The existing drift script and
 owner-only scene remain unchanged and unexecuted. All tests here are synthetic and
 local-only; no automated-CI or hardware-proof claim.

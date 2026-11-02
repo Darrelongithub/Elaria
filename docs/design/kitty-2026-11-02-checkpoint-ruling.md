@@ -109,3 +109,33 @@ The mount checkpoint adds only 8 daemon lines across those named surfaces. All h
 checker, selector, ledger and cancellation logic resides in additive kitty modules.
 The module is not complete v1.1: unresolved opaque program effects are fail-closed and
 the owner scene remains NOT READY. See `docs/kitty-host.md` and the mount phase report.
+
+## Mount acceptance and binding adapter doctrine (subsequent owner relay)
+
+Design verified and accepted `e22005257a1be4680bfd164057bd4a7791601ac4`:
+2170 + 50 = 2220 / 6 skipped; lane 67 + 50 = 117; Ruff clean, remote matched,
+worktree clean, no PR. The structural protected-file audit is the project standard:
+substantive code stays additive; the protected file gains only a door. The existing
+8-line daemon exception is not expanded by this acceptance.
+
+Binding doctrine for **each of the 11 opaque families**:
+
+1. Every adapter fails closed.
+2. Inability to assess is a refusal with the reason recorded, never default-safe.
+3. Each adapter must test refusal when its own evidence is missing as primary behavior.
+4. The trail records WHO assessed and ON WHAT: adapter verdict and evidence reference,
+   not merely owner consent.
+5. No generic adapter. Per-family assessment is required; common receipt formatting
+   does not perform classification or count as an implemented family adapter.
+
+**Blocked, not bypassed** must be explicit in reports of missing evidence.
+Sequence: adapters first; complete target/effect coverage second; broader stream and
+cancellation fault tests third; resource bounds fourth. Fedora/OpenSSH/version-drift
+reconciliation runs **alongside**, not as an adapter dependency. Scene card **last**.
+Scene remains NOT READY; no PR, force-push, fixture changes, new protected hunks,
+owner hardware, live RC or paid/model service is authorized.
+
+Owner reports Python **3.14.8**; the sandbox's accepted gates used **3.11.2**.
+Try a full 3.14 suite before the card and record both interpreters/runs if available.
+Otherwise disclose the missing run. No shared `running_daemon` fixture repair is
+permitted, quirk or no quirk. Any owner hardware validation remains design-supervised.
