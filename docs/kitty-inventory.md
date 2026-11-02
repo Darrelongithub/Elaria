@@ -9,6 +9,7 @@ Do not substitute this version claim for verbatim owner output. No live kitty wa
 Authority: owner 2026-11-02 sequencing-only addendum > builder v1.1 > KITTY-CLAUSE v2.
 Clause SHA256: `8be8a4a94e958e1fd0323d8e687418f73e6cfd407a5a08bb6720b75769ffb6bc` (unchanged).
 PR23, console cherry-pick and SC-H1 remain independent held tracks, not build prerequisites.
+Lane placement is accepted in place by the 2026-11-02 design checkpoint ruling, NOT by the earlier sequencing-only A. See `docs/design/kitty-2026-11-02-checkpoint-ruling.md`.
 
 ## Scope and trust
 
@@ -20,6 +21,7 @@ PR23, console cherry-pick and SC-H1 remain independent held tracks, not build pr
 - Any irreversible/credential/unknown effect escalates K3. Existing T3 holds still refuse: a K3 Yes never overrides them.
 - SSH options depend on the installed OpenSSH binary. The pinned fallback flags and complete kitty-specific ssh.conf/copy surface are included; installed SSH help/man reconciliation is still open.
 - Defaults are the command-line defaults; an absent Python string default is None but generated Go CLI uses an empty string. `declared_default` retains explicit source metadata.
+- `send-key` on 0.47.1 carries `K3-send-key-exclude-active-unenforced-0.47.1` at verb and option level. Broadcast exclusion is untrustworthy even when `exclude_active=true`; a snapshot cannot make it atomic.
 - CLI fields are not wire fields. Protocol specs and options are separately recorded. Raw source expressions are retained rather than guessed.
 
 ## Primary sources and appendix cross-check
@@ -3174,7 +3176,7 @@ be refocused.
 
 Send arbitrary key presses to specified windows. All specified keys are sent first as press events then as release events in reverse order. Keys are sent to the programs running in the windows. They are sent only if the current keyboard mode for the program supports the particular key. For example: send-key ctrl+a ctrl+b. Note that errors are not reported, for technical reasons, so send-key always succeeds, even if no key was sent to any window.
 
-Hazards: target-default-may-be-active, effects-require-verification, silent-success, arbitrary-input, broadcast, his-window-K3.
+Hazards: target-default-may-be-active, effects-require-verification, silent-success, arbitrary-input, broadcast, his-window-K3, K3-send-key-exclude-active-unenforced-0.47.1.
 Async: False; streaming: False; no-response declaration: True.
 Argument declaration: `RemoteCommand.Args(spec='[KEYS TO SEND ...]', json_field='keys')`.
 Source: `kitty/rc/send_key.py`, SHA256 `a66921c25f138aac9ff87aebd603881aa08cfee3b83f822d1796599418c66e0b`.
@@ -3306,7 +3308,7 @@ Match all windows.
 
 Type: `bool-set`; CLI default: `false`; explicit source default: `null`.
 Choices: not enumerated.
-Option hazards: inherits act hazards.
+Option hazards: K3-send-key-exclude-active-unenforced-0.47.1.
 
 Do not send text to the active window, even if it is one of the matched windows.
 

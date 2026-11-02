@@ -166,9 +166,12 @@ class Bridge:
             tier = tier_for(act, assessment, targets, self.owned, self.catalogue)
             consent_ref = self.authorizer.authorize(act, plan, tier, assessment, verdict, targets)
             pre_text = {}
-            if act.verb == "send-text":
-                for w in targets:
-                    pre_text[w["id"]] = self.probe("get-text", {"match": exact_match([w["id"]])}, plan, [w])
+            if act.verb in SEND:
+                if act.verb == "send-text":
+                    for w in targets:
+                        pre_text[w["id"]] = self.probe("get-text", {"match": exact_match([w["id"]])}, plan, [w])
+                # BOTH send verbs need a fresh identity/focus observation and gate. In 0.47.1
+                # send-key ignores exclude_active; this does NOT make broadcast exclusion atomic.
                 # Fresh identity immediately before the send, after any get-text round trips.
                 latest = self.targets(act, self.snapshot(plan))
                 if fingerprint(latest) != fingerprint(targets):

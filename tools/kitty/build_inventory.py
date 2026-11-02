@@ -130,6 +130,8 @@ def build(root):
         hazards = ['target-default-may-be-active', 'effects-require-verification']
         if verb in {'send-key', 'send-text'}:
             hazards += ['silent-success', 'arbitrary-input', 'broadcast', 'his-window-K3']
+        if verb == 'send-key':
+            hazards += ['K3-send-key-exclude-active-unenforced-0.47.1']
         if verb == 'send-text':
             hazards += ['python-escape-cli', 'newline-execution', 'bracketed-paste-not-a-guarantee']
         if verb in {'close-window', 'close-tab', 'signal-child'}:
@@ -143,9 +145,14 @@ def build(root):
         if verb in k1:
             hazards += ['screen-or-environment-may-contain-secrets']
         spec = fields.get('options_spec', '') or ''
+        parsed_options = options(spec)
+        if verb == 'send-key':
+            for option in parsed_options:
+                if '--exclude-active' in option['flags']:
+                    option['hazards'].append('K3-send-key-exclude-active-unenforced-0.47.1')
         result[verb] = {'tier': 'K1' if verb in k1 else 'K3' if verb in k3 else 'K2',
                         'summary': fields.get('short_desc', ''), 'semantics': fields.get('desc', ''),
-                        'options': options(spec), 'option_spec': spec, 'argument_spec_source': arg_source,
+                        'options': parsed_options, 'option_spec': spec, 'argument_spec_source': arg_source,
                         'payload': payload, 'protocol_spec': fields.get('protocol_spec', ''),
                         'async': fields.get('is_asynchronous', False),
                         'stream': fields.get('reads_streaming_data', False),

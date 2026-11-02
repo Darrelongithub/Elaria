@@ -6,7 +6,11 @@ independent checker. Complete the integration and drift gates before the owner s
 Nothing here has been applied to kitty, Hyprland, system services or owner files.
 
 Authority: owner sequencing-only addendum > builder block v1.1 > unchanged clause v2.
-Current lane: `arena/b65d5161-elaria`, additive after `35adbba`; NO PR.
+Current lane: `arena/b65d5161-elaria`, accepted in place by the **2026-11-02 design
+checkpoint ruling**, additive after `35adbba`; NO PR. The earlier “explicit A” was
+sequencing-only and named no lane. See `docs/design/kitty-2026-11-02-checkpoint-ruling.md`.
+At branch-creation/merge era, cherry-pick kitty commits onto a hands-tip-based branch;
+the separate console `35adbbaf` cherry-pick plan is unchanged. Never force-push.
 
 ## 1. Record actual versions before changing anything
 
@@ -170,6 +174,13 @@ Unknown keys, inline passwords and any `hand_open` setting are rejected. Stream 
 currently has a one-shot 1 MiB bound. Timeout/crash means **effect unknown, no replay**.
 
 ## 6. Trusted-host contract and outstanding integration gate
+
+**Protected-file wall identified at the next checkpoint:** the existing daemon has a
+fixed `Daemon._handlers()` table and no plugin registration hook. Its authenticated IPC
+boundary is in protected `src/assistant/daemon.py`. The frozen hands bridge/core are
+synthetic-only, not an alternate production host. A real host mount needs a specific
+ruling; a copied/replacement daemon, monkey-patch or second daemon is not a workaround.
+No protected file has been changed. Other additive module work remains possible.
 
 The additive API is `Bridge(transport, checker, journal, verifier=...)`. Its `Act.plan()`
 uses the existing immutable `Plan/Step` canonical hash; `Authorizer` calls existing

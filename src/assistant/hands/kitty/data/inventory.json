@@ -3349,7 +3349,9 @@
           "type": "bool-set",
           "default": false,
           "declared_default": null,
-          "hazards": [],
+          "hazards": [
+            "K3-send-key-exclude-active-unenforced-0.47.1"
+          ],
           "choices": [],
           "metadata": {
             "type": "bool-set"
@@ -3401,7 +3403,8 @@
         "silent-success",
         "arbitrary-input",
         "broadcast",
-        "his-window-K3"
+        "his-window-K3",
+        "K3-send-key-exclude-active-unenforced-0.47.1"
       ],
       "source": "kitty/rc/send_key.py",
       "source_sha256": "a66921c25f138aac9ff87aebd603881aa08cfee3b83f822d1796599418c66e0b"

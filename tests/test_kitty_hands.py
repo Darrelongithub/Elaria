@@ -664,3 +664,94 @@ def test_runtime_must_be_current_environment(private, monkeypatch, runtime):
             monkeypatch.setenv('XDG_RUNTIME_DIR', runtime)
         with pytest.raises(PermissionError), endpoint(path, private):
             pass
+
+
+def test_adopted_send_key_hazard_is_machine_readable_at_both_levels():
+    data = inventory()
+    entry = data['verbs']['send-key']
+    flag = 'K3-send-key-exclude-active-unenforced-0.47.1'
+    assert data['upstream_version'] == '0.47.1'
+    assert entry['tier'] == 'K3'
+    assert flag in entry['hazards']
+    option = next(o for o in entry['options'] if '--exclude-active' in o['flags'])
+    assert flag in option['hazards']
+    assert 'set-os-window-title' not in data['verbs']
+
+
+def prepared_key_broadcast():
+    fake, events = FakeKitty(), []
+    fake.windows.append(dict(fake.windows[0], id=2, pid=102, created_at=2))
+    bridge = Bridge(fake, checker(), events.append)
+    act = make_act('send-key', {'keys': ['left']}, (1, 2))
+    plan = act.plan(1)
+    targets = bridge.inspect(act, plan)
+    return bridge, fake, events, act, plan, targets
+
+
+def test_send_key_is_k3_even_with_her_ids_and_session_hand_open():
+    bridge, fake, _, act, plan, targets = prepared_key_broadcast()
+    bridge.owned.update(fingerprint([w]) for w in targets)
+    bridge.authorizer.open_hand(owner_phrase='kitty hand open', reference=secrets.token_hex(12))
+    with pytest.raises(RuntimeError):
+        bridge.execute(act, plan)
+    assert 'send-key' not in [c[0] for c in fake.calls]
+    grant(bridge, act, plan, targets)
+    assert bridge.execute(act, plan)['verification'] == 'unverified'
+    assert next(c[2] for c in fake.calls if c[0] == 'send-key') == 'K3'
+
+
+@pytest.mark.parametrize('change', ['pid', 'cmdline', 'foreground_processes', 'is_active'])
+def test_send_key_fresh_snapshot_blocks_changed_program_or_active_broadcast(change):
+    bridge, fake, events, act, plan, targets = prepared_key_broadcast()
+    grant(bridge, act, plan, targets)
+
+    def changing(_, phase, __):
+        if phase == 'pre-exec':
+            fake.windows[0][change] = {
+                'pid': 999, 'cmdline': ['/usr/bin/vim'],
+                'foreground_processes': [{'pid': 999, 'cmdline': ['vim']}], 'is_active': True,
+            }[change]
+        return Assessment(1, 'reversible')
+
+    bridge.authorizer.checker = changing
+    with pytest.raises(RuntimeError):
+        bridge.execute(act, plan)
+    assert 'send-key' not in [c[0] for c in fake.calls]
+    assert events[-1]['verification'] == 'refused'
+
+
+def test_send_key_runs_pre_send_adjudication_and_denial_beats_exact_yes():
+    bridge, fake, _, act, plan, targets = prepared_key_broadcast()
+    grant(bridge, act, plan, targets)
+    phases = []
+
+    def deny_late(_, phase, __):
+        phases.append(phase)
+        return Assessment(3 if phase == 'pre-send' else 1, 'reversible')
+
+    bridge.authorizer.checker = deny_late
+    with pytest.raises(RuntimeError):
+        bridge.execute(act, plan)
+    assert phases == ['plan', 'pre-exec', 'pre-send']
+    assert 'send-key' not in [c[0] for c in fake.calls]
+
+
+def test_send_key_success_has_fresh_probe_but_not_a_false_effect_claim():
+    bridge, fake, events, act, plan, targets = prepared_key_broadcast()
+    grant(bridge, act, plan, targets)
+    fake.calls.clear()
+    phases = []
+
+    def observe(_, phase, __):
+        phases.append(phase)
+        return Assessment(1, 'reversible')
+
+    bridge.authorizer.checker = observe
+    result = bridge.execute(act, plan)
+    assert phases == ['plan', 'pre-exec', 'pre-send']
+    assert [c[0] for c in fake.calls] == ['ls', 'ls', 'send-key', 'ls']
+    assert result['verification'] == 'unverified'
+    assert events[-1]['verification'] == 'unverified'
+    # The flag is still supplied, but neither API success nor snapshot exclusion is proof
+    # that the active window cannot change between this snapshot and the actual key event.
+    assert fake.calls[2][1]['exclude_active'] is True
