@@ -121,6 +121,14 @@ def _smoke_table(tmp_path: Path) -> list[list[str]]:
         ["dictate"],
         ["events"],
         ["events", "--recent", "5", "--kind", "ptt.lifecycle"],
+        # WP7 cold storage & backup (storage lane, increment 5). `fetch` is given a
+        # wav that is not in the manifest on purpose: the smoke assertion is that the
+        # entry point is ALIVE and answers, and an honest exit-2 refusal is an answer.
+        # `run` is dry-run only — a smoke invocation must change nothing.
+        ["backup", "status"],
+        ["backup", "fetch", str(mic)],
+        ["backup", "run", "--dry-run"],
+        ["backup", "check"],
     ]
 
 

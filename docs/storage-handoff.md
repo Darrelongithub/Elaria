@@ -1634,3 +1634,97 @@ lane's fence established — class, count, hash prefix, never the raw text. Main
 converging on report 006 §6's shape. Mainline's `error_text(exc)` convention (failure text
 never empty; a message-less TimeoutError still names its class) matches what this lane's
 skip details already did by recording `type(exc).__name__`.
+
+---
+
+## 2026-11-02 — INCREMENT 5 LANDED: `assist backup` CLI + sensors (report 018)
+
+**SHA:** `dcb33d4` + this entry's commit. Branch `arena/storage`, PR #24 head.
+
+**GATES:** full suite **2062 passed / 6 skipped / 0 errors**, `ruff check .` → **All
+checks passed!** (baseline 2017/6/0 → +45, the new file in full, no parametrize).
+CPython 3.11.2, sandbox `.venv`.
+
+**DELIVERED**
+
+- **`src/assistant/sensors.py`** — the six events (`backup.started/done/failed/verify/
+  check`, `storage.gauge`) through `journal_log.log_event()`. Every line satisfies the
+  canonical §2 contract and a test proves it: `split(" ", 6)` → 6 or 7 parts,
+  **`session_id` is `-`** (a backup run is not a session), **`peak` is `-`**, dispatch keys
+  on the event name never the verdict. `backup.verify` carries `backend=` and `method=`
+  straight from the `Verification`, so **provenance reaches the journal**: a fixture reads
+  `local-path-fixture; hash`, a real one `rclone:mega-elaria; presence`.
+- **`src/assistant/backup_cli.py`** — `assist backup status | fetch <artifact> | run
+  [--dry-run] | check [artifact] [--kind monthly|quarterly]`. Every edge injected
+  (manifest, verifier, movers, restorer, clock), so the whole surface runs on fixtures with
+  no restic, no rclone, no MEGA. The cold read path **refuses rather than guesses**: unknown
+  artifact → 2; not cold → 2; no restorer → 2; restore impossible → 1 + `backup.failed`;
+  **hash mismatch → 1 + `backup.verify confirmed=no` and "refusing to call this a
+  restore"**. A restore that does not hash-verify is not a restore. `run` refuses without a
+  verifier (increment 2's posture, still standing at the CLI layer). `run --dry-run` changes
+  nothing — a test asserts the manifest summary is byte-identical before and after.
+- **`src/assistant/cli.py` — FIRST registration-point edit in this lane. 23 added,
+  0 removed.** A `backup` subparser block plus one dispatch line. No existing line modified.
+
+**THE GAUGE AND THE FLOOR:** `StorageGauge` carries hot/cold bytes and counts,
+`remote_free_bytes`, `floor_bytes`. The floor is **10 GB consumed expressed as
+`remote_free`** so it stays equivalent on a 20 GB tier. **An unread remote is `unknown`,
+not zero** — reporting unknown as zero would suppress the knock the design asked for, and
+reporting unknown as below-floor would raise one it never asked for. Both refused.
+
+**DEFECTS SURFACED AND FIXED (D17–D21)**
+
+- **D17 — the Bug 7 smoke table refused my subcommands, and it was right to.**
+  `test_every_parser_leaf_has_a_smoke_invocation` failed naming all four backup leaves.
+  Its own docstring says the table is *meant* to rot loudly — this is the designed
+  extension point, and extending it is what a mainline contributor adding a subcommand is
+  supposed to do. The file is **not** on the lane's forbidden list and the edit is **8
+  added, 0 removed**. Recorded prominently because it is the **first mainline test file
+  this lane has touched**. Two judgement calls in the entries: `fetch` is given a wav
+  deliberately **not** in the manifest — the smoke assertion is that the entry point is
+  alive and answers, and an honest exit-2 refusal is an answer; and `run` is **dry-run
+  only**, because a smoke invocation must change nothing. All four verified to run (0, 2,
+  0, 2) before being added.
+- **D18 — the privacy fence was caller discipline, not structure.**
+  `backup_started(reason=…)` / `backup_failed(reason=…)` passed the caller's string
+  straight to `log_event()`. A caller doing `backup_failed(reason=str(exc))` hands us a
+  `FileNotFoundError` whose message is an absolute path, and **the path reaches the
+  journal**. A test proved it. Same class as D10: the fence held only because callers were
+  careful. Fixed with `scrub()` applied **inside `_emit()`**, so every line is scrubbed on
+  the way out regardless of emitter or caller. Anything path-like becomes `<path>`.
+  Over-redaction accepted (`read/write` → `read<path>write`).
+- **D19 — `scan()` called twice, and the second call classified a decision.**
+  `classify(scan(...))` raised `TypeError: 'TierDecision' object is not iterable`.
+  `scan()` already walks **and** classifies — it is the belt. Fixed to one call; also
+  removed a reference to `decision.problems`, a field that does not exist.
+- **D20 — `_check()` answered the wrong question when given a named artifact.** With no
+  cold artifacts it returned `nothing cold to drill` *before* looking at the named one.
+  Restructured: named first, `nothing cold to drill` only when nothing was named.
+- **D21 — three of my own fixtures/expectations were wrong.** (a) An **18-byte payload is a
+  header-only never-retry mark** — under `WAV_HEADER_BYTES = 44` — so `scan()` **correctly**
+  excluded it and every test needing `send_cold` silently asserted nothing. Third time a
+  fixture has been quietly wrong this way. Fixed with an 82-byte payload plus a comment.
+  (b) A fresh fixture is inside the 14-day window and correctly HOT; added an `_age()`
+  helper. (c) `assist queue` legitimately requires a sub-action, so my shadowing test's
+  expectation was wrong; excluded with a comment, six commands that do parse are covered.
+
+**FIREWALL:** zero edits to `daemon.py`, `transcribe.py`, `live_client.py`, `HANDOFF.md`,
+`tests/conftest.py`; zero edits to `config.py`, `ladder.py`, `pyproject.toml`.
+`cli.py` 23/0 and `test_bug7_cli_smoke.py` 8/0 — **the whole increment removed 0 lines**.
+First increment to touch a shared registration point, and it did so without modifying
+anything that already existed.
+
+**NOT CLAIMED:** no live MEGA traffic, no restic invocation, no rclone invocation.
+`[TESTED-ONLY]` throughout; against a real remote `[UNVERIFIED]`. **`restic check` and
+`--read-data-subset` are NOT implemented** — `backup check` is the drill *shape* only; the
+restic rung and the quarterly ≤5%/≤500 MB rung are increment 8. Nightly timer and
+post-close hook are increment 7. Ladder chain #5 is increment 6. No credentials. Gate 1
+unchanged.
+
+**BASE MOVEMENT:** none new. Ancestry guard fired on the **standing** condition — base
+still `fdcdb47`, unchanged since report 017. My branch was cut at `b3db316` and the base
+has advanced twice since; the lane does not rebase onto a moving base, by ruling. No new
+drift check, no re-dating, no re-measure.
+
+**NEXT:** increment 6 — ladder chain #5 "backup chain", additive, per the WP5 monthly
+trigger shape.

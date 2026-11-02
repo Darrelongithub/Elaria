@@ -1956,6 +1956,24 @@ def build_parser() -> argparse.ArgumentParser:
     queue_ext = queue_sub.add_parser("add-external", help="park an external action for approval")
     queue_ext.add_argument("action_name")
     queue_ext.add_argument("description")
+    backup_p = sub.add_parser(
+        "backup",
+        help="WP7 cold storage & backup — status, cold fetch, one run, integrity drill")
+    backup_sub = backup_p.add_subparsers(dest="backup_action", required=True)
+    backup_sub.add_parser("status", help="manifest summary + storage gauge (path-blind)")
+    backup_fetch = backup_sub.add_parser(
+        "fetch", help="cold read path: manifest lookup, restore, hash-verify")
+    backup_fetch.add_argument("artifact", help="the artifact to restore")
+    backup_fetch.add_argument("--out", help="where to put the restored copy")
+    backup_run = backup_sub.add_parser("run", help="one backup pass: tier, plan, reconcile")
+    backup_run.add_argument("--dry-run", action="store_true",
+                            help="report the plan; change nothing, contact nothing")
+    backup_check = backup_sub.add_parser(
+        "check", help="integrity drill: restore a cold artifact to tmp and hash-verify")
+    backup_check.add_argument("artifact", nargs="?", help="drill this artifact; "
+                                                          "default is a random cold one")
+    backup_check.add_argument("--kind", choices=("monthly", "quarterly"),
+                              default="monthly", help="drill cadence")
     sub.add_parser("halt", help="panic switch (§4.4)")
     sub.add_parser("resume", help="clear the halt flag")
     ladder_p = sub.add_parser(
@@ -2258,6 +2276,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "queue":
             return _queue_command(args, config)
+
+        if args.command == "backup":
+            from .backup_cli import backup_command
+
+            return backup_command(args, config)
 
         if args.command == "ask":
             result = call(config.socket_path, "ask",
