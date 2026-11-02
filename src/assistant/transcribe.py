@@ -58,7 +58,7 @@ from .clipboard import copy_text
 from .config import DEFAULTS
 from .cost import iso_now, shadow_cost_usd
 from .inbox import write_inbox_note
-from .journal_log import log_event, log_transcription_stump
+from .journal_log import error_text, log_event, log_starvation, log_transcription_stump
 from .live_client import (
     DuplexLiveTransport,
     LiveEvent,
@@ -520,7 +520,11 @@ class DictationService:
             if not timed_out:
                 self._log(f"{step}_failed", session_id=session_id,
                           elapsed_s=round(time.monotonic() - started, 3),
-                          error=str(exc)[:200], **fields)
+                          # F3a: NEVER an empty error string on a failure
+                          # event — asyncio.wait_for raises a message-less
+                          # TimeoutError and the 2026-11-02 starved turn
+                          # journaled `error: ""` from exactly here.
+                          error=error_text(exc)[:200], **fields)
             raise
         except Exception as exc:
             self._log(f"{step}_failed", session_id=session_id,
@@ -556,6 +560,10 @@ class DictationService:
         # must be initialized at entry).
         wav_pre_closed = False
         speculative_fallback = None
+        # F3c: the fallback chain's outcome class (landed/empty/timeout/
+        # error) — read at the gate's starvation check; initialized at
+        # entry (the final_wait_note lesson).
+        fallback_class = None
         if self.save_audio:
             audio_path = self.audio_dir / f"{when:%Y%m%d-%H%M%S}-{session_id[:6]}.wav"
             wav_sink = WavSink(audio_path)
@@ -745,7 +753,7 @@ class DictationService:
                 # failure is exactly what "5 failures, all key/voice" cannot
                 # rule out by inspection.
                 live_failures.append(f"connect: {exc}")
-                self._ledger_live_failure(stage="connect", error=str(exc))
+                self._ledger_live_failure(stage="connect", error=error_text(exc))
                 notes.append(f"live connect failed ({exc}) — will transcribe the saved audio")
                 await emit({"event": "session.reconnecting", "reason": str(exc),
                             "fallback": "local" if network_drop else "gemini_batch",
@@ -938,7 +946,7 @@ class DictationService:
                               duration_s=round(duration_s, 3))
                 except Exception as exc:
                     self._log("dictate.wav_close_failed", session_id=session_id,
-                              error=str(exc)[:120])
+                              error=error_text(exc)[:120])
             prelim_no_speech = (captured_bytes == 0 or peak_rms < 0.003
                                 or session_peak < self.silence_floor)
             # W6 cost guard (the scene-3b/BH-K1 contract): never spend the
@@ -964,7 +972,8 @@ class DictationService:
                             asr.transcribe_file, self.config, self.client,
                             str(audio_path),
                             offline=offline_at_start or network_drop,
-                            local_backend=self.local_backend),
+                            local_backend=self.local_backend,
+                            session_id=session_id),
                         timeout=self.FALLBACK_TIMEOUT_S))
 
             # PTT released / source exhausted: close the utterance. A Live
@@ -1151,7 +1160,7 @@ class DictationService:
                               duration_s=round(duration_s, 3))
                 except Exception as exc:
                     self._log("dictate.wav_close_failed", session_id=session_id,
-                              error=str(exc)[:120])
+                              error=error_text(exc)[:120])
 
             # Persist capture.stats before ANY cleanup await. If a transport or
             # source close is wedged, status still reports the bytes/peak and
@@ -1391,7 +1400,8 @@ class DictationService:
                             asyncio.to_thread(
                                 asr.transcribe_file, self.config, self.client,
                                 str(audio_path), offline=use_offline_chain,
-                                local_backend=self.local_backend),
+                                local_backend=self.local_backend,
+                                session_id=session_id),
                             timeout_s=self.FALLBACK_TIMEOUT_S,
                             session_id=session_id, audio_path=str(audio_path),
                             offline=use_offline_chain)
@@ -1401,6 +1411,7 @@ class DictationService:
                     log_event("fallback.outcome", session_id=session_id,
                               verdict=("landed" if fallback_text else "empty"),
                               detail=f"file-transcription leg {outcome_detail}")
+                    fallback_class = "landed" if fallback_text else "empty"
                     if fallback_text:
                         final_text = fallback_text
                         backend = str(getattr(fallback, "backend", backend))
@@ -1415,6 +1426,7 @@ class DictationService:
                     else:
                         notes.append("saved-WAV fallback returned no transcript")
                 except TimeoutError:
+                    fallback_class = "timeout"
                     log_event("fallback.outcome", level="warn",
                               session_id=session_id, verdict="timeout",
                               detail=(f"file-transcription leg exceeded "
@@ -1432,20 +1444,34 @@ class DictationService:
                         f"saved-WAV fallback timed out after "
                         f"{self.FALLBACK_TIMEOUT_S:g}s")
                 except Exception as exc:
+                    fallback_class = "error"
+                    # F3a: the chain's real failure text surfaces here —
+                    # `all ASR backends failed — <per-backend reasons>` —
+                    # never an empty error string on a failure event.
                     log_event("fallback.outcome", level="warn",
                               session_id=session_id, verdict="error",
-                              detail=f"file-transcription leg failed: {exc}")
+                              detail=(f"file-transcription leg failed: "
+                                      f"{error_text(exc)}"))
                     await emit_lifecycle_event(
                         "dictate.fallback_error_emit",
-                        {"event": "error", "error": str(exc),
+                        {"event": "error", "error": error_text(exc),
                          "session_id": session_id})
                     if not final_text:
                         backend = "local" if use_offline_chain else backend
-                    notes.append(f"saved-WAV fallback failed: {exc}")
+                    notes.append(f"saved-WAV fallback failed: {error_text(exc)}")
             else:
                 notes.append("saved-WAV fallback unavailable: no audio file was saved")
             if backend == "gemini_live" and live_failed and not final_text:
                 backend = "local" if use_offline_chain else "gemini_batch"
+            # F3c: whole-chain starvation is its own schema event — the
+            # per-backend class-marks sit above it in the journal, the wav
+            # is kept (the deferred contract owns the retry). The four
+            # classes: empty / timeout / error / (landed never starves).
+            if (fallback_class not in (None, "landed") and not final_text):
+                log_starvation(
+                    session_id, fallback_class,
+                    detail=(f"file chain produced no transcript; "
+                            f"wav kept at {audio_path}; retained for retry"))
         if speculative_fallback is not None and not needs_fallback:
             # W6: good Live text won the race — the speculative leg's
             # result is discarded unawaited and never substituted (the
@@ -1595,7 +1621,8 @@ class DictationService:
         offline = bool(connectivity and connectivity.is_offline)
         transcript = await asyncio.to_thread(
             asr.transcribe_file, self.config, self.client, str(audio_path),
-            offline=offline, local_backend=self.local_backend)
+            offline=offline, local_backend=self.local_backend,
+            session_id=session_id)
         cloud_status = self._cloud_status(
             backend=transcript.backend, confidence=transcript.confidence,
             raw=transcript.text, audio_path=audio_path, offline=offline)

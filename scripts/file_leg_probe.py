@@ -193,7 +193,9 @@ def run(config, client, wav_paths: list[str], *, printer=print,
                     f"confidence={transcript.confidence} "
                     f"language_ok={transcript.language_ok}")
         except Exception as exc:
-            printer(f"  leg raised: {type(exc).__name__}: {exc}")
+            message = str(exc).strip()
+            printer(f"  leg raised: {type(exc).__name__}"
+                    + (f": {message}" if message else ""))
 
         if raw_pass and sdk is not None:
             printer("section 4 — raw SDK pass (production wire shape; "

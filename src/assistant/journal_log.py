@@ -157,3 +157,55 @@ def log_transcription_stump(session_id: str, text: str, *, source: str) -> bool:
                       f"{kind.replace('_', ' ')}; the text itself is kept in "
                       f"the transcript row, never this line"))
     return True
+
+
+# -- voice-chain resilience (window findings order v1, 2026-11-02) --------
+#
+# The 2026-11-02 starved turn journaled `saved_wav_fallback_failed
+# (error "")` — an empty error string on a failure event (a message-less
+# TimeoutError from asyncio.wait_for). Empty error strings are forbidden
+# on failure events from here on: `error_text` names the class even when
+# the message is empty.
+
+def error_text(exc: BaseException) -> str:
+    """The failure text of `exc` — NEVER empty (F3a). A message-less
+    exception (asyncio.wait_for's TimeoutError) still names its class."""
+    message = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {message}" if message else name
+
+
+def backend_mark_detail(text: str | None = None, *, error: str = "") -> str:
+    """Per-backend class-mark detail (F3c): chars + sha16 where text
+    exists, the failure reason when there is one, NEVER the raw text."""
+    raw = text or ""
+    base = (f"chars={len(raw)}; "
+            f"sha16={hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+            if raw else "chars=0")
+    if error:
+        base += f"; reason={error}"
+    return base
+
+
+def log_backend_mark(session_id: str, backend: str, klass: str, *,
+                     text: str | None = None, error: str = "") -> str:
+    """Schema line `transcription.backend` — one per-backend empty/failure
+    class-mark (F3c), journaled AS the chain walks so a leg abandoned at
+    its budget still leaves the per-backend picture behind. Never raises.
+    """
+    return log_event(
+        "transcription.backend", level="warn", session_id=str(session_id),
+        verdict=str(klass),
+        detail=f"backend={backend}; {backend_mark_detail(text, error=error)}")
+
+
+def log_starvation(session_id: str, klass: str, *, detail: str = "") -> str:
+    """Schema line `transcription.starvation` — the whole-chain event
+    (F3c): nothing landed for audio that needed recovery. The per-backend
+    marks sit above it in the journal; the wav is kept (deferred contract).
+    """
+    return log_event(
+        "transcription.starvation", level="warn", session_id=str(session_id),
+        verdict="starved",
+        detail=(f"outcome={klass}"
+                + (f"; {detail}" if detail else "")))

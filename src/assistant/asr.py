@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .fixtures import FixtureStore
+from .journal_log import error_text, log_backend_mark
 from .live_client import (
     FixtureLiveTransport,
     GenaiLiveTransport,
@@ -330,9 +331,22 @@ def batch_chain(config, client, *, offline: bool = False,
 
 
 def transcribe_file(config, client, audio_path: str, *, offline: bool = False,
-                    local_backend: BatchBackend | None = None) -> Transcript:
-    """Walk the fallback chain until one backend produces text (§12.7:
-    quota exhaustion degrades instead of failing)."""
+                    local_backend: BatchBackend | None = None,
+                    session_id: str | None = None) -> Transcript:
+    """Walk the fallback chain until one backend produces text.
+
+    F3 (window findings order v1, 2026-11-02): a 200-with-empty-text
+    result counts as that backend FAILING and the walk falls through to
+    the next backend (the chain default is ['gemini_batch', 'local'] —
+    with the local leg alive, an empty Gemini answer becomes a whisper
+    transcript instead of silence). Every backend outcome is class-marked
+    (`transcription.backend`, chars + sha16 where text exists, never the
+    text) as the walk happens, so a leg abandoned at its budget still
+    leaves the per-backend picture behind. When NOTHING lands, the
+    chain's real failure text rises (`all ASR backends failed — <per-
+    backend reasons>`) — never a silent empty (§12.7 still degrades the
+    TURN: the gate keeps the wav and marks it deferred).
+    """
     language = primary_language(config)
     # BH-K19: [asr] assert_output_language promised this check since the
     # blueprint (§12.4) but nothing called it. Enforced here, at the one
@@ -343,7 +357,6 @@ def transcribe_file(config, client, audio_path: str, *, offline: bool = False,
         "assert_output_language", True))
     expected = configured_languages(config)
     errors: list[str] = []
-    last_empty: Transcript | None = None
     last_flagged: Transcript | None = None
     for backend in batch_chain(config, client, offline=offline,
                                local_backend=local_backend):
@@ -358,14 +371,15 @@ def transcribe_file(config, client, audio_path: str, *, offline: bool = False,
                     last_flagged = result
                     continue
                 return result
-            last_empty = result
             errors.append(f"{backend.name}: empty transcript")
+            log_backend_mark(session_id, backend.name, "empty",
+                             text=result.text or "")
         except Exception as exc:
-            errors.append(f"{backend.name}: {exc}")
+            reason = error_text(exc)
+            errors.append(f"{backend.name}: {reason}")
+            log_backend_mark(session_id, backend.name, "failed", error=reason)
     if last_flagged is not None:
         return last_flagged
-    if last_empty is not None:
-        return last_empty
     raise RuntimeError("all ASR backends failed — " + " | ".join(errors))
 
 
