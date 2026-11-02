@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elaria.invalid/kitty-inventory.schema.json",
+  "title": "Elaria pinned kitty inventory",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "upstream_version",
+    "upstream_commit",
+    "researched_on",
+    "owner_rpm_ruling",
+    "owner_version_verbatim",
+    "owner_drift_reconciled",
+    "source_url",
+    "license",
+    "unknown_verb_tier",
+    "classification_note",
+    "global_options",
+    "common_options_note",
+    "verbs",
+    "kittens",
+    "packaging_status",
+    "config",
+    "errata"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "upstream_version": {},
+    "upstream_commit": {},
+    "researched_on": {},
+    "owner_rpm_ruling": {},
+    "owner_version_verbatim": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "owner_drift_reconciled": {
+      "type": "boolean"
+    },
+    "source_url": {},
+    "license": {},
+    "unknown_verb_tier": {
+      "const": "K3"
+    },
+    "classification_note": {},
+    "global_options": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/option"
+      }
+    },
+    "common_options_note": {},
+    "verbs": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/verb"
+      }
+    },
+    "kittens": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "purpose",
+          "source",
+          "options",
+          "hazards"
+        ],
+        "properties": {
+          "purpose": {
+            "type": "string"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/option"
+            }
+          }
+        }
+      }
+    },
+    "packaging_status": {},
+    "config": {},
+    "errata": {}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "option": {
+      "type": "object",
+      "required": [
+        "flags",
+        "type",
+        "default",
+        "declared_default",
+        "hazards",
+        "choices",
+        "metadata",
+        "semantics"
+      ],
+      "properties": {
+        "flags": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^-"
+          }
+        },
+        "type": {
+          "type": "string"
+        },
+        "default": {},
+        "declared_default": {},
+        "hazards": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "choices": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "semantics": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "verb": {
+      "type": "object",
+      "required": [
+        "tier",
+        "summary",
+        "semantics",
+        "options",
+        "option_spec",
+        "argument_spec_source",
+        "payload",
+        "protocol_spec",
+        "async",
+        "stream",
+        "no_response",
+        "hazards",
+        "source",
+        "source_sha256"
+      ],
+      "properties": {
+        "tier": {
+          "enum": [
+            "K1",
+            "K2",
+            "K3"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "semantics": {
+          "type": "string"
+        },
+        "option_spec": {
+          "type": "string"
+        },
+        "argument_spec_source": {
+          "type": "string"
+        },
+        "protocol_spec": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "source_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/option"
+          }
+        },
+        "hazards": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "payload": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "type",
+              "required",
+              "semantics"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "semantics": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "async": {
+          "type": "boolean"
+        },
+        "stream": {
+          "type": "boolean"
+        },
+        "no_response": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
