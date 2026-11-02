@@ -153,6 +153,32 @@ def raw_sdk_pass(sdk, model: str, prompt: str, path: str, *, printer=print) -> N
             content = getattr(cand, "content", None)
             for j, part in enumerate(getattr(content, "parts", None) or []):
                 printer(f"    part[{j}]: {repr(part)[:400]}")
+                # Diagnostic (2026-11-02): name the part TYPE fields
+                # explicitly. `response.text` reads text parts only — a
+                # transcription model answers in `audio_transcription`
+                # parts (Part.audio_transcription.text) and the plain
+                # accessor then reports 0 chars. The repr line above can
+                # bury that in truncation; these lines cannot.
+                dump = getattr(part, "model_dump", None)
+                if callable(dump):
+                    try:
+                        fields = sorted(
+                            key for key, value in dump(exclude={
+                                "text", "thought", "thought_signature"}).items()
+                            if value is not None)
+                        printer(f"    part[{j}] non-text fields: "
+                                f"{fields or ['(none)']}")
+                    except Exception:  # noqa: S110 - diagnostic only
+                        pass
+                transcript = getattr(part, "audio_transcription", None)
+                if transcript is not None:
+                    tr_text = str(getattr(transcript, "text", "") or "")
+                    printer(f"    part[{j}] audio_transcription.text "
+                            f"({len(tr_text)} chars): {tr_text[:400]!r}")
+                    printer(f"    part[{j}] audio_transcription meta: "
+                            f"finished={getattr(transcript, 'finished', None)} "
+                            f"language_code="
+                            f"{getattr(transcript, 'language_code', None)}")
         usage = getattr(response, "usage_metadata", None)
         printer(f"  usage_metadata: {usage}")
         printer("  reading: finish_reason=MAX_TOKENS -> truncation; "

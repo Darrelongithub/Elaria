@@ -129,6 +129,65 @@ def test_raw_pass_prints_finish_reason_and_usage(config, tmp_path,
     assert "raw model text (2 chars): 'He'" in out
 
 
+def test_raw_pass_names_audio_transcription_parts(config, tmp_path,
+                                                  monkeypatch):
+    """2026-11-02 diagnostic: the raw pass names the part TYPE fields and
+    prints the audio_transcription accessor text — `response.text` reads
+    text parts only, so a transcription model's answer in an
+    audio_transcription part must be visible in the paste. This is the
+    instrument that settles whether 0-char runs carried an answer."""
+    path = _write_wav(tmp_path / "raw.wav", frames=1600)
+
+    class _Transcript:
+        text = "The quick brown fox."
+        finished = True
+        language_code = "en"
+
+    class _Part:
+        text = None
+        audio_transcription = _Transcript()
+
+        def model_dump(self, exclude=None):
+            return {"text": None, "audio_transcription": self.audio_transcription}
+
+    class _Cand:
+        def __init__(self):
+            self.finish_reason = "STOP"
+            self.content = type("C", (), {"parts": [_Part()]})()
+
+    class _Resp:
+        def __init__(self):
+            self.text = None  # _get_text() shape: no text parts -> None
+            self.candidates = [_Cand()]
+            self.usage_metadata = type("U", (), {
+                "prompt_token_count": 29,
+                "candidates_token_count": 12})()
+
+    class _Models:
+        def generate_content(self, *, model, contents):
+            return _Resp()
+
+    class _Sdk:
+        files = type("F", (), {"upload": staticmethod(lambda *, file: object())})()
+        models = _Models()
+
+    class _Client:
+        _transport = type("T", (), {"_client": _Sdk()})()
+
+    monkeypatch.setattr(
+        asr, "transcribe_file",
+        lambda *a, **k: Transcript("The quick brown fox.", "en", "local"))
+    lines = []
+    rc = probe.run(config, _Client(), [str(path)], printer=lines.append,
+                   raw_pass=True)
+    out = "\n".join(lines)
+    assert rc == 0
+    assert "raw model text (0 chars): ''" in out
+    assert "part[0] non-text fields: ['audio_transcription']" in out
+    assert "part[0] audio_transcription.text (20 chars): 'The quick brown fox.'" in out
+    assert "finished=True language_code=en" in out
+
+
 # -- mini order M-2: arm C (registry files model, same wire) ---------------
 
 def _armc_client(calls: list, texts: dict):
