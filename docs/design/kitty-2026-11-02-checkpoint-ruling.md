@@ -139,3 +139,34 @@ Owner reports Python **3.14.8**; the sandbox's accepted gates used **3.11.2**.
 Try a full 3.14 suite before the card and record both interpreters/runs if available.
 Otherwise disclose the missing run. No shared `running_daemon` fixture repair is
 permitted, quirk or no quirk. Any owner hardware validation remains design-supervised.
+
+## Standalone drift delivery and platform collector grant (subsequent owner relay)
+
+Design granted the standalone, immutable two-file drift kit. The owner's mainline tree
+at `/home/darrel/Elaria` must not switch lanes or gain a worktree for this. Either approved
+GitHub API download or extraction of the identical blobs from accepted commit
+`72f53b2a553f8495206f64aae2ec623c2acea7d7` is permitted, retaining the script-relative
+layout and both SHA256 checks before Python. Failure stops; no source/version fallback.
+A fetch updates Git metadata but need not alter the branch or checkout. The actual
+owner extraction packet was not visible in the relay; equivalence is conditional on
+those bytes/layout/verification, not an audit of unseen commands.
+
+Amendment B is closed: `tools/kitty/drift.py` is Python **stdlib-only**. It does not
+require the assistant's uv environment or any third-party Python package. System Python
+is appropriate; this is not a Python 3.14 mounted-daemon test. The two approved drift
+files and their checksums remain unchanged.
+
+Separately, design authorises **BUILD, NOT OWNER RUN** of the Fedora/OpenSSH metadata
+collector: fixed argv, bounded subprocesses/output, private evidence, no installs,
+connections, ssh -G, personal configuration, keys, agents or terminal contents. Package
+manuals must come from RPM membership, with installed compression handled. Owner kitty
+configuration/effective settings remain outside both instruments. The owner may run the
+previously approved `/usr/bin/rpm -qf /usr/bin/kitty /usr/bin/kitten` query, not this new
+collector without a further owner-run ruling.
+
+A relay of `kitten 0.47.1` is an instrument reading, not Fedora `0.47.1-1.fc44` evidence
+or downstream-patch equivalence. No upstream/source pin is promoted into an unobserved
+owner fact. The voice-chain fixture finding reinforces this distinction; no cross-lane
+work is authorised or performed here. This turn authorises the collector only, not
+additional adapter work. Scene NOT READY, no PR, no extra protected hunks, stub-only
+tests and unchanged shared fixtures remain binding.
