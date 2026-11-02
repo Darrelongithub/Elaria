@@ -280,8 +280,61 @@ def test_grace_elapsed_purges(tmp_path):
                               ts=_iso(NOW - timedelta(days=15))))
     plan = plan_reconcile(man, now=NOW, grace_days=14)
     assert [(a.from_state, a.to_state) for a in plan.actions] == [(TRASHED, PURGED)]
-    reconcile(man, plan)
-    assert man.state_of(art) == PURGED
+
+
+def test_purge_requires_a_mover_and_never_claims_a_false_success(tmp_path):
+    """Increment 3's seam: the purge is recorded only once the file is actually gone.
+
+    The old behaviour recorded `purged` in the manifest while the trashed file sat on
+    disk — the manifest claiming a purge that never happened. With no mover the state
+    must stay `trashed` and a problem must be recorded.
+    """
+    man = _man(tmp_path)
+    art = tmp_path / "a.wav"
+    man.append(ManifestRecord(artifact=str(art), state=TRASHED,
+                              ts=_iso(NOW - timedelta(days=15))))
+    plan = reconcile(man, plan_reconcile(man, now=NOW, grace_days=14))
+    assert man.state_of(art) == TRASHED, "no mover, no recorded purge"
+    assert any("no purge mover" in p for p in plan.problems)
+
+
+def test_purge_removes_the_file_then_records_the_state(tmp_path):
+    """Order matters: the file goes first, the manifest record second."""
+    man = _man(tmp_path)
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    trashed_file = trash / "a.wav"
+    trashed_file.write_bytes(b"payload")
+    man.append(ManifestRecord(artifact=str(trashed_file), state=TRASHED,
+                              ts=_iso(NOW - timedelta(days=15))))
+
+    order = []
+
+    def purge(path):
+        order.append(("purged-file", path.exists()))
+        path.unlink()
+        order.append(("now-gone", not path.exists()))
+
+    reconcile(man, plan_reconcile(man, now=NOW, grace_days=14),
+              purge_mover=purge)
+    assert order == [("purged-file", True), ("now-gone", True)]
+    assert man.state_of(trashed_file) == PURGED
+
+
+def test_purge_failure_keeps_the_trashed_state(tmp_path):
+    """A failed purge is reported, never swallowed: the remote copy is unaffected."""
+    man = _man(tmp_path)
+    art = tmp_path / "a.wav"
+    man.append(ManifestRecord(artifact=str(art), state=TRASHED,
+                              ts=_iso(NOW - timedelta(days=15))))
+
+    def boom(path):
+        raise OSError("permission denied")
+
+    plan = reconcile(man, plan_reconcile(man, now=NOW, grace_days=14),
+                     purge_mover=boom)
+    assert man.state_of(art) == TRASHED
+    assert any("purge failed" in p for p in plan.problems)
 
 
 def test_purge_is_terminal_and_never_replanned(tmp_path):

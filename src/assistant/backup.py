@@ -38,6 +38,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .cost import iso_now
 from .safety import try_sha256_file
 from .storage import FLIPPED, PURGED, TRASHED, UPLOADED, StorageManifest
 
@@ -55,14 +56,20 @@ _MAX_PASSES = 8
 class ReconcileAction:
     """One thing reconcile intends to do, and why.
 
-    `artifact` is the absolute path. It stays inside this process — `summary()` is the
-    only shape allowed to leave it.
+    `artifact` is the **manifest key** — the path the journal records state under, and the
+    path the artifact had when it was HOT. `target` is the **filesystem path to act on**,
+    which differs once a trim has moved the file: after a trim the artifact lives in trash
+    under a stamped name, and a purge that targets the manifest key would look for a file
+    that is no longer there and silently do nothing while the manifest recorded `purged`.
+
+    Both stay inside this process — `summary()` is the only shape allowed to leave it.
     """
 
     artifact: str
     from_state: str
     to_state: str
     reason: str
+    target: str = ""
 
 
 @dataclass
@@ -140,20 +147,27 @@ def plan_reconcile(manifest: StorageManifest, *, now,
             if elapsed >= grace_days:
                 plan.actions.append(ReconcileAction(
                     artifact, TRASHED, PURGED,
-                    f"grace elapsed ({elapsed}d >= {grace_days}d)"))
+                    f"grace elapsed ({elapsed}d >= {grace_days}d)",
+                    target=_trashed_as(record.detail) or artifact))
             # else: grace still running. Two copies remain. Nothing to do — and that
             # silence is the copy-count invariant holding, not a missed action.
 
     return plan
 
 
-def reconcile(manifest: StorageManifest, plan: ReconcilePlan, *,
-              trim_mover=None) -> ReconcilePlan:
+def reconcile(manifest: StorageManifest, plan: ReconcilePlan, *, now=None,
+              trim_mover=None, purge_mover=None) -> ReconcilePlan:
     """Apply a plan. The flip is always fsync'd before the trim mover is called.
 
-    `trim_mover` takes an artifact path and returns its trash location; it is injected so
-    tests never touch a real trash dir and no filesystem move happens implicitly. When it
-    is None the trim is planned but not performed, which is the correct no-remote posture.
+    `trim_mover` takes an artifact path and returns its trash location; `purge_mover` takes
+    a trashed path and removes it. Both are injected so tests never touch a real trash dir
+    and no filesystem change happens implicitly. When either is None that step is planned
+    but not performed, which is the correct no-remote posture.
+
+    `now` is the clock the plan was computed against, and records written here are stamped
+    with it. It must be the same clock `plan_reconcile` used, or a grace period would be
+    measured against one time and recorded against another — which is exactly the kind of
+    split that makes a 14-day grace silently become 13 or 15.
 
     Returns the plan with any newly discovered problems appended, so a caller can report
     what actually happened rather than what was intended.
@@ -164,7 +178,7 @@ def reconcile(manifest: StorageManifest, plan: ReconcilePlan, *,
             # append() fsyncs before returning, so this decision is durable before
             # anything destructive is attempted.
             ok = manifest.append(
-                _record_for(manifest, action), expect_from=UPLOADED)
+                _record_for(manifest, action, now=now), expect_from=UPLOADED)
             if not ok:
                 plan.problems.append(
                     f"{action.from_state}: flip refused by the state machine; "
@@ -175,30 +189,75 @@ def reconcile(manifest: StorageManifest, plan: ReconcilePlan, *,
                     f"{action.from_state}: no trim mover configured; trim deferred")
                 continue
             try:
-                trim_mover(Path(action.artifact))
+                trashed_as = trim_mover(Path(action.target or action.artifact))
             except OSError as exc:
                 plan.problems.append(
                     f"{action.from_state}: trim failed ({type(exc).__name__}); "
                     f"flip remains durable and the next run retries")
                 continue
-            manifest.append(_record_for(manifest, action), expect_from=FLIPPED)
+            record = _record_for(manifest, action, now=now)
+            if trashed_as is not None:
+                # Record where the file went. Without this the purge has no way to find
+                # it: the manifest key is the HOT path, and the file is no longer there.
+                record.detail = f"{record.detail}; trashed_as={trashed_as}"
+            manifest.append(record, expect_from=FLIPPED)
         elif action.to_state == PURGED:
-            manifest.append(_record_for(manifest, action), expect_from=TRASHED)
+            # The grace has elapsed, so the remote is now the only copy that should
+            # remain. The purge is recorded only once the file is actually gone, so the
+            # manifest never claims a purge that did not happen.
+            if purge_mover is None:
+                plan.problems.append(
+                    f"{action.from_state}: no purge mover configured; purge deferred")
+                continue
+            where = Path(action.target or action.artifact)
+            try:
+                gone = purge_mover(where)
+            except OSError as exc:
+                plan.problems.append(
+                    f"{action.from_state}: purge failed ({type(exc).__name__}); "
+                    f"remote copy is unaffected, next run retries")
+                continue
+            if gone is False:
+                # The mover says the target was already absent. The goal — the file is
+                # gone — is met, so the state advances, but it is reported rather than
+                # passed over in silence.
+                plan.problems.append(
+                    f"{action.from_state}: purge target was already absent")
+            manifest.append(_record_for(manifest, action, now=now),
+                            expect_from=TRASHED)
     return plan
 
 
-def _record_for(manifest: StorageManifest, action: ReconcileAction):
-    """A new record for the transition, carrying the artifact's existing facts forward."""
+def _record_for(manifest: StorageManifest, action: ReconcileAction, *, now=None):
+    """A new record for the transition, carrying the artifact's existing facts forward.
+
+    Stamped with `now` when the caller supplies it, so a grace period is measured and
+    recorded against one clock. Left to the real clock only when no clock was injected.
+    """
     current = manifest.current().get(action.artifact)
     from .storage import ManifestRecord
     return ManifestRecord(
         artifact=action.artifact,
         state=action.to_state,
+        ts=now.isoformat(timespec="seconds") if now is not None else iso_now(),
         sha256=current.sha256 if current else None,
         size=current.size if current else None,
         tier=current.tier if current else None,
         detail=action.reason,
     )
+
+
+def _trashed_as(detail: str) -> str:
+    """Where the trim mover said it put the file, or "" if it never said.
+
+    Parsed out of the `trashed` record's detail. This is the only place the trash location
+    is recovered from, and it is why `reconcile()` records it in the first place.
+    """
+
+    for part in (detail or "").split("; "):
+        if part.startswith("trashed_as="):
+            return part[len("trashed_as="):]
+    return ""
 
 
 def _parse_ts(value: str):
@@ -207,7 +266,8 @@ def _parse_ts(value: str):
 
 
 def reconcile_all(manifest: StorageManifest, *, now, verify_remote=None,
-                  trim_mover=None, grace_days: int = 14) -> ReconcilePlan:
+                  trim_mover=None, purge_mover=None,
+                  grace_days: int = 14) -> ReconcilePlan:
     """Run reconcile to quiescence. This is what startup calls.
 
     One pass advances each artifact by at most **one** state, and that is deliberate: a
@@ -227,7 +287,8 @@ def reconcile_all(manifest: StorageManifest, *, now, verify_remote=None,
         combined.problems.extend(plan.problems)
         if not plan.actions:
             return combined
-        reconcile(manifest, plan, trim_mover=trim_mover)
+        reconcile(manifest, plan, now=now, trim_mover=trim_mover,
+                  purge_mover=purge_mover)
         combined.actions.extend(plan.actions)
         combined.problems.extend(
             p for p in plan.problems if p not in combined.problems)

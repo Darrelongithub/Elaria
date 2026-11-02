@@ -1444,3 +1444,86 @@ clean. Firewall clean — no edits to `daemon.py`, `transcribe.py`, `live_client
 Increment 2 supplied the `trim_mover` seam, so increment 3 implements the real mover (grace
 clock, trash dir; idempotency already structural). It must honour the census's **permanent
 exclusions**: voice-cache and test-assets are never tiered or trimmed, forever.
+
+---
+
+## 2026-11-02 — INCREMENT 3 LANDED: tiering engine + trim (report 016)
+
+**SHA:** `344c867` + this entry's commit. Branch `arena/storage`, PR #24 head.
+
+**GATES:** full suite **1975 passed / 6 skipped / 0 errors**, `ruff check .` → **All
+checks passed!** (baseline 1948/6/0 → +27: 24 new tiering tests, crash points 20 → 23).
+CPython 3.11.2, sandbox `.venv`.
+
+**DELIVERED**
+- `src/assistant/tiering.py` — `PERMANENT_EXCLUSIONS` (voice-cache, test-assets — census-
+  ruled, checked before anything config can add), `WAV_HEADER_BYTES = 44`,
+  `is_header_only_wav()`, `is_excluded(path, *, data_dir, extra)`, `Candidate` /
+  `Candidate.from_path()`, `TierDecision` (path-blind `summary()`), `classify()` with the
+  two triggers (size = the backstop, oldest go cold until under cap; age = the
+  steady-state trigger) and `binding` reporting which fired, `scan()` (the belt; degrades
+  unreadable entries to "not a candidate"), `TrashMover` with `move()` (stamp + counter,
+  never overwrites, trash dir 0700) and `purge()` (re-raises OSError).
+- `tests/test_wp7_tiering_trim.py` — 24 tests. The census finding pinned as a test: at
+  13 MiB/day the **age** trigger binds and the 2 GiB cap is ~11× away.
+
+**DEFECTS SURFACED AND FIXED (all four mine, all in my own new code)**
+- **D9** — `Candidate.from_path` built a **naive local** mtime; `classify()` subtracts it
+  from an **aware UTC** `now`. Would have raised `TypeError` on the first candidate.
+  Never reviewable; only the run caught it.
+- **D10 — the important one.** The manifest keys artifacts under their **HOT** path, but
+  after a trim the file is in trash under a **stamped name**. The purge acted on the
+  manifest key, found nothing, and — because `purge()` returns `False` rather than raising
+  for a missing file — **the manifest recorded `purged` while the trashed file was still
+  on disk.** The same defect increment 2's amendment existed to prevent, reintroduced
+  through the back door. Fixed with `ReconcileAction.target` (filesystem path, distinct
+  from the manifest key), `trashed_as=<path>` recorded in the `trashed` record's detail,
+  and `_trashed_as()` recovering it for the purge action. A test now asserts the trash dir
+  is **empty**, not that the manifest says purged.
+- **D11** — `plan_reconcile` took an injected `now` but `reconcile()` stamped its records
+  with the real clock. A grace period measured against one clock and recorded against
+  another. `now` is now threaded through `reconcile_all()` → `reconcile()` →
+  `_record_for()`; the real clock remains the default when none is injected.
+- **D12** — my own test expectation was backwards (the engine's oldest-first was right),
+  and the size trigger is unexpressible with real files because `window_gb` is
+  GB-denominated. Rewritten to build `Candidate` objects directly at GB scale.
+
+**AMENDMENT TO INCREMENT 2, UNREPORTED UNTIL NOW (surfaced per report 016 §5)**
+`backup.py`'s `reconcile()` and `reconcile_all()` gained an optional `purge_mover`. The
+old behaviour recorded `purged` in the manifest while the trashed file still sat on disk.
+Now the purge is recorded only once the file is actually gone; with no mover the state
+stays `trashed` and a problem is recorded. Three new crash-point tests pin it.
+
+**FIREWALL:** zero edits to `daemon.py`, `transcribe.py`, `live_client.py`,
+`HANDOFF.md`, `tests/conftest.py`; zero edits to `cli.py`, `config.py`, `ladder.py`,
+`pyproject.toml`. Two new modules, two modified files — both mine from increment 2.
+Increment 3 needed no registration point at all.
+
+**Q22 CLOSED: (b) — own the trash dir and the grace clock.** `executor.trash()` is the
+destructive-action gate for user-initiated deletes with its own ledger; WP7's trim is a
+retention move with a grace clock and a re-drivable purge. The never-overwrite
+stamp+counter pattern is mirrored, not shared. Raised for the owner's record.
+
+**NOT CLAIMED:** no remote contacted, no MEGA traffic, no restic invocation, no
+credentials. `[TESTED-ONLY]` on the tiering logic; against the owner's real wavs
+`[UNVERIFIED]`. No compression applied by this increment — `hot_window_*` governs HOT
+residency independent of compression, as ruled. `trim_grace_days` remains the only
+`INTERIM-PENDING-SHEETS` config value. Still stopped at Gate 1 for live traffic and merge.
+
+**NEXT:** increment 4 — remote abstraction (`LocalPathBackend` fixture + `RcloneBackend`),
+which retires the no-verifier posture by supplying the remote confirmation
+`plan_reconcile` currently refuses to act without.
+
+**BASE MOVEMENT (same day, before the push):** ancestry guard fired — PR base moved
+`b3db316` → **`0320c11`**, 12 new mainline commits (mini order M / scene7).
+`journal_log.py` gained 58 lines, so the **sole early trigger** was checked immediately.
+**IT DID NOT FIRE:** the change is purely additive — `log_event()`'s signature and the
+line format are untouched, the diff lands after `return line`; one new event name,
+`transcription.stump` (verdicts `noise_token` / `short_stump`), emitted through the same
+`log_event()`. The §2 canonical contract — `split(" ", 6)`, 6-or-7 parts, `parts[2]`
+dispatch — is unchanged. `audio kept at` still 4 (1 daemon / 3 transcribe); Drift 2 does
+not recur. `cost.iso_now` and `storage.py` unmodified across the movement, so my
+increment 1–3 seams are intact. **No re-dating, no re-measure** — the bare-movement clause
+applies. `arena/storage` is now 12 commits behind the new base; expected for a long-lived
+stacked PR, and increment 3 consumes no journal code, so no increment-3 result changes.
+Full detail in report 016 §10.
