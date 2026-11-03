@@ -51,6 +51,13 @@ class Transcript:
     # marked, so the caller can surface it instead of silently
     # trusting possibly-translated output (§12.4).
     language_ok: bool = True
+    # Ruling (b), 2026-11-03: the model's declared language_code, raw.
+    # None means "the model declared nothing" — an ABSENCE that must
+    # stay visible, never silent agreement with the configured set
+    # (hardware showed language_code=None on a complete transcript).
+    # A populated value that differs from the configured set is the
+    # divergence that announces a translation.
+    model_language: str | None = None
 
 
 class BatchBackend(Protocol):
@@ -89,11 +96,15 @@ class GeminiBatchBackend:
                 Path(audio_path), languages[0], also_languages=languages[1:],
                 preserve_code_switching=code_switching_enabled(self._config),
                 **deadline_option)
+            declared = result.get("language_code") or None
             return Transcript(text=result["text"],
-                              language=",".join(languages), backend=self.name)
+                              language=(declared or ",".join(languages)),
+                              backend=self.name, model_language=declared)
         result = self._client.transcribe_batch(
             Path(audio_path), language, **deadline_option)
-        return Transcript(text=result["text"], language=language, backend=self.name)
+        declared = result.get("language_code") or None
+        return Transcript(text=result["text"], language=(declared or language),
+                          backend=self.name, model_language=declared)
 
     async def transcribe_async(self, audio_path: str, language: str, *,
                                deadline: float | None = None) -> Transcript:
@@ -107,10 +118,14 @@ class GeminiBatchBackend:
                 Path(audio_path), languages[0], also_languages=languages[1:],
                 preserve_code_switching=code_switching_enabled(self._config),
                 **deadline_option)
+            declared = result.get("language_code") or None
             return Transcript(text=result["text"],
-                              language=",".join(languages), backend=self.name)
+                              language=(declared or ",".join(languages)),
+                              backend=self.name, model_language=declared)
         result = await transcribe(Path(audio_path), language, **deadline_option)
-        return Transcript(text=result["text"], language=language, backend=self.name)
+        declared = result.get("language_code") or None
+        return Transcript(text=result["text"], language=(declared or language),
+                          backend=self.name, model_language=declared)
 
 
 def _segment_confidence(segments: list) -> float | None:

@@ -507,6 +507,86 @@ class PerModelLimiter:
             waited += wait
 
 
+def extract_transcript(response) -> tuple[str, str | None, list[str]]:
+    """Read a generateContent response's transcript wherever it is.
+
+    2026-11-03 (owner hardware diagnostic, the fix's evidence): a
+    transcription model answers in `Part.audio_transcription` parts
+    (`types.py:2368`, "Output only. The transcription of the audio part")
+    while `GenerateContentResponse.text` concatenates TEXT parts only —
+    a perfect 44-character answer sat in the same response object that
+    reported 0 chars. Read BOTH, join in part order (single space
+    between pieces), and report the part types seen so "we did not read
+    it" is never recorded as "there was nothing" (F3c: unparsed vs
+    empty). Ruled semantics (design chat 2026-11-02/03):
+
+    - a part carrying both readable fields is read ONCE —
+      `audio_transcription.text` wins when it has content, and the
+      collision always rides `part_types_seen` as the token
+      'text+audio_transcription' (a recorded fact, never a silent
+      precedence rule);
+    - candidate[0] only, matching the SDK's `text` semantics;
+    - `finished` is NOT load-bearing (it returned None on a complete
+      44-char transcript) — no completeness gate exists here;
+    - the model's `language_code` is returned RAW: None means "the model
+      declared nothing" and callers must record it as an absence, never
+      as agreement with the configured set.
+
+    Never raises: a response shape this cannot read yields ("", None,
+    [its part tokens]) — the unparsed shape, not a lie of emptiness.
+    """
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        # No parts to walk: the response-level accessor is the only
+        # readable source (and is exactly what the SDK itself falls back
+        # to). Recorded as its own token so a mark never claims a part
+        # was read when none existed.
+        fallback = getattr(response, "text", None)
+        text = fallback.strip() if isinstance(fallback, str) else ""
+        return (text, None, ["response.text"] if text else [])
+    content = getattr(candidates[0], "content", None)
+    pieces: list[str] = []
+    seen: list[str] = []
+    declared: str | None = None
+    for part in getattr(content, "parts", None) or []:
+        text_part = getattr(part, "text", None)
+        is_thought = bool(getattr(part, "thought", False))
+        audio = getattr(part, "audio_transcription", None)
+        fields: list[str] = []
+        if isinstance(text_part, str):
+            fields.append("text")
+        dump = getattr(part, "model_dump", None)
+        if callable(dump):
+            try:
+                fields.extend(sorted(
+                    key for key, value in dump(
+                        exclude={"text", "thought", "thought_signature"}
+                    ).items() if value is not None))
+            except Exception:  # noqa: S110 - extraction must never raise
+                pass
+        elif audio is not None:
+            fields.append("audio_transcription")
+        if is_thought:
+            fields.append("thought")
+        deduped: list[str] = []
+        for field in fields:
+            if field not in deduped:
+                deduped.append(field)
+        seen.append("+".join(deduped) if deduped else "empty")
+        if is_thought:
+            continue
+        audio_text = (str(getattr(audio, "text", "") or "")
+                      if audio is not None else "")
+        if audio_text.strip():
+            pieces.append(audio_text.strip())
+            lang = getattr(audio, "language_code", None)
+            if declared is None and lang:
+                declared = str(lang)
+        elif isinstance(text_part, str) and text_part.strip():
+            pieces.append(text_part.strip())
+    return " ".join(pieces).strip(), declared, seen
+
+
 def batch_transcription_prompt(language: str,
                                also_languages: list[str] | None = None,
                                *, preserve_code_switching: bool = False) -> str:
@@ -1219,9 +1299,12 @@ class GeminiClient:
                     "languages": [language, *others], "prompt": prompt}
         correlation_id = uuid.uuid4().hex[:12]
         if isinstance(self._transport, _SdkTransport) and self.mode != "mock":
-            text = self._sdk_transcribe(
+            text, language_code, part_types = self._sdk_transcribe(
                 path, model, prompt, correlation_id, duration, deadline=deadline)
-            return {"text": text, "model": model, "duration_s": duration, "backend": "gemini_batch"}
+            return {"text": text, "model": model, "duration_s": duration,
+                    "backend": "gemini_batch",
+                    "language_code": language_code,
+                    "part_types_seen": part_types}
         response = self._call_once(
             "transcribe_batch", model, contents, {},
             correlation_id=correlation_id, attempt=1, audio_seconds=duration,
@@ -1229,7 +1312,8 @@ class GeminiClient:
         )
         return {"text": response.get("text", ""), "model": model,
                 "duration_s": duration, "backend": "gemini_batch",
-                "fixture": response.get("fixture")}
+                "fixture": response.get("fixture"),
+                "language_code": None, "part_types_seen": []}
 
     async def transcribe_batch_async(self, audio_path, language: str = "en", *,
                                      also_languages: list[str] | None = None,
@@ -1293,14 +1377,16 @@ class GeminiClient:
                     response = await self._transport._client.aio.models.generate_content(
                         model=model, contents=[prompt, uploaded],
                         config=generation_config)
-            text = response.text or ""
+            text, language_code, part_types = extract_transcript(response)
             error = None
         except asyncio.CancelledError as exc:
             error_exc = cancelled_exc = exc
-            text, error = "", error_text(exc)
+            text, language_code, part_types = "", None, []
+            error = error_text(exc)
         except Exception as exc:
             error_exc = exc
-            text, error = "", error_text(exc)
+            text, language_code, part_types = "", None, []
+            error = error_text(exc)
         self.store.log_llm_call(
             ts=iso_now(), correlation_id=correlation_id, role="transcribe_batch",
             model=model, mode=self.mode, tokens_in=0, tokens_out=estimate_tokens(text),
@@ -1322,7 +1408,9 @@ class GeminiClient:
                     f"{error} (retry-after: held {hold_s:g}s)") from error_exc
             raise RuntimeError(error) from error_exc
         return {"text": text, "model": model, "duration_s": duration,
-                "backend": "gemini_batch"}
+                "backend": "gemini_batch",
+                "language_code": language_code,
+                "part_types_seen": part_types}
 
     def _sdk_transcribe(self, path, model, prompt, correlation_id, duration,
                         *, deadline: float | None = None):  # pragma: no cover
@@ -1357,11 +1445,12 @@ class GeminiClient:
                 response = self._transport._client.models.generate_content(
                     model=model, contents=[prompt, uploaded],
                     config=generation_config)
-            text = response.text or ""
+            text, language_code, part_types = extract_transcript(response)
             error = None
         except Exception as exc:
             error_exc = exc
-            text, error = "", error_text(exc)
+            text, language_code, part_types = "", None, []
+            error = error_text(exc)
         self.store.log_llm_call(
             ts=iso_now(), correlation_id=correlation_id, role="transcribe_batch",
             model=model, mode=self.mode, tokens_in=0, tokens_out=estimate_tokens(text),
@@ -1383,7 +1472,7 @@ class GeminiClient:
                 raise RateLimitError(
                     f"{error} (retry-after: held {hold_s:g}s)") from error_exc
             raise RuntimeError(error) from error_exc
-        return text
+        return text, language_code, part_types
 
     def list_models(self) -> dict:
         """For `assist voice models`/doctor: the real list, with voice routing.

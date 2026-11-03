@@ -146,6 +146,14 @@ def raw_sdk_pass(sdk, model: str, prompt: str, path: str, *, printer=print) -> N
         text = response.text or ""
         printer(f"  model: {model}")
         printer(f"  raw model text ({len(text)} chars): {text!r}")
+        # The shared extraction (2026-11-03 fix): the instrument reads
+        # the response exactly as production does — the raw line above is
+        # the broken `response.text` accessor kept for contrast.
+        from assistant.gemini_client import extract_transcript
+        extracted, model_language, part_types = extract_transcript(response)
+        printer(f"  extracted transcript ({len(extracted)} chars, "
+                f"parts={part_types}, model_language={model_language!r}): "
+                f"{extracted[:400]!r}")
         candidates = getattr(response, "candidates", None) or []
         for i, cand in enumerate(candidates):
             printer(f"  candidate[{i}] finish_reason="
@@ -182,7 +190,10 @@ def raw_sdk_pass(sdk, model: str, prompt: str, path: str, *, printer=print) -> N
         usage = getattr(response, "usage_metadata", None)
         printer(f"  usage_metadata: {usage}")
         printer("  reading: finish_reason=MAX_TOKENS -> truncation; "
-                "STOP with a stump -> the model heard a stump")
+                "STOP with empty raw text and NO non-text parts -> nothing "
+                "transcribable; STOP with empty raw text but "
+                "audio_transcription parts -> the answer is in the part "
+                "(response.text cannot read it)")
     except Exception as exc:
         printer(f"  raw pass raised: {type(exc).__name__}: {exc}")
 
