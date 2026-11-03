@@ -141,6 +141,17 @@ labels them; the engine's public `setLevels` consumer path is used unchanged. Th
 speaking state during text display does **not** assert TTS playback. A future audio path
 must replace synthesis with measured levels/`attachElement`; audio is not implemented here.
 
+Readiness contract correction (2026-11-03): use the nested
+`connectivity.effective_mode == "ONLINE"`, the preference-resolved enum used by
+`ModeStatus.is_online`, with consistent `online is True`, `offline is False` and
+`forced_offline is False`. Missing/malformed/contradictory fields refuse. The top-level
+`connectivity_mode` is also uppercase; only the display alias `connectivity.mode` is
+lowercase. Network health is not preference resolution: explicit online with an unhealthy
+last probe remains eligible under the daemon's policy. `gemini_mode` and reply `mode` are
+separate, config-derived lowercase values; they must still equal `live`. No case-folding
+or fallback to a display alias is used. Actual `local-awareness` and `local-hotword-checkin`
+reply tags are labelled non-model; show-off's offline `local` tag is an OFFLINE error.
+
 Only a daemon reporting **live + online** receives turns. Genuine model words are returned
 verbatim. Local-intent/memory responses carry an explicit non-model label. Mock/fixture,
 queued, timeout, withheld and unknown-provenance results are errors, never model answers.

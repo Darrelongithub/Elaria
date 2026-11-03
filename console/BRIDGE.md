@@ -25,13 +25,13 @@ hard stop, not permission to fetch, install or reconstruct something from chat.
 
 Committed executable: **`console/run_bridge.py`**.
 
-SHA256: **`cfcfadb085a1919b37f8ed287543a62dd0e8927e2454efbe036c3bbc154cbc23`**.
+SHA256: **`54f93a9ce35a1eea4847aa35c96bf7d484f45fec7954142d80f122ca5f524d05`**.
 
 From a copy containing this release's `console/` payload and the existing `.venv` interpreter,
 this is one physical command line. It checks the launcher before Python runs; the launcher
 then checks all five payload hashes before importing the bridge. A mismatch stops.
 
-`test "$(sha256sum console/run_bridge.py)" = 'cfcfadb085a1919b37f8ed287543a62dd0e8927e2454efbe036c3bbc154cbc23  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
+`test "$(sha256sum console/run_bridge.py)" = '54f93a9ce35a1eea4847aa35c96bf7d484f45fec7954142d80f122ca5f524d05  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
 
 `-I` isolates Python import paths; `-B` avoids bytecode writes. No standalone install, branch
 switch or mainline deployment is performed by this command. If using an extracted bundle
@@ -44,7 +44,7 @@ existing interpreter is `/home/darrel/Elaria/.venv/bin/python`, this alternative
 uses it without copying files into or switching that checkout. A missing interpreter or
 checksum mismatch stops; there is no install/repair fallback.
 
-`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = 'cfcfadb085a1919b37f8ed287543a62dd0e8927e2454efbe036c3bbc154cbc23  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py`
+`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = '54f93a9ce35a1eea4847aa35c96bf7d484f45fec7954142d80f122ca5f524d05  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py`
 
 Optional **`--check`** performs artifact/dependency checks and one existing-daemon `status`
 RPC, then exits; it opens no browser server and sends no chat/model/voice turn. `--socket`
@@ -62,7 +62,9 @@ File-origin, cross-origin and non-loopback socket URLs are refused.
 
 Opening the page only probes daemon status. **A model call can occur only after you submit
 text**, through the existing `console.say` handler. Live/online readiness is required;
-mock, record, unknown or offline posture does not forward turns. The launcher never changes
+mock, record, unknown or offline posture does not forward turns. Readiness uses the daemon’s
+preference-resolved `connectivity.effective_mode == "ONLINE"` and consistent boolean flags,
+not a lowercase comparison against top-level `connectivity_mode`. The launcher never changes
 that posture. If it isn't ready, keep the fallback rather than treating a stub as her answer.
 
 Ctrl-C stops this bridge only. It does not stop the daemon or roll back a submitted turn.

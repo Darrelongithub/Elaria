@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import http.client
 import importlib.util
@@ -25,14 +26,29 @@ spec = importlib.util.spec_from_file_location('console_wire_bridge', ASSETS / 'b
 bridge_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge_module)
 
-LIVE = {'running': True, 'gemini_mode': 'live', 'connectivity_mode': 'online'}
+# Consumed status subset of the owner's reported artifact, not an invented lowercase enum.
+# Unrelated owner timestamps/conversation content are deliberately not copied.
+LIVE = {
+    'running': True, 'mode': 'idle', 'halted': False, 'gemini_mode': 'live',
+    'connectivity_mode': 'ONLINE',
+    'connectivity': {
+        'preference': 'auto', 'effective_mode': 'ONLINE', 'mode': 'online',
+        'online': True, 'offline': False, 'forced_offline': False,
+        'network_healthy': True, 'reason': 'Gemini endpoint reachable',
+        'checked_at_s': None, 'pending_preference': None, 'switch_parked': False,
+    },
+}
+OFFLINE = copy.deepcopy(LIVE)
+OFFLINE['connectivity_mode'] = 'OFFLINE'
+OFFLINE['connectivity'].update(effective_mode='OFFLINE', mode='offline', online=False,
+                               offline=True, network_healthy=False, reason='synthetic offline')
 ANSWER = {'reply': 'Synthetic wire reply — not live model proof.', 'via': 'gemini',
           'mode': 'live', 'fixture': None, 'model': 'synthetic-test-double', 'withheld': None}
 
 
 class FakeRPC:
     def __init__(self, *, status=None, result=None, failure=None):
-        self.status = dict(LIVE if status is None else status)
+        self.status = copy.deepcopy(LIVE if status is None else status)
         self.result = dict(ANSWER if result is None else result)
         self.failure = failure
         self.calls = []
@@ -164,7 +180,7 @@ async def test_http_only_fixed_authenticated_assets_no_public_token():
 
 
 @pytest.mark.parametrize('status', [dict(LIVE, gemini_mode='mock'), dict(LIVE, gemini_mode='record'),
-                                    dict(LIVE, connectivity_mode='offline'), {},
+                                    OFFLINE, {},
                                     dict(LIVE, running=False)])
 async def test_not_live_ready_never_acks_or_dispatches(status):
     rpc = FakeRPC(status=status)
@@ -284,7 +300,7 @@ async def test_live_posture_rechecked_before_every_send():
     async with running(rpc) as bridge, wire(bridge) as ws:
         await hello(ws)
         await read_until(ws, 'hello-ok')
-        rpc.status['connectivity_mode'] = 'offline'
+        rpc.status = copy.deepcopy(OFFLINE)
         await send(ws)
         reply, _ = await read_until(ws, 'reply')
         assert 'offline' in reply['error'] and not rpc.says
@@ -416,7 +432,7 @@ async def test_health_loss_marks_offline_and_disconnects(monkeypatch):
     async with running(rpc) as bridge, wire(bridge) as ws:
         await hello(ws)
         await read_until(ws, 'hello-ok')
-        rpc.status['connectivity_mode'] = 'offline'
+        rpc.status = copy.deepcopy(OFFLINE)
         async with asyncio.timeout(2):
             while True:
                 frame = json.loads(await ws.recv())
@@ -528,3 +544,117 @@ async def test_committed_launcher_process_serves_wire_and_stops_without_stopping
             assert process.returncode == 0, output.decode()
             assert b'synthetic-secret' not in output
         assert (await bridge_module.daemon_call(path, 'status', {}, 1)) == LIVE
+
+
+def test_owner_reported_live_shape_is_ready():
+    assert bridge_module.readiness(LIVE) is None
+
+
+def test_status_fixture_matches_real_connectivity_serializer():
+    from assistant.modes import ONLINE, ModeStatus
+
+    produced = ModeStatus('auto', ONLINE, True, 'Gemini endpoint reachable').as_dict()
+    assert LIVE['connectivity'] == produced
+    assert LIVE['connectivity_mode'] == produced['effective_mode'] == 'ONLINE'
+    assert produced['mode'] == 'online'
+
+
+@pytest.mark.parametrize('field,value', [
+    ('effective_mode', 'online'), ('effective_mode', 'OFFLINE'),
+    ('effective_mode', 'FORCED_OFFLINE'), ('effective_mode', None),
+    ('online', False), ('online', 1), ('online', 'true'), ('online', None),
+    ('offline', True), ('offline', 0), ('offline', None),
+    ('forced_offline', True), ('forced_offline', 0), ('forced_offline', None),
+])
+def test_missing_malformed_or_contradictory_connectivity_refuses(field, value):
+    status = copy.deepcopy(LIVE)
+    status['connectivity'][field] = value
+    assert bridge_module.readiness(status) is not None
+    del status['connectivity'][field]
+    assert bridge_module.readiness(status) is not None
+
+
+@pytest.mark.parametrize('connectivity', [None, [], 'ONLINE', {}, True])
+def test_missing_connectivity_object_does_not_fall_back_to_alias(connectivity):
+    assert bridge_module.readiness(dict(LIVE, connectivity=connectivity)) is not None
+
+
+@pytest.mark.parametrize('preference,healthy,expected', [
+    ('auto', True, 'ONLINE'), ('auto', False, 'OFFLINE'),
+    ('offline', True, 'FORCED_OFFLINE'), ('online', False, 'ONLINE'),
+])
+def test_readiness_matches_real_preference_resolution(config, preference, healthy, expected):
+    from assistant.modes import ModeManager
+
+    config.raw['connectivity'] = {'mode': preference}
+    produced = ModeManager(config, probe=lambda: healthy).status()
+    assert produced.effective_mode == expected
+    status = dict(LIVE, connectivity_mode=produced.effective_mode,
+                  connectivity=produced.as_dict())
+    assert (bridge_module.readiness(status) is None) == produced.is_online
+
+
+@pytest.mark.parametrize('value', ['LIVE', ' LiVe ', 'mock', 'record'])
+def test_config_produces_lowercase_gemini_modes(monkeypatch, value):
+    from assistant.config import VALID_MODES, load_config
+
+    monkeypatch.setenv('GEMINI_MODE', value)
+    config = load_config()
+    assert config.gemini_mode == value.strip().lower()
+    assert config.gemini_mode in VALID_MODES
+    status = dict(LIVE, gemini_mode=config.gemini_mode)
+    assert (bridge_module.readiness(status) is None) == (config.gemini_mode == 'live')
+
+
+@pytest.mark.parametrize('via', ['local-awareness', 'local-hotword-checkin'])
+def test_actual_local_reply_tags_are_not_claimed_as_model_answers(via):
+    reply = bridge_module.reply_message(dict(ANSWER, via=via, model=None), 9)
+    assert reply['provenance'] == 'local-daemon'
+    assert reply['text'].startswith('[LOCAL DAEMON — not a model answer]')
+
+
+def test_showoff_offline_local_tag_is_not_model_output():
+    reply = bridge_module.reply_message(dict(ANSWER, via='local', model=None), 9)
+    assert '[OFFLINE]' in reply['error'] and 'text' not in reply
+
+
+@pytest.mark.parametrize('text,via', [('I have company', 'local-awareness'),
+                                     ('Elaria', 'local-hotword-checkin')])
+async def test_local_tags_from_actual_console_say(config, running_daemon, monkeypatch, text, via):
+    daemon, _ = running_daemon
+    monkeypatch.setattr(config, 'gemini_mode', 'live')
+    monkeypatch.setattr(daemon.mode_manager, '_probe', lambda: True)
+    result = await bridge_module.daemon_call(config.socket_path, 'console.say',
+                                             {'text': text, 'speak': False}, 5)
+    assert result['mode'] == 'live' and result['via'] == via and result['fixture'] is None
+    assert bridge_module.reply_message(result, 1)['provenance'] == 'local-daemon'
+
+
+async def test_websocket_uses_actual_status_and_ask_producers_with_stub_generation(
+        config, running_daemon, monkeypatch):
+    from assistant.gemini_client import HarnessResult
+
+    daemon, _ = running_daemon
+    calls = []
+
+    async def generate(prompt, **kwargs):
+        calls.append(kwargs)
+        return HarnessResult('Synthetic real-handler response, not model proof.',
+                             'synthetic-test-double', 1, False, None, 'synthetic')
+
+    # Only the generation/probe leaves are stubbed. Do NOT invent status or reply envelopes.
+    # The shared running_daemon fixture and all production files remain unchanged.
+    monkeypatch.setattr(config, 'gemini_mode', 'live')
+    monkeypatch.setattr(daemon.mode_manager, '_probe', lambda: True)
+    monkeypatch.setattr(daemon, '_generate', generate)
+    status = await bridge_module.daemon_call(config.socket_path, 'status', {}, 3)
+    assert status['connectivity_mode'] == status['connectivity']['effective_mode'] == 'ONLINE'
+    assert status['connectivity']['mode'] == 'online' and status['gemini_mode'] == 'live'
+    assert bridge_module.readiness(status) is None
+    async with running(bridge_module.daemon_call, config.socket_path) as bridge, wire(bridge) as ws:
+        await hello(ws)
+        await read_until(ws, 'hello-ok')
+        await send(ws)
+        reply, _ = await read_until(ws, 'reply')
+        assert reply['text'] == 'Synthetic real-handler response, not model proof.'
+        assert reply['provenance'] == 'live-model' and len(calls) == 1

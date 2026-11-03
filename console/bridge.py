@@ -92,7 +92,14 @@ def readiness(status: dict) -> str | None:
         return 'Daemon is not running.'
     if status.get('gemini_mode') != 'live':
         return 'Daemon is not in live mode. No mock/fixture turn was sent.'
-    if status.get('connectivity_mode') != 'online':
+    # ModeStatus.is_online uses the preference-resolved effective_mode enum.
+    # `mode` is only its lowercase display alias; network health is NOT preference.
+    connectivity = status.get('connectivity')
+    if (not isinstance(connectivity, dict)
+            or connectivity.get('effective_mode') != 'ONLINE'
+            or connectivity.get('online') is not True
+            or connectivity.get('offline') is not False
+            or connectivity.get('forced_offline') is not False):
         return 'Daemon is offline or connectivity is unknown. No turn was sent.'
     return None
 
@@ -114,6 +121,8 @@ def reply_message(result: dict, request_id: int) -> dict:
         reply['error'] = '[NOT LIVE] Mock, fixture or unconfirmed mode; reply not presented.'
     elif via == 'local-queue' or result.get('queued_job_id') is not None:
         reply['error'] = '[QUEUED] Daemon queued the turn; no model answer. Do not replay it.'
+    elif via == 'local':
+        reply['error'] = '[OFFLINE] Show-off turn stayed local; no model answer.'
     elif via == 'local-timeout-fallback':
         reply['error'] = '[TIMEOUT] No model answer; daemon fallback not presented.'
     elif not isinstance(result.get('reply'), str) or not result['reply'].strip():
@@ -122,7 +131,7 @@ def reply_message(result: dict, request_id: int) -> dict:
         reply['error'] = '[BOUND] Reply exceeds the bridge display limit; not truncated.'
     elif via in {'gemini', 'gemini-unparsed-command', 'showoff'} and result.get('model'):
         reply.update(text=result['reply'], provenance='live-model')
-    elif via in {'local-intent', 'local-memory', 'company-awareness',
+    elif via in {'local-intent', 'local-memory', 'local-awareness', 'local-hotword-checkin',
                  'guest-deflection', 'showoff-refusal'}:
         reply.update(text='[LOCAL DAEMON — not a model answer]\n' + result['reply'],
                      provenance='local-daemon')
