@@ -118,6 +118,70 @@ Rules the daemon side must honour: `v` mismatch → refuse with `bye`; `send` re
 
 ---
 
+
+## 5a. Text bridge — 2026-11-03 implementation and owner ruling
+
+The console and hands builder are **the same builder on the same branch**, with separate
+commits/revert paths. This supersedes §2's lane-topology/own-PR wording: no PR is authorised.
+The protected-file firewall and verbatim engine pin remain absolute.
+
+`run_bridge.py` starts a **separate process**, implemented in `bridge.py`, speaking the
+existing owner-authenticated newline-JSON Unix IPC. It does not mount a new daemon handler,
+start a second assistant, import a model SDK, or change the daemon's authority policy.
+Verified on parent `82880e8`: `daemon.py:974`,
+`async def _console_say(self, params: dict) -> dict`; text, speak=false by default,
+shared `_ask`, reply plus shared conversation. The typed route bypasses PTT, transcription
+and transcription-confidence gating. It does not repair those paths or prove model availability.
+
+**Minimum implemented:** hello/hello-ok (v1), same-ID send/reply, state, levels.
+**Levels are SYNTHESISED TEXT CADENCE, NOT measured audio.** This is the owner's explicit
+ruling for text turns. Both the bridge frames (`source: synthesised-text`, `measured: false`)
+and the shell's typewriter levels are labelled accordingly in code. The wrapper permanently
+labels them; the engine's public `setLevels` consumer path is used unchanged. The named
+speaking state during text display does **not** assert TTS playback. A future audio path
+must replace synthesis with measured levels/`attachElement`; audio is not implemented here.
+
+Only a daemon reporting **live + online** receives turns. Genuine model words are returned
+verbatim. Local-intent/memory responses carry an explicit non-model label. Mock/fixture,
+queued, timeout, withheld and unknown-provenance results are errors, never model answers.
+Readiness is checked before acknowledgement and every send, then polled every three seconds;
+loss closes the wire and restores disconnected lamps. No wire failure falls back to stubs
+in a window which attached a wire. Standalone `index.html` still has its honest stub fallback.
+
+Notify, transcript rows, audio rows, live memory and reply audio are **not implemented**.
+Transcript/audio remain PENDING by default; memory retains the eleven labelled shell-copy
+cards. The connect sentence no longer incorrectly declares all panes live. No placeholder
+arrays are sent to turn badges green. A green wire means connection, not a proven model answer.
+
+The launcher starts a **new loopback-only HTTP/WebSocket listener on 127.0.0.1:8744**.
+It does NOT launch, widen, narrow or edit `serve.py`; that existing server remains
+**0.0.0.0:8123** and would expose its static files to reachable LAN clients if run separately.
+Open the private URL printed by the launcher. It carries a random, per-process local pairing
+token in the URL fragment, **not an API key**. Public HTTP pages do not expose the token or
+shell content. The authenticated shell and `/elaria` requests require the token; WebSocket
+requests additionally require the exact loopback Origin/Host. File-origin and cross-origin
+clients are refused. Do not publish the pairing URL; stopping the process invalidates it.
+The browser makes no non-localhost requests; no API key/configuration is loaded by the bridge.
+
+The existing shell client now enforces loopback URLs, protocol acknowledgement version,
+700 ms × 1.7 reconnect backoff capped at 15 s (reset after hello-ok, not TCP open), the
+45-second abandonment and same-ID matching. Connection loss rejects pending calls without
+replaying them. History is at most 20 entries, trimmed oldest-first to the 64 KiB frame bound;
+it is display context only. The daemon owns conversation/authority, including across shell
+tabs. The bridge forwards only text, speak=false and history_limit=1 to console.say.
+
+Limits: 8 KiB UTF-8 input, 32 KiB UTF-8 reply, four connected clients, one turn at a time,
+3-second status deadline and 35-second turn deadline. An IPC response lost after sending
+means **outcome unknown**, not rollback; the bridge blocks later turns across reconnect until
+an explicit restart after conversation review. No automatic retry, queue drain or cancellation
+claim is made. A disconnect cannot undo an action the daemon may already have performed.
+
+See `BRIDGE.md` for the committed launcher, checksum-first one-line delivery and verification
+boundary. `gate_verbatim` still requires ENGINE_SHA
+`5e32329105aac85368806d06f98ace0d2c04681f324b5d7349a9763f1efb6447`.
+
+---
+
 ## 6. Her states: the owner's spec, verbatim
 
 > *"listening orange, thinking, rapid movement then talking pulsing"*

@@ -1958,6 +1958,7 @@ table.grid tr[hidden] { display: none; }
   }
 
   /* ------------------------------------------------------------------ conversation */
+  // SYNTHESISED TEXT CADENCE, never measured audio. Audio uses attachElement instead.
   const levelFor = (ch) => (/[\s.,;:!?]/.test(ch) ? .06 : .38 + Math.random() * .5);
   let abortType = null;
   function typeInto(body, text) {
@@ -2030,6 +2031,7 @@ table.grid tr[hidden] { display: none; }
       '\n\nkeys: alt+1 transcript · alt+2 memory · alt+3 audio · alt+K sidebar · alt+B orb · alt+N new · alt+0 font · esc close/skip\n\nanything that is not a command is a sentence, and a sentence comes to me.';
   }
   async function send(text) {
+    if (!daemon && wireRequested) return out('[WARN] daemon wire unavailable — no turn sent and no stub reply.');
     if (forcedOffline) return out('[WARN] I am marked offline. /state idle wakes me.');
     if (busy) return out('still answering the last one. Esc skips ahead.');
     const s = cur();
@@ -2106,8 +2108,14 @@ table.grid tr[hidden] { display: none; }
      truth. The protocol is written down in INTEGRATION.md — this is its client half.
      localhost only, no key, no traffic leaves the machine. */
   const WIRE_V = 1;
+  let wireRequested = false;  // attaching a wire never silently falls back to standalone stubs
   function attachSocket(url) {
     url = url || 'ws://127.0.0.1:8744/elaria';
+    const endpoint = new URL(url);
+    if (!['ws:', 'wss:'].includes(endpoint.protocol)
+        || !['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname)
+        || endpoint.username || endpoint.password) throw new Error('console wire must be localhost only');
+    wireRequested = true;
     let ws = null, dead = false, tries = 0, n = 0;
     const pend = new Map();
     const backoff = () => Math.min(15000, 700 * Math.pow(1.7, tries++));
@@ -2115,17 +2123,24 @@ table.grid tr[hidden] { display: none; }
       if (dead || typeof WebSocket === 'undefined') return;
       try { ws = new WebSocket(url); } catch (e) { retry(); return; }
       ws.onopen = () => {
-        tries = 0;
         ws.send(JSON.stringify({ t: 'hello', v: WIRE_V, client: 'console', caps: ['text', 'transcript', 'audio', 'memory'] }));
       };
       ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch (e) { return; } route(m); };
-      ws.onclose = () => { ws = null; window.ElariaShell.disconnect(); retry(); };
+      ws.onclose = () => {
+        ws = null;
+        pend.forEach((finish) => finish({ error: 'wire disconnected; a submitted turn may still complete. Inspect the daemon conversation before repeating it. No automatic replay.' }));
+        pend.clear(); window.ElariaShell.disconnect(); retry();
+      };
       ws.onerror = () => { try { if (ws) ws.close(); } catch (e) { /* already closing */ } };
     }
     function retry() { if (!dead) setTimeout(open, backoff()); }
     function route(m) {
       if (!m || !m.t) return;
-      if (m.t === 'hello-ok') return window.ElariaShell.connect({ name: m.name || 'daemon', send: sendOver });
+      if (m.t === 'hello-ok') {
+        if (m.v !== WIRE_V) { dead = true; ws.close(); window.ElariaShell.disconnect(); return; }
+        tries = 0;  // reset only AFTER a real handshake, not every failed TCP reconnect
+        return window.ElariaShell.connect({ name: m.name || 'daemon', send: sendOver });
+      }
       if (m.t === 'reply') { const p = pend.get(m.id); pend.delete(m.id); if (p) p(m); return; }
       if (m.t === 'state') return window.ElariaShell.setState(m.name);
       if (m.t === 'levels') return window.ElariaShell.levels(m.role, m.level);
@@ -2141,7 +2156,17 @@ table.grid tr[hidden] { display: none; }
         const id = ++n;
         pend.set(id, (m) => m.error ? rej(new Error(m.error))
           : res(m.audio ? { text: m.text || '', audio: m.audio } : (m.text || '')));
-        ws.send(JSON.stringify({ t: 'send', id, text: text, session: ctx && ctx.session, history: ctx && ctx.history }));
+        const message = { t: 'send', id, text, session: ctx && ctx.session,
+          history: ctx && ctx.history ? ctx.history.slice(-20) : [] };
+        let encoded = JSON.stringify(message);
+        // History is display context, not daemon authority. Trim oldest context to the wire bound.
+        while (new Blob([encoded]).size > 65536 && message.history.length) {
+          message.history.shift(); encoded = JSON.stringify(message);
+        }
+        if (new Blob([encoded]).size > 65536) {
+          pend.delete(id); rej(new Error('message exceeds the 64 KiB wire bound; no turn sent')); return;
+        }
+        ws.send(encoded);
         setTimeout(() => { if (pend.delete(id)) rej(new Error('daemon went quiet')); }, 45000);
       });
     }
@@ -2160,7 +2185,7 @@ table.grid tr[hidden] { display: none; }
       simOn = false; if (V) V.simulate(false); syncOrb();
       lamps(); settle();
       notify({ text: 'Daemon connected' + (adapter.name ? ': ' + adapter.name : '') + '.', log: false });
-      out('[OK] wire up. replies, transcript, audio and memory now come from the daemon.');
+      out('[OK] wire up. replies use the attached adapter; each pane keeps its own data status.');
     },
     disconnect() {
       if (!daemon) return;
