@@ -331,3 +331,82 @@ def test_probe_raw_pass_uses_the_shared_helper():
     assert "audio_transcription.text (44 chars)" in out
     assert "the answer is in the part" in out, \
         "the reading line must not call an unread answer a stump"
+
+
+# ------------------- ruling (b) confirmation: ALL FOUR construction paths
+# The design chat's confirmation ask (2026-11-03): `declared` must reach
+# every path that feeds a Transcript — multi-language and
+# single-language, sync and async — so model_language is never None
+# while a real declared value existed upstream. These pin the three
+# paths the first cut left uncovered (single-language sync was already
+# pinned above).
+def _multi_config():
+    return type("Cfg", (), {
+        "section": lambda self, name: (
+            {"languages": ["en", "sw"], "preserve_code_switching": True}
+            if name == "asr" else {}),
+    })()
+
+
+class _MultiClient:
+    """Dict client serving both the sync and async call sites."""
+
+    def __init__(self, result):
+        self._result = result
+        self.calls: list = []
+
+    def transcribe_batch(self, audio_path, language, **kwargs):
+        self.calls.append(("sync", language, kwargs))
+        return self._result
+
+    async def transcribe_batch_async(self, audio_path, language, **kwargs):
+        self.calls.append(("async", language, kwargs))
+        return self._result
+
+
+def test_sync_multi_language_declared_reaches_model_language():
+    result = {"text": "habari yako", "language_code": "sw",
+              "part_types_seen": ["audio_transcription"]}
+    client = _MultiClient(result)
+    transcript = asr.GeminiBatchBackend(client, _multi_config()).transcribe(
+        "x.wav", "en")
+    assert transcript.language == "sw"
+    assert transcript.model_language == "sw", \
+        "a declared value must never vanish on the multi-language branch"
+
+
+def test_async_single_language_declared_reaches_model_language():
+    result = {"text": "hello", "language_code": "en",
+              "part_types_seen": ["audio_transcription"]}
+    client = _MultiClient(result)
+    transcript = asyncio.run(
+        asr.GeminiBatchBackend(client).transcribe_async("x.wav", "en"))
+    assert transcript.language == "en"
+    assert transcript.model_language == "en"
+
+
+def test_async_multi_language_declared_reaches_model_language():
+    result = {"text": "habari yako", "language_code": "sw",
+              "part_types_seen": ["audio_transcription"]}
+    client = _MultiClient(result)
+    transcript = asyncio.run(
+        asr.GeminiBatchBackend(client, _multi_config()).transcribe_async(
+            "x.wav", "en"))
+    assert transcript.language == "sw"
+    assert transcript.model_language == "sw"
+
+
+def test_absent_declaration_never_invents_a_language_anywhere():
+    """The fixture/mock dict carries language_code None — every path must
+    report the ABSENCE, never a fabricated declaration."""
+    result = {"text": "words", "language_code": None, "part_types_seen": []}
+    client = _MultiClient(result)
+    sync_t = asr.GeminiBatchBackend(client, _multi_config()).transcribe(
+        "x.wav", "en")
+    async_t = asyncio.run(
+        asr.GeminiBatchBackend(client, _multi_config()).transcribe_async(
+            "x.wav", "en"))
+    for transcript in (sync_t, async_t):
+        assert transcript.model_language is None
+        assert transcript.language == "en,sw", \
+            "configured set is the fallback when the model declares nothing"
