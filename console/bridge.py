@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import socket
 import stat
@@ -140,6 +141,130 @@ def reply_message(result: dict, request_id: int) -> dict:
     return reply
 
 
+# Advisory input-shape observer, not a dispatcher or authority. Pinned grammar source:
+# a6cc1507fb798bcbe1d9998bfcc8f2cb69cff8e1:src/assistant/intents.py:25-59.
+# The daemon's returned via is authoritative for reply provenance; its executed kind is absent.
+OBSERVED_PATTERNS = [
+    ("halt", re.compile(r"^\s*(?:halt|stop everything|panic stop)(?:\s+(?:now|please))*\s*[!.]*\s*$", re.IGNORECASE)),
+    ("status", re.compile(r"^\s*(status|are you (up|running|alive)|health)\s*\??\s*$", re.IGNORECASE)),
+    ("mode_offline", re.compile(r"^\s*(go offline|offline mode|force offline|disconnect)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("mode_online", re.compile(r"^\s*(go online|online mode|reconnect)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("mode_auto", re.compile(r"^\s*(auto mode|connectivity auto|automatic mode)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("queue_status", re.compile(r"^\s*(queue status|what'?s queued|what is queued|show (the )?queue)\s*\??\s*$", re.IGNORECASE)),
+    ("queue_drain", re.compile(r"^\s*(drain (the )?queue|process (the )?queue)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("cost", re.compile(r"^\s*(?:cost|spend|quota|usage|(?:api|gemini|token|my)\s+(?:cost|spend|quota|usage)|how much (?:have|did) (?:i|we) (?:spend|use)(?:\s+today|\s+this\s+month)?)\s*[?.!]*\s*$", re.IGNORECASE)),
+    ("undo", re.compile(r"^\s*undo(?:\s+since\s+(\S+))?\s*[!.]*\s*$", re.IGNORECASE)),
+    ("remember", re.compile(r"^\s*remember\s+(?:that\s+)?(.+?)\s*$", re.IGNORECASE | re.DOTALL)),
+    ("forget", re.compile(r"^\s*forget\s+(?:about\s+)?(.+?)\s*$", re.IGNORECASE)),
+    ("where", re.compile(r"^\s*(?:where(?:'s| is| are)|find(?: me)?|locate)\s+(.+?)\s*\??\s*$", re.IGNORECASE)),
+    ("search", re.compile(r"^\s*search\s+(?:for\s+)?(.+?)\s*$", re.IGNORECASE)),
+    ("organise", re.compile(r"^\s*(?:organi[sz]e|sort(?:\s+out)?|tidy)\s+(.+?)\s*$", re.IGNORECASE)),
+    # Phase 7: the ladder speaks Kiswahili too — same narrow grammar.
+    # (simama = stop, hali = status, gharama = cost, kumbuka = remember,
+    # sahau = forget, iko wapi = where is, tafuta = search, panga = organise,
+    # rudisha = restore/undo.)
+    ("halt", re.compile(r"^\s*(simama|wacha yote|simamisha yote)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("status", re.compile(r"^\s*(hali|uko sawa|unaendelea vipi)\s*\??\s*$", re.IGNORECASE)),
+    ("mode_offline", re.compile(r"^\s*(enda nje ya mtandao|hali ya nje ya mtandao)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("mode_online", re.compile(r"^\s*(rudi mtandaoni|enda mtandaoni|hali ya mtandaoni)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("mode_auto", re.compile(r"^\s*(hali ya kiotomatiki|kiotomatiki)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("queue_status", re.compile(r"^\s*(hali ya foleni|foleni ikoje|onyesha foleni)\s*\??\s*$", re.IGNORECASE)),
+    ("queue_drain", re.compile(r"^\s*(tenda foleni|chakata foleni)\s*[!.]*\s*$", re.IGNORECASE)),
+    ("cost", re.compile(r"^\s*(?:gharama|nimetumia kiasi gani|quota)\s*[?.!]*\s*$", re.IGNORECASE)),
+    ("undo", re.compile(r"^\s*(rudisha|tenda upya)(?:\s+tangu\s+(\S+))?\s*[!.]*\s*$", re.IGNORECASE)),
+    ("remember", re.compile(r"^\s*kumbuka\s+(?:kwamba\s+)?(.+?)\s*$", re.IGNORECASE | re.DOTALL)),
+    ("forget", re.compile(r"^\s*sahau\s+(?:kuhusu\s+)?(.+?)\s*$", re.IGNORECASE)),
+    ("where", re.compile(r"^\s*(?:iko wapi|wapi)\s+(.+?)\s*\??\s*$", re.IGNORECASE)),
+    ("search", re.compile(r"^\s*tafuta\s+(.+?)\s*$", re.IGNORECASE)),
+    ("organise", re.compile(r"^\s*(?:panga|ratibu)\s+(.+?)\s*$", re.IGNORECASE)),
+]
+
+
+def observed_intent(text):
+    text = re.sub(r"^(?:(?:hey|hi|hello)\s+)?elaria\b[\s,!:.-]*", '', text.strip(),
+                  flags=re.IGNORECASE)
+    return next((kind for kind, pattern in OBSERVED_PATTERNS if pattern.match(text)), None)
+
+
+def positive_id(value):
+    return type(value) is int and 0 < value <= 2**53 - 1
+
+
+def attribution(result, reply, text, observation):
+    """Bounded metadata separate from model prose. No extra RPCs or hidden content leakage.
+
+    The history tail is sampled AFTER _ask and can race another caller. Even a matching tail
+    is only a candidate conversation reference, never a request-bound operation receipt.
+    """
+    rows = [f'Bridge observation: {observation} (not a durable journal receipt).']
+    kind = observed_intent(text)
+    rows.append('Input shape (advisory): ' + (kind or 'unclassified; executed intent not on wire') + '.')
+    rows.append('Operation journal reference: not supplied by console.say; mainline seam required.')
+    if 'text' not in reply:
+        rows.append('Reply not displayed; execution/effect not established. No automatic replay.')
+        return rows
+    via = result.get('via')
+    rows.append('Reply provenance: ' + str(reply.get('provenance')) + ' / ' + str(via) + '.')
+    if reply.get('provenance') == 'live-model':
+        rows.append('Model prose is not a capability confirmation, approval or effect receipt.')
+    conversation = result.get('conversation')
+    cid = result.get('conversation_id')
+    if positive_id(cid):
+        rows.append(f'Daemon conversation reference: #{cid} (not an operation reference).')
+    else:
+        rows.append('Daemon conversation reference: unavailable.')
+    messages = conversation.get('messages') if isinstance(conversation, dict) else None
+    tail = messages[0] if isinstance(messages, list) and len(messages) == 1 else None
+    if (positive_id(cid) and isinstance(conversation, dict) and conversation.get('id') == cid and isinstance(tail, dict)
+            and positive_id(tail.get('id')) and tail.get('role') == 'assistant'
+            and tail.get('channel') == 'console' and tail.get('via') == via
+            and tail.get('text') == result.get('reply')):
+        rows.append(f'Returned conversation-tail message: #{tail["id"]}; matching text, '
+                    'NOT request-bound (concurrent turns may race).')
+    else:
+        rows.append('Message reference: unavailable or tail not correlated; no attribution inferred.')
+    local = reply.get('provenance') == 'local-daemon'
+    body = result.get('reply', '')
+    if kind in {'where', 'search'}:
+        if not local or via != 'local-memory':
+            rows.append('Lookup outcome: model fallback / non-index response; no verified index hit.')
+        else:
+            rows.append('Lookup outcome: daemon local-memory reply, not a fresh-file read.')
+            lines = body.splitlines()
+            valid = False
+            if kind == 'where' and lines:
+                match = re.fullmatch(r'Found ([1-3]) candidate\(s\) locally:', lines[0])
+                valid = bool(match and len(lines[1:]) == int(match[1])
+                             and all(x.startswith('- ') for x in lines[1:]))
+            elif kind == 'search' and lines and lines[0] == 'Local matches:':
+                valid = 0 < len(lines[1:]) <= 6 and all(
+                    re.match(r'^- \[(document|fact|transcript)\] ', x) for x in lines[1:])
+            if valid and all(len(x) <= 700 for x in lines[1:]):
+                rows.extend('Daemon-reported hit text (unstructured): ' + x[2:] for x in lines[1:])
+            else:
+                rows.append('Structured indexed refs: unavailable; inspect the local reply, not an inferred receipt.')
+    if kind == 'remember':
+        rows.extend(['Fact ID and kind: not supplied on this wire; mainline receipt seam required.',
+                     ('Retention limit: deactivation is not erasure; stored text/history can remain. '
+                     'No retention duration or exact restore guarantee is supplied.')])
+    if kind == 'forget':
+        count = re.fullmatch(r'Forgotten \(([0-9]{1,19}) fact\(s\) deactivated\).', body)
+        rows.append('Affected count (daemon-reported, not independently verified): ' +
+                    (count[1] if local and via == 'local-intent' and count else 'unavailable') + '.')
+        rows.append('Deactivation-not-erasure: fact text and conversation history may remain.')
+    if kind == 'organise':
+        rows.append('Resolved root set: not supplied on this wire; do not infer it from the request.')
+        rows.append('Audited semantics (not an execution receipt): configured-root reads; '
+                    'index/chunk/status, plan/item and shadow-log writes; no apply in this intent.')
+        plan = re.fullmatch(r'Shadow plan\(s\) ((?:#[0-9]+(?:, )?)+) building — nothing moves '
+                            r'without your review \+ apply. Watch `assist events`\.', body)
+        if local and via == 'local-intent' and plan and len(plan[1]) <= 500:
+            rows.append('Plan references from daemon reply: ' + plan[1] + '; started is not completed.')
+    if kind == 'undo':
+        rows.append('Undo gate belongs to mainline; this bridge does not establish approval or reversal.')
+    return rows
+
+
 def validate_send(message: dict) -> str | None:
     if set(message) - {'t', 'id', 'text', 'session', 'history'}:
         return 'Unsupported send fields; no turn sent.'
@@ -162,6 +287,8 @@ class Bridge:
         self.turns = set()
         self.busy = False
         self.uncertain = False
+        self.observation_prefix = secrets.token_hex(6)
+        self.observation_n = 0
         # Load only exact assets, never route a caller-controlled filesystem path.
         engine = (assets / 'elaria-visualizer.js').read_bytes()
         if hashlib.sha256(engine).hexdigest() != ENGINE_SHA:
@@ -271,10 +398,13 @@ background:#110d1c;color:#e3bd80;z-index:1}
 
     async def turn(self, ws, message):
         request_id = message['id']
+        self.observation_n += 1
+        observation = f'{self.observation_prefix}:{self.observation_n}'
+        notes = attribution({}, {}, message['text'], observation)
         try:
             problem = await self.probe()
             if problem:
-                await self.emit(ws, t='reply', id=request_id, error=problem)
+                await self.emit(ws, t='reply', id=request_id, error=problem, attribution=notes)
                 await self.emit(ws, t='state', name='offline', reason=problem)
                 return
             await self.emit(ws, t='state', name='thinking')
@@ -286,6 +416,8 @@ background:#110d1c;color:#e3bd80;z-index:1}
                 'text': message['text'], 'speak': False, 'history_limit': 1,
             }, TURN_SECONDS)
             reply = reply_message(result, request_id)
+            notes = attribution(result, reply, message['text'], observation)
+            reply['attribution'] = notes
             await self.emit(ws, **reply)
             if 'text' in reply:
                 # This is the shell's text-display state, NOT evidence that TTS is playing.
@@ -301,7 +433,7 @@ background:#110d1c;color:#e3bd80;z-index:1}
         except IPCFailure as exc:
             self.uncertain = self.uncertain or exc.uncertain
             with suppress(ConnectionClosed, TimeoutError):
-                await self.emit(ws, t='reply', id=request_id,
+                await self.emit(ws, t='reply', id=request_id, attribution=notes,
                                 error=('Outcome unknown; daemon may have processed the turn. '
                                    'Inspect its conversation before restarting this bridge. No replay.'
                                    if exc.uncertain else 'Daemon unavailable; no turn sent.'))
@@ -312,7 +444,7 @@ background:#110d1c;color:#e3bd80;z-index:1}
             # Unexpected bridge failures are visible and never become an implicit retry.
             self.uncertain = True
             with suppress(ConnectionClosed, TimeoutError):
-                await self.emit(ws, t='reply', id=request_id,
+                await self.emit(ws, t='reply', id=request_id, attribution=notes,
                                 error='Bridge failure; outcome unknown. Inspect daemon conversation; no replay.')
                 await self.emit(ws, t='state', name='offline')
         finally:

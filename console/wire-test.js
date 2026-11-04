@@ -49,6 +49,9 @@ async function until(predicate, message) {
                 'real WS reply did not appear in DOM');
     await until(() => seen.some(x => x.role === 'output' && x.value > 0), 'no synthesised wire output levels');
     assert(seen.every(x => x.value >= 0 && x.value <= 1));
+    await until(() => doc.querySelector('.msg.ai .attribution'), 'missing reply attribution');
+    assert(doc.querySelector('.attribution').textContent.includes('not a durable journal'));
+    assert(doc.querySelector('.attribution').textContent.includes('live-model'));
     assert(!root.querySelector('header'));
     assert(root.getElementById('wire-error').hidden);
     assert(doc.getElementById('orbnote').textContent.includes('synthesised text cadence, not measured audio'));

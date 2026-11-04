@@ -328,3 +328,11 @@ the GLSL gate passes.
    after their own first nonempty feed, never from another pane or an empty placeholder.
 4. Owner eye/ear sign-off on: her size and position, the full-screen transcript, the mini-orb
    notification, and listening reading cool rather than orange. He is the instrument; the suite is not.
+
+### Optional attribution metadata (Task A, 2026-11-04)
+
+Reply frames may include `attribution`, an array of bounded plain-text observations separate
+from `text`/`error`. The shell renders at most 24 strings of at most 1000 characters using
+textContent, persists them with the displayed message, and tolerates absent/invalid metadata.
+These observations are not model prose, journal events, approvals or inferred effect receipts.
+The bridge adds no RPC; a sampled conversation tail is explicitly not request-bound.

@@ -404,3 +404,10 @@ table.grid tr[hidden] { display: none; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* Transport/source evidence is visually separate from assistant prose; no stage geometry change. */
+.attribution { margin-top: 12px; padding: 10px 12px; border-left: 2px solid var(--sys);
+  background: rgba(121, 189, 224, .04); color: var(--sys); font-size: 11px; line-height: 1.55;
+  overflow-wrap: anywhere; }
+.attribution > b { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+.attribution p { margin: 5px 0 0; }

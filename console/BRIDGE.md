@@ -27,13 +27,13 @@ hard stop, not permission to fetch, install or reconstruct something from chat.
 
 Committed executable: **`console/run_bridge.py`**.
 
-SHA256: **`ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c`**.
+SHA256: **`30adee34237ccfffc99f1926c68927c9400ebf9517366de786ccc2277b7acc8a`**.
 
 From a copy containing this release's `console/` payload and the existing `.venv` interpreter,
 this is one physical command line. It checks the launcher before Python runs; the launcher
 then checks all five payload hashes before importing the bridge. A mismatch stops.
 
-`test "$(sha256sum console/run_bridge.py)" = 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --open`
+`test "$(sha256sum console/run_bridge.py)" = '30adee34237ccfffc99f1926c68927c9400ebf9517366de786ccc2277b7acc8a  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --open`
 
 `-I` isolates Python import paths; `-B` avoids bytecode writes. No standalone install, branch
 switch or mainline deployment is performed by this command. If using an extracted bundle
@@ -46,13 +46,13 @@ existing interpreter is `/home/darrel/Elaria/.venv/bin/python`, this alternative
 uses it without copying files into or switching that checkout. A missing interpreter or
 checksum mismatch stops; there is no install/repair fallback.
 
-`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py --open`
+`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = '30adee34237ccfffc99f1926c68927c9400ebf9517366de786ccc2277b7acc8a  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py --open`
 
 Optional **`--check`** performs artifact/dependency checks and one existing-daemon `status`
 RPC, then exits; it creates no launch file/profile, opens no browser/server, and sends no
 chat/model/voice turn. It is mutually exclusive with `--open`. Exact checkout preflight:
 
-`test "$(sha256sum console/run_bridge.py)" = 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --check`
+`test "$(sha256sum console/run_bridge.py)" = '30adee34237ccfffc99f1926c68927c9400ebf9517366de786ccc2277b7acc8a  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --check`
 
 `--socket` accepts an explicit absolute existing socket path when XDG_RUNTIME_DIR is
 unavailable. There is no guessed socket, alternate host, auto-start, paid/model fallback or
@@ -77,7 +77,7 @@ A 0700 `elaria-console-<random>` directory is created beside the daemon socket, 
 For manual mode, use the following verified invocation and open that local file on the same
 machine as the daemon. Do not share/read its contents into logs; it contains the live token.
 
-`test "$(sha256sum console/run_bridge.py)" = 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
+`test "$(sha256sum console/run_bridge.py)" = '30adee34237ccfffc99f1926c68927c9400ebf9517366de786ccc2277b7acc8a  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
 
 The browser is detached with a new POSIX session, closed inherited FDs and null standard
 streams. Only desktop/session/locale environment is passed; model keys, SSH agents and shell
@@ -202,3 +202,27 @@ No new capability route is implemented pending that decision and the separate WS
 
 Drafts first remains binding for any future messaging: compose → owner review/approval →
 only then send; no send adapter or autonomy tier first. Draft review itself is not yet built.
+
+## Task A — attribution surface (2026-11-04)
+
+Each completed wire reply has a separate **Bridge attribution** block, persisted with its
+browser display record. Errors with available observations retain them too. This is not
+model prose and not a newly invented operation journal. Input-shape recognition is advisory,
+not a dispatcher; unclassified/local-awareness/guest outcomes remain visible through actual
+reply provenance. No added RPC, database lookup or daemon change.
+
+Available: bridge observation ID; actual reply provenance; returned conversation ID; a
+matching history-tail message ID explicitly **not request-bound**; local lookup hit text
+labelled unstructured versus model fallback; exact forget count when its local reply matches
+the producer's format, with **deactivation-not-erasure**; organise plan IDs reported in its
+reply and audited write-kind semantics, not completed-write evidence.
+
+Missing on console.say: executed-intent identity, request-bound message/operation journal
+refs, structured index refs, remember fact ID/kind, and organise resolved roots/write receipt.
+Those gaps are visible and requested as mainline seams, not inferred from neighbouring rows.
+Withheld/fixture/invalid replies expose no hidden history or effect details. See
+`docs/phase-reports/console-2026-11-04-task-a-attribution.md`.
+
+The owner has assigned scoped-undo fail-closed enforcement to mainline; this bridge neither
+implements that gate nor certifies that a given daemon has deployed it. Reads, remember,
+forget and organise remain on the existing typed route until their pilots are ruled/built.

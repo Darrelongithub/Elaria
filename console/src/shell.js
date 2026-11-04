@@ -289,13 +289,26 @@
 
   /* ------------------------------------------------------------------ log rendering */
   const ROLE = { me: 'you', ai: 'elaria', sys: '', note: '', warn: '', err: '' };
-  function msgEl(r, text, ts) {
+  function receiptRows(value) {
+    return Array.isArray(value) ? value.filter(x => typeof x === 'string' && x.length <= 1000).slice(0, 24) : [];
+  }
+  function receiptEl(value) {
+    const rows = receiptRows(value);
+    if (!rows.length) return null;
+    const box = h('aside', 'attribution');
+    box.setAttribute('aria-label', 'Bridge attribution, separate from reply prose');
+    box.append(h('b', '', 'Bridge attribution'));
+    rows.forEach(row => box.append(h('p', '', row))); // textContent only, never HTML/model markup
+    return box;
+  }
+  function msgEl(r, text, ts, attribution) {
     const m = h('article', 'msg ' + r), hd = h('header');
     if (ROLE[r]) hd.append(h('b', 'who', ROLE[r]));
     hd.append(h('time', '', fmt(ts || Date.now())));
     const body = h('div', 'body');
     body.innerHTML = r === 'me' ? paintYou(text || '') : paintHer(text || '');
     m.append(hd, body);
+    const receipt = receiptEl(attribution); if (receipt) m.append(receipt);
     return m;
   }
   const pin = () => { if (pinned) el.log.scrollTop = el.log.scrollHeight; };
@@ -305,11 +318,11 @@
     if (typeof content !== 'string') m.querySelector('.body').append(content);
     el.pad.append(m); pin();
   }
-  const pushTo = (s, r, t) => { if (s) { s.msgs.push({ r, t, ts: Date.now() }); save(); renderSess(); } };
+  const pushTo = (s, r, t, attribution) => { if (s) { s.msgs.push({ r, t, ts: Date.now(), attribution: receiptRows(attribution) }); save(); renderSess(); } };
   function push(r, t) { pushTo(cur(), r, t); }
   function renderLog() {
     el.pad.replaceChildren();
-    cur().msgs.forEach((m) => el.pad.append(msgEl(m.r, m.t, m.ts)));
+    cur().msgs.forEach((m) => el.pad.append(msgEl(m.r, m.t, m.ts, m.attribution)));
     pinned = true; el.log.scrollTop = el.log.scrollHeight; el.jump.hidden = true;
     $('sname').textContent = '~/sessions/' + cur().name;
   }
@@ -721,7 +734,9 @@
     const ended = audio ? playClip(audio) : Promise.resolve();
     await typeInto(body, text); await ended;
     body.classList.remove('typing'); el.log.removeAttribute('aria-busy'); skip = false;
-    pushTo(s, 'ai', text);
+    const receipt = receiptEl(rep && rep.attribution); if (receipt) m.append(receipt);
+    pushTo(s, 'ai', text, rep && rep.attribution);
+    pin();
     if (!document.hasFocus() || document.hidden) { away = text; document.title = '\u25cf Elaria'; }
   }
   function respond(text) {
@@ -757,7 +772,9 @@
       if (left > 0) await sleep(left);
       await deliver(rep, s);
     } catch (err) {
-      out('[BROKEN] the daemon call failed: ' + ((err && err.message) || 'unknown error'));
+      const message = '[BROKEN] the daemon call failed: ' + ((err && err.message) || 'unknown error');
+      el.pad.append(msgEl('err', message, null, err && err.attribution));
+      pushTo(s, 'err', message, err && err.attribution); pin();
     } finally { busy = false; settle(); }
   }
   async function run(v) {
@@ -868,8 +885,10 @@
       return new Promise((res, rej) => {
         if (!ws || ws.readyState !== 1) return rej(new Error('wire not open'));
         const id = ++n;
-        pend.set(id, (m) => m.error ? rej(new Error(m.error))
-          : res(m.audio ? { text: m.text || '', audio: m.audio } : (m.text || '')));
+        pend.set(id, (m) => {
+          if (m.error) { const error = new Error(m.error); error.attribution = receiptRows(m.attribution); rej(error); }
+          else res({ text: m.text || '', audio: m.audio, attribution: receiptRows(m.attribution) });
+        });
         const message = { t: 'send', id, text, session: ctx && ctx.session,
           history: ctx && ctx.history ? ctx.history.slice(-20) : [] };
         let encoded = JSON.stringify(message);
