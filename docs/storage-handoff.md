@@ -1867,3 +1867,137 @@ timer + WP5 monthly trigger shape) and 8 (monthly restore-drill scaffolding).
 pipeline ever emit chunked WAVs - the fix is correct either way but the risk was
 theoretical if not; (3) report 020's §9 obligations remain open pending the design chat's
 ruling on the harness incident - no recurrence this activation.
+
+---
+
+## 2026-11-03 - Report 022: mark writer answered, census ground truth, and a correction I owe
+
+**Branch:** `arena/storage` @ `04ad75a`. **Frozen branch (condition 3):** `origin
+arena/e7a1cca5-elaria = b181712563c1577f5faea4e59fe5f7e104a89ed1`, verified before and
+after. Untouched.
+
+**THE MARK WRITER - answered.** `assistant.capture.WavSink` (mainline, read-only to this
+lane) writes the never-retry marks: a sink opened and closed with zero frames emits
+**exactly 44 bytes** - canonical PCM, `fmt` at 12, `data` at 36, zero-frame `data` chunk,
+no LIST/INFO/fact. Its fmt chunk is byte-identical to the census captures. Proven by
+running the class, not by reading it.
+
+**WAS ANY MARK MIS-TIERED? No.** Checked against ground truth, not the record (the D10
+class): 80,698,682 + 57,600,044 + 44 = 138,298,770 = `du -sb audio/`, reconciling exactly.
+A chunked mark would have to be a 38th file (breaking the arithmetic) or hidden inside the
+35 (at most ~62 B = 0.000077% of tierable volume). The census found exactly one mark.
+
+**DID THE CENSUS MOVE? No.** 11.29 MiB/day, cold 5.48-7.93 MB/day, Q26 3.45-5.00 yr
+daily / 1.07-1.38 yr with events - all unchanged. Worst case if every mark were
+mis-counted: ~36 B/day compressed = 0.00063%. **The fix is purely defensive, which is
+still worth having** - it removes a dependency on which tool wrote the file (a restore
+from cold, an ffmpeg/sox round-trip, or any writer other than WavSink could carry a
+chunk).
+
+**OPEN QUESTION 1 (D7) - closed.** Ruled mainline's; fix, measurement and the
+no-fixture-changes-without-a-grant constraint relayed by the design chat. Nothing further
+from this lane.
+
+**A CORRECTION I OWE - `ladder.py` is MAINLINE's, not my lane's creation.** Last
+activation I confirmed in one line that it was my lane's own creation. That was wrong, and
+the design chat's inference - which my wrong line appeared to corroborate - is also wrong.
+Verified with full SHAs: `ladder.py` exists at `f915d8e` (my branch point) and at the base
+`a6cc150`, created by mainline `b96fd23` (2026-10-25, WP0 EYES). Report 000's "No
+ladder.py" was true of `ed20344` (the frozen-branch artifact the harness checks out) and
+false of `f915d8e`; `ed20344` is an ANCESTOR of `f915d8e` and `b96fd23` created the file
+between them. The base has exactly four chains - console (582), wake (620), voice (655),
+event (698), run_chain (748) - and my HEAD has those four at byte-identical line numbers
+plus `backup_chain` (764). My only removals are the two argparse registration lines.
+35,542 B on the base, 41,398 B on my HEAD. **The collision question is inverted: mainline
+already owns ladder.py, and PR #24 is precisely where my extension of it merges.** No
+future collision to guard against - a present merge to review, additive by construction.
+Mainline's "ladder" vocabulary (the §13.4 intent ladder, model escalation ladder) lives in
+cli.py/hotword.py/daemon.py/intents.py and shares only the word, not the file.
+
+**HOW THE ERROR HAPPENED, recorded so it is not repeated:** `git cat-file -e <sha>:path`
+was run when `<sha>` was not yet a local object (restricted refspec), and the failure on
+the COMMIT was read as the FILE being absent. A second check in the same session repeated
+the pattern with an unset shell variable, making `git show :path` read the index and appear
+to show `backup_chain` on the base. Two false negatives, both from git plumbing rather than
+the repository. **The rule that catches both: never conclude a path is absent from a
+cat-file/show failure without first confirming the revision resolved.**
+
+**THE SAFETY ADDENDUM FIRED A SECOND TIME - PUSH HELD (then resumed on ruling).** Reflog
+showed a fresh clone then `checkout: moving from main to arena/e7a1cca5-elaria` - a forced
+checkout onto the frozen branch, refspec still restricted. Per the addendum that activation
+stopped and reported before pushing; nothing was pushed. Recovery was the report-020
+method in order: frozen hash verified before; explicit-URL fetch of
+`refs/heads/arena/storage` -> FETCH_HEAD = 04ad75a; integrity check over all 21 tracked
+WP7 files; `checkout -f -B arena/storage FETCH_HEAD` local-only; frozen hash verified after.
+
+**A MEASUREMENT HAZARD, NOT A DEFECT:** the recreated `.venv` (pytest ruff only) produced
+**21 failures** in `tests/test_stream_g_primary.py`, all
+`ModuleNotFoundError: No module named 'google'`. With the full recorded dep set
+(`pytest ruff google-genai httpx`) the suite is back to **2104/6/0, ruff clean**. A
+re-provisioned venv is a measurement hazard.
+
+**Fifth base movement `be9183c -> a6cc150` - bare, triggers nothing.** Four commits
+(voice-chain extraction/resilience). `journal_log.py` byte-identical; `audio kept at`
+still 4; Drift 2 does not recur; both §2 clauses re-verified directly against the local
+module; merge-base still `f915d8e` and `f915d8e` still an ancestor of the base, so no
+history rewrite. Suite re-measured unconditionally: 2104/6/0, ruff clean. **GATE 1e
+unchanged: this lane still consumes no journal shape, so the zero-migration-cost window is
+still open.**
+
+---
+
+## 2026-11-04 - MERGE NOTE: the two argparse lines removed from ladder.py retire no mainline interface
+
+Design-chat review item on PR #24: the two argparse lines removed from
+`src/assistant/ladder.py` must not retire a mainline interface. Shown here, with the
+behavioural proof, because a merge note that asserts rather than demonstrates is worth
+nothing.
+
+**The two lines, base vs mine (full SHAs; base = `a6cc150` = `arena/c2a7085d-elaria` tip):**
+
+```python
+# BASE (mainline), ladder.py lines 789 / 791
+        description="hardware truth ladder (chains: console, wake, voice, event)")
+                        choices=("console", "wake", "voice", "event", "all"))
+
+# MINE (04ad75a), ladder.py lines 898 / 900
+        description="hardware truth ladder (chains: console, wake, voice, event, backup)")
+                        choices=("console", "wake", "voice", "event", "backup", "all"))
+```
+
+**Proof, measured rather than read:**
+
+| Check | Result |
+|---|---|
+| BASE choices | `('console', 'wake', 'voice', 'event', 'all')` |
+| MINE choices | `('console', 'wake', 'voice', 'event', 'backup', 'all')` |
+| every BASE choice still accepted by MINE | **True** |
+| nothing REMOVED | **True** |
+| the ONLY addition | `('backup',)` |
+| the four chain names keep their relative order | True |
+| `"backup"` is inserted immediately before the sentinel `"all"` | True |
+| description still names all four originals | **True** |
+| all four BASE chain methods present on MINE's `Ladder` | **True** (missing: none) |
+| all four originals + `backup` present | True |
+| `run_chain` still dispatches `"all"` | True |
+
+**The precise structural statement:** the base tuple minus its sentinel `"all"` is
+`('console', 'wake', 'voice', 'event')`, which **is** a prefix of mine. The base tuple is
+therefore not a *literal* prefix, because `"backup"` is inserted before `"all"` rather than
+appended after it. That is deliberate: `"all"` is the sentinel meaning "every chain", so a
+new chain must be inserted before it or `"all"` would silently stop meaning "every chain".
+Appending after `"all"` would have retired the sentinel's contract while leaving the
+command working - the exact class of quiet breakage this note exists to exclude.
+
+**Conclusion: neither line retires a mainline interface.** Both are strictly additive
+insertions. `assist ladder console|wake|voice|event|all` behaves identically on the base and
+on this branch; the only new surface is `assist ladder backup`.
+
+The same two lines in `src/assistant/cli.py` (`choices=` and `help=`) are the registration
+point for the `--ladder` flag and were changed by the same insertion. Both are argparse
+registration only - no function signature, return type, exit code or public name changed.
+
+**Pinned by test:** `tests/test_wp0_ladder.py` lists `"backup chain"` in its chain tuple and
+pins 25 rung lines (5 chains x 5 rungs). It is the designed extension point, not on the
+forbidden list. It would fail if a chain were dropped, which is what makes this note
+checkable rather than merely asserted.
