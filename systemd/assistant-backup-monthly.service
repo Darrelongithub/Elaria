@@ -1,0 +1,43 @@
+[Unit]
+Description=Elaria — WP7 monthly integrity drill (restore + hash-verify + restic check)
+Documentation=file:%h/Elaria/docs/storage-handoff.md
+# Ordered after the nightly backup pass so the drill reads a repository that tonight's
+# run already reconciled. Ordering only, never a dependency: a drill must still run on a
+# day the nightly pass did nothing, which is exactly the day it is most worth having.
+After=assistant-backup.service
+# The drill reads from cold storage. On a machine with no network it is a correct no-op
+# that records "nothing to drill" rather than a failure, which is why network-online is
+# Wants (ordering) and not Requires (a gate).
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# One command, no arguments that could carry content. `--kind monthly` is the ruled
+# cadence (Q24: (c) then (a)); quarterly is the bounded-data variant and is run by the
+# owner's own initiative or a separate unit, never automatically, because it reads up to
+# 5% / 500 MB of the repository on purpose.
+ExecStart=%h/.local/bin/assist backup check --kind monthly --record
+# §4.4/§4.8: the drill's sensor lines and the drill record go to the journal, never to a
+# file inside the repo. The DrillJournal itself lives at 0600 OUTSIDE the repo.
+StandardOutput=journal
+StandardError=journal
+# A failed drill is the single most important thing this lane can report, so it must not
+# be swallowed by a restart policy. Restart=no: tomorrow's elapse plus Persistent=true
+# covers it, and the record keeps the failure visible.
+Restart=no
+# The drill restores to a temporary directory and hash-verifies. PrivateTmp means that
+# directory is private to this unit, so a restored artifact never lands anywhere another
+# process on the machine can see it.
+PrivateTmp=true
+NoNewPrivileges=true
+# The restic passphrase is a 0600 file outside the repo with a paper escrow off-machine.
+# This unit deliberately does NOT name it: a unit file is world-readable by design, and
+# `--password-file` is supplied by the assistant's own config read, never by the unit.
+# Deferral: an artifact above `defer_above_mb` waits for AC/unmetered power, decided by
+# `assist backup` from `[backup]`, not by this unit.
+Environment=ELARIA_BACKUP_DRILL_KIND=monthly
+
+[Install]
+# Installed by the .timer, not directly. Present so an operator can drive the drill by
+# hand with `systemctl --user start assistant-backup-monthly.service`.
+WantedBy=default.target

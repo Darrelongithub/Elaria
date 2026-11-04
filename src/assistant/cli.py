@@ -1974,6 +1974,14 @@ def build_parser() -> argparse.ArgumentParser:
                                                           "default is a random cold one")
     backup_check.add_argument("--kind", choices=("monthly", "quarterly"),
                               default="monthly", help="drill cadence")
+    # Increment 8: record the outcome so "one live monthly drill passes" is auditable
+    # afterwards rather than remembered. Path-free by construction.
+    backup_check.add_argument("--record", action="store_true",
+                              help="append the outcome to the drill journal (0600, "
+                                   "outside the repo)")
+    backup_check.add_argument("--last", action="store_true",
+                              help="show the most recent recorded drill of this kind "
+                                   "and run nothing")
     # Increment 7: the trigger surface. `watch` observes the audio root and the journal
     # and reports whether a backup should wake. It NEVER performs a backup - that is
     # `run`'s job - and it never touches the daemon, per the trigger ruling.

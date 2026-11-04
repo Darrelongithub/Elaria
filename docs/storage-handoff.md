@@ -2100,3 +2100,84 @@ zero-migration-cost window is still open.**
 
 **NEXT:** increment 8 - monthly restore-drill scaffolding. Gate 1 unchanged: no live MEGA
 traffic, no merge.
+
+---
+
+## 2026-11-04 - Report 024: INCREMENT 8 LANDED (monthly restore-drill scaffolding) - WP7 build plan COMPLETE
+
+**Branch:** `arena/storage`. **Frozen branch (condition 3):** `origin
+arena/e7a1cca5-elaria = b181712563c1577f5faea4e59fe5f7e104a89ed1`, verified before and
+after. Untouched.
+
+**FIRING FOUR.** Fresh clone + forced checkout onto the frozen branch, refspec still
+restricted. Canonical checklist run as a checklist: frozen-hash verify before; explicit-URL
+fetch -> FETCH_HEAD = 8405ff7; integrity check over 31 files; local-only checkout; verify
+after. **All PASS, 0 mismatches - nothing uncommitted was lost, because report 023's work
+was already committed and pushed.** The report-023 lesson (preserve a flagged mismatch
+BEFORE the checkout) was built into the checklist as step 3.5 this time; it did not need to
+fire.
+
+**BOTH DESIGN-CHAT RULINGS RECORDED.** (1) Separation stands: no reuse of mainline's
+`PollingWatcher`. The two snapshots serve different masters - recursive walk, debounce and
+full paths for the voice-test pipeline; flat, name-keyed, path-free for a backup trigger,
+because a path must never approach its output. Sharing would couple two lanes' evolution
+through a mainline-owned file, making every tweak for one purpose a cross-lane review. My
+three boundary tests are the enforceable form. If mainline ever wants unification, that is
+their request with its own ruling. (2) `systemd/` is the right home: the directory names a
+content type, not a unit type, and Fedora/systemd convention co-locates a timer with the
+service it activates. All-existing-units-are-daemons is history's coincidence, not a rule.
+
+**INCREMENT 8 - THE MONTHLY RESTORE-DRILL SCAFFOLDING - LANDED.** This closes the
+8-increment build plan.
+
+`src/assistant/drill.py` (new, ~340 lines) + `tests/test_wp7_drill_scaffolding.py` (new, 30
+tests) + `systemd/assistant-backup-monthly.service` (new) + additive `--record`/`--last`
+flags on `assist backup check` (`cli.py` +9/-0, `backup_cli.py` +95/-0).
+
+**FOUR PIECES.** (1) `DrillJournal` - an append-only, fsync'd, 0600 drill log outside the
+repo, mirroring `StorageManifest.append()`'s one-write-then-fsync discipline. The WP7 gate
+says "one live monthly drill passes", and a pass nobody can look up afterwards is not
+evidence. (2) `read_data_subset()` - the quarterly cap as the SMALLER of the percentage and
+the byte ceiling. **A percentage alone is not a bound: 5% of a 40 GB repository is 2 GB,
+four times the ruled ceiling.** With the repo size known both bounds are computed and the
+smaller wins; without it the percentage is passed and the byte ceiling is recorded as
+unenforceable rather than silently ignored. (3) `ResticCheck` - the seam that builds and
+runs `restic check` through the `rclone:` backend, with an EXPLICIT `rclone.timeout` (MEGA
+repo-open routinely exceeds restic's 1m default, restic #3511/#3514) and a
+`--password-file` path that is passed and never read. (4) `run_drill()` - the orchestration.
+
+**A MISSING RESTIC IS A DECLARED SKIP, NOT A PASS AND NOT A FAILURE.** The restore and the
+hash-verify are what prove the owner can get their audio back; `restic check` additionally
+proves the repository is internally consistent. Reporting a drill that could only do the
+first half as a full pass would be the silent-pass failure increment 4 exists to prevent.
+
+**A FAILED DRILL IS RECORDED, NOT JUST A SUCCESSFUL ONE.** Every return path in `_check`
+now writes a record - restore failure, hash mismatch, no restorer, no manifest record,
+artifact not cold, and the "nothing cold to drill" correct no-op. A journal that only ever
+shows passes is not evidence. A torn trailing line is discarded, so a crash mid-write can
+never manufacture a drill that ran. An unwritable journal returns False rather than raising:
+a drill that cannot be recorded still HAPPENED, and the caller must be able to see that the
+record failed without the drill itself failing.
+
+**THE PRIVACY FENCE HOLDS ON THE RECORD ITSELF.** A drill record carries a kind, an outcome,
+a backend name, a method and an artifact LABEL (its extension), and never a name or a path.
+`backend` names WHICH backend confirmed, per increment 4's rule that every verification
+record must name the backend that produced it.
+
+**END-TO-END VERIFIED THROUGH THE REAL CLI** with a scripted restic and a fixture backend:
+monthly pass records `{'ok': True, 'backend': 'local-path-fixture', 'method':
+'restore+hash', 'detail': 'restore=ok; hash=ok'}`; a fake-hash fixture correctly FAILS and
+records the failure; `--last` reads it back path-blind. The quarterly path records under
+`kind='quarterly'`.
+
+**SUITE: 2142/6/0 -> 2172/6/0, ruff clean (+30).** D7 did not fire this run.
+
+**WP7 BUILD PLAN COMPLETE.** All eight increments landed: 1 manifest, 2 reconcile +
+crash points, 3 tiering + trim, 4 remote abstraction, 5 CLI + sensors, 6 ladder chain #5 +
+refusal audit, 7 trigger surface, 8 drill scaffolding.
+
+**NEXT GATE:** the WP7 gate itself. Its conditions are benchmark numbers ruled go (Sheet 1
+still owed), a resolved kept-wav going cold with manifest flip + grace-trash trim, crash
+tests green, owner re-listen via `assist backup fetch` inside the ruled latency budget, one
+live monthly drill passing, ladder chain #5 including the integrity rung all REACHED, and
+zero credentials in repo or chat. **Gate 1 unchanged: no live MEGA traffic, no merge.**

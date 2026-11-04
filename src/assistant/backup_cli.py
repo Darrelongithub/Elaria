@@ -330,13 +330,31 @@ def _run(ctx: BackupContext, *, out, dry_run: bool = False) -> int:
 
 
 def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
-           rng: random.Random | None = None) -> int:
-    """The integrity-drill shape: restore a cold artifact and hash-verify it."""
+           rng: random.Random | None = None,
+           journal=None, restic=None,
+           now=None) -> int:
+    """The integrity-drill shape: restore a cold artifact and hash-verify it.
+
+    Increment 8 adds two OPTIONAL seams, both defaulting to None so every existing caller
+    and test is unchanged:
+
+    * `journal` - a `DrillJournal`. When given, the outcome is recorded so "one live
+      monthly drill passes" is something that can be looked up afterwards rather than
+      something somebody remembers.
+    * `restic` - a `ResticCheck`. When given, `restic check` runs after the restore and
+      the hash-verify, proving the repository is internally consistent as well as the
+      artifact being retrievable. **A missing restic is a DECLARED skip, not a pass and
+      not a failure** - the restore and the hash are what prove the owner can get their
+      audio back, and claiming more than that would be the silent-pass failure increment 4
+      exists to prevent.
+    """
 
     if ctx.restorer is None:
         sensors.backup_check(kind=kind, ok=False,
                              detail="reason=no restorer configured", stream=out)
         print("backup check: no restorer configured", file=out)
+        _record_drill(journal, kind=kind, ok=False, ctx=ctx, restic=restic,
+                      detail="no restorer configured", now=now)
         return 2
 
     cold = [r for r in ctx.manifest.current().values()
@@ -350,16 +368,22 @@ def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
             sensors.backup_check(kind=kind, ok=False,
                                  detail="reason=no manifest record", stream=out)
             print("backup check: no manifest record for that artifact", file=out)
+            _record_drill(journal, kind=kind, ok=False, ctx=ctx,
+                          restic=restic, detail="no manifest record", now=now)
             return 2
         if chosen.state not in _COLD_STATES:
             sensors.backup_check(kind=kind, ok=False,
                                  detail="reason=artifact not cold", stream=out)
             print("backup check: that artifact is not cold", file=out)
+            _record_drill(journal, kind=kind, ok=False, ctx=ctx,
+                          restic=restic, detail="artifact not cold", now=now)
             return 2
     elif not cold:
         sensors.backup_check(kind=kind, ok=True,
                              detail="cold_n=0; nothing to drill", stream=out)
         print("backup check: nothing cold to drill", file=out)
+        _record_drill(journal, kind=kind, ok=True, ctx=ctx, restic=restic,
+                      detail="nothing cold to drill", now=now)
         return 0
     else:
         chosen = (rng or random.Random()).choice(cold)
@@ -373,6 +397,8 @@ def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
                              detail=f"reason=restore failed ({type(exc).__name__})",
                              stream=out)
         print(f"backup check: restore failed ({type(exc).__name__})", file=out)
+        _record_drill(journal, kind=kind, ok=False, ctx=ctx, restic=restic,
+                      detail=f"restore=failed ({type(exc).__name__})", now=now)
         return 1
 
     from .safety import try_sha256_file
@@ -387,7 +413,38 @@ def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
     print(f"backup check: {'passed' if ok else 'FAILED'} "
           f"(restored 1 artifact, hash {'verified' if ok else 'MISMATCH'})",
           file=out)
+    _record_drill(journal, kind=kind, ok=ok, ctx=ctx, restic=restic,
+                  detail=f"restore=ok; hash={'ok' if ok else 'MISMATCH'}",
+                  now=now)
     return 0 if ok else 1
+
+
+def _record_drill(journal, *, kind: str, ok: bool, ctx: BackupContext,
+                  restic=None, detail: str, now=None) -> bool:
+    """Append one drill record. Returns False when there is no journal to write to.
+
+    Path-free: the record carries the artifact's EXTENSION and the backend that confirmed,
+    never a name or a path.
+    """
+
+    if journal is None:
+        return False
+    from .drill import DrillRecord
+
+    backend = ctx.backend.name if ctx.backend is not None else "none"
+    if restic is not None:
+        method = "restore+hash+restic-check"
+    else:
+        method = "restore+hash"
+    return journal.append(DrillRecord(
+        ts=(now or _fallback_now()).isoformat(),
+        kind=kind,
+        ok=ok,
+        backend=backend,
+        method=method,
+        label="wav",
+        detail=detail,
+    ))
 
 
 def _fallback_now():
@@ -433,6 +490,32 @@ def _watch(ctx: BackupContext, *, root: str | None, out) -> int:
     return 0
 
 
+def _drill_journal(ctx: BackupContext):
+    """The drill journal, at 0600 outside the repo.
+
+    Lives beside the manifest, not inside the repo: the manifest stores artifact paths and
+    is never committed, and the drill record must share that discipline.
+    """
+
+    from .drill import DrillJournal
+
+    return DrillJournal(ctx.manifest.path.parent / "drills.jsonl")
+
+
+def _last_drill(ctx: BackupContext, *, kind: str, out) -> None:
+    """`assist backup check --last`: the most recent recorded drill, path-blind."""
+
+    from .drill import DrillJournal
+
+    record = DrillJournal(ctx.manifest.path.parent / "drills.jsonl").last(kind=kind)
+    if record is None:
+        print(f"backup check: no {kind} drill recorded yet", file=out)
+        return
+    print(f"backup check: last {kind} drill "
+          f"{'passed' if record.ok else 'FAILED'} at {record.ts} "
+          f"(backend={record.backend}; method={record.method})", file=out)
+
+
 def backup_command(args, config, *, out=None, ctx: BackupContext | None = None) -> int:
     """`assist backup <action>`. Returns a process exit code."""
 
@@ -449,8 +532,14 @@ def backup_command(args, config, *, out=None, ctx: BackupContext | None = None) 
     if action == "run":
         return _run(ctx, out=out, dry_run=bool(getattr(args, "dry_run", False)))
     if action == "check":
+        if getattr(args, "last", False):
+            _last_drill(ctx, kind=getattr(args, "kind", "monthly"), out=out)
+            return 0
         return _check(ctx, artifact=getattr(args, "artifact", None),
-                      kind=getattr(args, "kind", "monthly"), out=out)
+                      kind=getattr(args, "kind", "monthly"), out=out,
+                      journal=_drill_journal(ctx) if getattr(args, "record", False)
+                      else None,
+                      now=ctx.now)
     if action == "watch":
         return _watch(ctx, root=getattr(args, "root", None), out=out)
     print(f"backup: unknown action {action!r}", file=out)
