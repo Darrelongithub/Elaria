@@ -2,7 +2,14 @@
 //
 // DUMB RENDERER BY DESIGN (§1.1): all state decisions live in
 // assistant/overlay.py (tested headless). This file only binds:
-//   visible ← state.visible · label ← state.text · pulse ← state.pulsing
+//   visible ← state.visible · pulse ← state.pulsing · tone ← state.kind
+//
+// SIGNAL-ONLY SURFACE (notification privacy, owner order 2026-10-26):
+// the pill shows a dot and a pulse — NEVER text. No caption, no check-in
+// line, no error message, no topic or reason fragment. Content lives in
+// the console (owner-raised), the journal and the inbox only. The feed's
+// `text` field exists for those owner-raised consumers and is deliberately
+// not bound here.
 //
 // WAYLAND NON-NEGOTIABLES (§3.3):
 //   * layer-shell Overlay layer, passive — never exclusive, never modal
@@ -27,7 +34,6 @@ ShellRoot {
         // --- reactive state (bound from the JSON feed, see Process below) ---
         property bool stateVisible: false
         property string stateKind: "hidden"
-        property string stateText: ""
         property bool statePulsing: false
 
         // --- layer-shell: present but never in the way ---
@@ -43,7 +49,7 @@ ShellRoot {
 
         visible: stateVisible
         color: "transparent"
-        implicitWidth: Math.max(220, Math.min(720, label.implicitWidth + 56))
+        implicitWidth: 56
         implicitHeight: 44
 
         Rectangle {
@@ -58,13 +64,11 @@ ShellRoot {
                         : pill.stateKind === "error" ? "#ff79c6"
                         : "#3b4261"
 
-            // listening dot — pulses only while the mic is live
+            // the signal: one dot, pulsing only while the mic is live
             Rectangle {
                 id: dot
                 width: 10; height: 10; radius: 5
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.left: parent.left
-                anchors.leftMargin: 16
+                anchors.centerIn: parent
                 color: pill.stateKind === "listening" || pill.stateKind === "checkin"
                      ? "#ff5555" : "#50fa7b"
                 SequentialAnimation on opacity {
@@ -73,21 +77,6 @@ ShellRoot {
                     NumberAnimation { to: 0.25; duration: 550 }
                     NumberAnimation { to: 1.0; duration: 550 }
                 }
-            }
-
-            Text {
-                id: label
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.left: dot.right
-                anchors.leftMargin: 10
-                anchors.right: parent.right
-                anchors.rightMargin: 16
-                elide: Text.ElideRight
-                color: "#e6e9f5"
-                font.pixelSize: 14
-                text: pill.stateText.length > 0 ? pill.stateText
-                    : pill.stateKind === "listening" ? "Listening…"
-                    : pill.stateKind
             }
         }
 
@@ -102,8 +91,8 @@ ShellRoot {
                         const state = JSON.parse(line);
                         pill.stateVisible = state.visible === true;
                         pill.stateKind = state.kind || "hidden";
-                        pill.stateText = state.text || "";
                         pill.statePulsing = state.pulsing === true;
+                        // the feed's text field is read nowhere: signal-only surface.
                     } catch (e) {
                         // Malformed line: ignore. The feed is trusted-local,
                         // but a partial line must never crash the shell.

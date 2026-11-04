@@ -53,6 +53,20 @@ from assistant.transcribe import SessionResult
 REPO = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture(autouse=True)
+def _force_simulated_capture(monkeypatch):
+    """No bug6-class test may open the real mic (owner order 2026-10-26).
+
+    The bug6 suite failed on the laptop where the CLI-subprocess dictate
+    test opened the REAL microphone (~0 s of room audio → "no speech
+    captured" instead of the scripted mock transcript) while the headless
+    sandbox silently fell back to SimulatedCapture. Tests that
+    deliberately exercise capture-selection (target wiring) opt out with
+    monkeypatch.delenv("ASSIST_CAPTURE").
+    """
+    monkeypatch.setenv("ASSIST_CAPTURE", "simulated")
+
+
 def _result(session_id: str, raw_text: str) -> SessionResult:
     return SessionResult(
         session_id=session_id, raw_text=raw_text, cleaned_text=None,
@@ -71,7 +85,7 @@ class SlowDictation:
 
     async def dictate(self, source, *, mode="narration", sink=None,
                       stop_event=None, is_playback_active=None,
-                      session_id=None):
+                      session_id=None, on_final_text=None):
         await stop_event.wait()
         await asyncio.sleep(self.delay_s)
         return _result(session_id or "slow", self.text)
@@ -82,7 +96,7 @@ class SelfFinishingDictation:
 
     async def dictate(self, source, *, mode="narration", sink=None,
                       stop_event=None, is_playback_active=None,
-                      session_id=None):
+                      session_id=None, on_final_text=None):
         return _result(session_id or "done", "lost transcript")
 
 
@@ -185,10 +199,15 @@ def test_session_state_reset_answers_explicitly_and_promptly(
     # task/finisher/result for it are all gone — exactly the status snapshot
     # from the hardware box after Ctrl-C.
     daemon._ptt_session_id = "reset01"
+    daemon._ptt_last_session_id = "reset01"
     daemon._dictation_task = None
 
     status = call(config.socket_path, "status", timeout=5.0)
-    assert status["ptt_session_id"] == "reset01"
+    # W7a (2026-10-31): with no holder the live key is CLEAR — the old
+    # stale advertisement (closed session kept showing as ptt_session_id)
+    # is the defect the scene-7 evidence named. History is last_session_id.
+    assert status["ptt_session_id"] is None
+    assert status["last_session_id"] == "reset01"
     assert status["dictation_active"] is False
     assert status["dictation_processing"] is False
 

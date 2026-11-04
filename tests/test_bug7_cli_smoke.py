@@ -82,6 +82,7 @@ def _smoke_table(tmp_path: Path) -> list[list[str]]:
         ["queue", "add-external", "action", "description"],
         ["halt"],
         ["resume"],
+        ["ladder", "wake"],
         ["ptt", "stop"],
         ["transcribe", str(mic)],
         ["index"],

@@ -33,6 +33,8 @@ from .config import quota_rows
 from .config import voice_model as configured_voice_model
 from .cost import estimate_tokens, iso_now, shadow_cost_usd
 from .fixtures import FixtureStore, fixture_key
+from .journal_log import error_text, log_event
+from .model_registry import assert_model_permitted, verified_free_tier_rpm
 from .voice_catalogue import (
     live_catalogue,
     resolve_catalogue,
@@ -99,13 +101,19 @@ class Transport(Protocol):
         """
         ...
 
-    def generate_audio(self, model: str, text: str, voice_name: str) -> dict:
+    def generate_audio(self, model: str, text: str, voice_name: str, *,
+                       on_chunk=None) -> dict:
         """Optional: native-audio speech for `text`.
 
         Returns {"pcm": bytes (s16le mono), "sample_rate": int, "voice_name": str,
         "usage": {...}}. A transport that cannot produce audio omits this method;
         the caller then reports silence with the reason (amendment 2026-10-20: the
         dormant local voice is NOT a fallback), never a bare absence.
+
+        M-4 streaming: when `on_chunk` is given, every PCM chunk is handed
+        to it AS IT ARRIVES (the slice queue plays it while synthesis
+        continues); the full pcm is still assembled and returned. The sink
+        must not raise (the tts slice queue honors that).
         """
         raise NotImplementedError
 
@@ -259,7 +267,8 @@ class _SdkTransport:
             },
         }
 
-    def generate_audio(self, model: str, text: str, voice_name: str) -> dict:
+    def generate_audio(self, model: str, text: str, voice_name: str, *,
+                       on_chunk=None) -> dict:
         """Native audio from a LIVE model (Stage A fix).
 
         The previous implementation used `models.generate_content` with a
@@ -268,6 +277,10 @@ class _SdkTransport:
         the text is sent as one user turn, and the returned 24 kHz PCM parts are
         concatenated. The voice name is exactly the configured one — never a
         substitute.
+
+        M-4 streaming: `on_chunk` receives each PCM part as the session
+        emits it — the ear hears the first slice while the render continues
+        (the W6 whale was synthesized-but-unheard time).
         """
         from google.genai import types
 
@@ -316,6 +329,11 @@ class _SdkTransport:
                         data = getattr(inline, "data", None) if inline is not None else None
                         if data:
                             pcm.extend(data)
+                            if on_chunk is not None:
+                                try:
+                                    on_chunk(data)
+                                except Exception:  # noqa: S110 - the sink must not fail synthesis
+                                    pass
                             mime = str(getattr(inline, "mime_type", "") or "")
                             match = re.search(r"rate=(\d+)", mime)
                             if match:
@@ -368,6 +386,30 @@ def _is_retryable(exc: Exception) -> bool:
     return any(marker in text for marker in ("429", "rate", "quota", "resource_exhausted", "503"))
 
 
+# F2 (window findings order v1, 2026-11-02): the file leg paces itself
+# under the model's verified free-tier RPM (the registry is the knowledge
+# of record — gemini-3.5-transcribe = 3 RPM from the verbatim 429
+# quotaValue). A pacing wait beyond PACE_MAX_WAIT_S would eat the leg's
+# 8 s fallback window, so the leg refuses instead of waiting and the
+# chain falls through to local (F3b: empty = failure = next backend).
+PACE_MAX_WAIT_S = 2.0
+# A 429 without a parseable retry-after still holds one slot spacing
+# (60 s / 3 RPM = 20 s) before the next send.
+PACE_HOLD_DEFAULT_S = 20.0
+
+_RETRY_AFTER_RE = re.compile(
+    r"retry[_ -]?[Dd]elay[\"':=\s]+(\d+)|retry[_ -]?[Aa]fter[\"':=\s]+(\d+)",
+    re.IGNORECASE)
+
+
+def _retry_after_s(text: str) -> float | None:
+    """Seconds from a 429's retryDelay/retry-after, or None."""
+    match = _RETRY_AFTER_RE.search(text or "")
+    if match is None:
+        return None
+    return float(match.group(1) or match.group(2))
+
+
 def quota_family(model: str) -> str | None:
     """Map a model id to its [quota.models.*] row label (BH-K18).
 
@@ -393,7 +435,28 @@ class PerModelLimiter:
         self._rpm = rpm_by_model
         self._window = window_s
         self._stamps: dict[str, deque[float]] = {}
+        self._hold_until: dict[str, float] = {}
         self._lock = threading.Lock()
+
+    def hold(self, model: str, seconds: float, *,
+             now: Callable[[], float] = time.monotonic) -> None:
+        """F2 retry-after honoring: a server 429 holds every send to
+        `model` until its retryDelay expires (the stricter of overlapping
+        holds wins)."""
+        with self._lock:
+            until = float(now()) + max(0.0, float(seconds))
+            self._hold_until[model] = max(
+                self._hold_until.get(model, 0.0), until)
+
+    def _waits(self, model: str, limit: int, current: float,
+               stamps: deque) -> float:
+        """Seconds until this model may be sent: the server hold (429
+        retry-after) and the RPM window take the stricter wait. A window
+        with free slots never waits."""
+        hold_wait = self._hold_until.get(model, 0.0) - current
+        window_wait = (self._window - (current - stamps[0]) + 0.01
+                       if len(stamps) >= limit and stamps else 0.0)
+        return max(hold_wait, window_wait, 0.0)
 
     def acquire(self, model: str, *, sleep: Callable[[float], None] = time.sleep,
                 now: Callable[[], float] = time.monotonic, max_wait_s: float = 65.0) -> None:
@@ -407,10 +470,10 @@ class PerModelLimiter:
                 stamps = self._stamps.setdefault(model, deque())
                 while stamps and current - stamps[0] > self._window:
                     stamps.popleft()
-                if len(stamps) < limit:
+                wait = self._waits(model, limit, current, stamps)
+                if len(stamps) < limit and wait <= 0:
                     stamps.append(current)
                     return
-                wait = self._window - (current - stamps[0]) + 0.01
             if waited + wait > max_wait_s:
                 raise RateLimitError(f"local RPM limiter: {model} at {limit}/min — queued, not sent")
             sleep(wait)
@@ -429,10 +492,10 @@ class PerModelLimiter:
                 stamps = self._stamps.setdefault(model, deque())
                 while stamps and current - stamps[0] > self._window:
                     stamps.popleft()
-                if len(stamps) < limit:
+                wait = self._waits(model, limit, current, stamps)
+                if len(stamps) < limit and wait <= 0:
                     stamps.append(current)
                     return
-                wait = self._window - (current - stamps[0]) + 0.01
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -442,6 +505,108 @@ class PerModelLimiter:
                 raise RateLimitError(f"local RPM limiter: {model} at {limit}/min — queued, not sent")
             await asyncio.sleep(wait)
             waited += wait
+
+
+def extract_transcript(response) -> tuple[str, str | None, list[str]]:
+    """Read a generateContent response's transcript wherever it is.
+
+    2026-11-03 (owner hardware diagnostic, the fix's evidence): a
+    transcription model answers in `Part.audio_transcription` parts
+    (`types.py:2368`, "Output only. The transcription of the audio part")
+    while `GenerateContentResponse.text` concatenates TEXT parts only —
+    a perfect 44-character answer sat in the same response object that
+    reported 0 chars. Read BOTH, join in part order (single space
+    between pieces), and report the part types seen so "we did not read
+    it" is never recorded as "there was nothing" (F3c: unparsed vs
+    empty). Ruled semantics (design chat 2026-11-02/03):
+
+    - a part carrying both readable fields is read ONCE —
+      `audio_transcription.text` wins when it has content, and the
+      collision always rides `part_types_seen` as the token
+      'text+audio_transcription' (a recorded fact, never a silent
+      precedence rule);
+    - candidate[0] only, matching the SDK's `text` semantics;
+    - `finished` is NOT load-bearing (it returned None on a complete
+      44-char transcript) — no completeness gate exists here;
+    - the model's `language_code` is returned RAW: None means "the model
+      declared nothing" and callers must record it as an absence, never
+      as agreement with the configured set.
+
+    Never raises: a response shape this cannot read yields ("", None,
+    [its part tokens]) — the unparsed shape, not a lie of emptiness.
+    """
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        # No parts to walk: the response-level accessor is the only
+        # readable source (and is exactly what the SDK itself falls back
+        # to). Recorded as its own token so a mark never claims a part
+        # was read when none existed.
+        fallback = getattr(response, "text", None)
+        text = fallback.strip() if isinstance(fallback, str) else ""
+        return (text, None, ["response.text"] if text else [])
+    content = getattr(candidates[0], "content", None)
+    pieces: list[str] = []
+    seen: list[str] = []
+    declared: str | None = None
+    for part in getattr(content, "parts", None) or []:
+        text_part = getattr(part, "text", None)
+        is_thought = bool(getattr(part, "thought", False))
+        audio = getattr(part, "audio_transcription", None)
+        fields: list[str] = []
+        if isinstance(text_part, str):
+            fields.append("text")
+        dump = getattr(part, "model_dump", None)
+        if callable(dump):
+            try:
+                fields.extend(sorted(
+                    key for key, value in dump(
+                        exclude={"text", "thought", "thought_signature"}
+                    ).items() if value is not None))
+            except Exception:  # noqa: S110 - extraction must never raise
+                pass
+        elif audio is not None:
+            fields.append("audio_transcription")
+        if is_thought:
+            fields.append("thought")
+        deduped: list[str] = []
+        for field in fields:
+            if field not in deduped:
+                deduped.append(field)
+        seen.append("+".join(deduped) if deduped else "empty")
+        if is_thought:
+            continue
+        audio_text = (str(getattr(audio, "text", "") or "")
+                      if audio is not None else "")
+        if audio_text.strip():
+            pieces.append(audio_text.strip())
+            lang = getattr(audio, "language_code", None)
+            if declared is None and lang:
+                declared = str(lang)
+        elif isinstance(text_part, str) and text_part.strip():
+            pieces.append(text_part.strip())
+    return " ".join(pieces).strip(), declared, seen
+
+
+def batch_transcription_prompt(language: str,
+                               also_languages: list[str] | None = None,
+                               *, preserve_code_switching: bool = False) -> str:
+    """The exact transcription prompt the batch/file leg sends (§12.4/§12.5).
+
+    Module-level so the W1 file-leg probe (scripts/file_leg_probe.py) can
+    print what production sends without reimplementing the f-strings —
+    one construction, one truth (scene-7 work order, 2026-10-31).
+    """
+    others = [lang for lang in (also_languages or []) if lang != language]
+    if others and preserve_code_switching:
+        return (
+            f"Transcribe this audio verbatim. The speaker's primary language "
+            f"is {language} and they code-switch with {', '.join(others)}. "
+            "Transcribe EVERY passage in the language actually spoken in it. "
+            "Do NOT translate. Do NOT normalise mixed speech into one "
+            "language. Return only the transcript.")
+    return (f"Transcribe this audio verbatim. The language is {language}; "
+            "transcribe in that language exactly as spoken. Do NOT "
+            "translate. Return only the transcript.")
 
 
 class GeminiClient:
@@ -485,6 +650,14 @@ class GeminiClient:
             rpm = row.get("rpm")
             if isinstance(rpm, (int, float)) and rpm > 0:
                 return min(int(rpm), flat) if flat > 0 else int(rpm)
+            # F2: an rpm-less config row (the frozen transcribe-batch row
+            # carries rpm=None) resolves to the REGISTRY's verified figure
+            # — the 429 quotaValue is the knowledge of record — before the
+            # flash-derived alias default, which knows nothing about the
+            # transcribe model.
+            verified = verified_free_tier_rpm(model)
+            if verified is not None:
+                return min(verified, flat) if flat > 0 else verified
             return flat
 
         self._limiter = PerModelLimiter(rpm_for)
@@ -500,6 +673,8 @@ class GeminiClient:
                    correlation_id: str, attempt: int, audio_seconds: float = 0.0,
                    purpose: str | None = None, is_user_turn: bool | None = None,
                    on_first_token: Callable[[], None] | None = None) -> dict:
+        # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
+        assert_model_permitted(model)
         key = fixture_key(model, contents, gen_config)
         request = {"model": model, "contents": contents, "config": gen_config}
         started = time.monotonic()
@@ -564,6 +739,8 @@ class GeminiClient:
                                is_user_turn: bool | None = None,
                                on_first_token: Callable[[], None] | None = None,
                                deadline: float | None = None) -> dict:
+        # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
+        assert_model_permitted(model)
         key = fixture_key(model, contents, gen_config)
         request = {"model": model, "contents": contents, "config": gen_config}
         started = time.monotonic()
@@ -749,8 +926,12 @@ class GeminiClient:
         }, "voice": validation}
 
     def generate_voice(self, text: str, *, voice: str | None = None,
-                       correlation_id: str = "-") -> dict:
-        """One rate-limited, ledgered native-audio call. Interim online voice."""
+                       correlation_id: str = "-",
+                       on_chunk=None) -> dict:
+        """One rate-limited, ledgered native-audio call. Interim online voice.
+
+        M-4 streaming: `on_chunk` rides to the transport ONLY when given —
+        older transport fakes with strict signatures stay valid."""
         request = self.voice_request(text, voice=voice)
         if not request["voice_allowed"]:
             # The pin, enforced at the last moment: no transport will ever be told
@@ -767,6 +948,8 @@ class GeminiClient:
                 "spoken (the local voice is dormant by amendment 2026-10-20)"
             )
         model = request["model"]
+        # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
+        assert_model_permitted(model)
         # Validate before the transport sees a request. A wrong voice is a
         # refusal naming the allowed list, not a 400 halfway through a sentence.
         catalogue = self.voice_catalogue()
@@ -779,9 +962,11 @@ class GeminiClient:
             self._check_daily_cap(model)
             self._limiter.acquire(model, sleep=self._sleep)
             delay = 1.0
+            audio_kwargs = {"on_chunk": on_chunk} if on_chunk is not None else {}
             for try_no in range(4):
                 try:
-                    response = self._transport.generate_audio(model, text, request["voice_name"])
+                    response = self._transport.generate_audio(
+                        model, text, request["voice_name"], **audio_kwargs)
                     break
                 except Exception as exc:  # same backoff posture as text calls
                     if try_no == 3 or not _is_retryable(exc):
@@ -905,6 +1090,11 @@ class GeminiClient:
 
         used = self.store.calls_since(day_start_iso())
         if used >= self._daily_cap:
+            log_event("quota.counter", level="warn", verdict="rejected",
+                      detail=(f"model_version={model}; " if model else "")
+                             + (f"daily soft cap reached ({used}/{self._daily_cap} "
+                                "live calls) — refused locally, queued for the "
+                                "midnight Pacific reset"))
             raise QuotaExhausted(
                 f"daily soft cap reached ({used}/{self._daily_cap} live calls). "
                 "Queue and wait for the reset (midnight Pacific) — cascade "
@@ -919,13 +1109,28 @@ class GeminiClient:
             row = self._quota_by_family.get(family or "")
             if row and not row.get("unlimited_rpd"):
                 rpd = row.get("rpd")
-                if isinstance(rpd, (int, float)) and rpd > 0:
+                # §4.1 config cap (`rpd_cap`): deliberately below the free
+                # ceiling (chat/intent cap 400 under ~500 free). Enforcement
+                # takes the stricter of the measured RPD and the config cap;
+                # a cap still applies when the free row is unlimited.
+                cap = row.get("rpd_cap")
+                limits = [int(x) for x in (rpd, cap)
+                          if isinstance(x, (int, float)) and x > 0]
+                if limits:
+                    allowed = min(limits)
                     used_model = self.store.calls_since(day_start_iso(), model=model)
-                    if used_model >= int(rpd):
+                    if used_model >= allowed:
+                        source = ("[quota.models.{}.{}]".format(
+                            family, "rpd_cap" if allowed == cap and cap else "rpd"))
+                        log_event("quota.counter", level="warn", verdict="rejected",
+                                  detail=(f"model_version={model}; "
+                                          f"per-model daily quota reached for "
+                                          f"{model} ({used_model}/{allowed} today — "
+                                          f"{source}) — refused locally"))
                         raise QuotaExhausted(
                             f"per-model daily quota reached for {model} "
-                            f"({used_model}/{int(rpd)} today — "
-                            f"[quota.models.{family}] rpd). Resets midnight "
+                            f"({used_model}/{allowed} today — "
+                            f"{source}). Resets midnight "
                             "Pacific; use another model or wait (§12.8).")
 
     # -- the harness (§17): cheapest first, escalate on verified failure -------
@@ -1085,25 +1290,21 @@ class GeminiClient:
         # transcribe-live route AS a batch call (event_spike.py). Default
         # stays the dedicated batch STT model.
         model = model or self.config.model_for_role("transcribe_batch")
+        # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
+        assert_model_permitted(model)
         others = [lang for lang in (also_languages or []) if lang != language]
-        if others and preserve_code_switching:
-            prompt = (
-                f"Transcribe this audio verbatim. The speaker's primary language "
-                f"is {language} and they code-switch with {', '.join(others)}. "
-                "Transcribe EVERY passage in the language actually spoken in it. "
-                "Do NOT translate. Do NOT normalise mixed speech into one "
-                "language. Return only the transcript.")
-        else:
-            prompt = (f"Transcribe this audio verbatim. The language is {language}; "
-                      "transcribe in that language exactly as spoken. Do NOT "
-                      "translate. Return only the transcript.")
+        prompt = batch_transcription_prompt(
+            language, others, preserve_code_switching=preserve_code_switching)
         contents = {"audio_sha256": digest, "language": language,
                     "languages": [language, *others], "prompt": prompt}
         correlation_id = uuid.uuid4().hex[:12]
         if isinstance(self._transport, _SdkTransport) and self.mode != "mock":
-            text = self._sdk_transcribe(
+            text, language_code, part_types = self._sdk_transcribe(
                 path, model, prompt, correlation_id, duration, deadline=deadline)
-            return {"text": text, "model": model, "duration_s": duration, "backend": "gemini_batch"}
+            return {"text": text, "model": model, "duration_s": duration,
+                    "backend": "gemini_batch",
+                    "language_code": language_code,
+                    "part_types_seen": part_types}
         response = self._call_once(
             "transcribe_batch", model, contents, {},
             correlation_id=correlation_id, attempt=1, audio_seconds=duration,
@@ -1111,7 +1312,8 @@ class GeminiClient:
         )
         return {"text": response.get("text", ""), "model": model,
                 "duration_s": duration, "backend": "gemini_batch",
-                "fixture": response.get("fixture")}
+                "fixture": response.get("fixture"),
+                "language_code": None, "part_types_seen": []}
 
     async def transcribe_batch_async(self, audio_path, language: str = "en", *,
                                      also_languages: list[str] | None = None,
@@ -1137,19 +1339,16 @@ class GeminiClient:
         path = Path(audio_path)
         duration = wav_duration_s(path)
         model = model or self.config.model_for_role("transcribe_batch")
+        # §4.1: a forbidden model id never reaches the wire (Phase 0 pin fix).
+        assert_model_permitted(model)
         others = [lang for lang in (also_languages or []) if lang != language]
-        if others and preserve_code_switching:
-            prompt = (
-                f"Transcribe this audio verbatim. The speaker's primary language "
-                f"is {language} and they code-switch with {', '.join(others)}. "
-                "Transcribe EVERY passage in the language actually spoken in it. "
-                "Do NOT translate. Do NOT normalise mixed speech into one "
-                "language. Return only the transcript.")
-        else:
-            prompt = (f"Transcribe this audio verbatim. The language is {language}; "
-                      "transcribe in that language exactly as spoken. Do NOT "
-                      "translate. Return only the transcript.")
+        prompt = batch_transcription_prompt(
+            language, others, preserve_code_switching=preserve_code_switching)
         correlation_id = uuid.uuid4().hex[:12]
+        # F2: the meeting path shares the transcribe model's quota with the
+        # file leg — pace it too (cancellable by the meeting deadline).
+        await self._limiter.acquire_async(
+            model, deadline=deadline, max_wait_s=PACE_MAX_WAIT_S)
         started = time.monotonic()
 
         def request_config():
@@ -1178,14 +1377,16 @@ class GeminiClient:
                     response = await self._transport._client.aio.models.generate_content(
                         model=model, contents=[prompt, uploaded],
                         config=generation_config)
-            text = response.text or ""
+            text, language_code, part_types = extract_transcript(response)
             error = None
         except asyncio.CancelledError as exc:
             error_exc = cancelled_exc = exc
-            text, error = "", f"{type(exc).__name__}: {exc}"
+            text, language_code, part_types = "", None, []
+            error = error_text(exc)
         except Exception as exc:
             error_exc = exc
-            text, error = "", f"{type(exc).__name__}: {exc}"
+            text, language_code, part_types = "", None, []
+            error = error_text(exc)
         self.store.log_llm_call(
             ts=iso_now(), correlation_id=correlation_id, role="transcribe_batch",
             model=model, mode=self.mode, tokens_in=0, tokens_out=estimate_tokens(text),
@@ -1200,12 +1401,23 @@ class GeminiClient:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
                     "meeting transcription deadline expired") from error_exc
+            if _is_retryable(error_exc):
+                hold_s = _retry_after_s(error) or PACE_HOLD_DEFAULT_S
+                self._limiter.hold(model, hold_s)
+                raise RateLimitError(
+                    f"{error} (retry-after: held {hold_s:g}s)") from error_exc
             raise RuntimeError(error) from error_exc
         return {"text": text, "model": model, "duration_s": duration,
-                "backend": "gemini_batch"}
+                "backend": "gemini_batch",
+                "language_code": language_code,
+                "part_types_seen": part_types}
 
     def _sdk_transcribe(self, path, model, prompt, correlation_id, duration,
                         *, deadline: float | None = None):  # pragma: no cover
+        # F2: pace under the model's verified RPM BEFORE the wire call —
+        # this seam was the un-paced one (4 calls reached gemini-3.5-
+        # transcribe within 19 s on 2026-11-02 and drew the 429).
+        self._limiter.acquire(model, max_wait_s=PACE_MAX_WAIT_S)
         started = time.monotonic()
 
         def request_config():
@@ -1233,11 +1445,12 @@ class GeminiClient:
                 response = self._transport._client.models.generate_content(
                     model=model, contents=[prompt, uploaded],
                     config=generation_config)
-            text = response.text or ""
+            text, language_code, part_types = extract_transcript(response)
             error = None
         except Exception as exc:
             error_exc = exc
-            text, error = "", f"{type(exc).__name__}: {exc}"
+            text, language_code, part_types = "", None, []
+            error = error_text(exc)
         self.store.log_llm_call(
             ts=iso_now(), correlation_id=correlation_id, role="transcribe_batch",
             model=model, mode=self.mode, tokens_in=0, tokens_out=estimate_tokens(text),
@@ -1250,8 +1463,16 @@ class GeminiClient:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
                     "meeting transcription deadline expired") from error_exc
+            if _is_retryable(error_exc):
+                # F2 retry-after honoring: hold every later send past the
+                # 429's retryDelay (the verbatim 2026-11-02 one said 36s)
+                # and surface the rate error with its real text.
+                hold_s = _retry_after_s(error) or PACE_HOLD_DEFAULT_S
+                self._limiter.hold(model, hold_s)
+                raise RateLimitError(
+                    f"{error} (retry-after: held {hold_s:g}s)") from error_exc
             raise RuntimeError(error) from error_exc
-        return text
+        return text, language_code, part_types
 
     def list_models(self) -> dict:
         """For `assist voice models`/doctor: the real list, with voice routing.
@@ -1284,12 +1505,40 @@ class GeminiClient:
                 live = self._transport.list_models()
                 missing = [m for m in configured
                            if not any(m == name or m in name for name in live)]
-                return {**result, "verified": True, "models": live,
-                        "live_models": [m for m in live if "live" in m.lower()],
-                        "configured_missing": missing}
+                payload = {**result, "verified": True, "models": live,
+                           "live_models": [m for m in live if "live" in m.lower()],
+                           "configured_missing": missing}
+                self._record_model_verification(payload)
+                return payload
             except Exception as exc:
                 return {**result, "verified": False, "models": configured,
                         "error": f"{type(exc).__name__}: {exc}"}
         return {**result, "verified": False, "models": configured,
                 "error": ("mock/no-key — model IDs unverified until a live "
                           "models.list (see §11)")}
+
+    def _record_model_verification(self, payload: dict) -> None:
+        """Stamp the live models.list verification where doctor can consume it.
+
+        `assist voice models` IS the verification step (scene 2, 2026-10-26):
+        a successful live listing records configured_missing and the voice
+        catalogue facts, and `assist doctor` downgrades its "model ids
+        unverified" WARN against this stamp. Never raises.
+        """
+        import json
+
+        try:
+            stamp = {
+                "verified_at": iso_now(),
+                "configured_missing": payload.get("configured_missing") or [],
+                "models_count": len(payload.get("models") or []),
+                "voice_model": payload.get("voice_model"),
+                "catalogue_model": (payload.get("catalogue") or {}).get("model"),
+                "catalogue_count": (payload.get("catalogue") or {}).get("count"),
+            }
+            state = self.config.state_dir
+            state.mkdir(parents=True, exist_ok=True)
+            (state / "voice-models-verified.json").write_text(
+                json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
+        except Exception:  # noqa: S110 - a stamp write must never break the listing
+            pass

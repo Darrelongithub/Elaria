@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .fixtures import FixtureStore
+from .journal_log import error_text, log_backend_mark
 from .live_client import (
     FixtureLiveTransport,
     GenaiLiveTransport,
@@ -36,6 +37,7 @@ from .live_client import (
     RecordingTransport,
     ScriptedLiveTransport,
 )
+from .model_registry import assert_model_permitted
 
 
 @dataclass
@@ -49,6 +51,13 @@ class Transcript:
     # marked, so the caller can surface it instead of silently
     # trusting possibly-translated output (§12.4).
     language_ok: bool = True
+    # Ruling (b), 2026-11-03: the model's declared language_code, raw.
+    # None means "the model declared nothing" — an ABSENCE that must
+    # stay visible, never silent agreement with the configured set
+    # (hardware showed language_code=None on a complete transcript).
+    # A populated value that differs from the configured set is the
+    # divergence that announces a translation.
+    model_language: str | None = None
 
 
 class BatchBackend(Protocol):
@@ -87,11 +96,15 @@ class GeminiBatchBackend:
                 Path(audio_path), languages[0], also_languages=languages[1:],
                 preserve_code_switching=code_switching_enabled(self._config),
                 **deadline_option)
+            declared = result.get("language_code") or None
             return Transcript(text=result["text"],
-                              language=",".join(languages), backend=self.name)
+                              language=(declared or ",".join(languages)),
+                              backend=self.name, model_language=declared)
         result = self._client.transcribe_batch(
             Path(audio_path), language, **deadline_option)
-        return Transcript(text=result["text"], language=language, backend=self.name)
+        declared = result.get("language_code") or None
+        return Transcript(text=result["text"], language=(declared or language),
+                          backend=self.name, model_language=declared)
 
     async def transcribe_async(self, audio_path: str, language: str, *,
                                deadline: float | None = None) -> Transcript:
@@ -105,10 +118,14 @@ class GeminiBatchBackend:
                 Path(audio_path), languages[0], also_languages=languages[1:],
                 preserve_code_switching=code_switching_enabled(self._config),
                 **deadline_option)
+            declared = result.get("language_code") or None
             return Transcript(text=result["text"],
-                              language=",".join(languages), backend=self.name)
+                              language=(declared or ",".join(languages)),
+                              backend=self.name, model_language=declared)
         result = await transcribe(Path(audio_path), language, **deadline_option)
-        return Transcript(text=result["text"], language=language, backend=self.name)
+        declared = result.get("language_code") or None
+        return Transcript(text=result["text"], language=(declared or language),
+                          backend=self.name, model_language=declared)
 
 
 def _segment_confidence(segments: list) -> float | None:
@@ -129,6 +146,63 @@ def _segment_confidence(segments: list) -> float | None:
         weighted += math.exp(max(-20.0, min(0.0, float(logprob)))) * weight
         weights += weight
     return round(weighted / weights, 4) if weights else None
+
+
+class LocalAsrDegraded(RuntimeError):
+    """Named, logged, non-traceback degradation for the local ASR leg.
+
+    Scene-7 work order W3 (2026-10-31): on the owner's Fedora 44 /
+    Python 3.14.8 every local attempt died with a raw
+    `open() got an unexpected keyword argument 'metadata_errors'`.
+    faster-whisper 1.2.1's decode_audio calls
+    `av.open(file, metadata_errors=...)`; PyAV v11–v14 all accept that
+    kwarg, so a resolved `av` that rejects it is not conforming PyAV.
+    The leg must degrade BY NAME — and the diagnostic names the exact
+    `av` on the failing runtime so one run pins the dependency issue.
+    """
+
+
+def _faster_whisper_compat() -> tuple[bool, str, str]:
+    """(ok, reason, diagnostic) for the faster-whisper engine's `av` seam.
+
+    Pure introspection — no model load, no network. The diagnostic
+    carries `av.__file__`/version/open-params so a broken resolution is
+    named rather than guessed.
+    """
+    try:
+        import av
+    except Exception as exc:
+        return False, f"PyAV unavailable: {type(exc).__name__}: {exc}", ""
+    diag = (f"av_file={getattr(av, '__file__', '?')} "
+            f"av_version={getattr(av, '__version__', '?')}")
+    open_fn = getattr(av, "open", None)
+    if open_fn is None:
+        return False, "this 'av' module has no open() — not PyAV", diag
+    try:
+        import inspect
+        params = sorted(inspect.signature(open_fn).parameters)
+    except (TypeError, ValueError):
+        params = []
+    if params and "metadata_errors" not in params:
+        return (False,
+                ("av.open lacks metadata_errors — faster-whisper 1.2.1 calls "
+                 "it in audio.decode_audio and raises TypeError"),
+                f"{diag} open_params={params}")
+    return True, "", diag
+
+
+def _raise_local_degraded(reason: str, diag: str) -> None:
+    """Schema-log the degradation, then raise the named error."""
+    try:
+        from .journal_log import log_event
+        log_event("local_asr.degraded", level="warn", session_id="",
+                  verdict="degraded",
+                  detail=f"engine=faster-whisper; reason={reason}; {diag}")
+    except Exception:  # noqa: S110 - a log failure must not mask the name
+        pass
+    raise LocalAsrDegraded(
+        f"local ASR degraded: {reason} — remote fallback continues"
+        + (f"; {diag}" if diag else ""))
 
 
 class LocalWhisperBackend:
@@ -181,10 +255,26 @@ class LocalWhisperBackend:
                 confidence=float(self._settings.get("offline_mock_confidence", 0.5)))
         if self.engine in ("whisper.cpp", "whisper-cpp", "whisper_cpp"):
             return self._transcribe_whisper_cpp(audio_path, pinned)
-        model = self._load_model()
-        segments_iter, _info = model.transcribe(
-            audio_path, language=pinned, task="transcribe", vad_filter=True)
-        segments = list(segments_iter)
+        # W3 (2026-10-31): pre-check the real faster-whisper/av seam — a
+        # non-conforming `av` degrades BY NAME before any model load. An
+        # injected model_loader is a test seam (no faster-whisper decode),
+        # so the pre-check is for the real resolution only; the TypeError
+        # belt below covers every path.
+        if self._model_loader is None:
+            ok, reason, diag = _faster_whisper_compat()
+            if not ok:
+                _raise_local_degraded(reason, diag)
+        try:
+            model = self._load_model()
+            segments_iter, _info = model.transcribe(
+                audio_path, language=pinned, task="transcribe", vad_filter=True)
+            segments = list(segments_iter)
+        except TypeError as exc:
+            if "metadata_errors" in str(exc) or "unexpected keyword" in str(exc):
+                _raise_local_degraded(
+                    f"faster-whisper decode raised: {exc}",
+                    _faster_whisper_compat()[2])
+            raise
         text = " ".join(
             str(getattr(s, "text", "") if not isinstance(s, dict) else s.get("text", "")).strip()
             for s in segments).strip()
@@ -256,9 +346,22 @@ def batch_chain(config, client, *, offline: bool = False,
 
 
 def transcribe_file(config, client, audio_path: str, *, offline: bool = False,
-                    local_backend: BatchBackend | None = None) -> Transcript:
-    """Walk the fallback chain until one backend produces text (§12.7:
-    quota exhaustion degrades instead of failing)."""
+                    local_backend: BatchBackend | None = None,
+                    session_id: str | None = None) -> Transcript:
+    """Walk the fallback chain until one backend produces text.
+
+    F3 (window findings order v1, 2026-11-02): a 200-with-empty-text
+    result counts as that backend FAILING and the walk falls through to
+    the next backend (the chain default is ['gemini_batch', 'local'] —
+    with the local leg alive, an empty Gemini answer becomes a whisper
+    transcript instead of silence). Every backend outcome is class-marked
+    (`transcription.backend`, chars + sha16 where text exists, never the
+    text) as the walk happens, so a leg abandoned at its budget still
+    leaves the per-backend picture behind. When NOTHING lands, the
+    chain's real failure text rises (`all ASR backends failed — <per-
+    backend reasons>`) — never a silent empty (§12.7 still degrades the
+    TURN: the gate keeps the wav and marks it deferred).
+    """
     language = primary_language(config)
     # BH-K19: [asr] assert_output_language promised this check since the
     # blueprint (§12.4) but nothing called it. Enforced here, at the one
@@ -269,7 +372,6 @@ def transcribe_file(config, client, audio_path: str, *, offline: bool = False,
         "assert_output_language", True))
     expected = configured_languages(config)
     errors: list[str] = []
-    last_empty: Transcript | None = None
     last_flagged: Transcript | None = None
     for backend in batch_chain(config, client, offline=offline,
                                local_backend=local_backend):
@@ -284,14 +386,15 @@ def transcribe_file(config, client, audio_path: str, *, offline: bool = False,
                     last_flagged = result
                     continue
                 return result
-            last_empty = result
             errors.append(f"{backend.name}: empty transcript")
+            log_backend_mark(session_id, backend.name, "empty",
+                             text=result.text or "")
         except Exception as exc:
-            errors.append(f"{backend.name}: {exc}")
+            reason = error_text(exc)
+            errors.append(f"{backend.name}: {reason}")
+            log_backend_mark(session_id, backend.name, "failed", error=reason)
     if last_flagged is not None:
         return last_flagged
-    if last_empty is not None:
-        return last_empty
     raise RuntimeError("all ASR backends failed — " + " | ".join(errors))
 
 
@@ -311,6 +414,11 @@ def local_asr_status(config) -> dict:
         available = importlib.util.find_spec("faster_whisper") is not None
         reason = ("faster-whisper installed; model loads locally on first use"
                   if available else "install with `uv sync --extra offline`")
+        if available:
+            ok, compat_reason, diag = _faster_whisper_compat()
+            if not ok:
+                available = False
+                reason = f"installed but degraded: {compat_reason} ({diag})"
     return {
         "backend": "local",
         "engine": engine,
@@ -326,9 +434,12 @@ def make_live_transport(config, *, fixture_name: str | None = None) -> LiveTrans
     """Factory for the streaming path, by effective GEMINI_MODE."""
     if fixture_name:
         return FixtureLiveTransport(FixtureStore(config.fixtures_dir), fixture_name)
+    model = config.model_for_role("transcribe_live")
+    # §4.1: a forbidden model id never reaches the wire — and a forbidden
+    # config refuses the factory itself, even in mock (configured OR invoked).
+    assert_model_permitted(model)
     if config.gemini_mode == "mock":
         return ScriptedLiveTransport()
-    model = config.model_for_role("transcribe_live")
     transport = GenaiLiveTransport(config.api_key, model, primary_language(config))
     if config.gemini_mode == "record":
         # §12.9: record = real API + fixtures saved, streaming included.

@@ -201,8 +201,15 @@ def test_qml_cannot_steal_keyboard_focus():
 
 def test_qml_binds_exactly_the_reducer_contract():
     qml = (REPO / "ui/quickshell/shell.qml").read_text()
-    for key in ("state.visible", "state.kind", "state.text", "state.pulsing"):
+    # Signal-only surface (notification privacy, owner order 2026-10-26):
+    # the pill binds the state machine's flags but NEVER the text — no
+    # caption, check-in line or error string is rendered on the overlay.
+    for key in ("state.visible", "state.kind", "state.pulsing"):
         assert key in qml
+    assert "state.text" not in qml
+    assert "stateText" not in qml
+    assert not re.search(r"\bText\s*\{", qml), (
+        "the overlay pill must be a dot/pulse signal, never text")
 
 
 def test_waybar_module_is_valid_json_and_uses_follow():
