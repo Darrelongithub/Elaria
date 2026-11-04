@@ -2775,6 +2775,14 @@ class Daemon:
     async def _undo(self, params: dict) -> dict:
         from .executor import parse_since
 
+        # Owner ruling 2026-11-04 ("make her hands work"): scoped undo fails
+        # closed until the single-op review pilot exists. Canonical entry — the
+        # typed intent and the undo RPC both land here (intents.py aliases
+        # included); the scopeless path keeps the executor's own refusal.
+        if (params.get("since") or params.get("op_id") is not None
+                or params.get("plan_id") is not None):
+            raise ValueError("scoped undo is refused until the review pilot "
+                             "exists — nothing undone, no file moved")
         since = parse_since(str(params["since"])) if params.get("since") else None
         return await asyncio.to_thread(
             self.executor.undo, op_id=params.get("op_id"),
