@@ -186,6 +186,73 @@ def observed_intent(text):
     return next((kind for kind, pattern in OBSERVED_PATTERNS if pattern.match(text)), None)
 
 
+
+# Consumer registry, not an execution dispatcher. Source/limits in the Task B report.
+# A route existing is NOT readiness, approval, completion, or a fresh-file capability.
+CAPABILITIES = {
+    'status': 'Daemon status snapshot; not proof that other operations work now.',
+    'cost': 'Recorded usage/quota snapshot; not a live billing guarantee.',
+    'where': 'Indexed references, with possible model fallback; no fresh-file read.',
+    'search': 'Indexed matches, with possible model fallback; no fresh-file analysis.',
+    'remember': 'Existing typed fact storage; fact ID/kind receipt is missing on this wire.',
+    'forget': 'Existing typed matching-fact deactivation, not erasure; affected IDs missing.',
+    'halt': 'Existing daemon halt route; acknowledgement is not proof of every effect stopping.',
+    'undo': 'Existing daemon undo route; mainline owns its consent gate. Not a bridge approval.',
+    'organise': 'Existing configured-root index/plan building; metadata writes, no apply here.',
+}
+BRIDGE_FACTS = (
+    'Bridge facts: text-only; no speech, file reader, calendar or messaging-send adapter. '
+    'Status and console.say are the only daemon RPCs used. '
+    'Registry entries describe routes, not current readiness or permission. '
+    'No prior model claim is confirmed. This answer does not probe or execute the daemon.'
+)
+CAPABILITY_QUERY = re.compile(
+    r"^(?:(?:what|which)\s+(?:can|could|do|will)\s+you\b|"
+    r"what\s+are\s+your\s+(?:capabilities|abilities|functions)\b|"
+    r"(?:can|could|would|will)\s+you\b|are\s+you\s+able\b|"
+    r"do\s+you\s+(?:support|have\s+access|know\s+how)\b)"
+)
+# Explicit finite request frames, NOT a semantic classifier or all-paraphrase guarantee.
+UNREGISTERED_REQUEST = re.compile(
+    r"^(?:please\s+)?(?:open|read|analyse|analyze|summarise|summarize|inspect|review|load|scan|"
+    r"schedule|reschedule|book|send|text|email|message|whatsapp|dm|notify|reply|"
+    r"create|delete|move|rename|copy|execute|run|install|launch|browse|download|upload|call)\b|"
+    r"^(?:please\s+)?(?:check|show|manage|update|access|what(?:'s| is))\b.*\bcalendar\b"
+)
+
+
+def capability_boundary(text):
+    """Return only static registry/bridge facts, or None for the existing conversational path.
+
+    Existing typed intent shapes win BEFORE inspection, so unsupported-action words in
+    remember/search/etc payloads cannot become a refusal or a different operation.
+    """
+    if observed_intent(text):
+        return None
+    normalized = re.sub(r"^(?:(?:hey|hi|hello)\s+)?elaria\b[\s,!:.-]*", '', text.strip(),
+                        flags=re.IGNORECASE)
+    normalized = ' '.join(normalized.casefold().split()).rstrip('?.!')
+    namespace = re.match(r'^(capability|capabilities|help)(?:\s+(.*))?$', normalized)
+    question = CAPABILITY_QUERY.match(normalized)
+    unsupported = UNREGISTERED_REQUEST.search(normalized)
+    if not (namespace or question or unsupported):
+        return None
+    name = namespace[2] if namespace else None
+    if not name and question:
+        simple = re.fullmatch(r'(?:can|could|would|will) you (\w+)', normalized)
+        name = simple[1] if simple else None
+    if name in CAPABILITIES:
+        heading = 'Registered route (not execution or readiness):'
+        entries = [name]
+    else:
+        heading = ('Capability boundary: unregistered requests are refused; no prior prose claim is confirmed. '
+                   'Fresh-file analysis, calendar and messaging-send requests are refused here. '
+                   'Registered routes only:')
+        entries = list(CAPABILITIES)
+    return ('[BRIDGE REGISTRY — deterministic, no model call]\n' + heading + '\n' +
+            '\n'.join(f'- {name}: {CAPABILITIES[name]}' for name in entries) + '\n' + BRIDGE_FACTS)
+
+
 def positive_id(value):
     return type(value) is int and 0 < value <= 2**53 - 1
 
@@ -402,6 +469,17 @@ background:#110d1c;color:#e3bd80;z-index:1}
         observation = f'{self.observation_prefix}:{self.observation_n}'
         notes = attribution({}, {}, message['text'], observation)
         try:
+            registry_reply = capability_boundary(message['text'])
+            if registry_reply is not None:
+                await self.emit(ws, t='reply', id=request_id, text=registry_reply,
+                                provenance='bridge-registry', via='bridge-registry', audio=None,
+                                attribution=[
+                                    f'Bridge observation: {observation} (not a durable journal receipt).',
+                                    'Source: fixed bridge capability registry; no model generation.',
+                                    'Operation/message journal: not applicable; no console.say sent.',
+                                    'No daemon execution, runtime-readiness check or approval occurred.',
+                                ])
+                return
             problem = await self.probe()
             if problem:
                 await self.emit(ws, t='reply', id=request_id, error=problem, attribution=notes)

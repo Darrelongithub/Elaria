@@ -781,3 +781,81 @@ def test_attribution_dom_safety_and_persistence():
     run = subprocess.run(['node', str(ASSETS / 'attribution-test.js')], capture_output=True,
                          text=True, timeout=20, check=False)
     assert run.returncode == 0, run.stdout + run.stderr
+
+
+@pytest.mark.parametrize('text', [
+    'what can you do?', 'can you confirm you can do those rn?',
+    'analyse this fresh file /synthetic/report.pdf',
+    'capability teleport', 'capability calendar', 'capability send',
+    'can you read /synthetic/report.txt?', 'could you send a message?',
+    'please check my calendar', "what's on my calendar?", 'send this message to someone',
+    'create a fresh file', 'capability status and send messages',
+    'Elaria, what can you do?', 'capabilities',
+])
+def test_capability_refusals_and_catalogue_are_static_registry_only(text):
+    reply = bridge_module.capability_boundary(text)
+    assert reply and 'deterministic, no model call' in reply
+    assert 'unregistered requests are refused' in reply
+    assert 'no prior prose claim is confirmed' in reply
+    assert list(bridge_module.CAPABILITIES) == [
+        'status', 'cost', 'where', 'search', 'remember', 'forget', 'halt', 'undo', 'organise']
+    for name, description in bridge_module.CAPABILITIES.items():
+        assert f'- {name}: {description}' in reply
+    assert '/synthetic' not in reply
+
+
+@pytest.mark.parametrize('name', list(bridge_module.CAPABILITIES))
+def test_exact_registry_entry_answers_do_not_certify_readiness(name):
+    for query in [f'capability {name}', f'can you {name}?']:
+        reply = bridge_module.capability_boundary(query)
+        assert bridge_module.CAPABILITIES[name] in reply
+        assert 'not current readiness or permission' in reply
+        assert 'does not probe or execute the daemon' in reply
+
+
+@pytest.mark.parametrize('text', [
+    'status', 'cost', 'where is my calendar', 'find me send message',
+    'search for analyse files', 'remember that send a message is not approval',
+    'forget about calendar', 'halt', 'undo since synthetic', 'organise calendar',
+    'Elaria, remember can you teleport?', 'tafuta calendar', 'kumbuka send message',
+    'go offline', 'queue status', 'hello there', 'I enjoyed a book',
+])
+def test_boundary_preserves_existing_typed_routes_and_ordinary_conversation(text):
+    assert bridge_module.capability_boundary(text) is None
+
+
+@pytest.mark.parametrize('text', [
+    'what can you do?', 'can you confirm you can do those rn?',
+    'analyse this file /synthetic/test.txt', 'capability teleport',
+])
+@pytest.mark.parametrize('status', [LIVE, OFFLINE])
+async def test_registry_answers_never_submit_daemon_turn_after_accepted_handshake(text, status):
+    rpc = FakeRPC(result=dict(ANSWER, reply='unsupported capability promise'))
+    async with running(rpc) as bridge, wire(bridge) as ws:
+        await hello(ws)
+        await read_until(ws, 'hello-ok')
+        # Keep the existing live-ready hello gate; only the subsequent status changes.
+        rpc.status = copy.deepcopy(status)
+        await send(ws, request_id=23, text=text)
+        reply, _ = await read_until(ws, 'reply')
+        assert reply['id'] == 23 and reply['provenance'] == 'bridge-registry'
+        assert reply['text'] == bridge_module.capability_boundary(text)
+        assert 'no console.say sent' in ' '.join(reply['attribution'])
+        assert 'unsupported capability promise' not in reply['text']
+        assert not rpc.says
+
+
+@pytest.mark.parametrize('text', [
+    'remember send a message', 'forget calendar', 'search for analyse this file',
+    'where is calendar', 'organise files', 'undo since synthetic',
+])
+async def test_registry_does_not_rewrite_or_suppress_typed_execution(text):
+    rpc = FakeRPC()
+    async with running(rpc) as bridge, wire(bridge) as ws:
+        await hello(ws)
+        await read_until(ws, 'hello-ok')
+        await send(ws, text=text)
+        reply, _ = await read_until(ws, 'reply')
+        assert reply['provenance'] == 'live-model'  # synthetic stub; not capability proof
+        assert len(rpc.says) == 1
+        assert rpc.says[0][1] == {'text': text, 'speak': False, 'history_limit': 1}

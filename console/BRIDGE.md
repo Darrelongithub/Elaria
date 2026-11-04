@@ -2,7 +2,7 @@
 
 **Owner accepted the prior live demo (eight replies and orb) by relay. New sizing/labels
 and detached launcher are TESTED-ONLY pending owner visual/app-window review. No speech/audio
-proof is claimed. WS2 capability honesty and WS5 new hands remain held, not solved.**
+proof is claimed. WS2 has a bounded registry/refusal surface; unrestricted prose is not guaranteed honest. WS5 new hands remain held.**
 The standalone v6.15 shell remains the honest fallback if owner verification fails.
 
 ## What runs
@@ -27,13 +27,13 @@ hard stop, not permission to fetch, install or reconstruct something from chat.
 
 Committed executable: **`console/run_bridge.py`**.
 
-SHA256: **`30adee34237ccfffc99f1926c68927c9400ebf9517366de786ccc2277b7acc8a`**.
+SHA256: **`fde8c4160874dc14be07a8c56a79ee2c581ef07bf79b2144b1baf0e0d13904eb`**.
 
 From a copy containing this release's `console/` payload and the existing `.venv` interpreter,
 this is one physical command line. It checks the launcher before Python runs; the launcher
 then checks all five payload hashes before importing the bridge. A mismatch stops.
 
-`test "$(sha256sum console/run_bridge.py)" = '30adee34237ccfffc99f1926c68927c9400ebf9517366de786ccc2277b7acc8a  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --open`
+`test "$(sha256sum console/run_bridge.py)" = 'fde8c4160874dc14be07a8c56a79ee2c581ef07bf79b2144b1baf0e0d13904eb  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --open`
 
 `-I` isolates Python import paths; `-B` avoids bytecode writes. No standalone install, branch
 switch or mainline deployment is performed by this command. If using an extracted bundle
@@ -46,13 +46,13 @@ existing interpreter is `/home/darrel/Elaria/.venv/bin/python`, this alternative
 uses it without copying files into or switching that checkout. A missing interpreter or
 checksum mismatch stops; there is no install/repair fallback.
 
-`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = '30adee34237ccfffc99f1926c68927c9400ebf9517366de786ccc2277b7acc8a  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py --open`
+`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = 'fde8c4160874dc14be07a8c56a79ee2c581ef07bf79b2144b1baf0e0d13904eb  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py --open`
 
 Optional **`--check`** performs artifact/dependency checks and one existing-daemon `status`
 RPC, then exits; it creates no launch file/profile, opens no browser/server, and sends no
 chat/model/voice turn. It is mutually exclusive with `--open`. Exact checkout preflight:
 
-`test "$(sha256sum console/run_bridge.py)" = '30adee34237ccfffc99f1926c68927c9400ebf9517366de786ccc2277b7acc8a  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --check`
+`test "$(sha256sum console/run_bridge.py)" = 'fde8c4160874dc14be07a8c56a79ee2c581ef07bf79b2144b1baf0e0d13904eb  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --check`
 
 `--socket` accepts an explicit absolute existing socket path when XDG_RUNTIME_DIR is
 unavailable. There is no guessed socket, alternate host, auto-start, paid/model fallback or
@@ -77,7 +77,7 @@ A 0700 `elaria-console-<random>` directory is created beside the daemon socket, 
 For manual mode, use the following verified invocation and open that local file on the same
 machine as the daemon. Do not share/read its contents into logs; it contains the live token.
 
-`test "$(sha256sum console/run_bridge.py)" = '30adee34237ccfffc99f1926c68927c9400ebf9517366de786ccc2277b7acc8a  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
+`test "$(sha256sum console/run_bridge.py)" = 'fde8c4160874dc14be07a8c56a79ee2c581ef07bf79b2144b1baf0e0d13904eb  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
 
 The browser is detached with a new POSIX session, closed inherited FDs and null standard
 streams. Only desktop/session/locale environment is passed; model keys, SSH agents and shell
@@ -192,13 +192,13 @@ and one pane cannot promote another. The shared-conversation fact is documented 
 not repeated in the visible shell. Explicit samples are still labelled samples.
 
 `history_limit=1` is unchanged: it trims console.say's returned conversation envelope, which
-this bridge does not render. It does not control _ask's separate eight-message retrieval /
+is not rendered as history (Task A only labels a matching ID noncausal). It does not control _ask's separate eight-message retrieval /
 six-message prompt window. Increasing it alone would not cure unsupported capability claims.
 
-**WS2 is not closed:** live provenance cannot certify a claim's truth. Unrestricted model
-chat can still claim unsupported abilities. A hard guarantee requires an owner-selected
-constrained capability surface/output boundary, not just a new prompt or keyword filter.
-No new capability route is implemented pending that decision and the separate WS5 ruling.
+**WS2 boundary adopted and implemented:** the fixed registry below supplies capability
+answers, with deterministic refusals on its defined input surface. Unrestricted conversational
+prose remains untrusted for capabilities/effects; this is not a universal semantic filter.
+No new execution adapter or WS5 hands route is implemented.
 
 Drafts first remains binding for any future messaging: compose → owner review/approval →
 only then send; no send adapter or autonomy tier first. Draft review itself is not yet built.
@@ -226,3 +226,27 @@ Withheld/fixture/invalid replies expose no hidden history or effect details. See
 The owner has assigned scoped-undo fail-closed enforcement to mainline; this bridge neither
 implements that gate nor certifies that a given daemon has deployed it. Reads, remember,
 forget and organise remain on the existing typed route until their pilots are ruled/built.
+
+## Task B — registry/refusal boundary (2026-11-04)
+
+On an already accepted wire connection, `capabilities` / `capability NAME` / `help`, recognized
+capability inquiries (including “what can you do?” and “can you confirm you can do those rn?”),
+and the finite unsupported-request frames return **BRIDGE REGISTRY**, not model prose.
+Only `status, cost, where, search, remember, forget, halt, undo, organise` and static bridge
+facts supply these answers. Unknown names are refused, never generated into new capabilities.
+No console.say is sent for those answers; no live-readiness or approval claim is made.
+The existing live-ready hello gate, credentials, origin checks and uncertainty hold remain.
+
+The finite request frames refuse fresh-file analysis/open/read, calendar scheduling and
+messaging send, among other absent actions. They are **not** an all-language action detector:
+unrecognized conversation still reaches the existing daemon and may contain false claims.
+Type `capability NAME` for the explicit, closed catalogue boundary. A model “yes”, even one
+following a refused/registry turn, is not authority. Registry turns are browser display records,
+not daemon conversation entries. There is no global daemon/executor guard here.
+
+Existing typed intent shapes take precedence, so `search for analyse this file` stays search
+and `remember send a message` stays remember; neither becomes an analysis/send request.
+Their current mutations/fallback behavior is not disabled or silently rewritten. Existing
+aliases/connectivity/queue forms are preserved, not advertised as additions to the nine-entry
+catalogue. A finite grammar can both over-refuse ordinary phrasing and miss paraphrases;
+see `docs/phase-reports/console-2026-11-04-task-b-registry.md` for exact boundaries and tests.
