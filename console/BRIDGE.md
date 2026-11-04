@@ -1,6 +1,7 @@
 # Local text bridge — operator handoff
 
-**TESTED-ONLY. Real IPC/WebSocket/DOM wiring; no owner live-model or WebGL/audio proof.**
+**Owner accepted the prior live demo (eight replies and orb) by relay. New sizing/labels
+are TESTED-ONLY pending owner visual review. No speech/audio proof is claimed.**
 The standalone v6.15 shell remains the honest fallback if owner verification fails.
 
 ## What runs
@@ -25,13 +26,13 @@ hard stop, not permission to fetch, install or reconstruct something from chat.
 
 Committed executable: **`console/run_bridge.py`**.
 
-SHA256: **`54f93a9ce35a1eea4847aa35c96bf7d484f45fec7954142d80f122ca5f524d05`**.
+SHA256: **`1155961803e8919e9f517cb84ab4f7a1ca40805f06530db974ff36ec9df0f24d`**.
 
 From a copy containing this release's `console/` payload and the existing `.venv` interpreter,
 this is one physical command line. It checks the launcher before Python runs; the launcher
 then checks all five payload hashes before importing the bridge. A mismatch stops.
 
-`test "$(sha256sum console/run_bridge.py)" = '54f93a9ce35a1eea4847aa35c96bf7d484f45fec7954142d80f122ca5f524d05  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
+`test "$(sha256sum console/run_bridge.py)" = '1155961803e8919e9f517cb84ab4f7a1ca40805f06530db974ff36ec9df0f24d  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
 
 `-I` isolates Python import paths; `-B` avoids bytecode writes. No standalone install, branch
 switch or mainline deployment is performed by this command. If using an extracted bundle
@@ -44,7 +45,7 @@ existing interpreter is `/home/darrel/Elaria/.venv/bin/python`, this alternative
 uses it without copying files into or switching that checkout. A missing interpreter or
 checksum mismatch stops; there is no install/repair fallback.
 
-`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = '54f93a9ce35a1eea4847aa35c96bf7d484f45fec7954142d80f122ca5f524d05  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py`
+`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = '1155961803e8919e9f517cb84ab4f7a1ca40805f06530db974ff36ec9df0f24d  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py`
 
 Optional **`--check`** performs artifact/dependency checks and one existing-daemon `status`
 RPC, then exits; it opens no browser server and sends no chat/model/voice turn. `--socket`
@@ -87,15 +88,20 @@ blocks further turns after a lost IPC response until an explicit restart after r
 | memory pane | eleven labelled shell-copy cards, not a live-store claim |
 
 A green connection is not proof of a model answer. No empty placeholder arrays flip pane
-badges LIVE. The wrapper labels text-only operation and synthesised levels permanently.
+badges LIVE. The shell footer labels text-only operation and synthesised cadence; the wrapper has no
+normal-operation banner. Locked/expired-link failures remain explicit.
 The original engine is byte-identical under `gate_verbatim`; no visualizer knob/shader edit.
 The browser audio consumer hook `attachElement` exists, but this bridge does not deliver audio.
 
 The shell's browser tabs do **not** create independent daemon conversations. Browser history
 is capped/trimmed display context and is not injected into model history; the existing daemon
 owns conversation and authority. The bridge forwards only text, speak=false, history_limit=1.
-It neither mounts new hands routes nor converts model words into actions. Existing local
-intents, disclosure and hands refusal/consent boundaries remain the daemon's responsibility.
+It mounts no new hands routes and never parses generated words back into actions. **Typed
+input is different:** existing console.say routing can write/forget memory, change posture,
+build/index plans, drain the cloud queue, and run explicitly scoped undo. The typed route
+bypasses ASR confidence; scoped undo has executor checks but no fresh Yes dialogue. Do not
+confuse its operation lock with owner approval. See the pinned mainline audit in
+`docs/phase-reports/console-2026-11-04-research.md`.
 An owner-authenticated typed request is not evidence of an effect or automatic consent.
 A friend being present does not itself enable the daemon's existing company/show-off posture.
 
@@ -121,8 +127,37 @@ launcher process, and jsdom. Canvas is a test double; no hardware pixels/audio a
 An additional test calls the real fixture-backed daemon's existing `console.say` and confirms
 that its mock result cannot be presented as a live model answer. Shared fixtures are untouched.
 
-Owner verification remains: correct local readiness/lamp behavior, one live typed reply,
-its real provenance, readable text-driven orb/state behavior, and honest pending pane labels.
+The owner has accepted the previous live reply/state/orb demo by relay. Current owner
+verification is the changed sizing at wide/narrow geometries and the relocated labels.
+The new local Chromium geometry gate checks actual renderer/container dimensions with a
+synthetic backend, including resizing and narrow chat access; it is not owner visual approval.
 No microphone, voice repair, kitty scene, install, key transfer or privileged operation is
 part of that verification. If this gate cannot be completed in time, show the standalone
 shell with its explicit stub and shell-copy labels instead. No success is claimed in advance.
+
+
+## Current shell layout and honesty boundary
+
+Wide panel: 36vw; stage region: bounded to 80% of panel height, retaining flex:1 1 auto /
+min-height:0 and the unchanged maker engine at fit:1.8. Below 1040px the rail yields to 28vw;
+at 680px and below the large orb is omitted rather than floating over the composer. Sidebar
+opens on request below 940px and has an explicit close control. Footer/lamps remain visible
+under full-pane views. Only the chat log and pane contents scroll, not the document/orb.
+
+Removed-banner facts have designated homes: non-model outcomes on their replies;
+“synthesised text cadence, not measured audio” and “text-only, no speech” in the footer;
+PENDING/SHELL COPY in each pane's own badge. Empty feed arrays clear to pending/shell copy,
+and one pane cannot promote another. The shared-conversation fact is documented above,
+not repeated in the visible shell. Explicit samples are still labelled samples.
+
+`history_limit=1` is unchanged: it trims console.say's returned conversation envelope, which
+this bridge does not render. It does not control _ask's separate eight-message retrieval /
+six-message prompt window. Increasing it alone would not cure unsupported capability claims.
+
+**WS2 is not closed:** live provenance cannot certify a claim's truth. Unrestricted model
+chat can still claim unsupported abilities. A hard guarantee requires an owner-selected
+constrained capability surface/output boundary, not just a new prompt or keyword filter.
+No new capability route is implemented pending that decision and the separate WS5 ruling.
+
+Drafts first remains binding for any future messaging: compose → owner review/approval →
+only then send; no send adapter or autonomy tier first. Draft review itself is not yet built.

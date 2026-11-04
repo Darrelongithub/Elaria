@@ -69,9 +69,9 @@ setTimeout(() => { console.log("\nWATCHDOG: the suite did not finish in 30s"); c
   console.log("\n=== LAYOUT: sidebar | CHAT | orb rail ===");
   const cols = (html.match(/grid-template-columns:\s*var\(--sbw\)\s*minmax\(0,\s*1fr\)\s*var\(--orbw\)/) || []);
   ok("three-column grid declared", cols.length === 1);
-  ok("her panel is BIG now, per the ruling (396px default, 440px on wide screens)",
-    /--orbw:\s*396px/.test(html) && /--orbw:\s*440px/.test(html), "--orbw missing");
-  ok("and the chat is still the only flexible column, so it stays widest",
+  ok("wide panel follows the new 36vw ruling; stage retains bounded flex",
+    /--orbw:\s*36vw/.test(html) && /max-height:\s*80%/.test(html), "--orbw missing");
+  ok("chat keeps the remaining flexible column",
     /grid-template-columns:\s*var\(--sbw\)\s*minmax\(0,\s*1fr\)\s*var\(--orbw\)/.test(html));
   ok("chat column is the flexible one", /minmax\(0,\s*1fr\)/.test(html));
   ok("no right rail left over from v4", !/aside\.rail/.test(html));
@@ -115,12 +115,15 @@ setTimeout(() => { console.log("\nWATCHDOG: the suite did not finish in 30s"); c
   ok("his HTML is escaped, not injected", me.innerHTML.includes("&lt;b&gt;") && !me.querySelector("b"));
   ok("his newlines survive", /<br>/.test(paintYouProbe) || true);
   ok("his /command is still coloured", cmd ? cmd.querySelectorAll("span.cmd").length === 1 : false);
+  await tick(700); // let the explicit standalone stub reach its renderer
+  doc.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  await tick(30);
   ok("her text IS coloured", qa(".msg.ai .body span").length > 0);
 
   console.log("\n=== TRANSCRIPT OPENS FULL SCREEN, SIDEBAR STAYS PUT ===");
   ok("#full exists and starts closed", $("full") && !$("full").classList.contains("open"));
-  ok("#full leaves the sidebar visible (left: var(--sbw))",
-    /#full\s*\{[^}]*left:\s*var\(--sbw\)/.test(html.replace(/\n/g, " ")));
+  ok("#full leaves sidebar and footer outside its grid overlay",
+    /#full\s*\{[^}]*grid-column:\s*2 \/ -1; grid-row:\s*1/.test(html.replace(/\n/g, " ")));
   qa(".sec-h").find((b) => b.dataset.pane === "transcript").dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
   await tick(30);
   ok("clicking transcript opens the full-screen pane", $("full").classList.contains("open"));
@@ -128,7 +131,7 @@ setTimeout(() => { console.log("\nWATCHDOG: the suite did not finish in 30s"); c
   ok("sidebar itself is still in the document and not hidden",
     $("sb") && !$("sb").hasAttribute("hidden") && qa(".sec-h").length === 3);
   ok("transcript marks its own section active", $("sec-transcript").classList.contains("open"));
-  ok("pending state is honest, not empty", /PENDING/i.test($("fbody").textContent));
+  ok("pending state is honest, not empty", /PENDING/i.test($("fbadge").textContent) && /No journal transcript feed rows/.test($("fbody").textContent));
   ok("full pane names every column it will hold", /peak/.test($("fbody").textContent) && /verdict/.test($("fbody").textContent));
   ok("topbar button reports the open pane", $("tbWhich").textContent === "transcript");
 
@@ -228,8 +231,8 @@ setTimeout(() => { console.log("\nWATCHDOG: the suite did not finish in 30s"); c
   qa("[data-lamp]").forEach((li) => { on[li.dataset.lamp] = li.dataset.on; });
   ok("four lamps", Object.keys(on).length === 4, JSON.stringify(on));
   ok("console lamp green", on.console === "ok");
-  ok("daemon lamp amber = exists but unreachable", on.daemon === "wait");
-  ok("wire lamp red = does not exist yet", on.wire === "gone");
+  ok("daemon lamp amber = not connected", on.daemon === "wait");
+  ok("wire lamp red = not connected", on.wire === "gone");
   ok("ElariaShell wire surface exported", typeof window.ElariaShell === "object");
   ["connect", "disconnect", "notify", "say", "setState", "transcript", "audio", "memory"].forEach((k) =>
     ok("  ElariaShell." + k + "()", typeof window.ElariaShell[k] === "function"));

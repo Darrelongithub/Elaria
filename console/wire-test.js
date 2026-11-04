@@ -49,8 +49,14 @@ async function until(predicate, message) {
                 'real WS reply did not appear in DOM');
     await until(() => seen.some(x => x.role === 'output' && x.value > 0), 'no synthesised wire output levels');
     assert(seen.every(x => x.value >= 0 && x.value <= 1));
-    assert(root.body.textContent.includes('synthesised text cadence, NOT measured audio'));
-    assert(root.body.textContent.includes('Transcript/audio PENDING'));
+    assert(!root.querySelector('header'));
+    assert(root.getElementById('wire-error').hidden);
+    assert(doc.getElementById('orbnote').textContent.includes('synthesised text cadence, not measured audio'));
+    assert(doc.getElementById('orbnote').textContent.includes('text-only, no speech'));
+    assert.equal(doc.querySelectorAll('.console-footer .lamps li').length, 4);
+    assert(!doc.body.textContent.includes('driven by real levels'));
+    assert(!root.body.textContent.includes('tabs share'));
+    assert(!doc.body.textContent.includes('tabs share'));
     assert.equal(doc.getElementById('badge-transcript').textContent, 'pending');
     assert.equal(doc.getElementById('badge-audio').textContent, 'pending');
     assert(!doc.getElementById('logpad').textContent.includes('audio and memory now come from the daemon'));

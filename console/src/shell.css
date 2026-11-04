@@ -30,7 +30,7 @@
 
   --fs: 14px;
   --sbw: 298px;    /* left sidebar: sessions + transcript/memory/audio */
-  --orbw: 396px;   /* right panel: her, big. the centre stays the chat's */
+  --orbw: 36vw;    /* owner WS1 ruling: proportional wide panel; narrow widths yield */
   --mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, "Liberation Mono", monospace;
   --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
 }
@@ -57,8 +57,15 @@ button, textarea, input { font: inherit; color: inherit; }
 *::-webkit-scrollbar-track { background: transparent; }
 
 /* =================================================================== layout
-   three columns: sidebar | CHAT (the only flexible one, always widest) | her panel */
-.app { display: grid; grid-template-columns: var(--sbw) minmax(0, 1fr) var(--orbw); height: 100dvh; }
+   three columns with explicit placement: sidebar | flexible CHAT | proportional orb */
+.app { display: grid; grid-template-columns: var(--sbw) minmax(0, 1fr) var(--orbw);
+  grid-template-rows: minmax(0, 1fr) auto; height: 100dvh; }
+.sb { grid-column: 1; grid-row: 1 / -1; }
+.term { grid-column: 2; grid-row: 1; }
+.orb { grid-column: 3; grid-row: 1; }
+.console-footer { grid-column: 2 / -1; grid-row: 2; display: flex; align-items: center;
+  gap: 16px; min-width: 0; padding: 10px 18px; border-top: 1px solid var(--line2); }
+.console-footer .lamps { flex: none; margin-left: auto; }
 
 /* =================================================================== sidebar */
 .sb { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden;
@@ -68,6 +75,7 @@ body.sb-off .sb { opacity: 0; pointer-events: none; }
 
 .sb-top { display: flex; align-items: center; gap: 8px; padding: 15px 14px 12px;
   border-bottom: 1px solid var(--line2); }
+#closeSb { display: none; }
 .sb-top h2 { margin: 0; flex: 1; font: 700 11px/1 var(--mono); letter-spacing: .34em; text-transform: uppercase;
   color: var(--name); text-shadow: 0 0 18px rgba(255, 138, 43, .35); }
 
@@ -127,7 +135,7 @@ body.sb-off .sb { opacity: 0; pointer-events: none; }
   background: repeating-linear-gradient(0deg, rgba(255,255,255,.03) 0 1px, transparent 1px 3px); }
 
 /* the old header row — big wordmark, lamp words, borders — was called terrible and it was.
-   What is left is a whisper: a path, four dots that mean something on hover, three ghost buttons. */
+   What remains here is a path and three controls; status lamps are pinned in the footer. */
 .th { display: flex; align-items: center; gap: 14px; padding: 9px 18px 5px; }
 .spath { flex: 1; min-width: 0; font-size: 11px; color: var(--dimmer); letter-spacing: .08em;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -217,7 +225,7 @@ body.sb-off .sb { opacity: 0; pointer-events: none; }
 /* =================================================================== her panel (right)
    composition copied from the reference: wordmark + live readout on one line at the top,
    then she fills everything left over. NO buttons — every state arrives in real time.      */
-.orb { position: relative; display: flex; flex-direction: column; min-width: 0; overflow: hidden;
+.orb { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden;
   --glow: var(--violet); transition: --glow 1.2s ease;
   border-left: 1px solid var(--line2);
   background: radial-gradient(120% 80% at 50% 42%, rgba(7, 6, 12, .96), rgba(4, 3, 8, .98) 74%); }
@@ -250,13 +258,14 @@ body.orb-off .orb { opacity: 0; pointer-events: none; }
   background: linear-gradient(90deg, var(--violet), var(--magenta), var(--orange)); transition: width .09s linear; }
 .sw { animation: swap .5s ease; }
 
-.stage-box { position: relative; z-index: 0; flex: 1 1 auto; min-height: 0; width: 100%; }
+.stage-box { position: relative; z-index: 0; flex: 1 1 auto; min-height: 0; width: 100%;
+  max-height: 80%; margin-block: auto; }
 #stage { position: absolute; inset: 0; opacity: 0; transition: opacity 1.8s ease; }
 .orb.ready #stage { opacity: 1; }
 .stage-msg { position: absolute; inset: 0; display: grid; place-items: center; margin: 0; padding: 24px; text-align: center;
   color: var(--warn); font-size: 12px; line-height: 1.7; }
-.orbnote { position: relative; z-index: 1; flex: none; margin: 0; padding: 10px 18px 14px; text-align: center;
-  font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--dimmer); }
+.orbnote { flex: 1; min-width: 0; margin: 0; font-size: 10px; line-height: 1.6;
+  letter-spacing: .06em; color: var(--dim); }
 
 .wants { position: absolute; z-index: 2; top: 52px; right: 14px; width: 9px; height: 9px; border-radius: 50%;
   background: var(--magenta); box-shadow: 0 0 14px var(--magenta); animation: ping 1.6s ease-in-out infinite; }
@@ -264,7 +273,8 @@ body.orb-off .orb { opacity: 0; pointer-events: none; }
 
 /* =================================================================== full-screen pane
    covers the chat and her panel. the sidebar stays exactly as it is. */
-#full { position: fixed; z-index: 15; top: 0; right: 0; bottom: 0; left: var(--sbw); display: none; flex-direction: column;
+#full { position: relative; z-index: 15; grid-column: 2 / -1; grid-row: 1; min-width: 0; min-height: 0;
+  display: none; flex-direction: column;
   background: linear-gradient(180deg, rgba(10, 8, 17, .98), rgba(6, 5, 11, .99));
   border-left: 1px solid var(--line2); box-shadow: -34px 0 80px -44px #000; }
 #full.open { display: flex; animation: fin .24s cubic-bezier(.2, .8, .25, 1); }
@@ -365,28 +375,23 @@ table.grid tr[hidden] { display: none; }
 @keyframes bar   { 0%, 100% { transform: scaleY(.3); } 50% { transform: scaleY(1); } }
 
 /* =================================================================== responsive
-   nothing is ever deleted at a narrow width — it becomes an overlay. */
-@media (min-width: 1600px) { :root { --orbw: 440px; } }
-@media (max-width: 1400px) { :root { --orbw: 352px; } }
-@media (max-width: 1240px) { :root { --orbw: 312px; --sbw: 274px; } .mark { letter-spacing: .3em; } }
-@media (max-width: 1040px) { :root { --orbw: 268px; } .readout span { display: none; } }
+   chat wins: sidebar opens only on request; small screens omit the large orb, not the footer. */
+@media (max-width: 1240px) { :root { --sbw: 274px; } .mark { letter-spacing: .3em; } }
+@media (max-width: 1040px) { :root { --orbw: 28vw; } .readout span { display: none; } }
 
 @media (max-width: 940px) {
   :root { --sbw: 0px; }
+  #closeSb { display: block; }
   .sb { position: fixed; z-index: 18; top: 0; bottom: 0; left: 0; width: 292px; opacity: 1;
     transform: translateX(-102%); transition: transform .22s ease; box-shadow: 26px 0 60px -34px #000; }
-  body:not(.sb-off) .sb { transform: none; }
+  body.sb-peek .sb { transform: none; }
   body.sb-off .sb { opacity: 1; pointer-events: auto; }
-  #full { left: 0; }
   .sec:not(.grow) > .sec-b { max-height: 30vh; }
 }
 @media (max-width: 680px) {
   :root { --orbw: 0px; }
-  .orb { position: fixed; z-index: 17; right: 10px; bottom: 10px; width: 96px; height: 96px; padding: 0;
-    border: 1px solid var(--line); border-radius: 16px; background: rgba(10, 9, 18, .92); }
-  body.orb-off .orb { display: none; }
-  .orb-top, .orbnote { display: none; }
-  .stage-box { flex: none; position: absolute; inset: 6px; }
+  .orb, #tgOrb { display: none; }
+  .console-footer { padding-inline: 12px; gap: 12px; }
   .th { padding: 10px 14px 8px; }
   .log { padding: 14px 15px 18px; }
   .cwrap { padding: 0 12px 6px; }

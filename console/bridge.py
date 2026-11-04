@@ -195,13 +195,13 @@ class Bridge:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Elaria — local text wire</title><style>
 html,body{margin:0;height:100%;background:#110d1c;color:#dbd2ed;font:12px monospace}
-body{display:flex;flex-direction:column}header{padding:8px 14px;line-height:1.6}
-iframe{flex:1;border:0;width:100%;min-height:0}b{color:#e3bd80}
+body{overflow:hidden}
+iframe{display:block;border:0;width:100%;height:100%}
+#wire-error:not([hidden]){position:fixed;inset:0;margin:0;padding:24px;
+background:#110d1c;color:#e3bd80;z-index:1}
 </style><script src="/bridge-client.js" defer></script></head><body>
-<header><b id="wire-status" role="status">Connecting to the local daemon…</b><br>
-Text-only · levels are synthesised text cadence, NOT measured audio · speech unavailable.<br>
-Transcript/audio PENDING · memory is the labelled shell copy · tabs share one daemon conversation.
-</header><iframe id="console" title="Elaria console"></iframe></body></html>''').encode()
+<p id="wire-error" role="alert" hidden></p>
+<iframe id="console" title="Elaria console"></iframe></body></html>''').encode()
 
     def process_request(self, connection, request):
         try:

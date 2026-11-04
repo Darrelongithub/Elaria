@@ -4,6 +4,7 @@
   <aside class="sb" id="sb" aria-label="Sessions and panels">
     <div class="sb-top">
       <h2>sessions</h2>
+      <button class="tbtn" id="closeSb" type="button" aria-label="close sidebar" title="close sidebar">&#215;</button>
       <button class="tbtn" id="bNew" type="button" title="new session (alt+N)">+ new</button>
     </div>
 
@@ -39,16 +40,10 @@
     </div>
   </aside>
 
-  <!-- ============ CENTRE: the chat. always the widest column. ============ -->
+  <!-- ============ CENTRE: the chat. the flexible priority column. ============ -->
   <section class="term" id="term" aria-label="Elaria terminal">
     <header class="th">
       <span class="spath" id="sname">~/sessions/boot</span>
-      <ul class="lamps" aria-label="Connection status">
-        <li data-lamp="console" title="console — this window, running, local"><i></i></li>
-        <li data-lamp="daemon" title="daemon — exists on your laptop, unreachable from here"><i></i></li>
-        <li data-lamp="voice"  title="voice — no audio path from this window"><i></i></li>
-        <li data-lamp="wire"   title="wire — the bridge does not exist yet"><i></i></li>
-      </ul>
       <div class="tools">
         <button class="tbtn" id="tgSb" type="button" aria-expanded="true" title="sidebar (alt+K)" aria-label="toggle sidebar">&#9776;</button>
         <button class="tbtn" id="tgOrb" type="button" aria-expanded="true" title="her panel (alt+B)" aria-label="toggle her panel">&#9673;</button>
@@ -86,9 +81,16 @@
       </div>
     </header>
     <div class="stage-box"><div id="stage" role="img" aria-label="Elaria visualizer, idle"></div></div>
-    <p class="orbnote" id="orbnote">no wire yet &#183; her shape, not her voice</p>
   </aside>
-</main>
+  <footer class="console-footer">
+    <p class="orbnote" id="orbnote">synthesised text cadence, not measured audio · text-only, no speech</p>
+      <ul class="lamps" aria-label="Connection status">
+        <li data-lamp="console" title="console — this window, running, local"><i></i></li>
+        <li data-lamp="daemon" title="daemon — not connected"><i></i></li>
+        <li data-lamp="voice"  title="voice — no audio path from this window"><i></i></li>
+        <li data-lamp="wire"   title="wire — not connected"><i></i></li>
+      </ul>
+  </footer>
 
 <!-- ============ FULL-SCREEN PANE: transcript / memory / audio ============ -->
 <div id="full" role="dialog" aria-label="Panel, full screen">
@@ -102,5 +104,7 @@
   </div>
   <div class="fb"><div class="inner" id="fbody"></div></div>
 </div>
+
+</main>
 
 <div id="toasts" aria-live="polite"></div>

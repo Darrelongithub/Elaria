@@ -243,9 +243,10 @@ hooks — `setLevels('output', {level})` per audio frame, or `attachElement(audi
 and the priority path for §5 wire consumers. Call `destroy()` if the panel is ever removed (the
 console never removes the rail; the floating mini-orb is a move, not a removal). The maker's cautions
 are verified shell-side: the container has a real height (`.stage-box` is `flex: 1 1 auto;
-min-height: 0` inside the fixed-height rail, `inset: 6px` absolute when floating — never `auto`, so
-his collapse trap cannot bite); three.js is inlined ahead of the engine; `useMicrophone()` needs https
-or localhost (serve.py is localhost; `/mic` fails honestly through try/catch on `file://`).
+min-height: 0` inside a definite grid row, with an 80% maximum stage height; no floating
+narrow-screen stage); three.js is inlined ahead of the engine; `useMicrophone()` needs https
+or localhost (`serve.py` still binds **0.0.0.0:8123**, not loopback-only; the bridge uses
+127.0.0.1:8744; `/mic` fails honestly through try/catch on `file://`).
 
 **Colour ruling stands (2026-11-02): the maker's per-state worlds are the owner's adopted look.**
 `PALS` — nine-stop palettes per state, cross-faded on every `setState`: idle violet, listening
@@ -256,7 +257,8 @@ spec is superseded by that adoption. With the engine pinned, the only colour lev
 maker file. One caution for comparisons: states differ in motion AND colour by design; judge her
 state against the same state in the original, never thinking against idle.
 
-**Smoothness is pixel ratio and MSAA, not shader work.** The owner's last visual gap ("just a matter of
+**Historical v6.9 explanation, not permission to edit the now-pinned engine:**
+Smoothness was investigated through pixel ratio and MSAA, not shader work. The owner's last visual gap ("just a matter of
 smoothening something out") was aliasing: the renderer was created with `antialias: false`, and the
 adaptive quality loop dropped pixel ratio whenever mean frame time crossed 26 ms — which a small preview
 iframe does constantly, so she rendered at ratio 1 with no MSAA and read as jagged, while the original
@@ -270,25 +272,30 @@ render the owner rejected.
 *declared*, so every shader program failed to compile and the orb drew nothing — silently. `build.py`
 runs `gate_glsl`: it resolves each shader's concatenated source (PAL and VERT_COMMON prefixes included)
 and **refuses to build** if any `uXxx` is used without a `uniform ... uXxx` declaration in that same
-shader. Declare new uniforms in every stage that reads them, or the build stops you.
+shader. The current engine is absolute-pinned: any engine change is out of scope, even if
+the GLSL gate passes.
 
 ## 7. Layout rulings that are load-bearing (do not "improve" these away)
 
-- **Three columns:** sidebar `--sbw` · **chat = the only flexible column, always the widest** · her panel
-  `--orbw` (396 px, 440 px ≥1600 px). The owner rejected a centred orb and a 55 %-width orb; the centre
-  belongs to the conversation.
+- **2026-11-04 owner ruling supersedes the narrow-rail sizes:** sidebar `--sbw` · flexible chat
+  · right panel `--orbw:36vw` on wide screens. Stage region is bounded to 80% of panel height;
+  engine and fit:1.8 remain unchanged. Explicit grid placement prevents fixed-overlay sidebar
+  removal from shifting chat into a zero-width column. Below 1040px the rail yields to 28vw;
+  at <=680px it is hidden, never floating over or cropping the composer.
 - **Sidebar, top to bottom:** sessions (permanently open) then transcript · memory · audio fold-outs.
   Fold-outs animate **both directions** (`max-height`/`opacity`, 0.3 s) — an instant show/hide reads as a bug.
 - **Transcript opens full screen** over the chat *and* her panel, stopping at the sidebar edge, so the
-  sidebar stays exactly where it is. Esc plays a 0.18 s exit animation before hiding. `#full` is
-  `left: var(--sbw)`; below 940 px the sidebar becomes a fixed overlay and `#full` goes `left: 0`.
+  sidebar stays where it is. Esc plays a 0.18 s exit animation before hiding. `#full` occupies
+  grid columns 2/-1, row 1, leaving the bottom footer visible. Below 940px the sidebar opens
+  only on explicit request and offers a close control; the chat retains its column.
 - **Her panel has no buttons.** State and signal rows exist in the standalone demo only, to stimulate
   modes by hand; in the console every state arrives in real time. `/state`, `/sim`, `/mic` remain as
   typed commands. The panel top line is `ELARIA` + live readout (state word · source · meter).
-- **Header is a whisper:** session path · four lamp dots (words only in `title`, explained by `/status`) ·
-  three ghost buttons. A labelled header bar with a wordmark was called terrible and removed.
-- **Colour descriptions stay:** the swatch legend under the composer *and* the colour-key line in the
-  boot transcript. The owner asked for them back after they were removed by mistake.
+- **Header is a whisper:** session path and three controls. Four status dots now live in the
+  bottom-pinned footer, with state-specific hover text. The outer three-line bridge banner
+  is removed; its facts have the homes specified in BRIDGE.md.
+- **Colour descriptions stay:** the colour-key line in the boot transcript remains. The old
+  swatch row is absent, consistent with the already-accepted v6.15 smoke gate.
 - **Colour semantics:** white = his words (and `paintYou` adds colour to nothing else but `/commands`),
   green = her words only, orange = names/labels/numbers, blue = machine, violet = aside, amber = not yet,
   red = broken/absent, ice = paths, acid = commands. `paintYou` emitting zero spans for plain prose is
@@ -318,6 +325,6 @@ shader. Declare new uniforms in every stage that reads them, or the build stops 
    and sandboxed-preview cases and has broken them before).
 3. With no daemon: lamps `ok/wait/wait/gone`, panes `pending`, replies labelled stub. With the daemon:
    wire lamp green within one hello round-trip, and `transcript`/`audio`/`memory` badges read `live`
-   after their first rows.
+   after their own first nonempty feed, never from another pane or an empty placeholder.
 4. Owner eye/ear sign-off on: her size and position, the full-screen transcript, the mini-orb
    notification, and listening reading cool rather than orange. He is the instrument; the suite is not.

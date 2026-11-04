@@ -658,3 +658,33 @@ async def test_websocket_uses_actual_status_and_ask_producers_with_stub_generati
         reply, _ = await read_until(ws, 'reply')
         assert reply['text'] == 'Synthetic real-handler response, not model proof.'
         assert reply['provenance'] == 'live-model' and len(calls) == 1
+
+
+def test_pane_labels_and_empty_feed_provenance():
+    import subprocess
+
+    if not shutil.which('node') or not (ASSETS / 'node_modules/jsdom').exists():
+        pytest.skip('local-only DOM gate needs console jsdom dependency')
+    run = subprocess.run(['node', str(ASSETS / 'labels-test.js')],
+                         capture_output=True, text=True, timeout=20, check=False)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert 'PASS:' in run.stdout
+
+
+async def test_optional_actual_browser_geometry():
+    # Opt-in existing local browser; never install/download a browser from a test or CI.
+    if not os.environ.get('ELARIA_CHROMIUM_PATH') or not shutil.which('node'):
+        pytest.skip('set ELARIA_CHROMIUM_PATH and provide local playwright-core for geometry gate')
+    async with running() as bridge:
+        env = dict(os.environ, ELARIA_TEST_URL=bridge.origin + '/#pair=' + bridge.token)
+        process = await asyncio.create_subprocess_exec(
+            'node', str(ASSETS / 'layout-test.js'), env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 220)
+            assert process.returncode == 0, (stdout + stderr).decode()
+            assert b'PASS:' in stdout
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()

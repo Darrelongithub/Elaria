@@ -102,25 +102,24 @@
     { name: '20261031-135604-b7704b.wav', size: '171,840 B', age: 'today', tier: 'hot' },
     { name: '20261025-181730-4d90bf.wav', size: '44 B', age: '6 days', tier: 'never-retry' }
   ];
-  const CENSUS = 'audio census: 37 files on the laptop = 35 session wavs + 2 artifacts · kept 80,698,682 B · steady 11.29 MiB/day · zstd -19 ratios 0.475 / 0.582 FINAL';
+  const CENSUS = 'design-record audio census (not a current manifest): 37 files = 35 session wavs + 2 artifacts · kept 80,698,682 B · steady 11.29 MiB/day · zstd -19 ratios 0.475 / 0.582 FINAL';
   const TR_COLS = 'every row will carry: time · session id · who spoke · her exact words · peak amplitude · keep verdict';
   const AU_COLS = 'every row will carry: file · size · age · tier (hot 14 d / cold / never-retry)';
 
   const STUBS = [
     'stub reply. the daemon is not wired to this window, so this text is the shell talking, not me.\n\nwhat that proves: prompt, screen, colour pass, sidebar, orb and session store all work. that is the half you asked to see.',
     'stub again. note what did not happen: no network call, no api spend, no key touched. 0 requests left this browser.',
-    'the shell is holding your text. the missing piece is 1 socket between this window and the daemon that already runs on your laptop.',
-    'stub. /status shows which lamp is missing and why — amber means exists-but-unreachable, red means does-not-exist-yet.',
-    'still the shell. when the wire lands this line gets replaced by a real one and the wire lamp goes green.'
+    'the shell is holding your text. this standalone window is not connected to a daemon.',
+    'stub. /status shows which lamp is missing and why — amber means unavailable here; red means disconnected, not proof a component does not exist.',
+    'still the shell. a connected adapter supplies replies; the wire lamp does not certify model output or an action.'
   ];
   let stubI = 0;
   const statusText = () => 'lamps, honestly:\n\n' +
     '  console   [ON]              this window, running, local\n' +
-    '  daemon    [' + (daemon ? 'CONNECTED' : 'NOT CONNECTED') + ']   ' + (daemon ? 'adapter attached' : 'exists on your laptop, unreachable from here') + '\n' +
+    '  daemon    [' + (daemon ? 'CONNECTED' : 'NOT CONNECTED') + ']   ' + (daemon ? 'adapter attached' : 'connection not established') + '\n' +
     '  voice     [' + (micOn || clip ? 'CONNECTED' : 'NOT CONNECTED') + ']   ' + (micOn ? 'microphone live' : clip ? 'her voice playing' : 'no audio path from this window') + '\n' +
-    '  wire      [' + (daemon ? 'CONNECTED' : 'ABSENT') + ']          ' + (daemon ? 'bridge up' : 'the bridge does not exist yet') + '\n\n' +
-    'what the wire unlocks, in order: real replies · the transcript pane goes live · the audio pane reads the manifest · the memory pane reads her store instead of this baked-in copy.\n\n' +
-    'it is 1 small local listener. that is the whole next step.';
+    '  wire      [' + (daemon ? 'CONNECTED' : 'ABSENT') + ']          ' + (daemon ? 'bridge up' : 'connection not established') + '\n\n' +
+    'Text replies use the attached adapter. Connection is not a claim that journal, manifest, memory or speech feeds are present; each pane keeps its own status.';
 
   /* ------------------------------------------------------------------ storage */
   const KEY = 'elaria.console.v6';
@@ -165,7 +164,15 @@
   function settle() { if (busy || voiceTimer) return; setState(forcedOffline ? 'offline' : micOn ? 'listening' : 'idle'); }
   function lamps() {
     const on = { console: 'ok', daemon: daemon ? 'ok' : 'wait', voice: (micOn || clip) ? 'ok' : 'wait', wire: daemon ? 'ok' : 'gone' };
-    document.querySelectorAll('[data-lamp]').forEach((li) => { li.dataset.on = on[li.dataset.lamp]; });
+    const titles = {
+      console: 'console — this local window is running',
+      daemon: daemon ? 'daemon — adapter attached' : 'daemon — not connected',
+      voice: micOn ? 'microphone input live' : clip ? 'adapter audio attached' : 'voice — no audio path from this window',
+      wire: daemon ? 'wire — connected; not proof of model output or an action' : 'wire — not connected'
+    };
+    document.querySelectorAll('[data-lamp]').forEach((li) => {
+      li.dataset.on = on[li.dataset.lamp]; li.title = titles[li.dataset.lamp];
+    });
   }
 
   let lastSrc = '';
@@ -398,10 +405,12 @@
     if (openSec !== name) setSec(name);
     if (fullPane) { fullPane = name; el.tbWhich.textContent = name; renderFull(); }
   }
-  const badgeFor = (p) => p === 'memory' ? ['cp', 'shell copy']
-    : demoOn ? ['sm', 'sample'] : liveTR || liveAU ? ['sm', 'live'] : ['st', 'pending'];
+  const nonempty = (rows) => Array.isArray(rows) && rows.length > 0 ? rows : null;
+  const paneLive = (p) => nonempty(p === 'transcript' ? liveTR : p === 'audio' ? liveAU : liveMEM);
+  const badgeFor = (p) => paneLive(p) ? ['sm', 'live']
+    : p === 'memory' ? ['cp', 'shell copy'] : demoOn ? ['sm', 'sample'] : ['st', 'pending'];
   function syncBadges() {
-    ['transcript', 'audio'].forEach((p) => {
+    ['transcript', 'memory', 'audio'].forEach((p) => {
       const b = $('badge-' + p), [cls, txt] = badgeFor(p);
       b.className = 'badge ' + cls; b.textContent = txt;
     });
@@ -416,7 +425,7 @@
     expand.addEventListener('click', () => openFull(name));
     if (name === 'transcript') {
       const rows = liveTR || (demoOn ? DEMO_TR : null);
-      if (!rows) b.append(h('p', 'mini', '[PENDING] no wire — nothing to show yet. ' + TR_COLS + '.'));
+      if (!rows) b.append(h('p', 'mini', 'No transcript feed rows received. ' + TR_COLS + '.'));
       else rows.slice(0, 4).forEach((r) => {
         const d = h('div', 'mrow');
         d.append(h('span', 'k', r.ts), h('span', 'v', r.who + ': ' + r.text));
@@ -424,7 +433,7 @@
       });
     } else if (name === 'memory') {
       const cards = liveMEM || MEM;
-      b.append(h('p', 'mini', '[WARN] shell copy — ' + cards.length + ' cards baked into this file, not her live store.'));
+      b.append(h('p', 'mini', cards.length + ' cards.'));
       cards.slice(0, 4).forEach((c) => {
         const d = h('div', 'mrow');
         d.append(h('span', 'k', c.t), h('span', 'v', c.v));
@@ -432,7 +441,7 @@
       });
     } else {
       const rows = liveAU || (demoOn ? DEMO_AU : null);
-      b.append(h('p', 'mini', rows ? '[SAMPLE] ' + rows.length + ' rows shown.' : '[PENDING] no wire — nothing to show yet. ' + AU_COLS + '.'));
+      b.append(h('p', 'mini', rows ? rows.length + ' rows shown.' : 'No audio manifest rows received. ' + AU_COLS + '.'));
       b.append(h('p', 'mini', CENSUS));
       const mb = h('button', 'sbtn'); mb.type = 'button';
       mb.textContent = micOn ? 'stop microphone' : 'use microphone';
@@ -476,13 +485,13 @@
       el.fsub.textContent = 'voice transcription — every word she heard, with the peak and the keep verdict';
       const rows = liveTR || (demoOn ? DEMO_TR : null);
       if (!rows) b.append(blurb('warn', (() => { const f = document.createDocumentFragment();
-        f.append(h('b', '', '[PENDING] '), document.createTextNode('the transcript pane reads the daemon journal and there is no wire yet, so there is nothing honest to put here. ' + TR_COLS + '. Type '),
+        f.append(document.createTextNode('No journal transcript feed rows received. ' + TR_COLS + '. Type '),
           h('code', '', '/demo'), document.createTextNode(' to see the exact shape those rows will take, marked [SAMPLE] so nothing can be mistaken for live data.'));
         return f; })()));
       else {
-        b.append(blurb(demoOn ? 'warn' : 'live', (() => { const f = document.createDocumentFragment();
-          f.append(h('b', '', demoOn ? '[SAMPLE] ' : '[LIVE] '),
-            document.createTextNode(demoOn ? 'not live data. These rows are built from real ledger facts so you can judge the layout, then thrown away.' : 'rows from the daemon journal.'));
+        b.append(blurb(!liveTR && demoOn ? 'warn' : 'live', (() => { const f = document.createDocumentFragment();
+          f.append(h('b', '', !liveTR && demoOn ? '[SAMPLE] ' : ''),
+            document.createTextNode(!liveTR && demoOn ? 'not live data. These rows are built from real ledger facts so you can judge the layout, then thrown away.' : 'rows from the daemon journal.'));
           return f; })()));
         const t = table('voice rows', ['time', 'session', 'who', 'exact words', 'peak', 'verdict'],
           rows.map((r) => [r.ts, r.id, r.who, r.text, r.peak, r.verdict]),
@@ -492,13 +501,12 @@
       const s = cur();
       b.append(table('this session, typed — ' + s.name, ['time', 'who', 'words'],
         s.msgs.map((m) => [fmt(m.ts), ROLE[m.r] || m.r, m.t]), ['t', 'a', 'w']));
-      b.append(h('p', 'tnote', 'the typed log is stored in this browser only (localStorage). it is not her memory and it never leaves this machine.'));
+      b.append(h('p', 'tnote', 'This display cache is localStorage, not her memory. Submitted text goes to the daemon and may reach its configured model provider.'));
     } else if (name === 'memory') {
-      el.fsub.textContent = 'what she holds — baked into this file until the wire replaces it';
+      el.fsub.textContent = liveMEM ? 'cards received from the attached memory feed' : 'eleven design-record cards';
       const cards = liveMEM || MEM;
       b.append(blurb(liveMEM ? 'live' : 'warn', (() => { const f = document.createDocumentFragment();
-        f.append(h('b', '', liveMEM ? '[LIVE] ' : '[WARN] '),
-          document.createTextNode(liveMEM ? 'read from her store over the wire.' : 'shell copy, not her live store. These cards are baked into this HTML file from the design ledger so the pane has real content to show. When the wire lands they are replaced by what she actually holds.'));
+        f.append(document.createTextNode(liveMEM ? 'Cards supplied by the attached memory feed.' : 'These cards are baked into this HTML file from the design ledger. A separate memory feed is required to replace them.'));
         return f; })()));
       const n = data.sessions.reduce((a, x) => a + x.msgs.length, 0);
       const wrap = h('div', 'cards');
@@ -509,17 +517,16 @@
       });
       const local = h('div', 'card');
       local.append(h('h3', '', 'this browser'), h('p', '', data.sessions.length + ' session(s), ' + n + ' message(s), stored locally under ' + KEY + '.'),
-        h('span', 'w', 'localStorage — never uploaded'));
+        h('span', 'w', 'browser display cache; not daemon history'));
       wrap.append(local);
       b.append(wrap);
       if (q) Array.prototype.forEach.call(wrap.children, filt);
     } else {
       el.fsub.textContent = 'recordings on disk — what was kept, how big, and which tier it sits in';
       const rows = liveAU || (demoOn ? DEMO_AU : null);
-      b.append(blurb(rows ? (demoOn ? 'warn' : 'live') : 'warn', (() => { const f = document.createDocumentFragment();
-        f.append(h('b', '', rows ? (demoOn ? '[SAMPLE] ' : '[LIVE] ') : '[PENDING] '),
-          document.createTextNode(rows ? (demoOn ? 'not live data — real file names and sizes from the census, invented timestamps.' : 'rows from the storage manifest.')
-            : 'the audio pane reads the storage manifest and there is no wire yet. ' + AU_COLS + '.'));
+      b.append(blurb(rows ? (!liveAU && demoOn ? 'warn' : 'live') : 'warn', (() => { const f = document.createDocumentFragment();
+        f.append(document.createTextNode(rows ? (!liveAU && demoOn ? '[SAMPLE] Not live data — census names and sizes, invented timestamps.' : 'Rows supplied by the attached manifest feed.')
+            : 'No storage manifest feed rows received. ' + AU_COLS + '.'));
         return f; })()));
       b.append(h('p', 'tnote', CENSUS));
       if (rows) b.append(table('manifest rows', ['file', 'size', 'age', 'tier'],
@@ -559,17 +566,29 @@
      by the wire, the microphone, or her typing. /state and /sim stay as hidden commands for testing,
      and nothing on screen pretends otherwise. */
   function syncOrb() {
-    el.orbnote.textContent = daemon ? 'wire up \u00b7 driven by real levels'
-      : micOn ? 'microphone live \u00b7 nothing is stored'
-      : simOn ? 'no wire yet \u00b7 simulated, so she is not frozen'
-              : 'no wire yet \u00b7 her shape, not her voice';
+    el.orbnote.textContent = clip ? 'adapter audio attached; playback is not guaranteed'
+      : (micOn ? 'microphone input live · text output: ' : '') +
+        'synthesised text cadence, not measured audio · text-only, no speech';
   }
 
   /* ---- chrome toggles ---- */
+  function sidebarAria() {
+    const open = window.innerWidth <= 940 ? document.body.classList.contains('sb-peek') : data.prefs.sb;
+    el.tgSb.setAttribute('aria-expanded', String(open));
+    $('sb').inert = !open;
+  }
+  window.addEventListener('resize', () => {
+    if (window.innerWidth > 940) document.body.classList.remove('sb-peek');
+    sidebarAria();
+  });
   function toggleSb(force) {
+    if (window.innerWidth <= 940) {
+      const open = force != null ? force : !document.body.classList.contains('sb-peek');
+      document.body.classList.toggle('sb-peek', open); sidebarAria(); return;
+    }
     data.prefs.sb = force != null ? force : !data.prefs.sb;
     document.body.classList.toggle('sb-off', !data.prefs.sb);
-    el.tgSb.setAttribute('aria-expanded', String(data.prefs.sb));
+    sidebarAria();
     save();
   }
   function toggleOrb(force) {
@@ -578,6 +597,7 @@
     el.tgOrb.setAttribute('aria-expanded', String(data.prefs.orb));
     save();
   }
+  $('closeSb').addEventListener('click', () => { toggleSb(false); el.ta.focus(); });
   el.tgSb.addEventListener('click', () => { toggleSb(); el.ta.focus(); });
   el.tgOrb.addEventListener('click', () => { toggleOrb(); el.ta.focus(); });
   el.tgFull.addEventListener('click', () => openFull(fullPane || 'transcript'));
@@ -685,9 +705,9 @@
   function playClip(src) {
     const a = typeof src === 'string' ? new Audio(src) : src;
     if (V) { try { V.attachElement(a); } catch (e) { /* cross-origin audio cannot be analysed */ } }
-    clip = a; lamps();
+    clip = a; lamps(); syncOrb();
     return new Promise((r) => {
-      endClip = () => { endClip = null; clip = null; lamps(); r(); };
+      endClip = () => { endClip = null; clip = null; lamps(); syncOrb(); r(); };
       a.onended = a.onerror = endClip;
       a.play().catch(endClip);
     });
@@ -711,9 +731,9 @@
     if (t.includes('status') || t.includes('wire') || t.includes('daemon')) return statusText();
     if (t.includes('help') || t.includes('command') || t.includes('what can')) return cmdHelp();
     if (t.includes('transcri') || t.includes('memor') || t.includes('audio') || t.includes('wav'))
-      return 'those are sections in the sidebar, under sessions. transcript opens full screen across the chat and the orb — the sidebar stays where it is. memory and audio fold open in the sidebar and each has an "open full screen" button inside.\n\nkeys: alt+1 transcript, alt+2 memory, alt+3 audio, alt+K sidebar, alt+B orb.\n\ntranscript and audio are [PENDING] until the wire exists — /demo shows the shape they will take, marked [SAMPLE]. memory already has 11 real cards baked into this file.';
+      return 'those are sections in the sidebar, under sessions. transcript opens full screen across the chat and the orb — the sidebar stays where it is. memory and audio fold open in the sidebar and each has an "open full screen" button inside.\n\nkeys: alt+1 transcript, alt+2 memory, alt+3 audio, alt+K sidebar, alt+B orb.\n\ntranscript and audio wait for their own data feeds — /demo shows the shape they will take, marked [SAMPLE]. memory already has 11 real cards baked into this file.';
     if (t.includes('orb') || t.includes('visual') || t.includes('ball'))
-      return 'she is on the right now, in a narrow rail, because you said the centre belongs to the chat. the readout under her names the state and the signal — right now it says "simulated", which is honest: with no wire there is nothing real to drive her. /mic attaches your microphone and she reacts to your voice instead. /sim turns the synthetic voice off.';
+      return 'she is on the right in a proportional panel, yielding to chat on narrow screens. the readout names the current state and signal. /mic attaches your microphone and she reacts to your voice instead. /sim turns the synthetic voice off.';
     if (t.includes('notif') || t.includes('pop') || t.includes('tap'))
       return 'top right, a mini orb with her name and the message — that is the tap on the shoulder. an amber pip stays on the orb rail after the toast fades, so you still know she wanted you. /notify fires one now.';
     return STUBS[stubI++ % STUBS.length];
@@ -779,6 +799,7 @@
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       if (el.full.classList.contains('open')) return closeFull();
+      if (document.body.classList.contains('sb-peek')) { toggleSb(false); el.ta.focus(); return; }
       if (busy) interrupt();
       return;
     }
@@ -890,9 +911,9 @@
     say(text) { if (!busy) { const s = cur(); busy = true; deliver(text, s).finally(() => { busy = false; settle(); }); } },
     setState(s) { if (LABEL[s]) { forcedOffline = s === 'offline'; setState(s); } },
     levels(role, level) { setLevels(role, level); },
-    transcript(rows) { liveTR = rows; demoOn = false; syncBadges(); if (openSec === 'transcript') renderSec('transcript'); if (fullPane === 'transcript') renderFull(); },
-    audio(rows) { liveAU = rows; demoOn = false; syncBadges(); if (openSec === 'audio') renderSec('audio'); if (fullPane === 'audio') renderFull(); },
-    memory(cards) { liveMEM = cards; syncBadges(); if (openSec === 'memory') renderSec('memory'); if (fullPane === 'memory') renderFull(); },
+    transcript(rows) { liveTR = nonempty(rows); demoOn = false; syncBadges(); if (openSec === 'transcript') renderSec('transcript'); if (fullPane === 'transcript') renderFull(); },
+    audio(rows) { liveAU = nonempty(rows); demoOn = false; syncBadges(); if (openSec === 'audio') renderSec('audio'); if (fullPane === 'audio') renderFull(); },
+    memory(cards) { liveMEM = nonempty(cards); syncBadges(); if (openSec === 'memory') renderSec('memory'); if (fullPane === 'memory') renderFull(); },
     get state() { return { daemon: !!daemon, mic: micOn, state, pane: fullPane, section: openSec }; }
   };
 
@@ -904,11 +925,11 @@
       ['sys',  'elaria console shell v6 — ' + new Date().toLocaleString() + ' — type /help for commands'],
       ['sys',  'lamps   console [ON]   daemon [NOT CONNECTED]   voice [NOT CONNECTED]   wire [ABSENT]'],
       ['note', 'colour key — green her · white you · orange names and numbers · blue system · violet aside · amber not-yet · red broken · ice paths · acid commands'],
-      ['note', 'layout — sessions, transcript, memory and audio in the left sidebar. her orb in a narrow rail on the right. the centre is the chat, always. transcript opens full screen across the chat and the orb; the sidebar stays exactly where it is.'],
+      ['note', 'layout — sessions, transcript, memory and audio in the left sidebar. her orb in a proportional panel on the right, yielding on narrow screens. the centre is the chat, always. transcript opens full screen across the chat and the orb; the sidebar stays exactly where it is.'],
       ['note', 'notification — when she wants you, a mini orb pops top right with her name and the message. /notify fires one so you can see it.'],
-      ['ai',   'Moved again, and this time she is on the right where she belongs.\n\nThe orb is a narrow rail now, not half your screen. The centre is the chat and nothing else competes with it. Transcript opens full screen across the chat and the orb when you click it — the sidebar stays put on the left, sessions at the top, exactly as they were.\n\nTwo things are worth pressing before the wire exists:\n\n  /demo      fills transcript and audio with sample rows so you can judge the layout\n  /notify    fires the mini-orb notification, which is how I will tap you on the shoulder\n\nAnd the orb is not frozen: it says "simulated" under her, honestly, because with no wire there is nothing real to drive it. /mic gives her your microphone instead and she reacts to your voice. Nothing is recorded or stored when you do.'],
+      ['note', 'Local shell preview — not a model answer.\n\nThe wide orb panel is proportional; narrow screens prioritise chat. /demo displays marked sample rows; /notify demonstrates the local notification surface. These do not prove daemon feed or messaging capabilities.'],
       ['me',   '/help'],
-      ['ai',   cmdHelp()]
+      ['sys',  cmdHelp()]
     ];
     B.forEach(([r, t], i) => s.msgs.push({ r, t, ts: now - (B.length - i) * 4000 }));
     save();
@@ -922,7 +943,7 @@
     applyPrefs();
     document.body.classList.toggle('sb-off', !data.prefs.sb);
     document.body.classList.toggle('orb-off', !data.prefs.orb);
-    el.tgSb.setAttribute('aria-expanded', String(data.prefs.sb));
+    sidebarAria();
     el.tgOrb.setAttribute('aria-expanded', String(data.prefs.orb));
     renderLog(); renderSess(); lamps(); paintState('idle'); syncBadges(); syncOrb();
     renderSec('transcript'); renderSec('memory'); renderSec('audio');
