@@ -524,8 +524,14 @@ async def test_committed_launcher_process_serves_wire_and_stops_without_stopping
             '--port', str(port), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         try:
             line = (await asyncio.wait_for(process.stdout.readline(), 10)).decode().strip()
-            assert line.startswith('Private console URL: '), line
-            url = urlsplit(line.removeprefix('Private console URL: '))
+            assert line.startswith('Private launch file: '), line
+            import html
+            import re
+            import stat
+
+            link = Path(line.removeprefix('Private launch file: '))
+            assert stat.S_IMODE(link.stat().st_mode) == 0o600
+            url = urlsplit(html.unescape(re.search(r'0;url=([^"]+)', link.read_text())[1]))
             token = parse_qs(url.fragment)['pair'][0]
             assert url.hostname == '127.0.0.1' and not calls  # no RPC/model until browser hello
             kwargs = {'proxy': None} if 'proxy' in inspect.signature(connect).parameters else {}
@@ -543,6 +549,7 @@ async def test_committed_launcher_process_serves_wire_and_stops_without_stopping
             output, _ = await asyncio.wait_for(process.communicate(), 10)
             assert process.returncode == 0, output.decode()
             assert b'synthetic-secret' not in output
+            assert b'#pair=' not in output and token.encode() not in output
         assert (await bridge_module.daemon_call(path, 'status', {}, 1)) == LIVE
 
 

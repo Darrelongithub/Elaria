@@ -107,8 +107,8 @@
   const AU_COLS = 'every row will carry: file · size · age · tier (hot 14 d / cold / never-retry)';
 
   const STUBS = [
-    'stub reply. the daemon is not wired to this window, so this text is the shell talking, not me.\n\nwhat that proves: prompt, screen, colour pass, sidebar, orb and session store all work. that is the half you asked to see.',
-    'stub again. note what did not happen: no network call, no api spend, no key touched. 0 requests left this browser.',
+    'stub reply. the daemon is not wired to this window, so this text is the shell talking, not me.\n\nthis is a local preview, not proof of live capabilities, successful persistence or owner-hardware rendering.',
+    'stub again. no daemon or model request was made for this turn. this is local preview text, not a model answer.',
     'the shell is holding your text. this standalone window is not connected to a daemon.',
     'stub. /status shows which lamp is missing and why — amber means unavailable here; red means disconnected, not proof a component does not exist.',
     'still the shell. a connected adapter supplies replies; the wire lamp does not certify model output or an action.'

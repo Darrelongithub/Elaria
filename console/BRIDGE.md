@@ -1,7 +1,8 @@
 # Local text bridge — operator handoff
 
 **Owner accepted the prior live demo (eight replies and orb) by relay. New sizing/labels
-are TESTED-ONLY pending owner visual review. No speech/audio proof is claimed.**
+and detached launcher are TESTED-ONLY pending owner visual/app-window review. No speech/audio
+proof is claimed. WS2 capability honesty and WS5 new hands remain held, not solved.**
 The standalone v6.15 shell remains the honest fallback if owner verification fails.
 
 ## What runs
@@ -26,13 +27,13 @@ hard stop, not permission to fetch, install or reconstruct something from chat.
 
 Committed executable: **`console/run_bridge.py`**.
 
-SHA256: **`1155961803e8919e9f517cb84ab4f7a1ca40805f06530db974ff36ec9df0f24d`**.
+SHA256: **`ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c`**.
 
 From a copy containing this release's `console/` payload and the existing `.venv` interpreter,
 this is one physical command line. It checks the launcher before Python runs; the launcher
 then checks all five payload hashes before importing the bridge. A mismatch stops.
 
-`test "$(sha256sum console/run_bridge.py)" = '1155961803e8919e9f517cb84ab4f7a1ca40805f06530db974ff36ec9df0f24d  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
+`test "$(sha256sum console/run_bridge.py)" = 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --open`
 
 `-I` isolates Python import paths; `-B` avoids bytecode writes. No standalone install, branch
 switch or mainline deployment is performed by this command. If using an extracted bundle
@@ -45,21 +46,61 @@ existing interpreter is `/home/darrel/Elaria/.venv/bin/python`, this alternative
 uses it without copying files into or switching that checkout. A missing interpreter or
 checksum mismatch stops; there is no install/repair fallback.
 
-`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = '1155961803e8919e9f517cb84ab4f7a1ca40805f06530db974ff36ec9df0f24d  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py`
+`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py --open`
 
 Optional **`--check`** performs artifact/dependency checks and one existing-daemon `status`
-RPC, then exits; it opens no browser server and sends no chat/model/voice turn. `--socket`
-accepts an explicit absolute existing socket path when XDG_RUNTIME_DIR is unavailable.
-There is no guessed socket, alternate host, auto-start, paid/model fallback or key setup.
+RPC, then exits; it creates no launch file/profile, opens no browser/server, and sends no
+chat/model/voice turn. It is mutually exclusive with `--open`. Exact checkout preflight:
 
-## Open it
+`test "$(sha256sum console/run_bridge.py)" = 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --check`
 
-The process prints a **private local pairing URL**. Open that URL on the **same machine as
-the daemon**. Its fragment contains a newly generated local capability token, not a model
-API key. Keep it private; do not paste it into chat/logs. It expires when this process stops.
-The root page alone contains neither token nor console memory cards. Both the shell asset
-and WebSocket require the token. The WebSocket also requires exact loopback Host/Origin.
-File-origin, cross-origin and non-loopback socket URLs are refused.
+`--socket` accepts an explicit absolute existing socket path when XDG_RUNTIME_DIR is
+unavailable. There is no guessed socket, alternate host, auto-start, paid/model fallback or
+key setup. The socket's parent directory must be owner-owned/private (0700) to hold launch
+files; the launcher refuses rather than changing its permissions.
+
+## Open it — detached, no printed token
+
+`--open` chooses installed Chrome/Chromium (stable Google Chrome, Google Chrome, Chromium,
+then chromium-browser), or an explicit absolute `--browser` executable. No download/install.
+It uses `--app=<private-file-URL>`, a **new private `--user-data-dir` for every launch**, and
+`--window-size=1440,900` (override with `--window-size W,H`). Native window-manager policy can
+override geometry. The app flag and unique profile cannot certify an unseen desktop window.
+
+The private file immediately redirects to the **just-generated pairing URL**. No static root
+or old URL is substituted. This indirection keeps the capability token out of **both stdout
+and process argv**. The native flags are the owner-relayed design verification of 2026-11-03;
+headless tests prove the file-to-current-URL navigation, not native app chrome/decoration.
+
+A 0700 `elaria-console-<random>` directory is created beside the daemon socket, with 0600
+`open.html` and, for `--open`, its own 0700 `profile/`. The launcher prints only the file path.
+For manual mode, use the following verified invocation and open that local file on the same
+machine as the daemon. Do not share/read its contents into logs; it contains the live token.
+
+`test "$(sha256sum console/run_bridge.py)" = 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
+
+The browser is detached with a new POSIX session, closed inherited FDs and null standard
+streams. Only desktop/session/locale environment is passed; model keys, SSH agents and shell
+startup variables are not. No inherited browser profile is reused. Closing its window leaves
+the bridge running; Ctrl-C stops the bridge, not the browser or daemon. Browser reaping is
+nonblocking; no executor thread waits on it during shutdown.
+
+**Costs:** each fresh profile has separate browser-local display history; it does not load
+another profile's tabs/cache. The daemon's existing context is unchanged and history_limit
+remains 1. Profiles/links are not automatically deleted underneath a detached browser; keep
+them private and remove only the named launch directory after both processes are stopped if
+cleanup is needed. Typical XDG runtime cleanup also removes them at logout. No existing
+browser configuration, assistant service unit, enablement, checkout or model key is changed.
+
+If another process/service owns the port, launch stops: no kill, restart or disable.
+**elaria-console.service stays under the enabled-state hold.**
+
+The root page contains neither token nor console cards. A narrow exception permits a
+cross-site **top-level navigation to that public root**, needed for file-to-HTTP navigation.
+Cross-site fetches/iframes, explicit foreign/null Origin, and non-loopback Host remain refused.
+Protected shell assets and WebSocket retain their token and origin/site gates. The private
+file is navigation only; it does not make a file-origin WebSocket connection. Bare roots and
+expired pairing links cannot load the console. Tokens expire when their bridge stops.
 
 Opening the page only probes daemon status. **A model call can occur only after you submit
 text**, through the existing `console.say` handler. Live/online readiness is required;

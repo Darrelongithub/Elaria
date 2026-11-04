@@ -211,7 +211,14 @@ background:#110d1c;color:#e3bd80;z-index:1}
             url = urlsplit(request.path)
             if host != f'127.0.0.1:{self.port}' or url.scheme or url.netloc or url.fragment:
                 return self.response(403)
-            if origin not in (None, self.origin) or site == 'cross-site':
+            # A private local launch file navigates to the public, token-free bootstrap.
+            # Allow only that top-level navigation shape; never relax protected assets,
+            # WebSocket Origin/site checks, iframe embedding, or cross-origin fetches.
+            public_navigation = (url.path == '/' and not url.query and origin is None
+                                 and request.headers.get('Sec-Fetch-Mode') == 'navigate'
+                                 and request.headers.get('Sec-Fetch-Dest') == 'document')
+            if (origin not in (None, self.origin)
+                    or (site == 'cross-site' and not public_navigation)):
                 return self.response(403)
             if url.path in {'/elaria', '/console'}:
                 params = parse_qs(url.query, strict_parsing=True)
