@@ -1983,6 +1983,39 @@ def build_parser() -> argparse.ArgumentParser:
     queue_ext = queue_sub.add_parser("add-external", help="park an external action for approval")
     queue_ext.add_argument("action_name")
     queue_ext.add_argument("description")
+    backup_p = sub.add_parser(
+        "backup",
+        help="WP7 cold storage & backup — status, cold fetch, one run, integrity drill")
+    backup_sub = backup_p.add_subparsers(dest="backup_action", required=True)
+    backup_sub.add_parser("status", help="manifest summary + storage gauge (path-blind)")
+    backup_fetch = backup_sub.add_parser(
+        "fetch", help="cold read path: manifest lookup, restore, hash-verify")
+    backup_fetch.add_argument("artifact", help="the artifact to restore")
+    backup_fetch.add_argument("--out", help="where to put the restored copy")
+    backup_run = backup_sub.add_parser("run", help="one backup pass: tier, plan, reconcile")
+    backup_run.add_argument("--dry-run", action="store_true",
+                            help="report the plan; change nothing, contact nothing")
+    backup_check = backup_sub.add_parser(
+        "check", help="integrity drill: restore a cold artifact to tmp and hash-verify")
+    backup_check.add_argument("artifact", nargs="?", help="drill this artifact; "
+                                                          "default is a random cold one")
+    backup_check.add_argument("--kind", choices=("monthly", "quarterly"),
+                              default="monthly", help="drill cadence")
+    # Increment 8: record the outcome so "one live monthly drill passes" is auditable
+    # afterwards rather than remembered. Path-free by construction.
+    backup_check.add_argument("--record", action="store_true",
+                              help="append the outcome to the drill journal (0600, "
+                                   "outside the repo)")
+    backup_check.add_argument("--last", action="store_true",
+                              help="show the most recent recorded drill of this kind "
+                                   "and run nothing")
+    # Increment 7: the trigger surface. `watch` observes the audio root and the journal
+    # and reports whether a backup should wake. It NEVER performs a backup - that is
+    # `run`'s job - and it never touches the daemon, per the trigger ruling.
+    backup_watch = backup_sub.add_parser(
+        "watch",
+        help="one trigger poll: report whether a backup should wake (no backup runs)")
+    backup_watch.add_argument("--root", help="audio root to observe (default: config)")
     sub.add_parser("halt", help="panic switch (§4.4)")
     sub.add_parser("resume", help="clear the halt flag")
     ladder_p = sub.add_parser(
@@ -1990,8 +2023,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="hardware truth ladder — chains console/wake/voice/event (§4.8)")
     ladder_p.add_argument(
         "chain", nargs="?", default="all",
-        choices=("console", "wake", "voice", "event", "all"),
-        help="one chain, or all four")
+        choices=("console", "wake", "voice", "event", "backup", "all"),
+        help="one chain, or all five")
     ptt_p = sub.add_parser("ptt", help="push-to-talk (bind press/release in Hyprland)")
     hotword_p = sub.add_parser(
         "hotword", help="wake-knock model (armed state, buffers, clips, watchdog)")
@@ -2285,6 +2318,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "queue":
             return _queue_command(args, config)
+
+        if args.command == "backup":
+            from .backup_cli import backup_command
+
+            return backup_command(args, config)
 
         if args.command == "ask":
             result = call(config.socket_path, "ask",
