@@ -403,6 +403,36 @@ def _fallback_now():
 # --------------------------------------------------------------------------------------
 
 
+def _watch(ctx: BackupContext, *, root: str | None, out) -> int:
+    """One trigger poll. Reports whether a backup should wake; performs none.
+
+    Path-free by construction: the output carries counts and extension labels only. The
+    `audio kept at {path}` detail is read to address an artifact and never printed.
+    """
+
+    from assistant.backup_triggers import BackupWatcher
+
+    watch_root = Path(root) if root else ctx.data_dir / "audio"
+    watcher = BackupWatcher(
+        root=watch_root,
+        cursor_path=ctx.data_dir / ".backup-journal-cursor",
+        data_dir=ctx.data_dir,
+        poll_s=int(ctx.section.get("watcher_poll_s", 30) or 30),
+        defer_above_mb=int(ctx.section.get("defer_above_mb", 100) or 100),
+    )
+    decision = watcher.poll()
+    if not decision.woke:
+        print("watch: nothing to back up", file=out)
+        return 0
+    labels = ", ".join(decision.labels) or "nothing"
+    print(f"watch: wake ({decision.reason}); {decision.count} artifact(s); "
+          f"kinds: {labels}", file=out)
+    if decision.deferred:
+        print(f"watch: deferred to AC/unmetered: {', '.join(decision.deferred)}",
+              file=out)
+    return 0
+
+
 def backup_command(args, config, *, out=None, ctx: BackupContext | None = None) -> int:
     """`assist backup <action>`. Returns a process exit code."""
 
@@ -421,5 +451,7 @@ def backup_command(args, config, *, out=None, ctx: BackupContext | None = None) 
     if action == "check":
         return _check(ctx, artifact=getattr(args, "artifact", None),
                       kind=getattr(args, "kind", "monthly"), out=out)
+    if action == "watch":
+        return _watch(ctx, root=getattr(args, "root", None), out=out)
     print(f"backup: unknown action {action!r}", file=out)
     return 2

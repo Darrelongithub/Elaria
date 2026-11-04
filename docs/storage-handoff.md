@@ -2001,3 +2001,102 @@ registration only - no function signature, return type, exit code or public name
 pins 25 rung lines (5 chains x 5 rungs). It is the designed extension point, not on the
 forbidden list. It would fail if a chain were dropped, which is what makes this note
 checkable rather than merely asserted.
+
+---
+
+## 2026-11-04 - Report 023: INCREMENT 7 landed (trigger surface) + a near-miss on mainline's watcher.py
+
+**Branch:** `arena/storage`. **Frozen branch (condition 3):** `origin
+arena/e7a1cca5-elaria = b181712563c1577f5faea4e59fe5f7e104a89ed1`, verified before and
+after. Untouched.
+
+**PUSH RESUMED ON RULING.** Firing three occurred (fresh clone + forced checkout onto the
+frozen branch, refspec still restricted). The canonical report-020 checklist was run as a
+checklist, not re-derived: frozen-hash verify before; explicit-URL fetch -> FETCH_HEAD =
+04ad75a; integrity check over 21 tracked WP7 files; local-only checkout; verify after.
+Report 022 went up as its OWN single commit (`07586a6`) under the ruling's three
+conditions: explicit refspec URL only; full-SHA verification of BOTH the pushed ref and
+the frozen ref before and after; report 022 before increments 7/8. All three PASS.
+
+**A DEFECT IN THE CHECKLIST, self-caught and recorded:** the integrity check flagged
+`docs/storage-handoff.md` as a mismatch - correctly, because the workspace held the
+uncommitted report-022 append. The subsequent force checkout then OVERWROTE it, and the
+append had to be re-written verbatim. **LESSON: a flagged mismatch means PRESERVE THE WORK
+BEFORE checking out, not after.** The checklist as written has a step that can destroy the
+thing it just detected.
+
+**INCREMENT 7 - THE TRIGGER SURFACE - LANDED.** `src/assistant/backup_triggers.py` (new,
+~430 lines) + `tests/test_wp7_watcher_triggers.py` (new, 38 tests) +
+`systemd/assistant-backup.service` + `systemd/assistant-backup.timer` +
+`systemd/assistant-backup-monthly.timer` + an additive `assist backup watch` CLI leaf
+(`cli.py` +7/-0 registration, `backup_cli.py` +40/-0 handler, smoke table +1 entry).
+
+**THE DAEMON IS NOT TOUCHED**, per the trigger ruling. The module observes the audio root
+and the journal and decides when a backup should wake; it never performs one. A one-line
+daemon hook may be proposed only after the mainline PR merges.
+
+**BELT/SUSPENDERS, POLARITY PINNED BY TEST.** The directory poll is TRUTH; the journal
+tail CORROBORATES and can never create a wake. `test_a_journal_post_close_alone_cannot_cre
+ate_a_wake` feeds a journal full of `session.close` lines into an unchanged directory and
+asserts a no-op. Inverting this would let a log line manufacture work - the forbidden
+optimisation. Cheap poll: `scandir` + name/size/mtime, no hashing (pinned by
+`test_no_hashing_is_performed`). Journal tail is incremental from a persisted cursor, so a
+restart resumes rather than replays. §2.1 honoured: dispatch keys on the event NAME
+(`parts[2]`), never the verdict. Privacy fence: `WakeDecision` carries counts and extension
+LABELS only, never names or paths.
+
+**DEFERRAL POLICY:** uploads above `[backup] defer_above_mb` (100 MB) wait for AC/unmetered
+power. The boundary itself does not defer (pinned), and a zero threshold disables the
+policy.
+
+**SYSTEMD:** nightly `OnCalendar=*-*-* 03:17:00` + `Persistent=true`, oneshot service
+running `assist backup run`. Monthly WP5 shape `OnCalendar=*-*-01 04:11:00` +
+`Persistent=true`. Both carry the T0 citation that multiple elapses in ONE continuous
+sleep collapse to a SINGLE activation - a laptop closed all month runs ONE drill, not
+thirty, which is correct because the manifest is a state machine and `reconcile_all()`
+runs to quiescence. **No unit names a secret** - pinned by a test that checks for
+ASSIGNMENTS (`Environment=PASSWORD`, `EnvironmentFile`), not for prose, because a comment
+explaining that no secret lives there is the policy, not a violation.
+
+### A NEAR-MISS ON MAINLINE'S FILE - reported, because it is the lane's most serious slip
+
+**`src/assistant/watcher.py` is MAINLINE's, and I overwrote it.** I wrote my increment-7
+module straight into that path with `write_file`, which creates-or-overwrites. The file was
+already in my HEAD (89 lines: `WatcherEvents`, `snapshot()`, `PollingWatcher`) and
+`tests/test_bughunt_systems.py` + `tests/test_phase3_organiser.py` import `PollingWatcher`
+from it. It was caught by **mainline's own tests** - `ImportError: cannot import name
+'PollingWatcher' from 'assistant.watcher'` - not by me.
+
+**Recovery, byte-exact:** `git checkout HEAD -- src/assistant/watcher.py` restored
+`17ce5430e835d02ceb4b47c6efc21501fae95760`, identical to the base; mainline's 81 tests pass
+again. The clobber was never committed, so nothing was lost and nothing was pushed.
+
+**There was a REAL name collision, not just a path collision.** Mainline's
+`snapshot(root) -> dict[str, tuple[int, float]]` walks recursively and keys by FULL PATH
+STRING, for the voice-test/dictation pipeline. Mine is flat and keys by NAME, because a
+backup trigger must not carry a path near its output. Same name, different return type,
+different job. Mine is now `directory_snapshot()` in `backup_triggers.py`.
+
+**This is the THIRD mainline-owned file this lane has touched, and the first time it was
+an accident.** `ladder.py` (extended, by design, merge-noted) and `cli.py` (registration
+point, by design) were deliberate. `watcher.py` was a blind `write_file`. Three boundary
+tests now pin it: the on-disk file must equal `HEAD:`'s version; this lane must not export
+a bare `snapshot`; and the two snapshots must not be interchangeable.
+
+**How it was missed:** I checked `git ls-tree` for a *ladder* collision and never checked
+whether `watcher.py` existed before writing to that path. **The rule that prevents it:
+before writing ANY new module, `git cat-file -e HEAD:<path>` first - and confirm the
+revision resolves before trusting a negative.**
+
+**SUITE:** 2104/6/0 -> **2142/6/0, ruff clean** (+38). D7 (the mainline `conftest.py:108`
+teardown flake) fired in 2 of 4 full-suite runs; the clean runs are 2142/6/0. It is
+pre-existing, mainline-owned, and unchanged by this increment.
+
+**FIFTH BASE MOVEMENT `be9183c -> a6cc150`** (four commits, voice-chain extraction).
+Bare movement: `journal_log.py` byte-identical, `audio kept at` still 4, Drift 2 does not
+recur, both §2 clauses re-verified, merge-base still `f915d8e` with no history rewrite.
+**GATE 1e unchanged - this lane still consumes no journal shape, so the
+zero-migration-cost window is still open.**
+
+**NEXT:** increment 8 - monthly restore-drill scaffolding. Gate 1 unchanged: no live MEGA
+traffic, no merge.

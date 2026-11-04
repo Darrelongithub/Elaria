@@ -129,6 +129,10 @@ def _smoke_table(tmp_path: Path) -> list[list[str]]:
         ["backup", "fetch", str(mic)],
         ["backup", "run", "--dry-run"],
         ["backup", "check"],
+        # Increment 7: the trigger surface. `watch` performs NO backup and touches no
+        # daemon - it is one poll that reports whether a backup should wake. Safe to
+        # smoke: it reads a directory and a journal cursor and prints a count.
+        ["backup", "watch"],
     ]
 
 

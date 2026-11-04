@@ -1974,6 +1974,13 @@ def build_parser() -> argparse.ArgumentParser:
                                                           "default is a random cold one")
     backup_check.add_argument("--kind", choices=("monthly", "quarterly"),
                               default="monthly", help="drill cadence")
+    # Increment 7: the trigger surface. `watch` observes the audio root and the journal
+    # and reports whether a backup should wake. It NEVER performs a backup - that is
+    # `run`'s job - and it never touches the daemon, per the trigger ruling.
+    backup_watch = backup_sub.add_parser(
+        "watch",
+        help="one trigger poll: report whether a backup should wake (no backup runs)")
+    backup_watch.add_argument("--root", help="audio root to observe (default: config)")
     sub.add_parser("halt", help="panic switch (§4.4)")
     sub.add_parser("resume", help="clear the halt flag")
     ladder_p = sub.add_parser(
