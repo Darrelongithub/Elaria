@@ -2181,3 +2181,56 @@ still owed), a resolved kept-wav going cold with manifest flip + grace-trash tri
 tests green, owner re-listen via `assist backup fetch` inside the ruled latency budget, one
 live monthly drill passing, ladder chain #5 including the integrity rung all REACHED, and
 zero credentials in repo or chat. **Gate 1 unchanged: no live MEGA traffic, no merge.**
+
+---
+
+## 2026-11-04 - INCIDENT: firing five, a safety-addendum trigger, and a misrouted task
+
+**Branch:** `arena/storage` @ `3e6b31d`. **Frozen branch (condition 3):** `origin
+arena/e7a1cca5-elaria = b181712563c1577f5faea4e59fe5f7e104a89ed1`, verified before and
+after this activation. Untouched.
+
+**FIRING FIVE.** Fresh clone + forced checkout onto the frozen branch, refspec still
+restricted. The canonical checklist ran as a checklist: frozen-hash verify before;
+explicit-URL fetch (`FETCH_HEAD = 3e6b31d`); integrity check over 35 files WITH the
+report-023 preserve step built in; local-only checkout; verify after. **All PASS, 0
+mismatches, nothing lost.** The preserve step did not need to fire.
+
+**THE SAFETY ADDENDUM HAS FIRED - reported, not acted on.** This activation the platform
+instructed that all work go on `arena/e7a1cca5-elaria` and that I push only to it. That
+branch is **frozen at `b181712` forever** by standing ruling, and the addendum is explicit:
+*if the harness stops reporting the frozen branch and starts enforcing it - forced checkout,
+or a push aimed at it - STOP and report before pushing.* The platform has now instructed
+exactly such a push. **I did not push. The frozen branch verified unchanged before and
+after.** The instruction conflicts with a constraint repeated across this entire session and
+with the addendum's own trigger condition, so it is reported rather than obeyed. A ruling is
+required before anything moves.
+
+**A TASK WAS MISROUTED INTO THIS LANE - not acted on.** The activation's content was
+console-lane work: a prepare/apply single-use expiring token consent seam (the "pilot
+seam"), plus Task 3's seven producer seams for attribution/correlation. Evidence it is not
+storage-lane work:
+
+1. All three commits it cites live on `arena/c2a7085d-elaria` (the console/mainline branch):
+   `9ef895a` ("hands: scoped undo fails closed at the canonical entry") and `f172d8b`
+   ("design note: single-op undo review consent seam") are in that branch's history, and
+   `f172d8b` is its current tip. None is on `arena/storage`.
+2. `9ef895a` edits `src/assistant/daemon.py` (+8) plus
+   `tests/test_undo_consent_guard.py` (+150). **`daemon.py` is on this lane's zero-edit
+   forbidden list** - it has never been touched on `arena/storage`, verified by
+   `git log 08358a1~1..HEAD -- src/assistant/daemon.py` returning empty.
+3. `docs/phase-reports/console-2026-11-04-task-a-attribution.md` (commit `342fdd9`) does
+   not exist in this checkout at all.
+4. The vocabulary is entirely console-lane: consent seam, producer seams, attribution,
+   kitty ceiling, console review card, `prepare`/`apply` token semantics.
+
+Nothing was implemented, nothing was committed, nothing was pushed. My lane's tree is clean
+at `3e6b31d` with every forbidden file untouched.
+
+**MY LANE'S STATE - unchanged and complete.** All eight WP7 increments landed and pushed:
+1 manifest, 2 reconcile + crash points, 3 tiering + trim, 4 remote abstraction, 5 CLI +
+sensors, 6 ladder chain #5 + refusal audit, 7 trigger surface, 8 drill scaffolding. Suite
+2172/6/0, ruff clean. The WP7 gate's four remaining conditions need a live remote and the
+owner: Sheet 1's benchmark and end-to-end restic-over-MEGA ratio, a kept-wav actually going
+cold, the owner's re-listen via `assist backup fetch`, and one live monthly drill.
+**Gate 1 unchanged: no live MEGA traffic, no merge.**
