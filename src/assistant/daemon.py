@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import json
 import math
@@ -29,6 +30,7 @@ import sys
 import time
 import uuid
 from contextvars import ContextVar
+from pathlib import Path
 
 from . import __version__
 from .asr import local_asr_status
@@ -229,6 +231,9 @@ class Daemon:
         self._dictation_task: asyncio.Task | None = None
         self._dictation_session_mode = "narration"
         self._capture_source = None
+        # Single-op undo review pilot (owner ruling 2026-11-04): token ->
+        # immutable ask. Memory only, single-use, expires (UNDO_ASK_TTL_S).
+        self._undo_asks: dict[str, dict] = {}
         self._stop_event: asyncio.Event | None = None
         # BUG6: ptt.stop answers on the release and the session finishes in the
         # background. Processing state is observable through ptt.result/status.
@@ -785,6 +790,8 @@ class Daemon:
             "review.list": self._review_list,
             "review.decide": self._review_decide,
             "undo": self._undo,
+            "undo.prepare": self._undo_prepare,
+            "undo.apply": self._undo_apply,
             "verify": self._verify,
             "memory.remember": self._memory_remember,
             "memory.list": self._memory_list,
@@ -2787,6 +2794,164 @@ class Daemon:
         return await asyncio.to_thread(
             self.executor.undo, op_id=params.get("op_id"),
             plan_id=params.get("plan_id"), since_iso=since)
+
+    # -- single-op undo review pilot (owner ruling 2026-11-04) --------------
+    #
+    # Design: docs/design/2026-11-04-undo-consent-seam.md. The guard in
+    # `_undo` keeps refusing EVERY scoped undo and stays byte-identical; this
+    # seam is the one blessed path and it is narrower than the rule it bends:
+    # exactly one operation, pre-verified before the owner is asked,
+    # re-verified before it runs, and single-use. A Yes approves a snapshot,
+    # never a query. Containment is this daemon route only — `cli.py`'s
+    # DaemonUnavailable fallback calls Executor.undo directly and is NOT
+    # contained here (global enforcement is a separate ruling).
+
+    UNDO_ASK_TTL_S = 600.0
+
+    def _undo_preverify(self, row: dict) -> list[str]:
+        """The executor's own three per-op facts, asked BEFORE the owner is.
+
+        A scope that cannot execute is never offered for approval.
+        """
+        from .safety import try_sha256_file
+
+        problems: list[str] = []
+        # executor.py:462 swaps: op["dst"] is the CURRENT home, op["src"] the
+        # original location. Pre-verify in that same orientation or the check
+        # refuses (or worse, blesses) the wrong path.
+        current, original = Path(str(row.get("dst"))), Path(str(row.get("src")))
+        expected = row.get("sha256_after") or row.get("sha256_before")
+        if not current.exists():
+            problems.append(f"{current} no longer exists")
+        elif expected and try_sha256_file(current) != expected:
+            problems.append(f"{current} changed since the operation")
+        if original.exists() and try_sha256_file(original) != (expected or ""):
+            problems.append(f"{original} is occupied by different content")
+        return problems
+
+    def _undo_drift(self, snapshot: dict, row: dict | None) -> list[str]:
+        """Every bound field re-read at apply; any difference is total."""
+        if row is None:
+            return ["the operation row is gone"]
+        drift = [f"{field} changed" for field in
+                 ("plan_id", "ts", "op", "src", "dst", "sha256_before",
+                  "sha256_after", "status")
+                 if row.get(field) != snapshot.get(field)]
+        if not drift:
+            drift = self._undo_preverify(row)
+        return drift
+
+    async def _undo_prepare(self, params: dict) -> dict:
+        """Resolve ONE operation, pre-verify it, and hand back an immutable
+        ask. Writes nothing; the ask is memory-only and single-use."""
+        self._require_ipc_owner()
+        from .executor import parse_since
+
+        since = parse_since(str(params["since"])) if params.get("since") else None
+        op_id = params.get("op_id")
+        plan_id = params.get("plan_id")
+        if since is None and op_id is None and plan_id is None:
+            raise ValueError("undo review needs a scope (op_id, plan_id or since)")
+        if op_id is not None:
+            row = await asyncio.to_thread(self.store.get_operation, int(op_id))
+            rows = ([row] if row and row.get("status") in
+                    ("committed", "copied", "intent") else [])
+        else:
+            rows = await asyncio.to_thread(
+                self.store.undoable_operations, plan_id=plan_id, since_iso=since)
+        if not rows:
+            raise ValueError("nothing undoable in that scope — no ask is raised")
+        if len(rows) > 1:
+            raise ValueError(
+                f"the review pilot handles one operation at a time; that scope "
+                f"resolves to {len(rows)} — pass an op_id and prepare again")
+        row = rows[-1]
+        blockers = self._undo_preverify(row)
+        if blockers:
+            raise ValueError("cannot offer that undo — " + "; ".join(blockers)
+                             + " (nothing is asked, nothing is undone)")
+        snapshot = {
+            "op_id": row["id"], "plan_id": row.get("plan_id"),
+            "ts": row.get("ts"), "op": row.get("op"), "src": row.get("src"),
+            "dst": row.get("dst"), "sha256_before": row.get("sha256_before"),
+            "sha256_after": row.get("sha256_after"), "status": row.get("status"),
+        }
+        ask_sha = hashlib.sha256(json.dumps(
+            snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        now = time.monotonic()
+        for stale in [tok for tok, ask in self._undo_asks.items()
+                      if now > ask["expires_at"]]:
+            self._undo_asks.pop(stale, None)
+        token = uuid.uuid4().hex
+        self._undo_asks[token] = {"snapshot": snapshot, "ask_sha256": ask_sha,
+                                  "prepared_at": now,
+                                  "expires_at": now + self.UNDO_ASK_TTL_S,
+                                  "used": False}
+        log_event("undo.prepare", verdict="prepared",
+                  detail=(f"ask_sha256={ask_sha[:16]}; op_id={snapshot['op_id']}; "
+                          f"op={snapshot['op']}; expires_in_s="
+                          f"{self.UNDO_ASK_TTL_S:g}; open_asks="
+                          f"{len(self._undo_asks)}"))
+        return {"token": token, "ask_sha256": ask_sha, "snapshot": snapshot,
+                "prepared_at": iso_now(), "age_s": 0.0,
+                "expires_in_s": self.UNDO_ASK_TTL_S}
+
+    async def _undo_apply(self, params: dict) -> dict:
+        """Answer one ask. No is terminal; a lapsed ask is terminal; Yes
+        re-verifies the whole snapshot and refuses totally on any drift."""
+        principal = self._require_ipc_owner()
+        actor = f"owner-ipc uid={principal.uid} pid={principal.pid}"
+        decision = str(params.get("decision") or "").strip().lower()
+        token = str(params.get("token") or "").strip()
+        if decision not in ("yes", "no"):
+            raise ValueError("undo.apply needs decision 'yes' or 'no'")
+        ask = self._undo_asks.get(token)
+        if ask is None:
+            raise ValueError("unknown undo ask — prepare a fresh one")
+        if ask["used"]:
+            raise ValueError("that ask was already answered — prepare a fresh one")
+        age = time.monotonic() - ask["prepared_at"]
+        if time.monotonic() > ask["expires_at"]:
+            ask["used"] = True
+            self._undo_asks.pop(token, None)
+            log_event("undo.apply", level="warn", verdict="lapsed",
+                      detail=(f"ask_sha256={ask['ask_sha256'][:16]}; "
+                              f"age_s={age:.1f}; {actor}; LAPSED — a lapsed ask "
+                              f"needs a fresh prepare, never a Yes"))
+            raise ValueError(f"that ask lapsed after {age:.0f}s — prepare a "
+                             f"fresh one (a lapsed ask cannot be approved)")
+        if decision == "no":
+            ask["used"] = True      # terminal; kept so a replay says so
+            log_event("undo.apply", verdict="declined",
+                      detail=(f"ask_sha256={ask['ask_sha256'][:16]}; "
+                              f"age_s={age:.1f}; {actor}; declined — nothing "
+                              f"was undone"))
+            self.store.log_persona_event(
+                iso_now(), "ack",
+                json.dumps({"ack": "declined",
+                            "ask_sha256": ask["ask_sha256"]}))
+            return {"undone": 0, "problems": [], "decision": "no",
+                    "ask_sha256": ask["ask_sha256"], "age_s": round(age, 1)}
+        row = await asyncio.to_thread(
+            self.store.get_operation, int(ask["snapshot"]["op_id"]))
+        drift = self._undo_drift(ask["snapshot"], row)
+        if drift:
+            ask["used"] = True      # terminal: drifted asks are not retried
+            log_event("undo.apply", level="warn", verdict="drifted",
+                      detail=(f"ask_sha256={ask['ask_sha256'][:16]}; "
+                              f"drift={'; '.join(drift)}; {actor}; refused — "
+                              f"nothing was undone"))
+            raise ValueError("undo refused, nothing was undone — "
+                             + "; ".join(drift) + " (prepare a fresh ask)")
+        ask["used"] = True        # single-use, consumed BEFORE execution
+        result = await asyncio.to_thread(
+            self.executor.undo, op_id=int(ask["snapshot"]["op_id"]))
+        log_event("undo.apply", verdict="approved",
+                  detail=(f"ask_sha256={ask['ask_sha256'][:16]}; "
+                          f"op_id={ask['snapshot']['op_id']}; age_s={age:.1f}; "
+                          f"{actor}; undone={result.get('undone')}"))
+        return {**result, "decision": "yes",
+                "ask_sha256": ask["ask_sha256"], "age_s": round(age, 1)}
 
     async def _verify(self, params: dict) -> dict:
         from .executor import parse_since
