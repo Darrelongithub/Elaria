@@ -4,7 +4,9 @@ Date: 2026-11-05 · Branch: `arena/c2a7085d-elaria` · Code read at **`e7316b9`*
 Scope authority: the 2026-11-04 order's TASK 3 — *estimate and design only, until an owner grant quotes the seven-seam list as its own scope.*
 Evidence class: **[TESTED-ONLY]** for everything that already exists (it is pinned in the suite); every "estimate" below is an unhurried forecast, not a measurement.
 
-Provenance of the list, stated plainly: the canonical table lives in the console lane's Task A report `342fdd9` (`docs/phase-reports/console-2026-11-04-task-a-attribution.md`). **That commit is not in this tree** — `git cat-file -t 342fdd9` → *not a valid object*. The seven seams below are therefore transcribed from **the order's own listing**, not from the console report. If the console's table differs in wording or in which field is wanted, this document is re-derived from theirs *before* any code; nothing here is worth defending against the source that actually specifies it.
+Provenance of the list, stated plainly: the canonical table lives in the console lane's Task A report `342fdd9` (`docs/phase-reports/console-2026-11-04-task-a-attribution.md`). At the time of writing, that commit was in no local ref — `git cat-file -t 342fdd9` → *not a valid object* — so the seven seams below were transcribed from **the order's own listing**.
+
+**Re-derived since (`§9`).** `342fdd9` sits on `origin/arena/b65d5161-elaria` (the console lane's branch); a full `git fetch origin 'refs/heads/*:refs/remotes/origin/*'` brought it into the object store, and the table was read from there — read-only, cross-lane input, nothing built for that lane. The transcription maps **1:1 onto the console's seven rows in the same order**, no seam missing and none added, with five wording-level deltas that change two estimates and one dependency. §9 records them. Where this document and the console table appear to disagree, the console table is the specification and this document is the thing that gets corrected.
 
 Two rules hold throughout, and they are the reason these are cheap:
 
@@ -121,7 +123,69 @@ So the turn claims "Remembered" and echoes the text back, regardless of what the
 
 ## Open questions
 
-1. **Which list is authoritative?** This one is transcribed from the order because the console's `342fdd9` is not in this tree. If the console table names an eighth seam or words one differently, the grant should quote *that*, and this document is revised to match before any code.
+1. **Which list is authoritative? — resolved.** The console's `342fdd9` table was read on 2026-11-05 (§9). It is authoritative; this document now matches it, with the deltas in §9 folded into the estimates below. A grant should quote the console's seven rows.
 2. **Is an optional key in the error branch acceptable wire drift?** Seam 2 is the only one that touches a payload shape rather than adding a field to a dict the console already reads. If that is too much for one grant, seam 2 can be split: `refs` on success first, `refused` on errors later.
 3. **Receipts in memory or in the row?** Seam 7's receipts live in daemon memory keyed by plan id, which means a daemon restart between build and read loses them (the plan row still has status/total/placed/abstained, so the loss is bounded). Persisting them would be a schema decision, and this document does not ask for one.
 4. **`outcome` vocabulary.** `answered | declined | escalated | queued | refused` is my proposal. If the console has already drawn a status vocabulary, its words should win — one vocabulary, not two that need translating.
+
+---
+
+## 9. Re-derivation against the console table (`342fdd9`) — the delta, recorded
+
+Obtained on 2026-11-05 from `342fdd9:docs/phase-reports/console-2026-11-04-task-a-attribution.md` (commit on `origin/arena/b65d5161-elaria`, brought in by a full-head fetch). Read-only; no file, branch or commit of that lane was touched. The console's table is headed *"Mainline seam requests — not implemented or invented"*, with columns *Missing evidence | Minimum producer seam requested | Current surface*.
+
+### The mapping — 1:1, same order, nothing missing, nothing invented
+
+| # | console row ("missing evidence") | console's "minimum producer seam requested" | this document's seam | verdict |
+|---|---|---|---|---|
+| 1 | Actual executed intent and request correlation | "Request-bound canonical intent/outcome, with correlation carried from authenticated dispatch through reply" | §1 | **identical** |
+| 2 | Operation journal attribution | "Structured operation/journal references, explicit no-operation/refused state where applicable, **tied to the request**" | §2 | **+ "tied to the request"** |
+| 3 | Causal message reference | "Message ID from this turn's append, not a post-turn history sample" | §3 | **identical** |
+| 4 | Indexed hits | "Structured source/ref/index **timestamp or revision** and local hit/miss/fallback outcome" | §4 | **+ "or revision"** |
+| 5 | Remember result | "Fact ID, kind, resulting state and **retention/restore** semantics from the actual service result" | §5 | **+ "restore"** |
+| 6 | Forget result | "Structured exact count, affected IDs/**versions**/state and operation/**decision** correlation **for the later pilot**" | §6 | **+ versions, state, decision correlation, pilot binding** |
+| 7 | Organise result | "Resolved root set, started plan IDs, write kinds and separate completed/failed **build** receipts" | §7 | **receipts are for the build, not the apply** |
+
+**No eighth seam. No seam in this document that the console did not ask for.** The transcription was faithful in substance; five rows were narrower than the console's wording, and those narrowings are the delta below. Each is resolved *in this document*, not deferred to code.
+
+### The five deltas, and what each costs
+
+**D1 — seam 2 must be "tied to the request" (estimate: a dependency, and +8 lines if granted alone).** The console requires the references be bound to the request that produced them, not merely present in a reply. That binding is seam 1's `corr_id`. Consequence: **seam 2 depends on seam 1.** Granted together, the cost is unchanged (~45). Granted alone, seam 2 must mint and carry its own request binding — a second correlation concept in the process, which is the worse outcome — **+8 lines, ~53**. Recommendation: if seam 2 is ever granted, seam 1 is granted with it.
+
+**D2 — seam 4 allows "index timestamp *or* revision" (estimate unchanged, ~34).** Checked against the schema rather than assumed: `documents` carries **`indexed_ts`** (`store.py:156`) and **`sha256`** (`store.py:151`), and `doc_chunks` (`store.py:161–166`) is a child of that row, so a chunk hit joins to both without a schema change. There is **no row revision and no version column anywhere in the store**, so "revision" can only honestly mean *content revision* — the document's `sha256` prefix — never a counter. Both halves of the console's "or" are therefore answerable today; the estimate moves ~30 → **~34** to thread `indexed_ts` and `sha256[:16]` through the vector arm's join and the keyword arm's `search_documents` rows.
+
+**D3 — seam 5 owes "restore" semantics, not only retention (estimate ~15 → ~17, one extra pin).** `facts.active` (`store.py:204`) is set to 0 by forget; the row and its text stay. So the truthful declaration is: **deactivation is reversible at the row level and no API restores it today** — no duration guarantee, no restore verb, and `forget` is not erasure. That is a second declared token (`"restore": "row_preserved_no_api"`) plus a pin asserting the row still exists, inactive, after a forget. This is also the honest form of the console's own "deactivation-not-erasure" disclosure, and it must not become a promise that a restore path exists.
+
+**D4 — seam 6 asks for versions, state and a pilot binding (estimate ~25 → ~30, one extra pin).** Three separate answers:
+- *versions*: **there are none.** `facts` is `id, ts, kind, text, source, confidence, evidence, active` (`store.py:196–205`) — no version, exactly as with `operations` (owner answer 3 deferred a version column as its own schema decision). The receipt therefore **declares the absence** rather than inventing a counter.
+- *state*: answerable — `{id, state: "inactive", ts}` per affected fact, since the row survives with `active = 0`.
+- *operation/decision correlation "for the later pilot"*: this is the one place the console's wording points at something that **does not exist yet**. A forget touches `facts`, not `operations`, so there is no operation row to bind to; the request-level `corr_id` is the only correlation available. If the later forget pilot needs a decision-level receipt identity, that identity is a **new object** — either a receipts table (schema decision) or a decided convention on `corr_id` + `ts`. Flagged as an open question; **+5 lines** covers `state` and the absence declaration, not a receipt table.
+
+**D5 — seam 7's receipts are *build* receipts (estimate unchanged, ~45; field labels corrected).** The console asks for "separate completed/failed **build** receipts". My §7 drafted `write_kinds` from the *apply* path (`op_ids` against the operations rows) — that is an apply receipt and must be labelled as one. Corrected shape: `organise.build: {plan_id, status, total, placed, abstained, error}` per plan, concurrently with `organise.apply: {applied, conflicts, refused, op_ids, write_kinds}`. The separation the order demanded ("separate completed/failed") is between **completed and failed builds**; keeping build and apply receipts in separate objects is the cleaner reading of both, and is what the field names now say.
+
+### Revised totals
+
+| # | seam | was | now | why |
+|---|---|---|---|---|
+| 1 | correlation | ~35 / 8 | **~35 / 8** | unchanged |
+| 2 | structured refs | ~45 / 10 | **~45 / 10** with 1 · **~53 / 12** alone | D1 |
+| 3 | message id | ~12 / 5 | **~12 / 5** | unchanged |
+| 4 | indexed hits | ~30 / 7 | **~34 / 7** | D2 |
+| 5 | remember | ~15 / 4 | **~17 / 5** | D3 |
+| 6 | forget | ~25 / 5 | **~30 / 6** | D4 |
+| 7 | organise | ~45 / 8 | **~45 / 8** | labels only, D5 |
+| | **total** | ~207 / 47 | **~218 / 49** | seams granted together, 1 before 2 |
+
+The three-seam first bite is unaffected in size and one pin heavier: **3 + 5 + 6 is ~59 lines and ~16 pins** (was ~52 / ~14), still the cheapest path to retiring the three currently-unverifiable claims — the discarded message id, the hardcoded "stored", the unknowable forget.
+
+### Two corroborations worth recording
+
+- The console independently found the **same seam-5 defect** from the consumer side: *"`a6cc150:src/assistant/daemon.py:3582` — local intent formatting discards remember's service ID and exposes only prose for others."* That is the producer-side finding in §5, reached without either lane reading the other's work. Two lanes converging on it from opposite ends is the strongest evidence in either report that it is real.
+- The console's report cites `a6cc150` line numbers (`daemon.py:3565`, `3582`); this document cites `e7316b9`. Same file, sixty-odd commits later, so the numbers differ — **no contradiction, and no renumbering of their cites**: SHA:line means each cite is true at its own SHA.
+- Unprompted convergence on the rule that makes all seven cheap: the console added *no* extra memory/plan/docs RPC to reconstruct these fields, on exactly the ground this document opens with — such queries "would not prove attribution and could expose unrelated data."
+
+### What this section changes about the standing instruction
+
+Nothing about the holds. `342fdd9` was read, not merged, not checked out, and no file from that lane exists in this tree; the seven seams remain unbuilt. The delta is recorded where the estimate lives so that whichever word arrives — *seams bite*, *seams yes*, *seams no* — the numbers being granted are the re-derived ones, not the transcription's.
+
+One new open question, from D4: **if the forget pilot needs a decision-level receipt identity, is that a receipts table (schema decision) or a convention over `corr_id` + `ts`?** I recommend the convention first — it needs no migration and answers "which forget was this" for any single request — and a table only if a later lane demonstrates a case the convention cannot express.
