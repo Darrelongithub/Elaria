@@ -1,3 +1,9 @@
+> **Owner ruling 2026-11-04 — WS6-interim OPEN:** Chrome app mode is rejected.
+> The historical `--open` / Chrome instructions below are **not the native handoff**; do not
+> use them for Win+Space. Task D's native host/status is in
+> `docs/phase-reports/console-2026-11-04-native-window-host.md`. Task E/v4 and reboot recovery
+> await the actual accepted v3 wrapper; no browser fallback is authorised.
+
 # Local text bridge — operator handoff
 
 **Owner accepted the prior live demo (eight replies and orb) by relay. New sizing/labels
