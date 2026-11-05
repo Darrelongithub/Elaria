@@ -1,9 +1,13 @@
 # Consent seam — single-op undo review pilot (design note, 2026-11-04)
 
-Status: **design only, no code.** Task 2 of the owner's 2026-11-04 hands
-ruling ("make her hands work"), adopting the consent matrix `c327df7` §5
-shape. The fail-closed guard that precedes this pilot landed at
-`9ef895a` (8 added lines, `daemon.py:_undo`).
+Status: **implemented** at `e7316b9` (`daemon.py` +165/−0, 18 pins in
+`tests/test_undo_review_pilot.py`); §9 records where the build differs
+from this note, and §9 is authoritative where the two disagree. Task 2 of
+the owner's 2026-11-04 hands ruling ("make her hands work"), adopting the
+consent matrix `c327df7` §5 shape. The fail-closed guard that precedes this
+pilot landed at `9ef895a` (8 added lines, `daemon.py:_undo`).
+
+Pilot report: `docs/phase-reports/2026-11-05-undo-review-pilot.md`.
 
 Line cites are `file:line @ 9ef895a` (SHA:line house rule).
 
@@ -185,3 +189,24 @@ pilot seam above can intercept that. Consequences, plainly:
   unauthenticated peer, and "no partial undo" — **~15–20 pins**,
   stub-only, no real filesystem races.
 - Console lane: the review surface itself (out of my lane).
+
+## 9. Implemented at `e7316b9` — where the build differs from this note
+
+Line cites `daemon.py:line @ e7316b9`. The answer shape below is what the
+console lane can rely on; everything else in this note is design intent.
+
+| the note said | the build does |
+| --- | --- |
+| expiry 120 s (§2, open Q1) | **600 s** — `UNDO_ASK_TTL_S = 600.0`, `daemon.py:2809`, per the owner's answer 1. Age is returned on both calls; a lapse journals `verdict=lapsed` and is terminal (fresh prepare, never a Yes). |
+| `no` journals the refusal (§2) | journals `verdict=declined` **and** emits exactly one persona line `{"ack": "declined", "ask_sha256": …}` — no paths, no echo of the reviewed content — per answer 2. |
+| token "discarded" on `no`/`yes` (§3 step 1) | marked `used` and **kept** until expiry, so a replay answers *already answered* instead of *unknown* (a `used` flag that is unreachable reads like a bad token and hides that a decision was taken). Execution still consumes before acting. |
+| snapshot hashed as `snapshot_sha256` over rows (§2) | flat single-row snapshot, digest named **`ask_sha256`** in both the response and the journal: sha256 over canonical JSON (`sort_keys`, `(",", ":")`). |
+| snapshot carries `root`, `expires_at` (§2) | not carried. Response is `{token, ask_sha256, snapshot, prepared_at, age_s, expires_in_s}`; `expires_at` stays internal on `time.monotonic()`, `prepared_at` is wall-clock ISO — two clocks, see the report's open Q5. |
+| spanning scopes stay refused by the guard (§2) | guard unchanged; `prepare` additionally refuses any scope resolving to **more than one row**, naming the count. `since`/`plan_id` work only when they resolve to exactly one operation. |
+| `verdict=… detail=snapshot_sha256=… ops=1 op_ids=[…]` (§5) | verdicts are bare tokens (`prepared`, `approved`, `declined`, `lapsed`, `drifted`); `detail` carries `ask_sha256=<hex16>` (prefix, not the full digest), `op_id`, `age_s`, and the derived actor `owner-ipc uid=… pid=…`. No `by=` field: the actor is the kernel-authenticated peer, never a JSON claim. |
+| — | `_undo_asks` is purged only at prepare (expired entries). Nothing is persisted, so a daemon restart silently invalidates every ask: that is a fresh prepare, not an error. |
+
+Unchanged from the note: the guard at `daemon.py:2782` still refuses every
+scoped undo on the bare `undo` RPC, the typed intent path (`daemon.py:3630`)
+stays refused, and the `cli.py` `DaemonUnavailable` fallback is untouched —
+containment is **console/daemon-route only, not global** (§6 still stands).
