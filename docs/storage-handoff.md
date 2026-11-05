@@ -2234,3 +2234,32 @@ sensors, 6 ladder chain #5 + refusal audit, 7 trigger surface, 8 drill scaffoldi
 owner: Sheet 1's benchmark and end-to-end restic-over-MEGA ratio, a kept-wav actually going
 cold, the owner's re-listen via `assist backup fetch`, and one live monthly drill.
 **Gate 1 unchanged: no live MEGA traffic, no merge.**
+
+---
+
+## 2026-11-04 - Report 025 prep: two rulings recorded, and the live-traffic scope drafted
+
+**Branch:** `arena/storage`. **Frozen branch (condition 3):** `origin
+arena/e7a1cca5-elaria = b181712563c1577f5faea4e59fe5f7e104a89ed1`, verified before this
+activation. Untouched.
+
+**RULING 1 - the quarterly drill stays OWNER-INITIATED, no timer.** It reads up to 5%/500 MB
+of the repository *on purpose*, and that is a deliberate consent-shaped act, not a scheduled
+one. The monthly timer carries the scheduled evidence; the quarterly is the owner's deep
+probe. The reasoning is recorded here rather than left implicit: a timer that reads a bounded
+slice of the repository every quarter would make a consent-shaped act into a background one,
+which is exactly the drift the ruling exists to prevent.
+
+**RULING 2 - `trim_grace_days` remains INTERIM-PENDING-SHEETS until measured.** The gate's
+grace-trash condition stays PROVISIONAL IN WRITING and finalises only when a live cycle
+produces real grace-trash data and the owner rules on it. **No silent finalization.** It is
+still the only interim value in `[backup]`.
+
+**Increment 8's three specifics recorded with approval by the design chat:** the cap as the
+smaller of percentage and byte ceiling (5% of 40 GB is 2 GB, four times the ruled ceiling);
+a missing restic as a declared skip rather than a pass or failure; and failed drills writing
+records exactly as passes do, because a journal that only shows passes is not evidence.
+
+**FIRING FOUR's preserve-before-checkout lesson has now canonised for the second time** - it
+earned its place again on firing six, where the uncommitted handoff append survived only
+because it was copied out before the checkout.
