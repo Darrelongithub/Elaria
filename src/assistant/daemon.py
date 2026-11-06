@@ -1275,11 +1275,22 @@ class Daemon:
                 raise ValueError(str(exc)) from exc
         opened = result["open"]
         # Her REASON is the first line of the turn, whichever surface opened.
+        first_row: dict = {}
+        first_row_absent = None
         if self.initiative.sessions is None:
-            self.sessions.append("assistant", result["first_line"],
-                                 channel=opened, via="knock", ts=iso_now())
+            first_row = self.sessions.append(
+                "assistant", result["first_line"],
+                channel=opened, via="knock", ts=iso_now()) or {}
+        else:
+            # The initiative path already wrote her first line; its id is not
+            # captured here, and sampling history after the fact would not be
+            # causal — so this is a declared absence, not an invented id.
+            first_row_absent = ("appended by the initiative path; its id is "
+                                "not captured here")
         conversation_id = self.sessions.history()["id"]
         payload = {**result, "conversation_id": conversation_id,
+                   "message_id": first_row.get("message_id"),
+                   "message_id_absent": first_row_absent,
                    "conversation": self.sessions.history(
                        limit=int(params.get("history_limit", 40)))}
         await self.broadcast({"event": "knock.accepted",
@@ -1288,6 +1299,7 @@ class Daemon:
                               "conversation_id": conversation_id})
         await self.broadcast({"event": "conversation.message",
                               "conversation_id": conversation_id,
+                              "message_id": first_row.get("message_id"),
                               "channel": opened, "role": "assistant"})
         return payload
 
@@ -2959,16 +2971,89 @@ class Daemon:
         since = parse_since(str(params["since"])) if params.get("since") else None
         return await asyncio.to_thread(self.executor.verify, since_iso=since)
 
+    def _read_fact(self, fact_id: int, *, active: bool = True) -> dict | None:
+        """Read a fact row back. `list_facts` is the store's only fact reader
+        and the corpus is small by design (§16), so this is a scan — never a
+        guess from the write call's return value."""
+        for row in self.store.list_facts(active_only=False):
+            if int(row["id"]) == int(fact_id):
+                if active and not row.get("active"):
+                    return None
+                return row
+        return None
+
     async def _memory_remember(self, params: dict) -> dict:
-        fact_id = self.memory.remember(str(params["text"]),
-                                       kind=str(params.get("kind", "profile")))
-        return {"fact_id": fact_id, "stored": "stated — inspect anytime: assist memory"}
+        """Store a fact, then PROVE it before claiming it.
+
+        The claim used to be a hardcoded sentence next to an id nobody read
+        back. Now the reply is the row: if the id does not read back active,
+        this raises rather than saying "stored".
+        """
+        text = str(params["text"]).strip()
+        kind = str(params.get("kind", "profile"))
+        fact_id = await asyncio.to_thread(self.memory.remember, text, kind=kind)
+        row = await asyncio.to_thread(self._read_fact, fact_id)
+        if row is None:
+            raise ValueError(
+                f"remember returned fact #{fact_id} but no active fact reads "
+                f"back — refusing to claim it was stored")
+        return {
+            "fact_id": int(fact_id),
+            "kind": str(row["kind"]),
+            "source": str(row["source"]),
+            "confidence": row.get("confidence"),
+            "active": True,
+            # Declarations, not queries: facts persist until `forget`.
+            "retention": "until_forgotten",
+            "restore": "row_preserved_no_api",
+            "stored": (f"fact #{int(fact_id)} ({row['source']}) — "
+                       f"inspect anytime: assist memory"),
+        }
 
     async def _memory_list(self, params: dict) -> dict:
         return {"facts": self.memory.beliefs(params.get("kind"))}
 
     async def _memory_forget(self, params: dict) -> dict:
-        return {"forgotten": self.memory.forget(str(params["topic"]))}
+        """Deactivate facts and name EXACTLY which ones.
+
+        A count alone is unknowable-after-the-fact: the row keeps no record of
+        who deactivated it. So the ids are collected at decision time, their
+        resulting state is read back, and the things this database cannot give
+        (a version, a durable receipt) are declared absent rather than implied.
+        """
+        topic = str(params["topic"])
+        count, ids = await asyncio.to_thread(
+            self.store.forget_facts_detailed, topic)
+        rows = {int(r["id"]): r
+                for r in await asyncio.to_thread(
+                    self.store.list_facts, active_only=False)}
+        facts = []
+        for fid in ids:
+            row = rows.get(int(fid))
+            facts.append({
+                "id": int(fid),
+                "kind": None if row is None else row.get("kind"),
+                "ts": None if row is None else row.get("ts"),
+                # Read back, never assumed: "still-active" would mean the
+                # UPDATE did not take, and that must be visible, not smoothed.
+                "state": ("unknown" if row is None
+                          else ("inactive" if not row.get("active")
+                                else "still-active")),
+            })
+        return {
+            "forgotten": int(count),
+            "fact_ids": [int(i) for i in ids],
+            "facts": facts,
+            # D4, ruled 2026-11-05: convention first — the decision identity is
+            # a correlation id plus its timestamp, not a receipts table.
+            "corr_id": uuid.uuid4().hex,
+            "corr_ts": iso_now(),
+            "declared": {
+                "versions": "absent — facts carry no version column",
+                "durable_receipt": ("absent — no receipts table; corr_id + "
+                                    "corr_ts is the decision identity"),
+            },
+        }
 
     async def _memory_recall(self, params: dict) -> dict:
         hits = await asyncio.to_thread(self.memory.recall, str(params["query"]))
@@ -3177,6 +3262,9 @@ class Daemon:
         return {
             "reply": reply, "speaker": "guest", "via": "guest-deflection",
             "channel": channel, "conversation_id": None,
+            # A guest turn writes no conversation row (BH-J1), so there is no
+            # causal message id to give — a declared null, not a missing field.
+            "message_id": None, "user_message_id": None, "receipt": None,
             "model": None, "register": decision.register, "serious_gate": None,
             "mode": self.config.gemini_mode, "fixture": None,
             "speech": speech, "memory_closed": True, "withheld": None,
@@ -3559,9 +3647,11 @@ class Daemon:
                         "pushback": decision.pushback, "reason": decision.reason}))
         conversation_id = self.sessions.active_id(iso_now())
         prior_turns = self.sessions.history(limit=8).get("messages") or []
-        self.sessions.append("user", text, channel=channel, ts=iso_now())
+        user_row = self.sessions.append("user", text, channel=channel,
+                                        ts=iso_now()) or {}
 
         reply, via, model, fixture = None, None, None, None
+        receipt = None          # set only by a local intent that produces one
         queued_job_id = None
         connectivity = await self._connectivity_snapshot()
         if company_command is not None:
@@ -3575,7 +3665,7 @@ class Daemon:
         intent = (None if company_command is not None or unparsed_command
                   else route(route_text))
         if intent is not None:
-            reply, via = await self._run_intent(intent)
+            reply, via, receipt = await self._run_intent(intent)
         if (reply is None and wake is not None and wake.is_checkin
                 and not unparsed_command):
             # "Elaria" / "hey Elaria" alone: a check-in. The settled terse line
@@ -3721,12 +3811,13 @@ class Daemon:
             via = "withheld"
 
         # Persist before any speech: a completed turn with hung caller is a failure (BUG1)
-        self.sessions.append("assistant", reply, channel=channel, via=via,
-                             ts=iso_now())
+        assistant_row = self.sessions.append("assistant", reply, channel=channel,
+                                             via=via, ts=iso_now()) or {}
         # Broadcast without blocking the IPC response (BUG1/BUG4: prune only on real disconnect)
         # We await the quick write; drain is background with timeout
         await self.broadcast({"event": "conversation.message",
                               "conversation_id": conversation_id,
+                              "message_id": assistant_row.get("message_id"),
                               "channel": channel, "role": "assistant"})
         # Speech is async after response: return promptly, synthesize in background (BUG1)
         # This bounds Live work and prevents console.say hanging on slow TTS
@@ -3738,6 +3829,14 @@ class Daemon:
             "reply": reply,
             "channel": channel,
             "conversation_id": conversation_id,
+            # This turn's own rows, from the writes themselves (not a later
+            # history sample: another caller can append after this returns).
+            "message_id": assistant_row.get("message_id"),
+            "user_message_id": user_row.get("message_id"),
+            # The producer's structured result where one exists — remember and
+            # forget today. None means "this turn produced no such receipt",
+            # never "no effect": use the refusals/via for that.
+            "receipt": receipt,
             "via": via,  # local-intent | local-memory | local-queue | gemini
             "model": model,
             "register": decision.register,
@@ -3752,65 +3851,79 @@ class Daemon:
             "withheld": withheld,
         }
 
-    async def _run_intent(self, intent) -> tuple[str | None, str]:
-        """Execute a local intent. (None, ...) = fall through to the model."""
+    async def _run_intent(self, intent) -> tuple[str | None, str, dict | None]:
+        """Execute a local intent.
+
+        Returns `(reply, via, receipt)`: `(None, ...)` falls through to the
+        model, and `receipt` is the producer's own structured result where one
+        exists (remember/forget today) — never a reconstruction of it.
+        """
         if intent.kind == "halt":
             await self._halt({})
-            return ("Halted. Nothing will move until you say resume.", "local-intent")
+            return ("Halted. Nothing will move until you say resume.", "local-intent", None)
         if intent.kind == "status":
             status = await self._status({})
             return ((f"Running ({status['mode']}), connectivity "
                     f"{status['connectivity_mode']}, gemini mode "
                     f"{status['gemini_mode']}, uptime {status['uptime_s']:.0f}s."),
-                    "local-intent")
+                    "local-intent", None)
         if intent.kind in ("mode_offline", "mode_online", "mode_auto"):
             value = intent.kind.rsplit("_", 1)[1]
             result = await self._mode_set({"mode": value})
             connectivity = result["connectivity"]
             suffix = " Switch parked until this session finishes." if connectivity["switch_parked"] else ""
             return (f"Connectivity preference: {value}; effective {connectivity['effective_mode']}.{suffix}",
-                    "local-intent")
+                    "local-intent", None)
         if intent.kind == "queue_status":
             counts = self.store.cloud_job_counts()
             detail = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "empty"
-            return (f"Cloud queue: {detail}.", "local-intent")
+            return (f"Cloud queue: {detail}.", "local-intent", None)
         if intent.kind == "queue_drain":
             result = await self._queue_drain({})
-            return (result["summary"], "local-intent")
+            return (result["summary"], "local-intent", None)
         if intent.kind == "cost":
             from .cost import format_cost_report
 
             data = await self._cost({})
             return (format_cost_report(data["month"], data["today"],
-                                       data["quota"], data["tier"]), "local-intent")
+                                       data["quota"], data["tier"]), "local-intent", None)
         if intent.kind == "remember" and intent.argument:
-            await self._memory_remember({"text": intent.argument})
-            return (f"Remembered (stated fact): {intent.argument}", "local-intent")
+            receipt = await self._memory_remember({"text": intent.argument})
+            named_fact = (f"Remembered as fact #{receipt['fact_id']} "
+                          f"({receipt['kind']}, {receipt['source']}).")
+            return (named_fact, "local-intent",
+                    {"receipt": "remember", **receipt})
         if intent.kind == "forget" and intent.argument:
-            count = self.memory.forget(intent.argument)
-            return (f"Forgotten ({count} fact(s) deactivated).", "local-intent")
+            receipt = await self._memory_forget({"topic": intent.argument})
+            if receipt["fact_ids"]:
+                named = ", ".join(f"#{i}" for i in receipt["fact_ids"])
+                reply = (f"Forgotten {named} "
+                         f"({receipt['forgotten']} fact(s) deactivated).")
+            else:
+                reply = "Nothing matched — no fact was deactivated."
+            return (reply, "local-intent", {"receipt": "forget", **receipt})
         if intent.kind == "where":
             answer = await asyncio.to_thread(self.memory.answer_where, intent.argument)
             if answer:
-                return (answer, "local-memory")
-            return (None, "local-memory")  # weak recall: escalate, never bluff
+                return (answer, "local-memory", None)
+            return (None, "local-memory", None)  # weak recall: escalate, never bluff
         if intent.kind == "search" and intent.argument:
             hits = await asyncio.to_thread(self.memory.recall, intent.argument)
             if hits:
                 lines = [f"- [{h.source}] {h.ref}: {h.text[:100]}" for h in hits]
-                return ("Local matches:\n" + "\n".join(lines), "local-memory")
-            return (None, "local-memory")
+                return ("Local matches:\n" + "\n".join(lines), "local-memory", None)
+            return (None, "local-memory", None)
         if intent.kind == "undo":
             result = await self._undo({"since": intent.argument} if intent.argument else {})
             return ((f"Undone {result['undone']} op(s); "
-                    f"{len(result['problems'])} problem(s)."), "local-intent")
+                    f"{len(result['problems'])} problem(s)."), "local-intent", None)
         if intent.kind == "organise":
             # Plans are cheap and write-free to BUILD — do that, then talk.
             started = await self._plan_build({})
             ids = ", ".join(f"#{s['plan_id']}" for s in started["started"])
             return ((f"Shadow plan(s) {ids} building — nothing moves without "
-                    "your review + apply. Watch `assist events`."), "local-intent")
-        return (None, "local-intent")
+                    "your review + apply. Watch `assist events`."), "local-intent", None)
+        return (None, "local-intent", None)
 
     async def _connectivity_tick(self) -> None:
         # refresh() itself returns immediately without probing when the owner

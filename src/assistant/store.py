@@ -845,22 +845,36 @@ class Store:
     def forget_facts(self, topic: str) -> int:
         """`assist forget <topic>` — deletes, no argument (§16). Matches an
         exact id ('#7' / '7') or a text substring."""
+        return self.forget_facts_detailed(topic)[0]
+
+    def forget_facts_detailed(self, topic: str) -> tuple[int, list[int]]:
+        """Deactivate matching facts and return `(count, ids)`.
+
+        The ids are read under the SAME lock and predicate as the UPDATE, so
+        the receipt names exactly the rows the database deactivated rather
+        than what the caller hoped to match. After the call the ids are
+        unknowable (the row keeps no record of who deactivated it), which is
+        why they are collected here and not reconstructed later.
+        """
         with self._lock:
             if topic.lstrip("#").isdigit():
-                cur = self._conn.execute(
-                    "UPDATE facts SET active = 0 WHERE id = ? AND active = 1",
-                    (int(topic.lstrip("#")),))
+                where, args = "id = ? AND active = 1", (int(topic.lstrip("#")),)
             else:
                 # Topic is user text, not a SQL pattern: `%` and `_` must
                 # stay literal or `forget %` would deactivate every fact.
                 escaped = (topic.replace("\\", "\\\\")
                            .replace("%", "\\%").replace("_", "\\_"))
-                cur = self._conn.execute(
-                    "UPDATE facts SET active = 0 WHERE active = 1 "
-                    "AND text LIKE ? ESCAPE '\\'",
-                    (f"%{escaped}%",))
+                where, args = ("active = 1 AND text LIKE ? ESCAPE '\\'",
+                               (f"%{escaped}%",))
+            ids = [int(r[0]) for r in self._conn.execute(
+                f"SELECT id FROM facts WHERE {where}", args).fetchall()]
+            cur = self._conn.execute(
+                f"UPDATE facts SET active = 0 WHERE {where}", args)
             self._conn.commit()
-            return cur.rowcount
+            # Same lock, same predicate, one transaction: a disagreement here
+            # would mean the two statements saw different rows, so report the
+            # database's own count and let the caller decide what that means.
+            return int(cur.rowcount), ids
 
     def deactivate_facts(self, fact_ids) -> int:
         """Deactivate a set of facts in one transaction (declined commitments).
