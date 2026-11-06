@@ -336,3 +336,42 @@ from `text`/`error`. The shell renders at most 24 strings of at most 1000 charac
 textContent, persists them with the displayed message, and tolerates absent/invalid metadata.
 These observations are not model prose, journal events, approvals or inferred effect receipts.
 The bridge adds no RPC; a sampled conversation tail is explicitly not request-bound.
+
+### Single-operation undo review (Task F, e7316b9 / §9 consumer)
+
+Only the current bridge/shell release implements this; native v4's explicitly historical
+fcd55ca1 worktree is NOT silently upgraded. Use a daemon with the landed prepare/apply seam.
+Canonical scoped undo text (including existing Swahili aliases) is intercepted before
+console.say and calls only undo.prepare. `undo review #N` prepares exactly that operation.
+Bare undo uses the original console.say text/parameters unchanged. No old-backend fallback.
+
+Successful reply frames may carry `undo_review` with a bridge-local review_id, the exact
+single-row snapshot, ask_sha256, prepared_at, conservative age_s and remaining_s. The daemon
+UUID token stays only in connection-bound bridge memory. The client never persists snapshots,
+review IDs or decisions in browser sessions. Public notices contain no snapshot details.
+
+Only the dedicated, private, focused card emits
+`{t:"undo-decision", id, review_id, ask_sha256, decision:"yes"|"no"}`. IDs share the ordinary
+connection's monotonic request sequence. There is no method/params passthrough and no caller
+operation/path list. The bridge consumes the binding before calling undo.apply with only its
+stored token and decision; it does not call undo, executor, CLI or shell. Replays with a new
+request ID read already-answered; duplicate request IDs retain the existing no-replay error.
+New chat input invalidates the previous pending selection, even if a fresh prepare fails.
+
+Company/restricted unknown or true blocks review preparation/dispatch. Periodic status sends
+`{t:"undo-privacy",allowed:bool}` to hide existing private content. Browser blur/hidden state,
+missing focus, another browser session, expiry or disconnect removes/hides approval controls.
+This is a focused UI + existing daemon disclosure signal, not an OS lock sensor or proof of
+identity derived from a browser flag. Owner IPC auth remains the producer's responsibility.
+
+§9 wins over the earlier design: TTL is at most 600s, token is the actual 32-hex UUID returned
+by e7316b9, snapshot is one flat row, digest is ask_sha256; no root/expiry timestamp/collateral
+inventory is invented. Monotonic bridge time starts BEFORE prepare and deducts response age;
+the browser deducts its entire request/paint delay too, then uses max(monotonic, wall elapsed).
+Yes checks freshness again, irrespective of the last paint; lapse removes the card on the
+next UI tick and never approves. The server remains final authority for expiry/restart/drift.
+
+Collateral and reversal limits are clearly labelled audited executor semantics, not extra
+prepared targets or a claim of exact restore. Receipt count is daemon-reported, not independent
+effect verification. Unknown outcomes are spent/no-replay; no automatic retry/reconciliation
+write. Global CLI/direct-executor containment is not claimed.

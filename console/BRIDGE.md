@@ -33,13 +33,13 @@ hard stop, not permission to fetch, install or reconstruct something from chat.
 
 Committed executable: **`console/run_bridge.py`**.
 
-SHA256: **`fde8c4160874dc14be07a8c56a79ee2c581ef07bf79b2144b1baf0e0d13904eb`**.
+SHA256: **`594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791`**.
 
 From a copy containing this release's `console/` payload and the existing `.venv` interpreter,
 this is one physical command line. It checks the launcher before Python runs; the launcher
 then checks all five payload hashes before importing the bridge. A mismatch stops.
 
-`test "$(sha256sum console/run_bridge.py)" = 'fde8c4160874dc14be07a8c56a79ee2c581ef07bf79b2144b1baf0e0d13904eb  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --open`
+`test "$(sha256sum console/run_bridge.py)" = '594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --open`
 
 `-I` isolates Python import paths; `-B` avoids bytecode writes. No standalone install, branch
 switch or mainline deployment is performed by this command. If using an extracted bundle
@@ -52,13 +52,13 @@ existing interpreter is `/home/darrel/Elaria/.venv/bin/python`, this alternative
 uses it without copying files into or switching that checkout. A missing interpreter or
 checksum mismatch stops; there is no install/repair fallback.
 
-`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = 'fde8c4160874dc14be07a8c56a79ee2c581ef07bf79b2144b1baf0e0d13904eb  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py --open`
+`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = '594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py --open`
 
 Optional **`--check`** performs artifact/dependency checks and one existing-daemon `status`
 RPC, then exits; it creates no launch file/profile, opens no browser/server, and sends no
 chat/model/voice turn. It is mutually exclusive with `--open`. Exact checkout preflight:
 
-`test "$(sha256sum console/run_bridge.py)" = 'fde8c4160874dc14be07a8c56a79ee2c581ef07bf79b2144b1baf0e0d13904eb  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --check`
+`test "$(sha256sum console/run_bridge.py)" = '594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --check`
 
 `--socket` accepts an explicit absolute existing socket path when XDG_RUNTIME_DIR is
 unavailable. There is no guessed socket, alternate host, auto-start, paid/model fallback or
@@ -83,7 +83,7 @@ A 0700 `elaria-console-<random>` directory is created beside the daemon socket, 
 For manual mode, use the following verified invocation and open that local file on the same
 machine as the daemon. Do not share/read its contents into logs; it contains the live token.
 
-`test "$(sha256sum console/run_bridge.py)" = 'fde8c4160874dc14be07a8c56a79ee2c581ef07bf79b2144b1baf0e0d13904eb  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
+`test "$(sha256sum console/run_bridge.py)" = '594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
 
 The browser is detached with a new POSIX session, closed inherited FDs and null standard
 streams. Only desktop/session/locale environment is passed; model keys, SSH agents and shell
@@ -256,3 +256,16 @@ Their current mutations/fallback behavior is not disabled or silently rewritten.
 aliases/connectivity/queue forms are preserved, not advertised as additions to the nine-entry
 catalogue. A finite grammar can both over-refuse ordinary phrasing and miss paraphrases;
 see `docs/phase-reports/console-2026-11-04-task-b-registry.md` for exact boundaries and tests.
+
+## Task F — undo review build (not silently wired into native v4)
+
+The current bridge/shell now consumes the landed e7316b9 prepare/apply pilot per §9 of
+5ee6853. Scoped undo prepares a private, focus-bound, expiring single-operation card; only
+its dedicated Yes/No path can call apply. Bare undo is unchanged. Missing seam, malformed
+snapshot, unknown privacy, stale/expired selection or transport uncertainty fail closed.
+See INTEGRATION.md for exact wire fields and limitations. No daemon/protected change.
+
+**Deployment split remains intentional:** native v4 still uses fcd55ca1 and its ed227a7d
+launcher pin. That older UI has no Task F card; with the pilot daemon it receives the scoped
+undo refusal. This build does not change that pin or claim the card is installed behind
+Win+Space. The updated current-release launcher hash above is NOT the historical v4 pin.

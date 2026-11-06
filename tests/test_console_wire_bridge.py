@@ -359,7 +359,8 @@ async def test_real_websocket_to_real_unix_protocol_with_synthetic_backend(tmp_p
         assert [c['method'] for c in calls].count('console.say') == 1
 
 
-@pytest.mark.parametrize('method,uncertain', [('status', False), ('console.say', True)])
+@pytest.mark.parametrize('method,uncertain', [('status', False), ('console.say', True),
+                                             ('undo.prepare', False), ('undo.apply', True)])
 async def test_ipc_total_deadline_is_unknown_only_after_turn_send(tmp_path, method, uncertain):
     async with unix_daemon(tmp_path, delay=0.3) as (path, _):
         with pytest.raises(bridge_module.IPCFailure) as exc:
@@ -847,7 +848,7 @@ async def test_registry_answers_never_submit_daemon_turn_after_accepted_handshak
 
 @pytest.mark.parametrize('text', [
     'remember send a message', 'forget calendar', 'search for analyse this file',
-    'where is calendar', 'organise files', 'undo since synthetic',
+    'where is calendar', 'organise files',  # scoped undo now has its separate Task F review gate
 ])
 async def test_registry_does_not_rewrite_or_suppress_typed_execution(text):
     rpc = FakeRPC()

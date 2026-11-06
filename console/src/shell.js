@@ -725,6 +725,96 @@
       a.play().catch(endClip);
     });
   }
+  /* Undo pilot: private, memory-only, connection-bound. Never stored in sessions or notifications. */
+  let undoCard = null, undoPrivate = false;
+  function clearUndo(reason) {
+    if (!undoCard) return;
+    clearInterval(undoCard.timer); undoCard.panel.remove(); undoCard = null;
+    if (reason) out('[UNDO REVIEW] ' + reason);
+  }
+  function undoElapsed(c) {
+    return Math.max(performance.now() - c.mono, Date.now() - c.wall, 0) / 1000;
+  }
+  function hideUndo() {
+    const c = undoCard; if (!c) return;
+    c.selected = false; c.privateBox.replaceChildren(); c.privateBox.hidden = true;
+    c.reveal.hidden = false;
+  }
+  function renderUndo(review, decide, elapsed) {
+    clearUndo('Previous card invalidated by a new preparation.');
+    if (!review || !review.snapshot || typeof decide !== 'function'
+        || typeof review.remaining_s !== 'number' || review.remaining_s <= elapsed) return;
+    const c = {review, decide, mono:performance.now(), wall:Date.now(),
+      remaining:review.remaining_s-elapsed, age:review.age_s+elapsed, session:cur().id,
+      selected:false, spent:false, allowed:wireRequested ? undoPrivate : true};
+    const panel = h('section', 'undo-review'); panel.setAttribute('aria-label', 'Private undo review');
+    const reveal = h('button', '', 'elaria needs a yes — review privately'); reveal.type = 'button';
+    const privateBox = h('div'); privateBox.hidden = true;
+    const clock = h('p', 'undo-age');
+    panel.append(reveal, clock, privateBox); document.body.append(panel);
+    Object.assign(c, {panel,reveal,privateBox,clock}); undoCard = c;
+    function fresh() {
+      return undoCard === c && !c.spent && c.allowed && cur().id === c.session
+        && !document.hidden && document.hasFocus() && undoElapsed(c) < c.remaining;
+    }
+    function show() {
+      if (!fresh()) return;
+      c.selected = true; reveal.hidden = true; privateBox.hidden = false;
+      privateBox.replaceChildren();
+      privateBox.append(h('h2', '', 'Undo — one prepared operation'));
+      privateBox.append(h('p', '', 'Private review selected. Yes approves only this immutable snapshot.'));
+      const rows = [
+        ['Operation', 'op_id', 'op', 'plan_id', 'ts', 'status'],
+        ['Targets — src is original; dst is current home', 'src', 'dst'],
+        ['Preconditions — rechecked by apply', 'sha256_before', 'sha256_after']
+      ];
+      for (const [label, ...fields] of rows) {
+        privateBox.append(h('h3', '', label));
+        for (const field of fields) privateBox.append(h('p', '', field + ': ' + String(review.snapshot[field])));
+      }
+      privateBox.append(h('p', '', 'Snapshot digest: ' + review.ask_sha256));
+      privateBox.append(h('p', '', 'Prepared at: ' + review.prepared_at + ' (wall-clock label; expiry uses a conservative elapsed budget).'));
+      privateBox.append(h('h3', '', 'Collateral and reversal limits'));
+      privateBox.append(h('p', '', 'Audited executor semantics, not extra prepared targets: undo can retire an identical duplicate through trash, write journal/state, and remove an emptied _Conflicts/_Unsorted parent. Prepare supplies no resolved root or collateral inventory. No extra scope is requested here.'));
+      privateBox.append(h('p', '', 'No promise of exact metadata restoration or atomic reversal. Drift, missing targets, expiry or restart refuse the ask. A transport result is not independent effect verification.'));
+      const yes = h('button', '', 'Yes — apply this snapshot'), no = h('button', '', 'No — terminal refusal');
+      yes.type = no.type = 'button'; yes.dataset.decision = 'yes'; no.dataset.decision = 'no';
+      const entry = h('input'); entry.setAttribute('aria-label', 'Focused undo decision: exact yes or no');
+      entry.autocomplete = 'off'; entry.spellcheck = false;
+      const hint = h('p', '', 'Use these buttons or the dedicated entry, never chat.');
+      const hide = h('button', '', 'Hide private review'); hide.type = 'button'; hide.onclick = hideUndo;
+      async function answer(value) {
+        if (!fresh() || !c.selected || !privateBox.contains(document.activeElement)) {
+          hint.textContent = 'no ask is selected'; return;
+        }
+        if (!['yes', 'no'].includes(value)) { hint.textContent = 'Enter exact yes or no.'; return; }
+        c.spent = true; yes.disabled = no.disabled = entry.disabled = true;
+        // Remove all private fields before dispatch; never re-arm this card on any failure.
+        clearUndo('Decision submitted once; awaiting daemon receipt.');
+        try { const result = await decide({review_id:review.review_id, ask_sha256:review.ask_sha256, decision:value});
+          out(result.text || '[UNDO REVIEW] answer received; no effect verification claimed.');
+        } catch (error) { out('[UNDO REVIEW] ' + (error.message || 'outcome unknown; no replay')); }
+      }
+      yes.onclick = () => answer('yes'); no.onclick = () => answer('no');
+      entry.addEventListener('keydown', event => {
+        if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); answer(entry.value.trim().toLowerCase()); }
+      });
+      privateBox.append(yes, no, entry, hint, hide); no.focus();
+    }
+    reveal.onclick = show;
+    function tick() {
+      const elapsed = undoElapsed(c);
+      if (elapsed >= c.remaining) { clearUndo('lapsed — fresh prepare required, never a Yes.'); return; }
+      clock.textContent = 'Ask age: ' + Math.floor(c.age+elapsed) + 's · lapses in ' + Math.max(0, Math.floor(c.remaining-elapsed)) + 's';
+      if (cur().id !== c.session) clearUndo('Selection changed; old approval is stale.');
+      else if (document.hidden || !document.hasFocus() || !c.allowed) hideUndo();
+    }
+    c.timer = setInterval(tick, 200); tick();
+  }
+  window.addEventListener('blur', hideUndo);
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') hideUndo(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) hideUndo(); });
+
   async function deliver(rep, owner) {
     const s = owner || cur();                       // bound at send time: an interrupt or a session
     const text = typeof rep === 'string' ? rep : String(rep.text || ''), audio = rep && rep.audio;  // switch must not
@@ -762,6 +852,7 @@
     if (!daemon && wireRequested) return out('[WARN] daemon wire unavailable — no turn sent and no stub reply.');
     if (forcedOffline) return out('[WARN] I am marked offline. /state idle wakes me.');
     if (busy) return out('still answering the last one. Esc skips ahead.');
+    clearUndo('New chat input invalidated the previous review; prepare fresh.');
     const s = cur();
     pinned = true; el.pad.append(msgEl('me', text)); pushTo(s, 'me', text); pin(); calmWants();
     busy = true; setState('thinking');
@@ -770,6 +861,7 @@
       const rep = daemon ? await daemon.send(text, { session: s.name, history: s.msgs.slice(-20) }) : respond(text);
       const left = 700 - (performance.now() - t0);   // hold "thinking" long enough to read as a state change
       if (left > 0) await sleep(left);
+      if (rep && rep.undoReview) renderUndo(rep.undoReview, daemon && daemon.decideUndo, (performance.now()-t0)/1000);
       await deliver(rep, s);
     } catch (err) {
       const message = '[BROKEN] the daemon call failed: ' + ((err && err.message) || 'unknown error');
@@ -870,9 +962,10 @@
       if (m.t === 'hello-ok') {
         if (m.v !== WIRE_V) { dead = true; ws.close(); window.ElariaShell.disconnect(); return; }
         tries = 0;  // reset only AFTER a real handshake, not every failed TCP reconnect
-        return window.ElariaShell.connect({ name: m.name || 'daemon', send: sendOver });
+        return window.ElariaShell.connect({ name: m.name || 'daemon', send: sendOver, decideUndo });
       }
-      if (m.t === 'reply') { const p = pend.get(m.id); pend.delete(m.id); if (p) p(m); return; }
+      if (m.t === 'undo-privacy') { undoPrivate = m.allowed === true; if (undoCard) { undoCard.allowed = m.allowed === true; if (!undoCard.allowed) hideUndo(); } return; }
+      if (m.t === 'reply') { const p = pend.get(m.id); pend.delete(m.id); if (p) { if (m.undo_review) undoPrivate = true; p(m); } return; }
       if (m.t === 'state') return window.ElariaShell.setState(m.name);
       if (m.t === 'levels') return window.ElariaShell.levels(m.role, m.level);
       if (m.t === 'notify') return window.ElariaShell.notify({ text: m.text || '', speak: !!m.speak });
@@ -887,7 +980,7 @@
         const id = ++n;
         pend.set(id, (m) => {
           if (m.error) { const error = new Error(m.error); error.attribution = receiptRows(m.attribution); rej(error); }
-          else res({ text: m.text || '', audio: m.audio, attribution: receiptRows(m.attribution) });
+          else res({ text: m.text || '', audio: m.audio, attribution: receiptRows(m.attribution), undoReview:m.undo_review });
         });
         const message = { t: 'send', id, text, session: ctx && ctx.session,
           history: ctx && ctx.history ? ctx.history.slice(-20) : [] };
@@ -901,6 +994,15 @@
         }
         ws.send(encoded);
         setTimeout(() => { if (pend.delete(id)) rej(new Error('daemon went quiet')); }, 45000);
+      });
+    }
+    function decideUndo(decision) {
+      return new Promise((res, rej) => {
+        if (!ws || ws.readyState !== 1) return rej(new Error('disconnected; prepare a fresh ask'));
+        const id = ++n;
+        pend.set(id, m => m.error ? rej(new Error(m.error)) : res(m));
+        ws.send(JSON.stringify({t:'undo-decision', id, ...decision}));
+        setTimeout(() => { if (pend.delete(id)) rej(new Error('outcome unknown; no replay')); }, 45000);
       });
     }
     open();
@@ -921,6 +1023,7 @@
       out('[OK] wire up. replies use the attached adapter; each pane keeps its own data status.');
     },
     disconnect() {
+      undoPrivate = false; clearUndo('Disconnected; old card invalidated.');
       if (!daemon) return;
       daemon = null; forcedOffline = true; lamps(); setState('offline'); syncOrb();
       notify({ text: 'Lost the daemon wire. Marked offline until it returns.', log: false });

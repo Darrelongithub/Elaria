@@ -411,3 +411,11 @@ table.grid tr[hidden] { display: none; }
   overflow-wrap: anywhere; }
 .attribution > b { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
 .attribution p { margin: 5px 0 0; }
+
+/* Private undo card only; engine and base layout are unchanged. */
+.undo-review { position:fixed; z-index:90; inset:8% 8% auto; max-height:80vh; overflow:auto;
+ padding:18px; border:1px solid #aa87cc; background:#171320; color:#eee4f7; box-shadow:0 8px 40px #000b; }
+.undo-review p { overflow-wrap:anywhere; white-space:pre-wrap; margin:8px 0; }
+.undo-review button, .undo-review input { margin:6px; padding:8px; color:inherit; background:#292033; border:1px solid #ab8cbd; }
+.undo-review button:focus, .undo-review input:focus { outline:2px solid #e4c2ff; }
+.undo-review [hidden] { display:none!important; }

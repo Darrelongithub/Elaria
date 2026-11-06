@@ -2,7 +2,7 @@
 
 No model SDK, configuration/key loading, microphone, storage or hands implementation.
 Levels below are SYNTHESISED TEXT CADENCE, never measured audio. The visualizer is untouched.
-Only status and console.say are sent to the existing newline-JSON Unix client interface.
+Only status, console.say and the pinned undo.prepare/undo.apply pilot seam are exposed.
 """
 from __future__ import annotations
 
@@ -36,6 +36,22 @@ HEALTH_SECONDS = 3
 MAX_CLIENTS = 4
 
 
+class UndoRefused(Exception):
+    pass
+
+
+def undo_refusal(error):
+    # Never expose daemon errors containing owner paths, tokens or snapshot data in chat/logs.
+    error = str(error)[:8192]
+    for marker, label in [('already answered', 'already-answered'), ('lapsed', 'lapsed'),
+                          ('nothing was undone', 'drifted/refused'),
+                          ('nothing undoable', 'nothing-undoable'), ('one operation', 'single-op-only'),
+                          ('unknown undo ask', 'unknown-ask')]:
+        if marker in error:
+            return label
+    return 'refused-or-seam-unavailable'
+
+
 class IPCFailure(Exception):
     def __init__(self, *, uncertain=False):
         super().__init__('Daemon IPC unavailable or invalid; no automatic replay.')
@@ -48,7 +64,7 @@ async def daemon_call(path: Path, method: str, params: dict, timeout: float) -> 
     Verify the socket and Linux peer UID before sending. A lost response after a send is
     uncertain, NOT a cancellation/rollback. No daemon error body or event content is forwarded.
     """
-    if method not in {'status', 'console.say'}:
+    if method not in {'status', 'console.say', 'undo.prepare', 'undo.apply'}:
         raise ValueError('bridge IPC method not allowed')
     writer = None
     sent = False
@@ -74,13 +90,15 @@ async def daemon_call(path: Path, method: str, params: dict, timeout: float) -> 
                     raise TypeError('invalid frame')
                 if 'ok' not in frame and 'event' in frame:
                     continue
+                if frame.get('id') == 1 and frame.get('ok') is False and method.startswith('undo.'):
+                    raise UndoRefused(undo_refusal(frame.get('error')))
                 if (frame.get('id') != 1 or frame.get('ok') is not True
                         or not isinstance(frame.get('result'), dict)):
                     raise ValueError('invalid or rejected response')
                 return frame['result']
             raise EOFError()
     except (OSError, ValueError, TypeError, RecursionError, EOFError, TimeoutError, IPCFailure) as exc:
-        raise IPCFailure(uncertain=sent and method == 'console.say') from exc
+        raise IPCFailure(uncertain=sent and method in {'console.say', 'undo.apply'}) from exc
     finally:
         if writer is not None:
             writer.close()
@@ -197,12 +215,12 @@ CAPABILITIES = {
     'remember': 'Existing typed fact storage; fact ID/kind receipt is missing on this wire.',
     'forget': 'Existing typed matching-fact deactivation, not erasure; affected IDs missing.',
     'halt': 'Existing daemon halt route; acknowledgement is not proof of every effect stopping.',
-    'undo': 'Existing daemon undo route; mainline owns its consent gate. Not a bridge approval.',
+    'undo': 'Single-op private prepare/review/apply card; bare undo unchanged. No approval in chat.',
     'organise': 'Existing configured-root index/plan building; metadata writes, no apply here.',
 }
 BRIDGE_FACTS = (
     'Bridge facts: text-only; no speech, file reader, calendar or messaging-send adapter. '
-    'Status and console.say are the only daemon RPCs used. '
+    'Status, console.say and the explicit undo prepare/apply review seam are the only RPCs used. '
     'Registry entries describe routes, not current readiness or permission. '
     'No prior model claim is confirmed. This answer does not probe or execute the daemon.'
 )
@@ -346,6 +364,55 @@ def validate_send(message: dict) -> str | None:
     return None
 
 
+
+# e7316b985e4463d961a2ec51af6a4023360a261c:src/assistant/daemon.py:2844
+UNDO_FIELDS = {'op_id', 'plan_id', 'ts', 'op', 'src', 'dst',
+               'sha256_before', 'sha256_after', 'status'}
+
+
+def undo_scope(text):
+    text = re.sub(r"^(?:(?:hey|hi|hello)\s+)?elaria\b[\s,!:.-]*", '', text.strip(), flags=re.IGNORECASE)
+    # Existing scoped typed forms. Bare forms deliberately do NOT enter the new route.
+    match = re.fullmatch(r'(?:undo\s+since|(?:rudisha|tenda upya)\s+tangu)\s+(\S+?)\s*[!.]*', text, re.IGNORECASE)
+    if match:
+        return {'since': match[1]}
+    match = re.fullmatch(r'undo review #([1-9][0-9]{0,14})', text, re.IGNORECASE)
+    return {'op_id': int(match[1])} if match else None
+
+
+def validate_undo(result):
+    if not isinstance(result, dict) or set(result) != {
+            'token', 'ask_sha256', 'snapshot', 'prepared_at', 'age_s', 'expires_in_s'}:
+        raise UndoRefused('invalid-prepare-envelope')
+    if len(json.dumps(result).encode()) > MAX_FRAME // 2:
+        raise UndoRefused('oversized-prepare')
+    snap = result['snapshot']
+    if (not isinstance(snap, dict) or set(snap) != UNDO_FIELDS
+            or not positive_id(snap['op_id'])
+            or snap['plan_id'] is not None and not positive_id(snap['plan_id'])
+            or snap['op'] not in {'move', 'rename', 'copy', 'mkdir', 'trash'}
+            or snap['status'] not in {'intent', 'copied', 'committed'}):
+        raise UndoRefused('invalid-single-operation-snapshot')
+    for key in ['ts', 'src', 'dst']:
+        if not isinstance(snap[key], str) or not 0 < len(snap[key]) <= 4096:
+            raise UndoRefused('invalid-snapshot-field')
+    for key in ['sha256_before', 'sha256_after']:
+        if snap[key] is not None and (not isinstance(snap[key], str) or not re.fullmatch('[0-9a-f]{64}', snap[key])):
+            raise UndoRefused('invalid-snapshot-hash')
+    digest = hashlib.sha256(json.dumps(snap, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    if result['ask_sha256'] != digest:
+        raise UndoRefused('snapshot-digest-mismatch')
+    if not isinstance(result['token'], str) or not re.fullmatch('[0-9a-f]{32}', result['token']):
+        raise UndoRefused('invalid-seam-token')
+    if not isinstance(result['prepared_at'], str) or len(result['prepared_at']) > 80:
+        raise UndoRefused('invalid-preparation-time')
+    if any(type(result[k]) not in (int, float) or not math.isfinite(result[k]) for k in ['age_s', 'expires_in_s']):
+        raise UndoRefused('invalid-expiry')
+    if not 0 <= result['age_s'] < result['expires_in_s'] <= 600:
+        raise UndoRefused('invalid-expiry')
+    return snap
+
+
 class Bridge:
     def __init__(self, socket_path: Path, assets: Path, *, port=8744, rpc=daemon_call):
         self.socket_path, self.assets, self.port, self.rpc = socket_path, assets, port, rpc
@@ -356,6 +423,8 @@ class Bridge:
         self.uncertain = False
         self.observation_prefix = secrets.token_hex(6)
         self.observation_n = 0
+        self.undo_asks = {}  # connection-bound, memory only; daemon tokens never enter the browser
+        self.review_private = False
         # Load only exact assets, never route a caller-controlled filesystem path.
         engine = (assets / 'elaria-visualizer.js').read_bytes()
         if hashlib.sha256(engine).hexdigest() != ENGINE_SHA:
@@ -448,14 +517,20 @@ background:#110d1c;color:#e3bd80;z-index:1}
     async def probe(self):
         try:
             status = await self.rpc(self.socket_path, 'status', {}, PROBE_SECONDS)
+            company = status.get('company')
+            self.review_private = (isinstance(company, dict) and company.get('company') is False
+                                   and company.get('restricted') is False)
             return readiness(status)
         except IPCFailure:
+            self.review_private = False
             return 'Daemon unavailable. No turn sent.'
 
     async def health(self, ws):
         while True:
             await asyncio.sleep(HEALTH_SECONDS)
             problem = await self.probe()
+            if ws in self.undo_asks:
+                await self.emit(ws, t='undo-privacy', allowed=self.review_private and not problem)
             if problem:
                 await self.emit(ws, t='state', name='offline', reason=problem)
                 await ws.close(code=1013, reason='Daemon not live-ready; reconnect later')
@@ -463,12 +538,103 @@ background:#110d1c;color:#e3bd80;z-index:1}
             elif not self.busy and not self.uncertain:
                 await self.emit(ws, t='state', name='idle')
 
+    async def prepare_undo(self, ws, request_id, scope):
+        try:
+            if await self.probe() or not self.review_private:
+                raise UndoRefused('private-posture-unavailable')
+            asks = self.undo_asks.setdefault(ws, {})
+            now = asyncio.get_running_loop().time()
+            for key in [key for key, ask in asks.items() if now >= ask['deadline']]:
+                del asks[key]
+            if len(asks) >= 16:
+                raise UndoRefused('review-bound-reached')
+            started = asyncio.get_running_loop().time()
+            result = await self.rpc(self.socket_path, 'undo.prepare', scope, TURN_SECONDS)
+            snapshot = validate_undo(result)
+            if await self.probe() or not self.review_private:
+                raise UndoRefused('private-posture-unavailable')
+            deadline = started + result['expires_in_s'] - result['age_s']
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise UndoRefused('lapsed')
+            review_id = secrets.token_hex(16)
+            # A new prepared selection invalidates prior pending cards on this connection.
+            for old in asks.values():
+                if old['state'] == 'pending':
+                    old['state'] = 'stale'
+            asks[review_id] = {'token': result['token'], 'digest': result['ask_sha256'],
+                               'deadline': deadline, 'state': 'pending'}
+            await self.emit(ws, t='reply', id=request_id, text='[UNDO REVIEW] Private review prepared; nothing applied.',
+                            provenance='undo-review', audio=None, attribution=[
+                                'Producer: undo.prepare; non-model, no apply dispatched.',
+                                'Ask digest: ' + result['ask_sha256'] +
+                                '; journal prefix correlation only, no operation/event ID supplied.'], undo_review={
+                                'review_id': review_id, 'snapshot': snapshot,
+                                'ask_sha256': result['ask_sha256'], 'prepared_at': result['prepared_at'],
+                                'age_s': result['age_s'] + asyncio.get_running_loop().time() - started,
+                                'remaining_s': remaining})
+        except UndoRefused as exc:
+            await self.emit(ws, t='reply', id=request_id, error='Undo review: ' + str(exc) + '; no apply dispatched.')
+
+    async def decide_undo(self, ws, message):
+        try:
+            asks = self.undo_asks.get(ws, {})
+            ask = asks.get(message['review_id'])
+            if ask is None:
+                raise UndoRefused('no ask is selected')
+            if ask['state'] != 'pending':
+                raise UndoRefused('already-answered' if ask['state'] in {'answered', 'unknown'} else ask['state'])
+            if message['ask_sha256'] != ask['digest']:
+                ask['state'] = 'stale'
+                raise UndoRefused('stale')
+            if await self.probe() or not self.review_private:
+                raise UndoRefused('private-posture-unavailable')
+            if asyncio.get_running_loop().time() >= ask['deadline']:
+                ask['state'] = 'lapsed'
+                raise UndoRefused('lapsed')
+            # Spend before any await to the effect path. Never re-arm on failure or timeout.
+            ask['state'] = 'answered'
+            result = await self.rpc(self.socket_path, 'undo.apply',
+                                    {'token': ask['token'], 'decision': message['decision']}, TURN_SECONDS)
+            if (not isinstance(result, dict) or result.get('decision') != message['decision']
+                    or result.get('ask_sha256') != ask['digest']
+                    or type(result.get('undone')) is not int or not 0 <= result['undone'] <= 1
+                    or not isinstance(result.get('problems'), list)
+                    or message['decision'] == 'no' and (result['undone'] != 0 or result['problems'])):
+                raise IPCFailure(uncertain=True)
+            # No paths/problems echoed into persistent chat; detailed snapshot stays on the card only.
+            await self.emit(ws, t='reply', id=message['id'], text='[UNDO REVIEW] ' +
+                            ('declined; already answered.' if message['decision'] == 'no' else
+                             f"daemon reports undone={result['undone']}, problems={len(result['problems'])}; already answered. ") +
+                            'Ask digest: ' + ask['digest'] + '. Transport acknowledgement is not independent effect verification.',
+                            provenance='undo-review', audio=None)
+        except UndoRefused as exc:
+            await self.emit(ws, t='reply', id=message['id'], error='Undo review: ' + str(exc) + '.')
+        except IPCFailure as exc:
+            self.uncertain = self.uncertain or exc.uncertain
+            await self.emit(ws, t='reply', id=message['id'], error='Undo review outcome unknown; no automatic replay.')
+        except (ConnectionClosed, TimeoutError):
+            pass
+        except Exception:
+            self.uncertain = True
+            with suppress(ConnectionClosed, TimeoutError):
+                await self.emit(ws, t='reply', id=message['id'], error='Undo review outcome unknown; no replay.')
+        finally:
+            self.busy = False
+
     async def turn(self, ws, message):
         request_id = message['id']
         self.observation_n += 1
         observation = f'{self.observation_prefix}:{self.observation_n}'
         notes = attribution({}, {}, message['text'], observation)
+        for ask in self.undo_asks.get(ws, {}).values():
+            if ask['state'] == 'pending':
+                ask['state'] = 'stale'  # any new chat input invalidates the selected act
         try:
+            scope = undo_scope(message['text'])
+            if scope is not None:
+                await self.prepare_undo(ws, request_id, scope)
+                return
             registry_reply = capability_boundary(message['text'])
             if registry_reply is not None:
                 await self.emit(ws, t='reply', id=request_id, text=registry_reply,
@@ -558,12 +724,17 @@ background:#110d1c;color:#e3bd80;z-index:1}
             async for raw in ws:
                 message = json.loads(raw)
                 if (not isinstance(raw, str) or not isinstance(message, dict)
-                        or message.get('t') != 'send' or type(message.get('id')) is not int
+                        or message.get('t') not in {'send', 'undo-decision'} or type(message.get('id')) is not int
                         or not 0 < message['id'] <= 2**53 - 1):
                     await self.emit(ws, t='bye', reason='Invalid §5 send message.')
                     return
                 request_id = message['id']
-                problem = validate_send(message)
+                problem = (validate_send(message) if message['t'] == 'send' else
+                           None if set(message) == {'t', 'id', 'review_id', 'ask_sha256', 'decision'}
+                           and isinstance(message.get('review_id'), str)
+                           and isinstance(message.get('ask_sha256'), str)
+                           and message.get('decision') in ('yes', 'no')
+                           else 'Invalid review decision; no dispatch.')
                 if request_id <= last_id:
                     problem = 'Duplicate or stale ID; no replay sent.'
                 last_id = max(last_id, request_id)
@@ -575,7 +746,8 @@ background:#110d1c;color:#e3bd80;z-index:1}
                     await self.emit(ws, t='reply', id=request_id, error=problem)
                     continue
                 self.busy = True
-                task = asyncio.create_task(self.turn(ws, message))
+                task = asyncio.create_task(self.turn(ws, message) if message['t'] == 'send'
+                                           else self.decide_undo(ws, message))
                 self.turns.add(task)
                 task.add_done_callback(self.turns.discard)
         except (json.JSONDecodeError, UnicodeError, ValueError, RecursionError):
@@ -588,6 +760,7 @@ background:#110d1c;color:#e3bd80;z-index:1}
                 monitor.cancel()
                 await asyncio.gather(monitor, return_exceptions=True)
             self.clients.discard(ws)
+            self.undo_asks.pop(ws, None)
             # Do NOT cancel/replay the daemon turn when the browser disconnects.
 
     async def start(self):
