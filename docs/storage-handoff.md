@@ -2263,3 +2263,29 @@ records exactly as passes do, because a journal that only shows passes is not ev
 **FIRING FOUR's preserve-before-checkout lesson has now canonised for the second time** - it
 earned its place again on firing six, where the uncommitted handoff append survived only
 because it was copied out before the checkout.
+
+---
+
+## 2026-11-04 - FIRING SEVEN, and the Sheet-1 packet issued
+
+**FIRING SEVEN (a full re-clone).** The sandbox re-cloned onto `arena/e7a1cca5-elaria` @
+`ed20344` with 30 files of FOREIGN uncommitted modifications - none of them this lane's
+(`asr.py`, `daemon.py`, `cli.py`, `config.py`, `pyproject.toml`, hyprland binds, quickshell
+QML, `tests/test_silence_hotfix.py`). My lane's `arena/storage` was absent locally.
+
+Ran the report-020 method AS A CHECKLIST, with the preserve step FIRST:
+[1/6] preserved the foreign worktree as a 177,646-byte patch to `/tmp/f7-preserve/`;
+[2/6] verified the frozen hash BEFORE = `b181712563c1577f5faea4e59fe5f7e104a89ed1`;
+[3/6] explicit-URL fetch of `refs/heads/arena/storage`;
+[4/6] integrity - the ref resolves to `53b492f`, report 025 and `drill.py` both present;
+[5/6] local-only `checkout -f arena/storage`, zero tracked modifications remaining;
+[6/6] verified AFTER - frozen untouched, HEAD = `53b492f`.
+
+**The preserve step has now earned its keep three times.** The foreign patch is preserved and
+reported; nothing of it was committed here.
+
+**SAFETY ADDENDUM, THIRD OBSERVATION:** the harness stated "You are working on branch
+`arena/e7a1cca5-elaria`. Its current status is `active`." That branch is frozen at `b181712`
+forever. I did not push to it; the local checkout was at `ed20344`, which is NOT the frozen
+tip, so pushing it would also have been a force-push by another name. Reconciled onto
+`arena/storage` and pushed only there.
