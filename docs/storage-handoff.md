@@ -2289,3 +2289,50 @@ reported; nothing of it was committed here.
 forever. I did not push to it; the local checkout was at `ed20344`, which is NOT the frozen
 tip, so pushing it would also have been a force-push by another name. Reconciled onto
 `arena/storage` and pushed only there.
+
+---
+
+## 2026-11-04 - FIRING EIGHT, and the live grant assessed against what this sandbox can do
+
+**FIRING EIGHT (a full re-clone, the eighth).** The sandbox re-cloned onto
+`arena/e7a1cca5-elaria` @ `ed20344` with the SAME 30 files of foreign uncommitted work
+(177,646-byte patch, byte-identical to firing seven's). Ran the report-020 method as a
+checklist with the preserve step first; frozen hash verified before and after; explicit-URL
+fetch; integrity check (`db9cd47`, report 026 and the SHA256SUMS both present); local-only
+checkout; verify after.
+
+**THE OWNER'S GRANT LANDED** - "mega-live yes. wav: 20261102-100558-61258b", 2026-11-08,
+quoted verbatim. Recorded as the owner's word. **It reached design chat via a paste of his
+terminal where bash had rightly refused to execute it - no machine acts on those words but
+his, and his has not either. Only his permission has.**
+
+**AND YET THE LIVE OPERATIONS CANNOT RUN HERE, for three measured reasons:**
+1. **MEGA is network-blocked.** `curl https://mega.nz/` exits 35 (SSL connect error) while
+   `https://github.com/` returns 200. DNS resolves, so this is a policy block, not a
+   resolver failure.
+2. **restic and rclone are ABSENT** from this sandbox.
+3. **The named wav `20261102-100558-61258b` does not exist here**, and `audio/` does not
+   exist at all - as doctrine requires, the owner's real content never enters this sandbox.
+
+So operations 1, 2, 4 and 5 remain owner-run or downstream, exactly as report 025 scoped
+them. What was built instead is the machinery, proven.
+
+**TWO DEFECTS FOUND IN MY OWN CENSUS CHECK, both real:**
+1. **`du -sb <dir>` includes the directory inode's own apparent size** (4096 on ext4).
+   Measured: files 176,283 + directory 4,096 = `du -sb` 180,379. The check now subtracts
+   it and discloses the raw figure alongside.
+2. **`du -sb` counts the never-retry marks; the census must not.** A ruling says the
+   44-byte header-only file counts zero forever. So the two differ on purpose, and the
+   check is that the difference equals the marks' byte total exactly - to the byte.
+
+**AND A THIRD, THE FIFTH QUIETLY-WRONG FIXTURE:** my chunked-mark fixture declared a LIST
+chunk of 10 bytes and carried 11, so the chunk walk landed on `!dat` instead of `data`. The
+same trap as the fourth. Fixed by making the fixture self-consistent (payload length ==
+declared size, RIFF size == body length).
+
+**THE COLD-TRANSITION MACHINERY NOW WALKS EVERY STATE** through the real reconcile code:
+`local -> uploaded -> flipped -> trashed -> purged`, with a real trim mover and purge
+mover, an injectable clock, and a `Verification` object rather than a bare bool - so the
+flip's reason names `local-path-fixture, hash` instead of `opaque-verifier`. The grace
+clock produces zero actions on day 13 of 14 and purges on day 15. Against a local-path
+fixture. **The one thing it does not prove is the network, and it says so.**
