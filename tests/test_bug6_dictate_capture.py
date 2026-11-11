@@ -44,6 +44,20 @@ from assistant.transcribe import DictationService
 FRAME_SAMPLES = SAMPLE_RATE * 30 // 1000
 
 
+@pytest.fixture(autouse=True)
+def _force_simulated_capture(monkeypatch):
+    """No bug6-class test may open the real mic (owner order 2026-10-26).
+
+    The bug6 suite failed on the laptop where the CLI-subprocess dictate
+    test opened the REAL microphone (~0 s of room audio → "no speech
+    captured" instead of the scripted mock transcript) while the headless
+    sandbox silently fell back to SimulatedCapture. Tests that
+    deliberately exercise capture-selection (target wiring) opt out with
+    monkeypatch.delenv("ASSIST_CAPTURE").
+    """
+    monkeypatch.setenv("ASSIST_CAPTURE", "simulated")
+
+
 def speech_frame() -> bytes:
     return struct.pack(f"<{FRAME_SAMPLES}h", *([6000] * FRAME_SAMPLES))
 
@@ -86,6 +100,18 @@ class HangingSource:
         self.closed = True
 
 
+# The shipped `[voice] silence_floor` default (config.DEFAULTS). Config
+# hygiene for these tests: verdict-affecting knobs are pinned to shipped
+# semantics, never the machine's live tuning. NOTE (2026-10-26, owner
+# correction): this pin did NOT fix the laptop failure — the live config
+# contains no silence_floor at all, so the earlier mechanism claim is
+# retracted. The real leak was the CLI-subprocess dictate opening the REAL
+# mic (~0 s captured → below any floor → "no speech captured"); the fix is
+# the env-forced simulated capture seam (ASSIST_CAPTURE=simulated, autouse
+# below). Status remains [BROKEN-laptop] until the owner's re-run.
+_SHIPPED_SILENCE_FLOOR = 0.05
+
+
 def _service_config(tmp_path):
     from assistant.config import load_config
 
@@ -93,7 +119,21 @@ def _service_config(tmp_path):
     config.raw["cleanup"] = {**config.raw.get("cleanup", {}), "enabled": False}
     config.raw["transcribe"] = {**config.raw.get("transcribe", {}),
                                 "inbox_dir": str(tmp_path / "inbox")}
+    config.raw["voice"] = {**config.raw.get("voice", {}),
+                           "silence_floor": _SHIPPED_SILENCE_FLOOR}
     return config
+
+
+@pytest.fixture(autouse=True)
+def _pin_ambient_voice_config(config):
+    """Pin the verdict-affecting knobs before any daemon/service is built.
+
+    The `config` fixture is `load_config()` — on the owner's laptop that
+    merges ~/.config/assistant/config.toml. Autouse so daemon-based tests
+    (which build DictationService at init, reading silence_floor once) are
+    hermetic too.
+    """
+    config.raw.setdefault("voice", {})["silence_floor"] = _SHIPPED_SILENCE_FLOOR
 
 
 def _run(coro):
@@ -211,6 +251,9 @@ def test_release_ends_a_dead_session_with_no_speech(tmp_path):
 # ===========================================================================
 def test_daemon_dictate_uses_configured_mic_target_and_fails_fast_on_silence(
         config, running_daemon, monkeypatch):
+    # this test exercises capture SELECTION (target wiring): un-force
+    # simulated capture so the (monkeypatched) PipeWireCapture is constructed
+    monkeypatch.delenv("ASSIST_CAPTURE", raising=False)
     daemon, _server = running_daemon
     # Exactly what the owner did on hardware: set mic_target by hand.
     daemon.config.raw.setdefault("capture", {})["mic_target"] = \
@@ -266,6 +309,9 @@ def test_daemon_dictate_uses_configured_mic_target_and_fails_fast_on_silence(
 
 def test_mic_target_precedence_param_beats_config_beats_meeting(
         config, running_daemon, monkeypatch):
+    # this test exercises capture SELECTION (target wiring): un-force
+    # simulated capture so the (monkeypatched) PipeWireCapture is constructed
+    monkeypatch.delenv("ASSIST_CAPTURE", raising=False)
     daemon, _server = running_daemon
     daemon.config.raw.setdefault("capture", {})["mic_target"] = "from-capture"
     daemon.config.raw.setdefault("meeting", {})["mic_target"] = "from-meeting"

@@ -13,6 +13,8 @@ import struct
 import time
 from pathlib import Path
 
+import pytest
+
 from assistant import asr
 from assistant.asr import Transcript
 from assistant.capture import SAMPLE_RATE, wav_duration_s
@@ -20,6 +22,20 @@ from assistant.store import Store
 from assistant.transcribe import DictationService
 
 FRAME_SAMPLES = SAMPLE_RATE * 30 // 1000
+
+
+@pytest.fixture(autouse=True)
+def _force_simulated_capture(monkeypatch):
+    """No bug6-class test may open the real mic (owner order 2026-10-26).
+
+    The bug6 suite failed on the laptop where the CLI-subprocess dictate
+    test opened the REAL microphone (~0 s of room audio → "no speech
+    captured" instead of the scripted mock transcript) while the headless
+    sandbox silently fell back to SimulatedCapture. Tests that
+    deliberately exercise capture-selection (target wiring) opt out with
+    monkeypatch.delenv("ASSIST_CAPTURE").
+    """
+    monkeypatch.setenv("ASSIST_CAPTURE", "simulated")
 
 
 def _speech_frame() -> bytes:
@@ -90,6 +106,9 @@ def test_live_close_without_final_falls_back_to_saved_wav_and_logs_capture(
         **config.raw.get("transcribe", {}),
         "inbox_dir": str(tmp_path / "inbox"),
         "copy_to_clipboard": False,
+        # the boundedness assertions below measure against THIS budget —
+        # final_wait_s is configurable now, so the test states it
+        "final_wait_s": 0.5,
     }
     store = Store(tmp_path / "bug6e.db")
     service = DictationService(config, store, None)
@@ -176,6 +195,9 @@ def test_failed_saved_wav_fallback_returns_explicit_no_final(
         **config.raw.get("transcribe", {}),
         "inbox_dir": str(tmp_path / "inbox"),
         "copy_to_clipboard": False,
+        # the boundedness assertions below measure against THIS budget —
+        # final_wait_s is configurable now, so the test states it
+        "final_wait_s": 0.5,
     }
     store = Store(tmp_path / "bug6e-no-final.db")
     service = DictationService(config, store, None)

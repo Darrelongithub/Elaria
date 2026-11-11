@@ -286,8 +286,11 @@ def test_session_open_cue_is_a_cached_local_earcon(config, tmp_path, monkeypatch
     config.raw["tts"]["cache_dir"] = str(tmp_path / "cue-cache")
     speech = SpeechService(config)
     played: list[Path] = []
-    monkeypatch.setattr(speech, "play_audio",
-                        lambda path: (played.append(Path(path)), True)[1])
+    monkeypatch.setattr(speech, "_play_with_detail",
+                        lambda path: (played.append(Path(path)),
+                                      {"played": True, "player": "test",
+                                       "argv": ["test", str(path)],
+                                       "returncode": 0, "error": ""})[1])
 
     path = speech.cached_ack(SESSION_CUE_KIND)
     assert path and Path(path).exists()

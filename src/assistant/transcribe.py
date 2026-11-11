@@ -58,6 +58,7 @@ from .clipboard import copy_text
 from .config import DEFAULTS
 from .cost import iso_now, shadow_cost_usd
 from .inbox import write_inbox_note
+from .journal_log import error_text, log_event, log_starvation, log_transcription_stump
 from .live_client import (
     DuplexLiveTransport,
     LiveEvent,
@@ -193,6 +194,38 @@ class SessionResult:
     # A missing Live final is distinct from silence: the saved WAV may still
     # contain speech and is retained for a later retry/re-transcription.
     no_final: bool = False
+    # The model of record for this session (scene-1 merge gate): rides into
+    # the §4.8 schema lines as `model_version=…` so a press can be proven to
+    # have been served, and by which model.
+    model: str | None = None
+    # G.6 latency sensor: monotonic mark at final.received / final.timeout,
+    # so release→final is measured, never inferred.
+    final_mark: float | None = None
+
+
+async def wait_for_live_terminal(current_collector: asyncio.Task | None,
+                                 terminal_event: asyncio.Event | None) -> None:
+    """Wait until the collector finishes or its terminal event fires.
+
+    Stream G: extracted from dictate() to module level so the adaptive
+    early-abandon (_wait_final_adaptive) and the plain wait share one
+    implementation. No closure state — both arguments are explicit."""
+    if (terminal_event is None or terminal_event.is_set()
+            or current_collector is None or current_collector.done()):
+        if current_collector is not None and current_collector.done():
+            current_collector.result()
+        return
+    terminal_wait = asyncio.create_task(terminal_event.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {current_collector, terminal_wait},
+            return_when=asyncio.FIRST_COMPLETED)
+        if current_collector in done:
+            current_collector.result()
+    finally:
+        if not terminal_wait.done():
+            terminal_wait.cancel()
+            await asyncio.gather(terminal_wait, return_exceptions=True)
 
 
 def _final_texts(events) -> list[str]:
@@ -244,7 +277,13 @@ class DictationService:
     TRANSPORT_CLOSE_TIMEOUT_S = 1.5
     SOURCE_CLOSE_TIMEOUT_S = 1.5
     EVENT_EMIT_TIMEOUT_S = 1.0
-    FALLBACK_TIMEOUT_S = 5.0
+    # W6 (2026-10-31, scene-7 evidence): the leg landed at the 5.0 s
+    # boundary on a good day (latency.table 94129e: final_to_reply 4.93 s
+    # under a 5.0 s cap) — a slower day times out a working leg. The
+    # budget is measured from VOICE-END (the speculative start), not from
+    # the gate, so the raise hides under the final wait on the healthy
+    # path.
+    FALLBACK_TIMEOUT_S = 8.0
     CLEANUP_TIMEOUT_S = 3.0
     PERSIST_TIMEOUT_S = 6.0
 
@@ -282,7 +321,71 @@ class DictationService:
         # and how much silence after the one check-in closes the session (VB-5/6).
         self.resume_s = float(settings.get("speech_resume_s", 0.4))
         self.grace_s = float(settings.get("checkin_grace_s", 8.0))
+        # Scene-3b-REDO stream E: the post-release wait for the final
+        # transcript is a budget, named and configurable — never a magic
+        # constant (the 2.5 s wall the reply regression died behind).
+        self.final_wait_s = float(settings.get("final_wait_s", 12.0))
+        # G.4: adaptive early-abandon grace (see _wait_final_adaptive).
+        self.final_abandon_grace_s = float(
+            settings.get("final_abandon_grace_s", 3.0))
         self.audio_dir = config.data_dir / "audio"
+
+    async def _voice_end_abandon(self, transport, grace_s: float) -> None:
+        """Resolves when the server's voice-activity END has been seen with
+        zero transcript-family messages for `grace_s` continuous seconds
+        (G.4). Without wire sensors this never resolves — no sensors, no
+        abandon."""
+        describe = getattr(transport, "wire_stats", None)
+        if not callable(describe):
+            await asyncio.Event().wait()
+            return
+        hold: float | None = None
+        while True:
+            try:
+                stats = describe() or {}
+            except Exception:   # a broken sensor never abandons the wait
+                stats = {}
+            family = int(stats.get("transcript_family") or 0)
+            if stats.get("voice_end") and family == 0:
+                now = time.monotonic()
+                hold = now if hold is None else hold
+                if now - hold >= grace_s:
+                    return
+            else:
+                hold = None   # a transcript-family message arrived: full budget
+            await asyncio.sleep(0.25)
+
+    async def _wait_final_adaptive(self, collector, collector_terminal_event,
+                                   transport):
+        """The post-release wait, with G.4 adaptive early-abandon.
+
+        The docs say the finalized transcript is emitted when the turn
+        completes — promptly at activityEnd for the Manual VAD idiom. So
+        when the server has already declared ACTIVITY_END and still no
+        transcript family exists, the remaining budget is cut to
+        `final_abandon_grace_s`; `final_wait_s` stays the ceiling.
+        Raises TimeoutError carrying the reason as its message."""
+        budget_s = self.final_wait_s
+        grace_s = self.final_abandon_grace_s
+        terminal = asyncio.ensure_future(
+            wait_for_live_terminal(collector, collector_terminal_event))
+        watcher = asyncio.ensure_future(
+            self._voice_end_abandon(transport, grace_s))
+        try:
+            done, _pending = await asyncio.wait(
+                {terminal, watcher}, timeout=budget_s,
+                return_when=asyncio.FIRST_COMPLETED)
+            if terminal in done:
+                return await terminal
+            if watcher in done:
+                raise TimeoutError(
+                    f"adaptive abandon after voice_end grace {grace_s}s "
+                    f"(voice end seen, no transcript family)")
+            raise TimeoutError(f"budget expired after {budget_s}s")
+        finally:
+            for task in (terminal, watcher):
+                task.cancel()
+            await asyncio.gather(terminal, watcher, return_exceptions=True)
 
     def _connectivity(self):
         """Mode snapshot for one session. A switch requested mid-session is
@@ -313,11 +416,21 @@ class DictationService:
             result.queued_job_ids.append(job_id)
             result.notes.append(
                 f"low-confidence offline transcript queued for Gemini redo (job #{job_id})")
+            # §4.8: deferred work is visible, not silent — the audio path
+            # ends in a queue row, and the marker names the job.
+            log_event("transcription.deferred", session_id=result.session_id,
+                      verdict="deferred",
+                      detail=(f"low-confidence transcript queued for cloud "
+                              f"redo (job #{job_id}); audio kept at "
+                              f"{result.audio_path}"))
         if (offline and skip_cleanup and self.queue_cleanup_offline
                 and result.raw_text.strip()):
             job_id = self.offline_queue.enqueue_cleanup(result.transcript_id)
             result.queued_job_ids.append(job_id)
             result.notes.append(f"transcript cleanup queued for reconnect (job #{job_id})")
+            log_event("transcription.deferred", session_id=result.session_id,
+                      verdict="deferred",
+                      detail=f"cleanup queued for reconnect (job #{job_id})")
         return result
 
     # -- public entry points ---------------------------------------------------
@@ -407,7 +520,11 @@ class DictationService:
             if not timed_out:
                 self._log(f"{step}_failed", session_id=session_id,
                           elapsed_s=round(time.monotonic() - started, 3),
-                          error=str(exc)[:200], **fields)
+                          # F3a: NEVER an empty error string on a failure
+                          # event — asyncio.wait_for raises a message-less
+                          # TimeoutError and the 2026-11-02 starved turn
+                          # journaled `error: ""` from exactly here.
+                          error=error_text(exc)[:200], **fields)
             raise
         except Exception as exc:
             self._log(f"{step}_failed", session_id=session_id,
@@ -424,7 +541,8 @@ class DictationService:
                       stop_event: asyncio.Event | None = None,
                       is_playback_active: Callable[[], bool] | None = None,
                       session_id: str | None = None,
-                      clock: Callable[[], float] | None = None) -> SessionResult:
+                      clock: Callable[[], float] | None = None,
+                      on_final_text: Callable[[str], None] | None = None) -> SessionResult:
         session_id = session_id or uuid.uuid4().hex[:12]
         emit = sink or _noop_sink
         self._log("dictate.enter", session_id=session_id, mode=mode, source_target=str(getattr(source, "target", None) or "default"))
@@ -436,6 +554,16 @@ class DictationService:
         when = datetime.now().astimezone()
         wav_sink = None
         audio_path = None
+        # W6 (2026-10-31): the speculative file-leg state is read at the
+        # BH-K3 gate and in the finally — initialize at entry (the
+        # final_wait_note lesson: gate-level reads of flush-local state
+        # must be initialized at entry).
+        wav_pre_closed = False
+        speculative_fallback = None
+        # F3c: the fallback chain's outcome class (landed/empty/timeout/
+        # error) — read at the gate's starvation check; initialized at
+        # entry (the final_wait_note lesson).
+        fallback_class = None
         if self.save_audio:
             audio_path = self.audio_dir / f"{when:%Y%m%d-%H%M%S}-{session_id[:6]}.wav"
             wav_sink = WavSink(audio_path)
@@ -459,6 +587,9 @@ class DictationService:
                           error=f"{type(exc).__name__}: {exc}"[:200])
 
         final_text = ""
+        # Flush-local otherwise: the offline path skips the flush block,
+        # and the H.1 route line reads this at the gate on every path.
+        final_wait_note = ""
         confidence: float | None = None
         connectivity = self._connectivity()
         offline_at_start = bool(connectivity and connectivity.is_offline)
@@ -469,6 +600,7 @@ class DictationService:
         no_speech = False
         no_final = False
         live_terminal_missing = False
+        final_mark: float | None = None   # G.6: set at final.* classification
         frame_loop_completed = False
         transport: LiveTransport | None = None
         collector: asyncio.Task | None = None
@@ -501,6 +633,12 @@ class DictationService:
         captured_bytes = 0
         peak_rms = 0.0
         session_peak = 0.0
+        # Stream H.4 capture-lifecycle sensors (2026-10-27): the owner
+        # reports "the microphone takes a minute to start and stop" —
+        # aggregate numbers only, never content.
+        dictate_started_mono = time.monotonic()
+        first_frame_latency_ms = None
+        first_speech_frame_s = None
         frames_seen = 0
         capture_label = str(getattr(source, "target", None) or "default")
 
@@ -575,25 +713,6 @@ class DictationService:
                 # EOF/error is terminal too, even if no final text was emitted.
                 terminal_event.set()
 
-        async def wait_for_live_terminal(current_collector: asyncio.Task | None,
-                                         terminal_event: asyncio.Event | None) -> None:
-            if (terminal_event is None or terminal_event.is_set()
-                    or current_collector is None or current_collector.done()):
-                if current_collector is not None and current_collector.done():
-                    current_collector.result()
-                return
-            terminal_wait = asyncio.create_task(terminal_event.wait())
-            try:
-                done, _pending = await asyncio.wait(
-                    {current_collector, terminal_wait},
-                    return_when=asyncio.FIRST_COMPLETED)
-                if current_collector in done:
-                    current_collector.result()
-            finally:
-                if not terminal_wait.done():
-                    terminal_wait.cancel()
-                    await asyncio.gather(terminal_wait, return_exceptions=True)
-
         def wrap_duplex(current: LiveTransport) -> LiveTransport:
             """One door for both the real and the fake transport (§12.9)."""
             if isinstance(current, DuplexLiveTransport):
@@ -634,7 +753,7 @@ class DictationService:
                 # failure is exactly what "5 failures, all key/voice" cannot
                 # rule out by inspection.
                 live_failures.append(f"connect: {exc}")
-                self._ledger_live_failure(stage="connect", error=str(exc))
+                self._ledger_live_failure(stage="connect", error=error_text(exc))
                 notes.append(f"live connect failed ({exc}) — will transcribe the saved audio")
                 await emit({"event": "session.reconnecting", "reason": str(exc),
                             "fallback": "local" if network_drop else "gemini_batch",
@@ -658,8 +777,19 @@ class DictationService:
                 captured_bytes += len(frame)
                 level = frame_rms(frame)
                 peak_rms = max(peak_rms, level)
-                session_peak = max(session_peak, pcm_peak(frame))
+                frame_peak = pcm_peak(frame)
+                session_peak = max(session_peak, frame_peak)
                 frame_s = len(frame) / 2 / 16000
+                # H.4: press→first-frame latency and where in the kept
+                # wav the first non-silent frame sits (HDA DSP power-up
+                # can clip first words; ACTIVITY_START 0s is ambiguous).
+                if frames_seen == 1:
+                    first_frame_latency_ms = round(
+                        (time.monotonic() - dictate_started_mono) * 1000, 1)
+                if first_speech_frame_s is None and (
+                        frame_peak >= self.silence_floor):
+                    first_speech_frame_s = round(
+                        (captured_bytes - len(frame)) / 2 / 16000, 3)
                 # BUG6: half-duplex inside the Live session. While her output
                 # is playing (or inside the ~400 ms guard), a frame is her own
                 # voice through the speakers. It is not buffered (a rotation
@@ -735,6 +865,14 @@ class DictationService:
                         # spin the rotation); duplicates from the replayed tail are
                         # folded when the finals are joined.
                         collected[:] = [e for e in collected if e.type != "go_away"]
+                        # §4.8: GoAway is a graceful close plus a visible marker,
+                        # never a silent drop. The session rotates; captured audio
+                        # is kept (prime directive).
+                        log_event("goaway.close", level="warn",
+                                  session_id=str(session_id or ""),
+                                  verdict="closed",
+                                  detail=("server GoAway — graceful close, session "
+                                          "rotating; captured audio kept"))
                         raise LiveUnavailable("server GoAway — rotating session")
                     await transport.send_audio(frame)
                     if level >= self.vad_threshold:
@@ -791,6 +929,53 @@ class DictationService:
                       frames_seen=frames_seen, bytes=captured_bytes,
                       duration_s=round(duration_s, 3))
 
+            # W6 (2026-10-31, scene-7 latency evidence): finalize the WAV
+            # at VOICE-END and start the saved-file transcription leg now
+            # — overlapped with the post-release final wait instead of
+            # stacked after the adaptive abandon (latency.table 94129e:
+            # release_to_final 3.59 s + final_to_reply 4.93 s stacked).
+            # The leg is speculative: when the Live primary delivers a
+            # final, the BH-K3 gate discards it unawaited and never
+            # substitutes it (the scene-3b substitution contract stands).
+            if wav_sink is not None:
+                self._log("dictate.wav_close_start", session_id=session_id)
+                try:
+                    duration_s = wav_sink.close() or duration_s
+                    wav_pre_closed = True
+                    self._log("dictate.wav_closed", session_id=session_id,
+                              duration_s=round(duration_s, 3))
+                except Exception as exc:
+                    self._log("dictate.wav_close_failed", session_id=session_id,
+                              error=error_text(exc)[:120])
+            prelim_no_speech = (captured_bytes == 0 or peak_rms < 0.003
+                                or session_peak < self.silence_floor)
+            # W6 cost guard (the scene-3b/BH-K1 contract): never spend the
+            # speculative call when the Live primary ALREADY covers the
+            # audio — a committed final with no speech after it. The gate
+            # below still runs the inline leg if the picture changes.
+            committed_now = " ".join(_final_texts(collected)).strip()
+            uncommitted_now = (sent_speech_s - speech_s_at_last_final
+                               if speech_s_at_last_final is not None else 0.0)
+            primary_covered = bool(committed_now) and uncommitted_now <= 0
+            if (wav_pre_closed and audio_path is not None
+                    and not prelim_no_speech and not primary_covered):
+                self._log("dictate.fallback_speculative_start",
+                          session_id=session_id, audio_path=str(audio_path))
+                log_event("fallback.speculative_start", session_id=session_id,
+                          verdict="started",
+                          detail=(f"at=voice-end; "
+                                  f"budget_s={self.FALLBACK_TIMEOUT_S:g}; "
+                                  f"file={Path(audio_path).name}"))
+                speculative_fallback = asyncio.create_task(
+                    asyncio.wait_for(
+                        asyncio.to_thread(
+                            asr.transcribe_file, self.config, self.client,
+                            str(audio_path),
+                            offline=offline_at_start or network_drop,
+                            local_backend=self.local_backend,
+                            session_id=session_id),
+                        timeout=self.FALLBACK_TIMEOUT_S))
+
             # PTT released / source exhausted: close the utterance. A Live
             # server may omit its final/turn_complete after activity_end, so
             # both the signal and the receive-loop wait are explicitly bounded.
@@ -815,24 +1000,50 @@ class DictationService:
                     live_failures.append(f"activity_end: {exc}")
                     notes.append(f"Live activity_end failed ({exc}); will use committed text or saved-WAV fallback")
 
+                collector_state = ("none" if collector is None
+                                   else "done" if collector.done() else "alive")
+                final_wait_started = time.monotonic()
+                final_wait_note = ""
+                # Stream E (2026-10-26): schema events that name the
+                # flush. final.wait fires at EVERY flush of a live
+                # session — its absence in a journal is the signal that
+                # we hung up before the flush arrived. final.received /
+                # final.timeout say what actually happened, naming a
+                # dead collector honestly instead of pretending to wait.
+                log_event("final.wait", session_id=session_id,
+                          verdict="waiting",
+                          detail=(f"budget_s={self.final_wait_s}; "
+                                  f"abandon_grace_s={self.final_abandon_grace_s}; "
+                                  f"collector={collector_state}; "
+                                  f"activity_end_ok={activity_end_ok}"))
                 if activity_end_ok and collector is not None:
                     try:
                         await self._await_lifecycle(
                             "dictate.transcript_final_wait",
-                            wait_for_live_terminal(collector,
-                                                   collector_terminal_event),
-                            timeout_s=self.FINAL_TRANSCRIPT_TIMEOUT_S,
+                            self._wait_final_adaptive(
+                                collector, collector_terminal_event,
+                                transport),
+                            timeout_s=self.final_wait_s,
                             session_id=session_id)
-                    except TimeoutError:
+                    except TimeoutError as exc:
                         live_terminal_missing = True
+                        final_wait_note = (
+                            str(exc).strip()
+                            or f"budget expired after {self.final_wait_s}s")
                         notes.append(
                             "Live final transcript timed out after activity_end; "
                             "will use committed text or saved-WAV fallback")
                     except Exception as exc:
                         live_terminal_missing = True
                         live_failed = True
+                        final_wait_note = f"final wait failed ({exc})"
                         live_failures.append(f"final wait: {exc}")
-                        notes.append(f"Live final wait failed ({exc}); will use committed text or saved-WAV fallback")
+                        notes.append(f"Live final wait failed ({exc}); "
+                                     "will use committed text or saved-WAV fallback")
+                elif collector is None:
+                    final_wait_note = "no live collector — final wait skipped"
+                elif not activity_end_ok:
+                    final_wait_note = "activity_end failed — final wait skipped"
                 diagnostics = {}
                 try:
                     describe = getattr(transport, "diagnostics", None)
@@ -845,11 +1056,72 @@ class DictationService:
                           event_counts=dict(live_event_counts), transport=diagnostics)
                 finals = _final_texts(collected)
                 final_text = " ".join(finals).strip()
-                if not final_text:
+                waited_s = round(time.monotonic() - final_wait_started, 3)
+                final_mark = time.monotonic()
+                if final_text:
+                    log_event("final.received", session_id=session_id,
+                              verdict="received",
+                              detail=(f"text_chars={len(final_text)}; "
+                                      f"waited_s={waited_s}"
+                                      + (f"; {final_wait_note}"
+                                         if final_wait_note else "")))
+                else:
                     live_terminal_missing = True
                     self._log("dictate.live_no_final", session_id=session_id,
                               activity_end_ok=activity_end_ok,
                               frames_seen=frames_seen)
+                    note = final_wait_note
+                    if not note:
+                        # A collector that finished WITHOUT delivering a final
+                        # is the sever: the link died mid-utterance. (A
+                        # collector that finished AFTER its final is the
+                        # healthy path — that lands in final.received.) The
+                        # CURRENT state decides: death can come mid-wait.
+                        collector_dead = (collector is None or collector.done())
+                        note = ("collector ended with no final "
+                                "(live link died?)"
+                                if collector_dead
+                                else "terminal reached with no final text")
+                    log_event("final.timeout", level="warn",
+                              session_id=session_id,
+                              verdict="missing",
+                              detail=(f"waited_s={waited_s}; "
+                                      f"collector={collector_state}; "
+                                      + note))
+                # Stream F sensors (2026-10-26): the deciding fork lives on
+                # the wire. ws.histogram counts every message type the Live
+                # session received (unparsed shapes sampled, text-only);
+                # audio.sent meters what we actually pushed to the socket.
+                wire = None
+                describe_wire = getattr(transport, "wire_stats", None)
+                if callable(describe_wire):
+                    try:
+                        wire = describe_wire()
+                    except Exception:  # a sensor never breaks close
+                        wire = None
+                if isinstance(wire, dict):
+                    types = wire.get("types") or {}
+                    samples = wire.get("samples") or []
+                    setup_ok = bool(wire.get("setup_complete"))
+                    log_event("ws.histogram", session_id=session_id,
+                              verdict="wire",
+                              detail=(f"setup={'ok' if setup_ok else 'missing'}"
+                                      f" retries={int(wire.get('setup_retries') or 0)}"
+                                      f"; voice_end={str(bool(wire.get('voice_end'))).lower()}"
+                                      f"; transcript_family={int(wire.get('transcript_family') or 0)}"
+                                      f" commits={int(wire.get('transcript_commits') or 0)}"
+                                      f" dupes={int(wire.get('transcript_dupes') or 0)}"
+                                      f" snapshots={int(wire.get('transcript_snapshots') or 0)}"
+                                      f"; types={json.dumps(types, sort_keys=True)}"
+                                      + (f"; samples={json.dumps(samples)[:600]}"
+                                         if samples else "")))
+                    sent = wire.get("audio_sent") or {}
+                    log_event("audio.sent", session_id=session_id,
+                              verdict="sent",
+                              detail=(f"chunks={int(sent.get('chunks') or 0)} "
+                                      f"bytes={int(sent.get('bytes') or 0)} "
+                                      f"format={sent.get('format') or '?'} "
+                                      f"rate={sent.get('rate') or '?'}"))
             duplex = {}
             if transport is not None and getattr(transport, "gate", None) is not None:
                 duplex = transport.gate.snapshot()
@@ -880,7 +1152,7 @@ class DictationService:
             if not frame_loop_completed:
                 self._log("dictate.frame_loop_incomplete", session_id=session_id,
                           frames_seen=frames_seen, bytes=captured_bytes)
-            if wav_sink:
+            if wav_sink and not wav_pre_closed:
                 self._log("dictate.wav_close_start", session_id=session_id)
                 try:
                     duration_s = wav_sink.close() or duration_s
@@ -888,7 +1160,7 @@ class DictationService:
                               duration_s=round(duration_s, 3))
                 except Exception as exc:
                     self._log("dictate.wav_close_failed", session_id=session_id,
-                              error=str(exc)[:120])
+                              error=error_text(exc)[:120])
 
             # Persist capture.stats before ANY cleanup await. If a transport or
             # source close is wedged, status still reports the bytes/peak and
@@ -917,6 +1189,8 @@ class DictationService:
                 "silence_floor": round(self.silence_floor, 4),
                 "duration_s": round(duration_s, 3), "gated_frames": gated_frames,
                 "stalled": stalled, "no_speech": no_speech,
+                "first_frame_latency_ms": first_frame_latency_ms,
+                "first_speech_frame_s": first_speech_frame_s,
             }
             if stalled:
                 notes.append("capture stalled — the capture process delivered no data")
@@ -939,6 +1213,19 @@ class DictationService:
             except Exception as exc:
                 self._log("dictate.capture_stats_log_failed", session_id=session_id,
                           error=f"{type(exc).__name__}: {exc}"[:200])
+            # H.4 (2026-10-27): the mic-lifecycle numbers ride the SCHEMA
+            # journal, not just capture.stats — journalctl must answer the
+            # "does start/stop feel slow" question in the scene dump.
+            # Aggregate only: latency and offsets, never content.
+            log_event("capture.lifecycle", session_id=session_id,
+                      verdict=("ok" if first_frame_latency_ms is not None
+                               else "no-frames"),
+                      detail=(f"node={capture_label}; "
+                              f"first_frame_latency_ms="
+                              f"{first_frame_latency_ms if first_frame_latency_ms is not None else 'n/a'}; "
+                              f"first_speech_frame_s="
+                              f"{first_speech_frame_s if first_speech_frame_s is not None else 'n/a'}; "
+                              f"frames={frames_seen} bytes={captured_bytes}"))
             if no_speech:
                 # Rule 1: the session journal carries the same plain line.
                 # Durable before any close await, like capture.stats — a
@@ -959,6 +1246,39 @@ class DictationService:
                 except Exception as exc:
                     self._log("dictate.silent_close_log_failed", session_id=session_id,
                               error=f"{type(exc).__name__}: {exc}"[:200])
+                # §4.8 schema line: the silence verdict with the measured peak
+                # — the sensor for "she heard nothing" (kept audio: none needed,
+                # but the transcript journal still holds the empty session).
+                log_event("silence.verdict", session_id=session_id,
+                          peak=round(session_peak, 4), verdict="silence",
+                          detail=(f"{HEARD_NOTHING} — node {capture_label}, "
+                                  f"{captured_bytes} bytes, peak "
+                                  f"{round(session_peak, 4)} under floor "
+                                  f"{round(self.silence_floor, 4)}"))
+
+            # Watch-item hardening (2026-10-26, stream F): close the
+            # transport BEFORE cancelling the collector, so the receiver
+            # stops producing into a queue nobody drains before its
+            # consumer dies. WP1 owns the 1.4 GB daemon-run profile.
+            if transport is not None:
+                try:
+                    await self._await_lifecycle(
+                        "dictate.transport_close", transport.close(),
+                        timeout_s=self.TRANSPORT_CLOSE_TIMEOUT_S,
+                        session_id=session_id)
+                    self._log("dictate.transport_closed", session_id=session_id)
+                    # H.4: stream-closed-at, a schema fact at session
+                    # close (the "mic keeps running" worry is
+                    # privacy-adjacent — the close time is evidence).
+                    log_event("stream.closed", session_id=session_id,
+                              verdict="closed",
+                              detail=(f"live stream closed "
+                                      f"{round(time.monotonic() - dictate_started_mono, 3)}s "
+                                      f"after session start"))
+                except Exception as exc:
+                    notes.append(f"Live transport close did not finish cleanly ({exc})")
+                    self._log("dictate.transport_close_failed", session_id=session_id,
+                              error=f"{type(exc).__name__}: {exc}"[:200])
 
             if collector is not None and not collector.done():
                 self._log("dictate.collector_cancel_start", session_id=session_id)
@@ -972,18 +1292,6 @@ class DictationService:
                     self._log("dictate.collector_cancelled", session_id=session_id)
                 except Exception as exc:
                     notes.append(f"Live event collector did not stop cleanly ({exc})")
-
-            if transport is not None:
-                try:
-                    await self._await_lifecycle(
-                        "dictate.transport_close", transport.close(),
-                        timeout_s=self.TRANSPORT_CLOSE_TIMEOUT_S,
-                        session_id=session_id)
-                    self._log("dictate.transport_closed", session_id=session_id)
-                except Exception as exc:
-                    notes.append(f"Live transport close did not finish cleanly ({exc})")
-                    self._log("dictate.transport_close_failed", session_id=session_id,
-                              error=f"{type(exc).__name__}: {exc}"[:200])
             try:
                 await self._await_lifecycle(
                     "dictate.source_close", source.aclose(),
@@ -1044,6 +1352,25 @@ class DictationService:
         clean_terminal = not live_terminal_missing and not live_failed
         tail_unconfirmed = uncommitted_speech_s > 0 and not clean_terminal
         needs_fallback = (not final_text or tail_unconfirmed) and not no_speech
+        # Stream H.1 (2026-10-27): the post-timeout ROUTE is a schema
+        # fact. The scene-6 "no fallback attempt" reading came from a
+        # journal where the attempt only existed as persona lifecycle
+        # rows — from here on the route and the fallback outcome are
+        # schema lines, and the timeout kind (adaptive abandon vs budget)
+        # rides the reason.
+        route_reason = (final_wait_note
+                        or ("final received" if final_text else "no wait note"))
+        log_event("post_timeout_route", session_id=session_id,
+                  verdict=("fallback" if needs_fallback else "deferred"),
+                  detail=(f"reason={route_reason}; "
+                          f"needs_fallback={str(bool(needs_fallback)).lower()}; "
+                          f"no_speech={str(bool(no_speech)).lower()}; "
+                          f"final={'yes' if final_text else 'no'}; "
+                          f"timeout_kind="
+                          + ("adaptive_abandon"
+                             if "adaptive abandon" in route_reason
+                             else "budget" if "timed out" in route_reason
+                             or "budget expired" in route_reason else "none")))
         if final_text and needs_fallback:
             notes.append(
                 f"Live transcript may be incomplete: {uncommitted_speech_s:.2f}s "
@@ -1058,16 +1385,33 @@ class DictationService:
         if needs_fallback:
             if audio_path is not None:
                 try:
-                    fallback = await self._await_lifecycle(
-                        "dictate.saved_wav_fallback",
-                        asyncio.to_thread(
-                            asr.transcribe_file, self.config, self.client,
-                            str(audio_path), offline=use_offline_chain,
-                            local_backend=self.local_backend),
-                        timeout_s=self.FALLBACK_TIMEOUT_S,
-                        session_id=session_id, audio_path=str(audio_path),
-                        offline=use_offline_chain)
+                    if speculative_fallback is not None:
+                        # W6: the leg already started at voice-end — await
+                        # it (its own budget runs from there).
+                        fallback = await self._await_lifecycle(
+                            "dictate.saved_wav_fallback",
+                            speculative_fallback,
+                            timeout_s=self.FALLBACK_TIMEOUT_S,
+                            session_id=session_id, audio_path=str(audio_path),
+                            offline=use_offline_chain)
+                    else:
+                        fallback = await self._await_lifecycle(
+                            "dictate.saved_wav_fallback",
+                            asyncio.to_thread(
+                                asr.transcribe_file, self.config, self.client,
+                                str(audio_path), offline=use_offline_chain,
+                                local_backend=self.local_backend,
+                                session_id=session_id),
+                            timeout_s=self.FALLBACK_TIMEOUT_S,
+                            session_id=session_id, audio_path=str(audio_path),
+                            offline=use_offline_chain)
                     fallback_text = str(getattr(fallback, "text", "") or "").strip()
+                    outcome_detail = ("returned no transcript" if not fallback_text
+                                      else f"returned {len(fallback_text)} chars")
+                    log_event("fallback.outcome", session_id=session_id,
+                              verdict=("landed" if fallback_text else "empty"),
+                              detail=f"file-transcription leg {outcome_detail}")
+                    fallback_class = "landed" if fallback_text else "empty"
                     if fallback_text:
                         final_text = fallback_text
                         backend = str(getattr(fallback, "backend", backend))
@@ -1081,18 +1425,67 @@ class DictationService:
                                 "transcript may be silently translated (§12.4)")
                     else:
                         notes.append("saved-WAV fallback returned no transcript")
-                except Exception as exc:
+                except TimeoutError:
+                    fallback_class = "timeout"
+                    log_event("fallback.outcome", level="warn",
+                              session_id=session_id, verdict="timeout",
+                              detail=(f"file-transcription leg exceeded "
+                                      f"{self.FALLBACK_TIMEOUT_S:g}s "
+                                      "(budget runs from voice-end)"))
                     await emit_lifecycle_event(
                         "dictate.fallback_error_emit",
-                        {"event": "error", "error": str(exc),
+                        {"event": "error",
+                         "error": f"saved-WAV fallback timed out after "
+                                  f"{self.FALLBACK_TIMEOUT_S:g}s",
                          "session_id": session_id})
                     if not final_text:
                         backend = "local" if use_offline_chain else backend
-                    notes.append(f"saved-WAV fallback failed: {exc}")
+                    notes.append(
+                        f"saved-WAV fallback timed out after "
+                        f"{self.FALLBACK_TIMEOUT_S:g}s")
+                except Exception as exc:
+                    fallback_class = "error"
+                    # F3a: the chain's real failure text surfaces here —
+                    # `all ASR backends failed — <per-backend reasons>` —
+                    # never an empty error string on a failure event.
+                    log_event("fallback.outcome", level="warn",
+                              session_id=session_id, verdict="error",
+                              detail=(f"file-transcription leg failed: "
+                                      f"{error_text(exc)}"))
+                    await emit_lifecycle_event(
+                        "dictate.fallback_error_emit",
+                        {"event": "error", "error": error_text(exc),
+                         "session_id": session_id})
+                    if not final_text:
+                        backend = "local" if use_offline_chain else backend
+                    notes.append(f"saved-WAV fallback failed: {error_text(exc)}")
             else:
                 notes.append("saved-WAV fallback unavailable: no audio file was saved")
             if backend == "gemini_live" and live_failed and not final_text:
                 backend = "local" if use_offline_chain else "gemini_batch"
+            # F3c: whole-chain starvation is its own schema event — the
+            # per-backend class-marks sit above it in the journal, the wav
+            # is kept (the deferred contract owns the retry). The four
+            # classes: empty / timeout / error / (landed never starves).
+            if (fallback_class not in (None, "landed") and not final_text):
+                log_starvation(
+                    session_id, fallback_class,
+                    detail=(f"file chain produced no transcript; "
+                            f"wav kept at {audio_path}; retained for retry"))
+        if speculative_fallback is not None and not needs_fallback:
+            # W6: good Live text won the race — the speculative leg's
+            # result is discarded unawaited and never substituted (the
+            # BH-K3 contract). The worker thread may still finish and
+            # bill; that quota tradeoff is named in the stream report.
+            speculative_fallback.cancel()
+            await asyncio.gather(speculative_fallback, return_exceptions=True)
+            self._log("dictate.fallback_speculative_discarded",
+                      session_id=session_id)
+            log_event("fallback.discarded", session_id=session_id,
+                      verdict="discarded",
+                      detail=("primary final landed; speculative leg result "
+                              "discarded (never substituted)"))
+            speculative_fallback = None
 
         no_final = bool(not final_text and not no_speech)
         if no_final:
@@ -1102,6 +1495,17 @@ class DictationService:
                       live_final_missing=live_terminal_missing,
                       audio_path=str(audio_path) if audio_path else None,
                       bytes=captured_bytes, duration_s=round(duration_s, 3))
+        elif on_final_text is not None and final_text:
+            # M-4 early dispatch (G.7.3(ii)): chat starts the moment the
+            # leg lands — before the cleanup model call and persist, which
+            # are the serial work between final text and reply generation
+            # (final_to_reply on 94129e was 4.93 s). The daemon's gate
+            # owns every veto; a callback failure never breaks the flow.
+            try:
+                on_final_text(final_text)
+            except Exception as exc:
+                self._log("dictate.early_dispatch_failed", session_id=session_id,
+                          error=f"{type(exc).__name__}: {exc}"[:200])
 
         cloud_status = self._cloud_status(
             backend=backend, confidence=confidence, raw=final_text,
@@ -1138,7 +1542,10 @@ class DictationService:
                 flagged=False, duration_s=duration_s, transcript_id=None,
                 notes=notes, confidence=confidence, cloud_status=cloud_status,
                 connectivity_mode=(connectivity.effective_mode
-                                   if connectivity else None))
+                                   if connectivity else None),
+                model=model)
+        if final_mark is not None and getattr(result, "final_mark", None) is None:
+            result.final_mark = final_mark
         try:
             result = self._enqueue_offline_work(
                 result, offline=use_offline_chain,
@@ -1173,11 +1580,30 @@ class DictationService:
                              "is retained for retry."),
                  "audio_path": str(audio_path) if audio_path else None,
                  "session_id": session_id})
+            # §4.8: a failure in the audio path is a visible marker line that
+            # keeps the recording, referenced by path (prime directive).
+            log_event("transcription.deferred", level="warn",
+                      session_id=session_id, verdict="no_final",
+                      detail=(f"model_version={getattr(result, 'model', None) or model}; "
+                              "no final transcript returned — audio kept at "
+                              f"{audio_path if audio_path else '(memory only)'}, "
+                              "retained for retry"))
         else:
             await emit_lifecycle_event(
                 "dictate.transcript_final_emit",
                 {"event": "transcript.final", "text": shown,
                  "inbox_path": result.inbox_path, "session_id": session_id})
+            # §4.8: the transcription landed — text committed, audio kept.
+            log_event("transcription.landed", session_id=session_id,
+                      verdict="landed",
+                      detail=(f"model_version={getattr(result, 'model', None) or model}; "
+                              f"{len(shown)} chars committed"
+                              + (f"; audio kept at {audio_path}" if audio_path
+                                 else "")))
+            # M-5 stump sensor: a landed stump (<12 chars or the
+            # noise-token class — W1's `<noise>`) is its own schema line,
+            # carrying class + char count + sha16, never the text.
+            log_transcription_stump(session_id, shown, source="dictate")
         await emit_lifecycle_event(
             "dictate.session_ended_emit",
             {"event": "session.ended", "session_id": session_id,
@@ -1195,7 +1621,8 @@ class DictationService:
         offline = bool(connectivity and connectivity.is_offline)
         transcript = await asyncio.to_thread(
             asr.transcribe_file, self.config, self.client, str(audio_path),
-            offline=offline, local_backend=self.local_backend)
+            offline=offline, local_backend=self.local_backend,
+            session_id=session_id)
         cloud_status = self._cloud_status(
             backend=transcript.backend, confidence=transcript.confidence,
             raw=transcript.text, audio_path=audio_path, offline=offline)
@@ -1216,6 +1643,13 @@ class DictationService:
             notes=notes, confidence=transcript.confidence, cloud_status=cloud_status,
             skip_cleanup=offline,
             connectivity_mode=connectivity.effective_mode if connectivity else None)
+        # M-5 stump sensor (file-service path): the landed text is checked
+        # at the same seam as the dictate flow — class + chars + sha16,
+        # never the text itself.
+        shown = (result.cleaned_text
+                 if (result.cleaned_text and not result.flagged)
+                 else result.raw_text)
+        log_transcription_stump(session_id, shown, source="transcribe_file")
         return self._enqueue_offline_work(result, offline=offline, skip_cleanup=offline)
 
     # -- persistence: store → cleanup → inbox → clipboard -----------------------
@@ -1273,7 +1707,8 @@ class DictationService:
             inbox_path=str(inbox_path) if inbox_path else None,
             clipboard=clipboard, flagged=flagged, duration_s=duration_s,
             transcript_id=transcript_id, notes=notes, confidence=confidence,
-            cloud_status=cloud_status, connectivity_mode=connectivity_mode)
+            cloud_status=cloud_status, connectivity_mode=connectivity_mode,
+            model=(cleanup.model if cleanup and cleanup.model else model))
 
     def _ledger_live_session(self, backend: str, duration_s: float, *, ok: bool,
                              error: str | None = None) -> None:

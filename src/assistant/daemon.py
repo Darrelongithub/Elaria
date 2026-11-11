@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import itertools
 import json
 import math
 import os
@@ -28,6 +30,7 @@ import sys
 import time
 import uuid
 from contextvars import ContextVar
+from pathlib import Path
 
 from . import __version__
 from .asr import local_asr_status
@@ -43,6 +46,7 @@ from .disclosure import (
 from .gemini_client import GeminiClient
 from .initiative import InitiativeError, InitiativeService, KnockSignal
 from .ipc import IpcPrincipal, ipc_peer_principal, serve
+from .journal_log import log_event
 from .modes import ModeManager
 from .offline_queue import CloudQueue
 from .organiser import OrganiserService
@@ -227,6 +231,9 @@ class Daemon:
         self._dictation_task: asyncio.Task | None = None
         self._dictation_session_mode = "narration"
         self._capture_source = None
+        # Single-op undo review pilot (owner ruling 2026-11-04): token ->
+        # immutable ask. Memory only, single-use, expires (UNDO_ASK_TTL_S).
+        self._undo_asks: dict[str, dict] = {}
         self._stop_event: asyncio.Event | None = None
         # BUG6: ptt.stop answers on the release and the session finishes in the
         # background. Processing state is observable through ptt.result/status.
@@ -246,6 +253,10 @@ class Daemon:
         self._ptt_started_at: float | None = None
         self._ptt_released_at: float | None = None
         self._ptt_capture_target: str | None = None
+        # WP0 watchdog (§4.2): the last auto-close marker, or None. Status
+        # carries it so "why did the mic drop" is answerable without a journal
+        # dive (the schema line + persona event remain the durable record).
+        self._last_watchdog_close: dict | None = None
         # SILENCE HOTFIX rule 1: the plain-language line the last voice
         # session left for the console ("she heard nothing"), or None. The
         # durable record is the session journal (session.silent_close);
@@ -253,6 +264,9 @@ class Daemon:
         self._last_session_line: str | None = None
         self._last_connectivity_mode = self.mode_manager.status(refresh=False).effective_mode
         self._background_tasks: set[asyncio.Task] = set()
+        # H.4 probes are passive sensors — kept out of _background_tasks
+        # so "await the ack waiters" bookkeeping never swallows them.
+        self._probe_tasks: set[asyncio.Task] = set()
         # One bound for every chat call (owner turns and guest turns): a
         # stalled transport must return a spoken fact, never freeze the
         # console (BH-I12).
@@ -268,6 +282,15 @@ class Daemon:
         # gate closed for the real worker lifetime; a text-duration estimate can
         # expire while synthesis is still delayed (I4).
         self._speech_playbacks: set[asyncio.Task] = set()
+        # G.6 latency stages per session: release → final → reply →
+        # synth → audible, each a monotonic mark, emitted as latency.table.
+        self._stage_marks: dict[str, dict[str, float]] = {}
+        self._latency_emitted: set[str] = set()
+        # M-4 early dispatch (G.7.3(ii)): chat starts the moment the
+        # transcription leg lands — before cleanup/persist. session_id ->
+        # (reply task, true dispatch mark). The late gate REUSES the task
+        # (exactly one reply per session) or cancels it (echo/veto paths).
+        self._early_reply_tasks: dict[str, tuple[asyncio.Task, float]] = {}
         # BUG F / Bug 8 (2026-10-20): the single 4 s total-turn bound is gone.
         # Two deadlines from [gemini]: a streaming first-token deadline (a
         # transport with no first token is dead) and a generous total bound (a
@@ -326,22 +349,136 @@ class Daemon:
             self._speaking_until = __import__("time").monotonic() + guard_s
             # Don't clear text immediately; let guard expire
 
-    def _start_speech_task(self, text: str, *, play: bool = True) -> asyncio.Task:
+    def _start_speech_task(self, text: str, *, play: bool = True,
+                           session_id: str | None = None) -> asyncio.Task:
         """Start one TTS call; a playing call owns the duplex gate through finish (I4)."""
         if play:
             self._set_speaking(True, text=text)
+        # session_id only rides when there is one — speech doubles with the
+        # older `speak(text, play=...)` signature stay valid.
+        speak_kwargs = {"play": play}
+        if session_id:
+            speak_kwargs["session_id"] = session_id
         worker = asyncio.create_task(asyncio.to_thread(
-            self.speech.speak, text, play=play))
+            self.speech.speak, text, **speak_kwargs))
         if play:
             self._speech_playbacks.add(worker)
 
             def finished(task: asyncio.Task) -> None:
                 self._speech_playbacks.discard(task)
                 self._set_speaking(False, text=text)
+                self._collect_speech_marks(session_id, task)
                 self._consume_task_result(task)
 
             worker.add_done_callback(finished)
         return worker
+
+    def _stage(self, session_id, name: str, mark: float | None = None) -> None:
+        marks = self._stage_marks.setdefault(str(session_id or ""), {})
+        marks.setdefault(name, mark if mark is not None else time.monotonic())
+
+    def _collect_speech_marks(self, session_id, task: asyncio.Task) -> None:
+        """Fold the speech result's synth/play marks into the stage table
+        and emit latency.table once the last leg lands (G.6).
+
+        M-4: a streamed result also carries `first_slice_mark` — the
+        first-audible-at-slice stage (G.7.3(i)); for streamed playback the
+        `audible` mark rides it (sound starts at the first slice)."""
+        try:
+            result = task.result()
+        except Exception:
+            self._emit_latency_table(session_id, final=True)
+            return
+        synth = getattr(result, "synth_mark", None)
+        play = getattr(result, "play_mark", None)
+        first = getattr(result, "first_slice_mark", None)
+        if synth is not None:
+            self._stage(session_id, "synth", synth)
+        if play is not None:
+            self._stage(session_id, "audible", play)
+        if first is not None:
+            self._stage(session_id, "first_slice", first)
+        self._emit_latency_table(session_id, final=True)
+
+    def _emit_latency_table(self, session_id, *, final: bool = False) -> None:
+        sid = str(session_id or "")
+        if sid in self._latency_emitted:
+            return
+        marks = self._stage_marks.get(sid) or {}
+        if len(marks) < 2:
+            return
+        required = ("release", "final", "reply", "synth", "audible")
+        if (not final and "reply" in marks
+                and "synth" not in marks and "audible" not in marks):
+            return   # reply speech still pending — the callback emits
+        self._latency_emitted.add(sid)
+        # M-4: legs run over every stage present in CHRONOLOGICAL order —
+        # streaming breaks the old synth-before-audible assumption (the
+        # first slice is audible WHILE synthesis continues). Zero-length
+        # legs (coincident marks: streamed audible == first_slice) are
+        # skipped; the canonical five keep their names and `missing=`.
+        tie = {"release": 0, "final": 1, "reply": 2, "audible": 3,
+               "first_slice": 4, "synth": 5}
+        order = sorted((m for m in marks if m in tie),
+                       key=lambda name: (marks[name], tie[name]))
+        legs = []
+        for a, b in itertools.pairwise(order):
+            delta = round(marks[b] - marks[a], 3)
+            if delta == 0:
+                continue
+            legs.append(f"{a}_to_{b}_s={delta}")
+        if "release" in marks and "first_slice" in marks:
+            legs.append(f"release_to_first_slice_s="
+                        f"{round(marks['first_slice'] - marks['release'], 3)}")
+        if "release" in marks and "audible" in marks:
+            legs.append(f"release_to_audible_s="
+                        f"{round(marks['audible'] - marks['release'], 3)}")
+        missing = [m for m in required if m not in marks]
+        log_event("latency.table", session_id=sid, verdict="stages",
+                  detail="; ".join(legs)
+                         + (f"; missing={','.join(missing)}" if missing else ""))
+        self._stage_marks.pop(sid, None)
+
+    # -- M-4 early dispatch (G.7.3(ii)): chat at leg-landing ---------------
+    def _early_dispatch_reply(self, session_id: str, text: str,
+                              params: dict) -> bool:
+        """Chat starts the moment the leg lands (mini order M-4).
+
+        Conversation/narration only: the command gate needs cleanup's
+        `flagged` verdict, which does not exist at leg-landing. The other
+        vetoes the late gate applies (silence, empty, echo-to-empty) are
+        checked here identically; the late path REUSES this task (exactly
+        one reply per session) and re-checks the echo veto on the cleaned
+        text (a late strip-to-empty cancels it).
+        """
+        sid = str(session_id or "")
+        if not sid or sid in self._early_reply_tasks:
+            return False
+        if self._dictation_session_mode not in ("conversation", "narration"):
+            return False
+        stripped = self._strip_self_echo(text)
+        if not stripped:
+            return False
+        started = time.monotonic()
+        self._dictate_log("dictate.reply_generation_start", session_id=sid,
+                          early=True)
+        log_event("reply.invocation", session_id=sid, verdict="invoked",
+                  detail=(f"mode={self._dictation_session_mode}; "
+                          f"text_chars={len(stripped)}; "
+                          f"speak={bool(params.get('speak', True))}; "
+                          f"early=true"))
+        self._stage(sid, "reply", started)
+        task = asyncio.create_task(self._ask({
+            "text": stripped,
+            "speak": bool(params.get("speak", True)),
+            "session_id": sid,
+        }))
+        self._early_reply_tasks[sid] = (task, started)
+        return True
+
+    def _claim_early_reply(self, session_id: str):
+        """Pop this session's early reply (single-fire: one claim wins)."""
+        return self._early_reply_tasks.pop(str(session_id or ""), None)
 
     def is_speaking(self) -> bool:
         return bool(self._ack_playbacks or self._speech_playbacks) or (
@@ -366,6 +503,7 @@ class Daemon:
         self._set_speaking(True, text=text)
         playback = asyncio.create_task(asyncio.to_thread(self.speech.play_ack, kind))
         self._ack_playbacks.add(playback)
+        session_id = str(self._ptt_session_id or "")
 
         def finished(task: asyncio.Task) -> None:
             self._ack_playbacks.discard(task)
@@ -374,13 +512,31 @@ class Daemon:
 
         playback.add_done_callback(finished)
 
+        def log_outcome(result: dict) -> None:
+            """Scene-3b sensor: the playback outcome is reported, never
+            swallowed — `ack.played`/`ack.failed` carry the player argv and
+            any error detail so the next scene reads truth from the journal."""
+            played = bool(result.get("played"))
+            detail = (f"ack_kind={kind} player={result.get('player') or '-'} "
+                      f"argv={' '.join(str(a) for a in (result.get('argv') or [])) or '-'}")
+            if not played and result.get("error"):
+                detail += f" error={result['error']}"
+            log_event("ack.played" if played else "ack.failed",
+                      level="info" if played else "warn",
+                      session_id=session_id,
+                      verdict="played" if played else "failed",
+                      detail=detail)
+
         async def wait_for_playback():
             try:
-                return await asyncio.shield(playback)
+                result = await asyncio.shield(playback)
             except Exception as exc:
                 await self.broadcast({"event": "speech.error", "ack_kind": kind,
                                       "error": str(exc)})
-                return {"played": False, "error": str(exc)}
+                result = {"played": False, "error": str(exc)}
+            log_outcome(result if isinstance(result, dict) else {"played": False,
+                                                                 "error": "no result"})
+            return result
 
         return self._track_task(asyncio.create_task(wait_for_playback()))
 
@@ -476,6 +632,11 @@ class Daemon:
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    def _spawn_probe(self, task: asyncio.Task) -> asyncio.Task:
+        self._probe_tasks.add(task)
+        task.add_done_callback(self._probe_tasks.discard)
+        return task
+
     def _meeting_mode(self) -> str:
         if self._meeting is not None:
             return "meeting"
@@ -545,7 +706,9 @@ class Daemon:
         synthesis of the same text (BH-I4).
         """
         try:
-            worker = self._start_speech_task(text, play=True)
+            worker = self._start_speech_task(
+                text, play=True,
+                session_id=(route or {}).get("session_id") or None)
             result = await asyncio.shield(worker)
             if result.error and not route.get("muted"):
                 await self.broadcast({"event": "speech.error", "error": result.error,
@@ -561,7 +724,8 @@ class Daemon:
         # return its real audio path, but never hang a handler on slow Live TTS
         # (BUG1). On timeout the SAME task keeps running in the background - a
         # second `speak()` would double the audio (BH-I4).
-        route = self.speech.route(text)
+        route = {**self.speech.route(text),
+                 "session_id": str(params.get("session_id") or "") or None}
         requested = params.get("speak")
         auto = (requested is None
                 and self.config.section("tts").get("speak_replies", False))
@@ -626,6 +790,8 @@ class Daemon:
             "review.list": self._review_list,
             "review.decide": self._review_decide,
             "undo": self._undo,
+            "undo.prepare": self._undo_prepare,
+            "undo.apply": self._undo_apply,
             "verify": self._verify,
             "memory.remember": self._memory_remember,
             "memory.list": self._memory_list,
@@ -767,7 +933,21 @@ class Daemon:
             "outstanding_intents": len(self.store.outstanding_intents()),
             "dictation_active": bool(self._dictation_task and not self._dictation_task.done()),
             "dictation_processing": self._ptt_processing,
-            "ptt_session_id": self._ptt_session_id,
+            # W7a (2026-10-31): `ptt_session_id` names a LIVE session only
+            # — exactly while a holder row exists (the scene-7 evidence:
+            # a closed session's id kept being advertised 14 s later with
+            # holders empty). History lives in `last_session_id`.
+            "ptt_session_id": (self._ptt_session_id
+                               if self._ptt_session_id is not None
+                               and (self._dictation_task is not None
+                                    or self._ptt_session_id in self._ptt_finishing)
+                               else None),
+            "last_session_id": self._ptt_last_session_id,
+            # §4.2: the honest enumeration of mic/Live holders (free tier: 3
+            # concurrent Live sessions). The ladder's wake chain reads this.
+            "session_holders": self._session_holders(),
+            "session_ceiling_s": self._session_ceiling_s(),
+            "last_watchdog_close": self._last_watchdog_close,
             "capture": capture,
             "capture_target": capture_target,
             "last_capture": last_capture,
@@ -834,8 +1014,17 @@ class Daemon:
         class_mode = self.presence.status().enabled
         should_speak = bool(params.get("speak",
                                       self.config.section("tts").get("speak_acks", True)))
+        # Scene-3b reporting fix: whenever nothing is going to play, the ack
+        # says WHY (the owner's evidence read played:false with no explanation
+        # on a stop ack that is silent by design).
+        suppressed = None
         if class_mode:
             should_speak = False       # spoken acks OFF in class mode
+            suppressed = "class mode: spoken acks OFF"
+        elif not should_speak:
+            suppressed = ("speak=False requested (release ack — never "
+                          "spoken by design)" if params.get("speak") is False
+                          else "speak_acks off in [tts]")
         if should_speak and cached is None and not route["muted"]:
             await self._await_ack_cache()          # VB-13: boot warming, once
             cached = self.speech.cached_ack(kind)
@@ -847,8 +1036,7 @@ class Daemon:
                          # what makes the next press audible.
                          "cache_miss": cached is None and not route["muted"],
                          "class_mode": class_mode,
-                         "speak_suppressed": ("class mode: spoken acks OFF"
-                                              if class_mode else None)}
+                         "speak_suppressed": suppressed}
         if cached is None:
             self._schedule_rewarm_if_requested()   # VB-2: miss -> one warm cycle
         if should_speak and cached:
@@ -900,6 +1088,15 @@ class Daemon:
                            f"{threshold:.2f}")
         if unknown and mutating:
             reasons.append("confidence is unknown and the intent would change files")
+        # §4.8: a rejected transcription is a visible marker line — the text
+        # is kept (it is in the journal), nothing ran, and the reason is plain.
+        log_event("transcription.rejected", level="warn",
+                  session_id=str(result.get("session_id") or ""),
+                  verdict="rejected",
+                  detail=((f"model_version={result['model']}; "
+                           if result.get("model") else "")
+                          + "nothing executed — " + "; ".join(reasons)
+                          + f"; transcript kept: {text[:60]!r}"))
         return {
             "via": "refused",
             "executed": False,
@@ -917,8 +1114,18 @@ class Daemon:
     async def _halt(self, params: dict) -> dict:
         set_halt(self.config.socket_path.parent)
         self.mode = "halted"
+        # G.7.3(i)/M-4 interrupt: drain any streamed playback queue + flag
+        # (cutoff < 100 ms contract) and reset the turn state — halt must
+        # stop mid-reply, not just stop the executor (G.7.2's gap).
+        try:
+            cutoff = await asyncio.to_thread(self.speech.interrupt_speech)
+        except Exception as exc:  # halt never fails on speech
+            cutoff = {"interrupted": False,
+                      "error": f"{type(exc).__name__}: {exc}"[:120]}
+        self._set_speaking(False)
         await self.broadcast({"event": "status.changed", "mode": self.mode, "halted": True})
-        return {"halted": True, "note": "executor checks this flag between every op (§4.4)"}
+        return {"halted": True, "note": "executor checks this flag between every op (§4.4)",
+                "speech_interrupted": cutoff}
 
     async def _resume(self, params: dict) -> dict:
         clear_halt(self.config.socket_path.parent)
@@ -1068,11 +1275,22 @@ class Daemon:
                 raise ValueError(str(exc)) from exc
         opened = result["open"]
         # Her REASON is the first line of the turn, whichever surface opened.
+        first_row: dict = {}
+        first_row_absent = None
         if self.initiative.sessions is None:
-            self.sessions.append("assistant", result["first_line"],
-                                 channel=opened, via="knock", ts=iso_now())
+            first_row = self.sessions.append(
+                "assistant", result["first_line"],
+                channel=opened, via="knock", ts=iso_now()) or {}
+        else:
+            # The initiative path already wrote her first line; its id is not
+            # captured here, and sampling history after the fact would not be
+            # causal — so this is a declared absence, not an invented id.
+            first_row_absent = ("appended by the initiative path; its id is "
+                                "not captured here")
         conversation_id = self.sessions.history()["id"]
         payload = {**result, "conversation_id": conversation_id,
+                   "message_id": first_row.get("message_id"),
+                   "message_id_absent": first_row_absent,
                    "conversation": self.sessions.history(
                        limit=int(params.get("history_limit", 40)))}
         await self.broadcast({"event": "knock.accepted",
@@ -1081,6 +1299,7 @@ class Daemon:
                               "conversation_id": conversation_id})
         await self.broadcast({"event": "conversation.message",
                               "conversation_id": conversation_id,
+                              "message_id": first_row.get("message_id"),
                               "channel": opened, "role": "assistant"})
         return payload
 
@@ -1190,6 +1409,16 @@ class Daemon:
     # -- hotword: wake-knock model (never straight hit->listening) ----------
     def _hotword_capture_factory(self):
         """Always-on capture for the wake path (production mic path)."""
+        if os.environ.get("ASSIST_CAPTURE", "").strip().lower() in (
+                "simulated", "mock", "fake"):
+            # Same hermeticity seam as ptt.start (owner order 2026-10-26):
+            # bug6-class tests never open the real mic, wake path included.
+            from .capture import SimulatedCapture
+
+            return SimulatedCapture(speech_frames=100_000,
+                                    frame_ms=int(self.config.section(
+                                        "capture").get("chunk_ms", 30)),
+                                    realtime=True)
         from .capture import PipeWireCapture
 
         capture_cfg = self.config.section("capture")
@@ -1403,6 +1632,111 @@ class Daemon:
         except Exception:
             return
 
+    # -- WP0 watchdog (§4.2): the 5-minute session ceiling -------------------
+    def _session_ceiling_s(self) -> float:
+        try:
+            return float(self.config.section("transcribe").get(
+                "ptt_session_ceiling_s",
+                DEFAULTS["transcribe"]["ptt_session_ceiling_s"]))
+        except (TypeError, ValueError):
+            return float(DEFAULTS["transcribe"]["ptt_session_ceiling_s"])
+
+    def _session_holders(self) -> list[dict]:
+        """Every session currently holding a mic / a Live slot (§4.2).
+
+        The free tier allows 3 concurrent Live sessions; this is the honest
+        enumeration `assist status` and the ladder's wake chain read. A row
+        exists exactly while a holder exists — no caching, no guessing.
+        """
+        holders: list[dict] = []
+        now = time.monotonic()
+        sid = self._ptt_session_id
+        if sid is not None and (self._dictation_task is not None
+                                or sid in self._ptt_finishing):
+            age = (round(now - self._ptt_started_at, 1)
+                   if self._ptt_started_at is not None else None)
+            holders.append({
+                "kind": "ptt" if self._dictation_task is not None else "ptt-finishing",
+                "session_id": sid,
+                "age_s": age,
+                "live": True,
+                "capture_target": self._ptt_capture_target,
+            })
+        meeting = self._meeting
+        if meeting is not None:
+            started = meeting.get("started_mono")
+            holders.append({
+                "kind": "meeting",
+                "session_id": meeting.get("session_id"),
+                "age_s": (round(now - started, 1)
+                          if isinstance(started, (int, float)) else None),
+                "live": False,
+            })
+        try:
+            state = getattr(self.event_service, "_state", None)
+            if isinstance(state, dict) and state.get("status") == "running":
+                holders.append({
+                    "kind": "event",
+                    "session_id": state.get("session_id") or state.get("event_id"),
+                    "age_s": None,
+                    "live": False,
+                })
+        except Exception:  # noqa: S110 - a broken read is one fewer holder row
+            pass
+        return holders
+
+    async def _watchdog_tick(self, *, now: float | None = None) -> bool:
+        """Auto-close a PTT/live session past the ceiling. True iff closed.
+
+        The close is the graceful release path (finisher, terminal result,
+        broadcasts) — never a hard cancel — and it leaves a visible marker in
+        three places: the stdout schema line, the store's journal, and
+        `assist status` (`last_watchdog_close`). The recording is kept by the
+        session itself and its path lands in the session's own close line.
+        """
+        ceiling = self._session_ceiling_s()
+        sid = self._ptt_session_id
+        if (sid is None or self._ptt_started_at is None
+                or self._ptt_released_at is not None
+                or sid in self._ptt_finishing
+                or self._dictation_task is None or self._dictation_task.done()):
+            return False
+        age = (now if now is not None else time.monotonic()) - self._ptt_started_at
+        if age < ceiling:
+            return False
+        marker = {
+            "session_id": sid,
+            "age_s": round(age, 1),
+            "ceiling_s": ceiling,
+            "capture_target": self._ptt_capture_target,
+            "message": (f"watchdog closed session {sid} after "
+                        f"{round(age, 1)} s — the mic was still held past the "
+                        f"{ceiling:g} s ceiling; the recording is kept"),
+        }
+        try:
+            self.store.log_persona_event(
+                iso_now(), "watchdog.close", json.dumps(marker))
+        except Exception:  # noqa: S110 - the schema line below is the marker
+            pass
+        log_event("watchdog.close", level="warn", session_id=sid,
+                  verdict="closed", detail=marker["message"])
+        self._last_watchdog_close = {**marker, "ts": iso_now()}
+        try:
+            await self._ptt_stop({"wait_s": 0, "watchdog": True})
+        except Exception as exc:
+            self._ptt_log("ptt.watchdog_close_failed", session_id=sid,
+                          error=f"{type(exc).__name__}: {exc}"[:200])
+        return True
+
+    async def _session_watchdog_loop(self) -> None:
+        """Periodic ceiling sweep. Cheap when nothing is holding."""
+        while True:
+            await asyncio.sleep(15.0)
+            try:
+                await self._watchdog_tick()
+            except Exception as exc:      # never die: the watchdog is a sensor
+                print(f"[assistd] session watchdog tick failed: {exc}", flush=True)
+
     @staticmethod
     def _consume_task_result(task: asyncio.Future) -> None:
         if task.cancelled():
@@ -1476,6 +1810,15 @@ class Daemon:
         capture_cfg = self.config.section("capture")
         frame_ms = int(capture_cfg.get("chunk_ms", 30))
         source_kind = params.get("source") or capture_cfg.get("source", "mic")
+        # Test-hermeticity seam (owner order 2026-10-26): bug6-class tests
+        # must never open the real mic — the CLI-subprocess dictate test
+        # captured ~0 s of room audio on the laptop and reported "no speech
+        # captured" where the scripted mock transcript was expected. An
+        # env-forced simulated capture fixes it for in-process daemons and
+        # spawned CLIs alike.
+        if os.environ.get("ASSIST_CAPTURE", "").strip().lower() in (
+                "simulated", "mock", "fake"):
+            source_kind = "simulated"
         # BUG 6 (2026-10-20): dictate used to spawn pw-record with NO --target
         # (params["target"] was never set by `assist dictate`) while the owner's
         # working microphone sat in config. Resolution order: explicit param →
@@ -1541,6 +1884,15 @@ class Daemon:
         self._ptt_finishing.discard(session_id)
         self._ptt_started_at = time.monotonic()
         self._ptt_released_at = None
+        # G.7.4 (2026-10-27): per-session transients must not outlive their
+        # session (third-party bug class: a crashed session's flags carried
+        # over until restart). The G.6 stage tables are keyed by session id
+        # — keep the last few (a reply still playing owes its table) and
+        # prune everything older, so a crash cannot accumulate them forever.
+        for _sid in list(self._stage_marks)[:-4]:
+            self._stage_marks.pop(_sid, None)
+        if len(self._latency_emitted) > 16:
+            self._latency_emitted = set(list(self._latency_emitted)[-8:])
         self._ptt_capture_target = str(getattr(self._capture_source, "target", None) or "default")
         # BUG 6d: a session replaced before it produced a result is TERMINAL.
         # Mark it now — "superseded, finished without a result" — so any
@@ -1559,14 +1911,34 @@ class Daemon:
                 self._ptt_unfinished_payload(old_session_id,
                                              superseded_by=session_id))
         self._ptt_log("ptt.start.session_create", session_id=session_id, capture_target=self._ptt_capture_target, mode=self._dictation_session_mode)
+        # §4.8 schema line: session.open — the live sensor for "is a session
+        # holding the mic right now" (the ladder's wake chain reads these).
+        log_event("session.open", session_id=session_id, verdict="listening",
+                  detail=(f"{self._dictation_session_mode} session open — "
+                          f"capture target {self._ptt_capture_target}"))
         try:
+            def early_dispatch(text: str) -> None:
+                # M-4: the leg landed — hand the text to the gate NOW; the
+                # turn's tail work (cleanup, persist) continues after.
+                self._early_dispatch_reply(session_id, text, params)
+
             self._dictation_task = self._track_task(asyncio.create_task(
                 self.dictation.dictate(
                     muted_source, mode=self._dictation_session_mode,
                     sink=dictation_sink, stop_event=self._stop_event,
                     is_playback_active=self.is_speaking,
-                    session_id=session_id)))
+                    session_id=session_id,
+                    on_final_text=early_dispatch)))
             self._ptt_log("ptt.start.dictate_spawned", session_id=session_id)
+            # Stream H.4 (2026-10-27): the owner sees the mic in-use
+            # indicator linger after a session ("takes a minute to …
+            # stop"). Privacy-adjacent: probe the capture node's
+            # PipeWire state ~5s after the dictation task ends and log
+            # `capture.node_state`. Best-effort and bounded — no
+            # PipeWire on this box means one honest "probe unavailable".
+            self._spawn_probe(asyncio.create_task(self._mic_release_probe(
+                session_id, self._dictation_task,
+                str(getattr(self._capture_source, "target", None) or ""))))
         except Exception as exc:
             self._ptt_log("ptt.start.dictate_spawn_failed", session_id=session_id, error=f"{type(exc).__name__}: {exc}"[:200])
             raise
@@ -1577,6 +1949,67 @@ class Daemon:
                 "capture_target": str(getattr(self._capture_source, "target", None)
                                       or "default"),
                 "connectivity": connectivity.as_dict()}
+
+    #: H.4: seconds after session close before the mic-state probe runs.
+    MIC_RELEASE_PROBE_DELAY_S = 5.0
+
+    async def _mic_release_probe(self, session_id: str, task,
+                                 target: str = "") -> None:
+        """H.4 sensor: was the capture node actually RELEASED after the
+        session closed? PipeWire node state ~5s after close — the
+        in-use indicator lingering is privacy-adjacent evidence."""
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=600)
+            except Exception:  # noqa: S110 - the probe is evidence, not cleanup
+                pass
+        await asyncio.sleep(self.MIC_RELEASE_PROBE_DELAY_S)
+        verdict = "unknown"
+        detail = "probe unavailable (pw-cli/pactl not found)"
+        for argv in (("pw-cli", "ls", "Node"), ("pactl", "list", "sources")):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL)
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+            except Exception:  # noqa: S112 - try the next probe; the
+                continue        # final verdict line reports what happened
+            text = out.decode("utf-8", "replace")
+            state = self._probe_state(text, target)
+            if state is not None:
+                verdict = state
+                detail = (f"{argv[0]} reports capture node "
+                          f"{target or '(default)'} state {state} "
+                          f"{self.MIC_RELEASE_PROBE_DELAY_S:g}s after close")
+                break
+            detail = (f"{argv[0]} ran but named no state for "
+                      f"{target or '(default)'}")
+        try:
+            log_event("capture.node_state", session_id=session_id,
+                      verdict=verdict, detail=detail)
+        except Exception:  # noqa: S110 - a broken journal never kills a probe
+            pass
+
+    @staticmethod
+    def _probe_state(text: str, target: str):
+        """Find the capture node's state in pw-cli/pactl output (text
+        shapes differ; best-effort, None when nothing matches)."""
+        norm = text.replace("\r", "")
+        blocks = norm.split("\n\n") if "\n\n" in norm else [norm]
+        if target:
+            chosen = [b for b in blocks if target in b]
+        else:
+            chosen = [b for b in blocks if "input" in b.lower()]
+        for block in chosen or blocks:
+            for line in block.splitlines():
+                low = line.strip().lower()
+                if low.startswith("state"):
+                    tail = low.split("state", 1)[1]
+                    for word in ("running", "idle", "suspended", "error",
+                                 "unavailable", "streaming"):
+                        if word in tail:
+                            return word
+        return None
 
     @staticmethod
     def _ptt_wait_budget(params: dict) -> float:
@@ -1618,6 +2051,17 @@ class Daemon:
         """
         wait_s = self._ptt_wait_budget(params)
         self._ptt_log("ptt.stop.received", session_id=str(self._ptt_session_id or ""))
+        # Scene-3b sensor (2026-10-26): every stop entry leaves a schema line
+        # FIRST — the next scene must distinguish "bind never fired" (no
+        # stop.requested at all) from "stop arrived and failed" (a line here)
+        # from text alone. Sources: cli | bind | watchdog.
+        stop_source = str(
+            params.get("stop_source")
+            or ("watchdog" if params.get("watchdog") else "cli"))
+        log_event("stop.requested", session_id=str(self._ptt_session_id or ""),
+                  verdict="requested",
+                  detail=f"source={stop_source}")
+        self._stage(self._ptt_session_id, "release")
         ack = await self._ack({"kind": "on_it", "speak": False})
         task = self._dictation_task
         session_id = self._ptt_session_id
@@ -1657,7 +2101,24 @@ class Daemon:
                 self._ptt_mark_terminal(
                     session_id, self._ptt_unfinished_payload(session_id))
 
+        if task is None:
+            # Stream D (2026-10-26): double-stop idempotency. The
+            # Win-first release can fire TWO release binds (both the
+            # legacy bindr and the ignore_mods bindri match), and any
+            # stop on an already-closed session must be a clean no-op —
+            # WITH its own schema line, never a silent nothing.
+            if self._ptt_processing:
+                noop_reason = "finish-in-flight"
+            elif session_id is not None and session_id in self._ptt_results:
+                noop_reason = "already-closed"
+            else:
+                noop_reason = "no-active-session"
+            log_event("stop.noop", session_id=str(session_id or ""),
+                      verdict=noop_reason,
+                      detail=(f"source={stop_source}; no active "
+                              "dictation — idempotent no-op"))
         response = {"listening": False, **ack, "result": None,
+                    "noop": task is None,
                     "processing": task is not None or self._ptt_processing,
                     "session_id": session_id,
                     "connectivity": self.mode_manager.status(refresh=False).as_dict()}
@@ -1870,6 +2331,9 @@ class Daemon:
                 "capture": getattr(session, "capture", None),
                 "no_speech": no_speech,
                 "no_final": no_final,
+                # Scene-1 merge gate: the model of record for this session —
+                # surfaced as `model_version=` on the §4.8 schema lines.
+                "model": getattr(session, "model", None),
                 # Factual narration from real state (§13.1) — no model call.
                 "narration": ("no speech captured" if no_speech else
                               "No final transcript received; captured audio is "
@@ -1884,6 +2348,8 @@ class Daemon:
             # filler resemblance. raw_text stays the ASR record (it matches
             # the stored transcript row); only the shown/routed text loses
             # her words, and the user's remainder is always kept.
+            if getattr(session, "final_mark", None) is not None:
+                self._stage(str(session_id or ""), "final", session.final_mark)
             stripped = self._strip_self_echo(result["text"])
             if stripped != result["text"]:
                 result["text"] = stripped
@@ -1892,14 +2358,28 @@ class Daemon:
                     result["narration"] = "echo suppressed — own TTS captured as input"
                     if session_mode == "command":
                         result["command"] = None
+                    # M-4: an early-dispatched reply for text that later
+                    # strips to empty (the cleaned transcript matched her
+                    # spoken words) must not speak — cancel it here.
+                    early_echo = self._claim_early_reply(session_id)
+                    if early_echo is not None:
+                        early_echo[0].cancel()
+                        early_echo[0].add_done_callback(self._consume_task_result)
             # The mode is captured at release time: a new dictation started
             # while this one is finishing must not reroute these words.
             # SILENCE HOTFIX rule 4: a silence-verdict session never reaches
             # the reply path — no canned filler, no fallback greeting, no
             # TTS. After the energy-floor discard its text is empty anyway;
             # `not no_speech` pins the invariant even if that ever changes.
-            if session_mode == "command" and result["text"].strip() and not no_speech:
-                veto = self._command_gate(result)
+            if (result["text"].strip() and not no_speech
+                    and session_mode in ("command", "conversation", "narration")):
+                # SILENCE HOTFIX rule 4 (preserved): empty / below-floor /
+                # garbage sessions never reach the reply path — the gate is
+                # the one the command path always had. A completed voice
+                # turn WITH real text now answers in every session mode
+                # (stream E: "the last code wall before her voice").
+                veto = (self._command_gate(result)
+                        if session_mode == "command" else None)
                 if veto is not None:
                     # Nothing was routed, so nothing was executed. The words are
                     # still reported (they are the user's dictation, kept in the
@@ -1907,31 +2387,53 @@ class Daemon:
                     result["command"] = veto
                     result["narration"] = veto["note"]
                 else:
-                    # Known grammar climbs the local ladder first; open text
-                    # follows the same offline queue policy as `ask`.
                     # Her own words were already stripped from result["text"]
                     # above (BH-K2); what remains is the user's and may route.
                     reply_timeout_s = max(
                         0.1, min(10.0, float(self._chat_timeout_s)))
-                    self._dictate_log(
-                        "dictate.reply_generation_start",
-                        session_id=str(session_id or ""),
-                        timeout_s=reply_timeout_s)
-                    reply_started = time.monotonic()
-                    from .intents import route as route_intent
+                    early = self._claim_early_reply(session_id)
+                    if early is not None:
+                        # M-4 early dispatch: chat started the moment the
+                        # leg landed — reuse the SAME task (exactly one
+                        # reply per session) with its true start mark.
+                        reply_task, reply_started = early
+                        self._stage(str(session_id or ""), "reply", reply_started)
+                        self._dictate_log(
+                            "dictate.reply_generation_reused",
+                            session_id=str(session_id or ""),
+                            elapsed_s=round(time.monotonic() - reply_started, 3))
+                    else:
+                        self._dictate_log(
+                            "dictate.reply_generation_start",
+                            session_id=str(session_id or ""),
+                            timeout_s=reply_timeout_s)
+                        # Schema line for the gate: the reply invocation is a
+                        # journal fact, not only a persona-event whisper.
+                        log_event("reply.invocation", session_id=str(session_id or ""),
+                                  verdict="invoked",
+                                  detail=(f"mode={session_mode}; "
+                                          f"text_chars={len(result['text'])}; "
+                                          f"speak={params.get('speak', True)}"))
+                        reply_started = time.monotonic()
+                        self._stage(str(session_id or ""), "reply", reply_started)
+                        from .intents import route as route_intent
 
-                    try:
-                        parsed_intent = route_intent(result["text"])
-                    except Exception:
-                        parsed_intent = None
-                    # Known local commands keep their existing grammar path.
-                    # Real, above-floor speech with no recognized task goes to
-                    # a generated clarification, never a stock ack/greeting.
-                    reply_task = asyncio.create_task(self._ask({
-                        "text": result["text"],
-                        "speak": params.get("speak", True),
-                        "unparsed_command": parsed_intent is None,
-                    }))
+                        try:
+                            parsed_intent = route_intent(result["text"])
+                        except Exception:
+                            parsed_intent = None
+                        ask_params = {
+                            "text": result["text"],
+                            "speak": params.get("speak", True),
+                            "session_id": str(session_id or ""),
+                        }
+                        if session_mode == "command":
+                            # Known local commands keep their existing grammar
+                            # path. Real, above-floor speech with no recognized
+                            # task goes to a generated clarification, never a
+                            # stock ack/greeting.
+                            ask_params["unparsed_command"] = parsed_intent is None
+                        reply_task = asyncio.create_task(self._ask(ask_params))
                     try:
                         done, _pending = await asyncio.wait(
                             {reply_task}, timeout=reply_timeout_s,
@@ -1973,7 +2475,12 @@ class Daemon:
                                       "failed."),
                             "error": str(exc)[:200],
                         }
-                if isinstance(result.get("command"), dict):
+                # Narration (the dictation pillar) keeps its factual
+                # report as the narration line — her spoken answer rides
+                # in the reply. Command and conversation let the reply
+                # BE the narration, as the command path always did.
+                if (isinstance(result.get("command"), dict)
+                        and session_mode != "narration"):
                     result["narration"] = result["command"].get(
                         "reply", result["narration"])
         except Exception as exc:
@@ -1991,6 +2498,13 @@ class Daemon:
                       "narration": "no speech captured"}
         finally:
             self._ptt_log("ptt.finish.finally", session_id=str(session_id or ""), has_result=str(result is not None))
+            # M-4: an early reply the gate never claimed (veto, silence,
+            # echo, or a session that errored out) must not speak for a
+            # turn that never completed — cancel it, exactly-one-reply.
+            orphan = self._claim_early_reply(session_id)
+            if orphan is not None:
+                orphan[0].cancel()
+                orphan[0].add_done_callback(self._consume_task_result)
             if session_id is not None:
                 self._ptt_last_result = result
                 self._ptt_last_session_id = session_id
@@ -2004,6 +2518,39 @@ class Daemon:
                 # _ptt_processing). The result is already retrievable by
                 # session id; the terminal event comes after the switch.
                 self._ptt_finishing.discard(session_id)
+                # §4.8 schema lines: session.close (+ a quota counter line so
+                # every session end carries today's spend on stdout).
+                capture = (result or {}).get("capture") or {}
+                model_of_record = (result or {}).get("model")
+                # G.6: every session ends with its measured stage table
+                # (a no-reply session emits here; a reply session emits at
+                # speech completion, so this call is its backstop).
+                self._emit_latency_table(session_id)
+                transcript_state = ("no_speech" if (result or {}).get("no_speech")
+                                    else "no_final" if (result or {}).get("no_final")
+                                    else "final")
+                log_event("session.close", session_id=session_id,
+                          peak=capture.get("peak"),
+                          verdict=("silence" if (result or {}).get("no_speech")
+                                   else "closed"),
+                          detail=((f"model_version={model_of_record}; "
+                                   if model_of_record else "")
+                                  + f"{self._dictation_session_mode or 'narration'} "
+                                  f"session closed — "
+                                  f"text_chars={len(str((result or {}).get('text') or ''))} "
+                                  f"({transcript_state})"
+                                  + (f"; audio kept at {(result or {}).get('audio_path')}"
+                                     if (result or {}).get("audio_path") else "")))
+                try:
+                    day = day_start_iso()
+                    log_event("quota.counter", session_id=session_id,
+                              verdict="counted",
+                              detail=(f"today: {self.store.user_turn_calls_since(day)} "
+                                      f"user-turn call(s), "
+                                      f"{self.store.housekeeping_calls_since(day)} "
+                                      "housekeeping call(s) on the ledger"))
+                except Exception:  # noqa: S110 - a counter read never breaks close
+                    pass
             # SILENCE HOTFIX rule 1: console status carries the last
             # finished session's plain line — a silence verdict leaves
             # "she heard nothing"; a session with a real transcript clears
@@ -2247,10 +2794,176 @@ class Daemon:
     async def _undo(self, params: dict) -> dict:
         from .executor import parse_since
 
+        # Owner ruling 2026-11-04 ("make her hands work"): scoped undo fails
+        # closed until the single-op review pilot exists. Canonical entry — the
+        # typed intent and the undo RPC both land here (intents.py aliases
+        # included); the scopeless path keeps the executor's own refusal.
+        if (params.get("since") or params.get("op_id") is not None
+                or params.get("plan_id") is not None):
+            raise ValueError("scoped undo is refused until the review pilot "
+                             "exists — nothing undone, no file moved")
         since = parse_since(str(params["since"])) if params.get("since") else None
         return await asyncio.to_thread(
             self.executor.undo, op_id=params.get("op_id"),
             plan_id=params.get("plan_id"), since_iso=since)
+
+    # -- single-op undo review pilot (owner ruling 2026-11-04) --------------
+    #
+    # Design: docs/design/2026-11-04-undo-consent-seam.md. The guard in
+    # `_undo` keeps refusing EVERY scoped undo and stays byte-identical; this
+    # seam is the one blessed path and it is narrower than the rule it bends:
+    # exactly one operation, pre-verified before the owner is asked,
+    # re-verified before it runs, and single-use. A Yes approves a snapshot,
+    # never a query. Containment is this daemon route only — `cli.py`'s
+    # DaemonUnavailable fallback calls Executor.undo directly and is NOT
+    # contained here (global enforcement is a separate ruling).
+
+    UNDO_ASK_TTL_S = 600.0
+
+    def _undo_preverify(self, row: dict) -> list[str]:
+        """The executor's own three per-op facts, asked BEFORE the owner is.
+
+        A scope that cannot execute is never offered for approval.
+        """
+        from .safety import try_sha256_file
+
+        problems: list[str] = []
+        # executor.py:462 swaps: op["dst"] is the CURRENT home, op["src"] the
+        # original location. Pre-verify in that same orientation or the check
+        # refuses (or worse, blesses) the wrong path.
+        current, original = Path(str(row.get("dst"))), Path(str(row.get("src")))
+        expected = row.get("sha256_after") or row.get("sha256_before")
+        if not current.exists():
+            problems.append(f"{current} no longer exists")
+        elif expected and try_sha256_file(current) != expected:
+            problems.append(f"{current} changed since the operation")
+        if original.exists() and try_sha256_file(original) != (expected or ""):
+            problems.append(f"{original} is occupied by different content")
+        return problems
+
+    def _undo_drift(self, snapshot: dict, row: dict | None) -> list[str]:
+        """Every bound field re-read at apply; any difference is total."""
+        if row is None:
+            return ["the operation row is gone"]
+        drift = [f"{field} changed" for field in
+                 ("plan_id", "ts", "op", "src", "dst", "sha256_before",
+                  "sha256_after", "status")
+                 if row.get(field) != snapshot.get(field)]
+        if not drift:
+            drift = self._undo_preverify(row)
+        return drift
+
+    async def _undo_prepare(self, params: dict) -> dict:
+        """Resolve ONE operation, pre-verify it, and hand back an immutable
+        ask. Writes nothing; the ask is memory-only and single-use."""
+        self._require_ipc_owner()
+        from .executor import parse_since
+
+        since = parse_since(str(params["since"])) if params.get("since") else None
+        op_id = params.get("op_id")
+        plan_id = params.get("plan_id")
+        if since is None and op_id is None and plan_id is None:
+            raise ValueError("undo review needs a scope (op_id, plan_id or since)")
+        if op_id is not None:
+            row = await asyncio.to_thread(self.store.get_operation, int(op_id))
+            rows = ([row] if row and row.get("status") in
+                    ("committed", "copied", "intent") else [])
+        else:
+            rows = await asyncio.to_thread(
+                self.store.undoable_operations, plan_id=plan_id, since_iso=since)
+        if not rows:
+            raise ValueError("nothing undoable in that scope — no ask is raised")
+        if len(rows) > 1:
+            raise ValueError(
+                f"the review pilot handles one operation at a time; that scope "
+                f"resolves to {len(rows)} — pass an op_id and prepare again")
+        row = rows[-1]
+        blockers = self._undo_preverify(row)
+        if blockers:
+            raise ValueError("cannot offer that undo — " + "; ".join(blockers)
+                             + " (nothing is asked, nothing is undone)")
+        snapshot = {
+            "op_id": row["id"], "plan_id": row.get("plan_id"),
+            "ts": row.get("ts"), "op": row.get("op"), "src": row.get("src"),
+            "dst": row.get("dst"), "sha256_before": row.get("sha256_before"),
+            "sha256_after": row.get("sha256_after"), "status": row.get("status"),
+        }
+        ask_sha = hashlib.sha256(json.dumps(
+            snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        now = time.monotonic()
+        for stale in [tok for tok, ask in self._undo_asks.items()
+                      if now > ask["expires_at"]]:
+            self._undo_asks.pop(stale, None)
+        token = uuid.uuid4().hex
+        self._undo_asks[token] = {"snapshot": snapshot, "ask_sha256": ask_sha,
+                                  "prepared_at": now,
+                                  "expires_at": now + self.UNDO_ASK_TTL_S,
+                                  "used": False}
+        log_event("undo.prepare", verdict="prepared",
+                  detail=(f"ask_sha256={ask_sha[:16]}; op_id={snapshot['op_id']}; "
+                          f"op={snapshot['op']}; expires_in_s="
+                          f"{self.UNDO_ASK_TTL_S:g}; open_asks="
+                          f"{len(self._undo_asks)}"))
+        return {"token": token, "ask_sha256": ask_sha, "snapshot": snapshot,
+                "prepared_at": iso_now(), "age_s": 0.0,
+                "expires_in_s": self.UNDO_ASK_TTL_S}
+
+    async def _undo_apply(self, params: dict) -> dict:
+        """Answer one ask. No is terminal; a lapsed ask is terminal; Yes
+        re-verifies the whole snapshot and refuses totally on any drift."""
+        principal = self._require_ipc_owner()
+        actor = f"owner-ipc uid={principal.uid} pid={principal.pid}"
+        decision = str(params.get("decision") or "").strip().lower()
+        token = str(params.get("token") or "").strip()
+        if decision not in ("yes", "no"):
+            raise ValueError("undo.apply needs decision 'yes' or 'no'")
+        ask = self._undo_asks.get(token)
+        if ask is None:
+            raise ValueError("unknown undo ask — prepare a fresh one")
+        if ask["used"]:
+            raise ValueError("that ask was already answered — prepare a fresh one")
+        age = time.monotonic() - ask["prepared_at"]
+        if time.monotonic() > ask["expires_at"]:
+            ask["used"] = True
+            self._undo_asks.pop(token, None)
+            log_event("undo.apply", level="warn", verdict="lapsed",
+                      detail=(f"ask_sha256={ask['ask_sha256'][:16]}; "
+                              f"age_s={age:.1f}; {actor}; LAPSED — a lapsed ask "
+                              f"needs a fresh prepare, never a Yes"))
+            raise ValueError(f"that ask lapsed after {age:.0f}s — prepare a "
+                             f"fresh one (a lapsed ask cannot be approved)")
+        if decision == "no":
+            ask["used"] = True      # terminal; kept so a replay says so
+            log_event("undo.apply", verdict="declined",
+                      detail=(f"ask_sha256={ask['ask_sha256'][:16]}; "
+                              f"age_s={age:.1f}; {actor}; declined — nothing "
+                              f"was undone"))
+            self.store.log_persona_event(
+                iso_now(), "ack",
+                json.dumps({"ack": "declined",
+                            "ask_sha256": ask["ask_sha256"]}))
+            return {"undone": 0, "problems": [], "decision": "no",
+                    "ask_sha256": ask["ask_sha256"], "age_s": round(age, 1)}
+        row = await asyncio.to_thread(
+            self.store.get_operation, int(ask["snapshot"]["op_id"]))
+        drift = self._undo_drift(ask["snapshot"], row)
+        if drift:
+            ask["used"] = True      # terminal: drifted asks are not retried
+            log_event("undo.apply", level="warn", verdict="drifted",
+                      detail=(f"ask_sha256={ask['ask_sha256'][:16]}; "
+                              f"drift={'; '.join(drift)}; {actor}; refused — "
+                              f"nothing was undone"))
+            raise ValueError("undo refused, nothing was undone — "
+                             + "; ".join(drift) + " (prepare a fresh ask)")
+        ask["used"] = True        # single-use, consumed BEFORE execution
+        result = await asyncio.to_thread(
+            self.executor.undo, op_id=int(ask["snapshot"]["op_id"]))
+        log_event("undo.apply", verdict="approved",
+                  detail=(f"ask_sha256={ask['ask_sha256'][:16]}; "
+                          f"op_id={ask['snapshot']['op_id']}; age_s={age:.1f}; "
+                          f"{actor}; undone={result.get('undone')}"))
+        return {**result, "decision": "yes",
+                "ask_sha256": ask["ask_sha256"], "age_s": round(age, 1)}
 
     async def _verify(self, params: dict) -> dict:
         from .executor import parse_since
@@ -2258,16 +2971,89 @@ class Daemon:
         since = parse_since(str(params["since"])) if params.get("since") else None
         return await asyncio.to_thread(self.executor.verify, since_iso=since)
 
+    def _read_fact(self, fact_id: int, *, active: bool = True) -> dict | None:
+        """Read a fact row back. `list_facts` is the store's only fact reader
+        and the corpus is small by design (§16), so this is a scan — never a
+        guess from the write call's return value."""
+        for row in self.store.list_facts(active_only=False):
+            if int(row["id"]) == int(fact_id):
+                if active and not row.get("active"):
+                    return None
+                return row
+        return None
+
     async def _memory_remember(self, params: dict) -> dict:
-        fact_id = self.memory.remember(str(params["text"]),
-                                       kind=str(params.get("kind", "profile")))
-        return {"fact_id": fact_id, "stored": "stated — inspect anytime: assist memory"}
+        """Store a fact, then PROVE it before claiming it.
+
+        The claim used to be a hardcoded sentence next to an id nobody read
+        back. Now the reply is the row: if the id does not read back active,
+        this raises rather than saying "stored".
+        """
+        text = str(params["text"]).strip()
+        kind = str(params.get("kind", "profile"))
+        fact_id = await asyncio.to_thread(self.memory.remember, text, kind=kind)
+        row = await asyncio.to_thread(self._read_fact, fact_id)
+        if row is None:
+            raise ValueError(
+                f"remember returned fact #{fact_id} but no active fact reads "
+                f"back — refusing to claim it was stored")
+        return {
+            "fact_id": int(fact_id),
+            "kind": str(row["kind"]),
+            "source": str(row["source"]),
+            "confidence": row.get("confidence"),
+            "active": True,
+            # Declarations, not queries: facts persist until `forget`.
+            "retention": "until_forgotten",
+            "restore": "row_preserved_no_api",
+            "stored": (f"fact #{int(fact_id)} ({row['source']}) — "
+                       f"inspect anytime: assist memory"),
+        }
 
     async def _memory_list(self, params: dict) -> dict:
         return {"facts": self.memory.beliefs(params.get("kind"))}
 
     async def _memory_forget(self, params: dict) -> dict:
-        return {"forgotten": self.memory.forget(str(params["topic"]))}
+        """Deactivate facts and name EXACTLY which ones.
+
+        A count alone is unknowable-after-the-fact: the row keeps no record of
+        who deactivated it. So the ids are collected at decision time, their
+        resulting state is read back, and the things this database cannot give
+        (a version, a durable receipt) are declared absent rather than implied.
+        """
+        topic = str(params["topic"])
+        count, ids = await asyncio.to_thread(
+            self.store.forget_facts_detailed, topic)
+        rows = {int(r["id"]): r
+                for r in await asyncio.to_thread(
+                    self.store.list_facts, active_only=False)}
+        facts = []
+        for fid in ids:
+            row = rows.get(int(fid))
+            facts.append({
+                "id": int(fid),
+                "kind": None if row is None else row.get("kind"),
+                "ts": None if row is None else row.get("ts"),
+                # Read back, never assumed: "still-active" would mean the
+                # UPDATE did not take, and that must be visible, not smoothed.
+                "state": ("unknown" if row is None
+                          else ("inactive" if not row.get("active")
+                                else "still-active")),
+            })
+        return {
+            "forgotten": int(count),
+            "fact_ids": [int(i) for i in ids],
+            "facts": facts,
+            # D4, ruled 2026-11-05: convention first — the decision identity is
+            # a correlation id plus its timestamp, not a receipts table.
+            "corr_id": uuid.uuid4().hex,
+            "corr_ts": iso_now(),
+            "declared": {
+                "versions": "absent — facts carry no version column",
+                "durable_receipt": ("absent — no receipts table; corr_id + "
+                                    "corr_ts is the decision identity"),
+            },
+        }
 
     async def _memory_recall(self, params: dict) -> dict:
         hits = await asyncio.to_thread(self.memory.recall, str(params["query"]))
@@ -2315,7 +3101,9 @@ class Daemon:
         self.mode = "meeting"
         await self.broadcast({"event": "status.changed", "mode": self.mode})
         self._meeting = {"session_id": session_id, "dual": dual, "frames": frames,
-                         "task": asyncio.create_task(collect())}
+                         "task": asyncio.create_task(collect()),
+                         "started_mono": time.monotonic(),
+                         "started_at": iso_now()}
         return {"state": "meeting"}
 
     async def _meeting_stop(self, params: dict) -> dict:
@@ -2474,6 +3262,9 @@ class Daemon:
         return {
             "reply": reply, "speaker": "guest", "via": "guest-deflection",
             "channel": channel, "conversation_id": None,
+            # A guest turn writes no conversation row (BH-J1), so there is no
+            # causal message id to give — a declared null, not a missing field.
+            "message_id": None, "user_message_id": None, "receipt": None,
             "model": None, "register": decision.register, "serious_gate": None,
             "mode": self.config.gemini_mode, "fixture": None,
             "speech": speech, "memory_closed": True, "withheld": None,
@@ -2856,9 +3647,11 @@ class Daemon:
                         "pushback": decision.pushback, "reason": decision.reason}))
         conversation_id = self.sessions.active_id(iso_now())
         prior_turns = self.sessions.history(limit=8).get("messages") or []
-        self.sessions.append("user", text, channel=channel, ts=iso_now())
+        user_row = self.sessions.append("user", text, channel=channel,
+                                        ts=iso_now()) or {}
 
         reply, via, model, fixture = None, None, None, None
+        receipt = None          # set only by a local intent that produces one
         queued_job_id = None
         connectivity = await self._connectivity_snapshot()
         if company_command is not None:
@@ -2872,7 +3665,7 @@ class Daemon:
         intent = (None if company_command is not None or unparsed_command
                   else route(route_text))
         if intent is not None:
-            reply, via = await self._run_intent(intent)
+            reply, via, receipt = await self._run_intent(intent)
         if (reply is None and wake is not None and wake.is_checkin
                 and not unparsed_command):
             # "Elaria" / "hey Elaria" alone: a check-in. The settled terse line
@@ -3018,12 +3811,13 @@ class Daemon:
             via = "withheld"
 
         # Persist before any speech: a completed turn with hung caller is a failure (BUG1)
-        self.sessions.append("assistant", reply, channel=channel, via=via,
-                             ts=iso_now())
+        assistant_row = self.sessions.append("assistant", reply, channel=channel,
+                                             via=via, ts=iso_now()) or {}
         # Broadcast without blocking the IPC response (BUG1/BUG4: prune only on real disconnect)
         # We await the quick write; drain is background with timeout
         await self.broadcast({"event": "conversation.message",
                               "conversation_id": conversation_id,
+                              "message_id": assistant_row.get("message_id"),
                               "channel": channel, "role": "assistant"})
         # Speech is async after response: return promptly, synthesize in background (BUG1)
         # This bounds Live work and prevents console.say hanging on slow TTS
@@ -3035,6 +3829,14 @@ class Daemon:
             "reply": reply,
             "channel": channel,
             "conversation_id": conversation_id,
+            # This turn's own rows, from the writes themselves (not a later
+            # history sample: another caller can append after this returns).
+            "message_id": assistant_row.get("message_id"),
+            "user_message_id": user_row.get("message_id"),
+            # The producer's structured result where one exists — remember and
+            # forget today. None means "this turn produced no such receipt",
+            # never "no effect": use the refusals/via for that.
+            "receipt": receipt,
             "via": via,  # local-intent | local-memory | local-queue | gemini
             "model": model,
             "register": decision.register,
@@ -3049,65 +3851,79 @@ class Daemon:
             "withheld": withheld,
         }
 
-    async def _run_intent(self, intent) -> tuple[str | None, str]:
-        """Execute a local intent. (None, ...) = fall through to the model."""
+    async def _run_intent(self, intent) -> tuple[str | None, str, dict | None]:
+        """Execute a local intent.
+
+        Returns `(reply, via, receipt)`: `(None, ...)` falls through to the
+        model, and `receipt` is the producer's own structured result where one
+        exists (remember/forget today) — never a reconstruction of it.
+        """
         if intent.kind == "halt":
             await self._halt({})
-            return ("Halted. Nothing will move until you say resume.", "local-intent")
+            return ("Halted. Nothing will move until you say resume.", "local-intent", None)
         if intent.kind == "status":
             status = await self._status({})
             return ((f"Running ({status['mode']}), connectivity "
                     f"{status['connectivity_mode']}, gemini mode "
                     f"{status['gemini_mode']}, uptime {status['uptime_s']:.0f}s."),
-                    "local-intent")
+                    "local-intent", None)
         if intent.kind in ("mode_offline", "mode_online", "mode_auto"):
             value = intent.kind.rsplit("_", 1)[1]
             result = await self._mode_set({"mode": value})
             connectivity = result["connectivity"]
             suffix = " Switch parked until this session finishes." if connectivity["switch_parked"] else ""
             return (f"Connectivity preference: {value}; effective {connectivity['effective_mode']}.{suffix}",
-                    "local-intent")
+                    "local-intent", None)
         if intent.kind == "queue_status":
             counts = self.store.cloud_job_counts()
             detail = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "empty"
-            return (f"Cloud queue: {detail}.", "local-intent")
+            return (f"Cloud queue: {detail}.", "local-intent", None)
         if intent.kind == "queue_drain":
             result = await self._queue_drain({})
-            return (result["summary"], "local-intent")
+            return (result["summary"], "local-intent", None)
         if intent.kind == "cost":
             from .cost import format_cost_report
 
             data = await self._cost({})
             return (format_cost_report(data["month"], data["today"],
-                                       data["quota"], data["tier"]), "local-intent")
+                                       data["quota"], data["tier"]), "local-intent", None)
         if intent.kind == "remember" and intent.argument:
-            await self._memory_remember({"text": intent.argument})
-            return (f"Remembered (stated fact): {intent.argument}", "local-intent")
+            receipt = await self._memory_remember({"text": intent.argument})
+            named_fact = (f"Remembered as fact #{receipt['fact_id']} "
+                          f"({receipt['kind']}, {receipt['source']}).")
+            return (named_fact, "local-intent",
+                    {"receipt": "remember", **receipt})
         if intent.kind == "forget" and intent.argument:
-            count = self.memory.forget(intent.argument)
-            return (f"Forgotten ({count} fact(s) deactivated).", "local-intent")
+            receipt = await self._memory_forget({"topic": intent.argument})
+            if receipt["fact_ids"]:
+                named = ", ".join(f"#{i}" for i in receipt["fact_ids"])
+                reply = (f"Forgotten {named} "
+                         f"({receipt['forgotten']} fact(s) deactivated).")
+            else:
+                reply = "Nothing matched — no fact was deactivated."
+            return (reply, "local-intent", {"receipt": "forget", **receipt})
         if intent.kind == "where":
             answer = await asyncio.to_thread(self.memory.answer_where, intent.argument)
             if answer:
-                return (answer, "local-memory")
-            return (None, "local-memory")  # weak recall: escalate, never bluff
+                return (answer, "local-memory", None)
+            return (None, "local-memory", None)  # weak recall: escalate, never bluff
         if intent.kind == "search" and intent.argument:
             hits = await asyncio.to_thread(self.memory.recall, intent.argument)
             if hits:
                 lines = [f"- [{h.source}] {h.ref}: {h.text[:100]}" for h in hits]
-                return ("Local matches:\n" + "\n".join(lines), "local-memory")
-            return (None, "local-memory")
+                return ("Local matches:\n" + "\n".join(lines), "local-memory", None)
+            return (None, "local-memory", None)
         if intent.kind == "undo":
             result = await self._undo({"since": intent.argument} if intent.argument else {})
             return ((f"Undone {result['undone']} op(s); "
-                    f"{len(result['problems'])} problem(s)."), "local-intent")
+                    f"{len(result['problems'])} problem(s)."), "local-intent", None)
         if intent.kind == "organise":
             # Plans are cheap and write-free to BUILD — do that, then talk.
             started = await self._plan_build({})
             ids = ", ".join(f"#{s['plan_id']}" for s in started["started"])
             return ((f"Shadow plan(s) {ids} building — nothing moves without "
-                    "your review + apply. Watch `assist events`."), "local-intent")
-        return (None, "local-intent")
+                    "your review + apply. Watch `assist events`."), "local-intent", None)
+        return (None, "local-intent", None)
 
     async def _connectivity_tick(self) -> None:
         # refresh() itself returns immediately without probing when the owner
@@ -3214,6 +4030,9 @@ class Daemon:
                              on_disconnect=self._subscribers.discard)
         connectivity_task = asyncio.create_task(self._connectivity_loop())
         knock_task = asyncio.create_task(self._knock_due_loop())
+        # WP0 watchdog (§4.2): auto-close a PTT/live session past the ceiling
+        # with a visible marker (a missed release once held the mic ~9 min).
+        watchdog_task = asyncio.create_task(self._session_watchdog_loop())
         _sd_notify("READY=1")
         print(f"[assistd] Elaria up · mode={self.config.gemini_mode} "
               f"· socket={self.config.socket_path}", flush=True)
@@ -3228,7 +4047,8 @@ class Daemon:
             async with server:
                 await stop.wait()
         finally:
-            await self.aclose(extra_tasks=(connectivity_task, warm_task, knock_task))
+            await self.aclose(extra_tasks=(connectivity_task, warm_task, knock_task,
+                                           watchdog_task))
 
     async def aclose(self, *, extra_tasks=()) -> None:
         if self._stop_event is not None:
@@ -3252,7 +4072,8 @@ class Daemon:
                 capture_error = exc
         tasks = [
             t for t in (*extra_tasks, self._dictation_task, meeting_task,
-                        *self._meeting_stop_tasks, *self._background_tasks)
+                        *self._meeting_stop_tasks, *self._background_tasks,
+                        *self._probe_tasks)
             if t is not None
         ]
         for task in tasks:

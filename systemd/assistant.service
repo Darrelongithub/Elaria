@@ -1,7 +1,12 @@
 [Unit]
 Description=Elaria — personal AI assistant daemon (Phase 0)
-After=pipewire.service
+After=network-online.target pipewire.service
 Documentation=file:%h/Elaria/assistant-blueprint.md
+# §4.4 crash-loop protection: three starts a minute, then stop. A 679-restart
+# storm once ran on systemd's default RestartSec=100ms with no start limits —
+# a crash-loop must be impossible by construction.
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=notify
@@ -16,7 +21,9 @@ EnvironmentFile=-%h/.config/assistant/gemini.env
 # missing inference/model = wake word paused, not a daemon startup dependency.
 ExecStart=%h/.local/bin/assistd
 Restart=on-failure
-RestartSec=3
+RestartSec=5
+# §4.4 + §4.8: the schema lines on stdout are the journal sensor.
+StandardOutput=journal
 # Children (player, pw-record) die with the daemon two ways: systemd's default
 # KillMode=control-group for `systemctl stop`, and PR_SET_PDEATHSIG set on each
 # spawn for a crash, an OOM kill or a manual `kill -9` (VB-10). Do NOT set
