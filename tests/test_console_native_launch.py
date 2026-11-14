@@ -49,8 +49,10 @@ def tiny_repo(paths, monkeypatch):
 
 
 def test_release_constants_remain_exact_owner_ruling():
-    assert v4.COMMIT == 'fcd55ca1bce34d8a1f479bf2d035cc866c4a482f'
-    assert v4.BRIDGE_SHA == 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c'
+    assert v4.COMMIT == '25ef8e67aee59598999941ff79ee7765e2480135'
+    assert v4.HISTORICAL_COMMIT == 'fcd55ca1bce34d8a1f479bf2d035cc866c4a482f'
+    assert v4.BRIDGE_SHA == '594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791'
+    assert v4.HISTORICAL_BRIDGE_SHA == 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c'
     assert v4.NATIVE_SHA == hashlib.sha256((ROOT / 'console/native_window.py').read_bytes()).hexdigest()
     paths = v4.owner_paths()
     assert str(paths.repo) == '/home/darrel/Elaria' and str(paths.worktree) == '/tmp/elaria-bridge'
@@ -405,3 +407,70 @@ def test_empty_transport_allowlist_overrides_protocol_specific_allow(tmp_path, m
     git(paths.repo, 'config', 'protocol.file.allow', 'always')  # synthetic config, not owner config
     with pytest.raises(v4.Stop):
         v4.git_read(paths, 'ls-remote', str(paths.repo))  # refused before even a file transport
+
+
+@pytest.mark.parametrize('block', [None, 'dirty', 'live', 'attached', 'wrong-pin'])
+def test_g_advances_only_clean_detached_historical_worktree(tmp_path, monkeypatch, block):
+    paths = paths_at(tmp_path)
+    tiny_repo(paths, monkeypatch)
+    old = v4.COMMIT
+    old_sha = v4.BRIDGE_SHA
+    log = v4.private_fd(paths.log)
+    try:
+        v4.ensure_worktree(paths, log)
+        (paths.repo / 'new').write_text('G synthetic deployment')
+        git(paths.repo, 'add', '.')
+        git(paths.repo, '-c', 'user.name=Synthetic', '-c', 'user.email=synthetic@example.invalid',
+            'commit', '-m', 'G synthetic deployment')
+        new = git(paths.repo, 'rev-parse', 'HEAD').decode().strip()
+        monkeypatch.setattr(v4, 'HISTORICAL_COMMIT', old)
+        monkeypatch.setattr(v4, 'HISTORICAL_BRIDGE_SHA', old_sha if block != 'wrong-pin' else '0' * 64)
+        monkeypatch.setattr(v4, 'COMMIT', new)
+        monkeypatch.setattr(v4, 'listener_pid', lambda: 42 if block == 'live' else None)
+        if block == 'dirty':
+            (paths.worktree / 'retained').write_text('owner bytes')
+        if block == 'attached':
+            git(paths.worktree, 'checkout', '-b', 'synthetic-fixture-only')
+        if block:
+            with pytest.raises(v4.Stop):
+                v4.ensure_worktree(paths, log)
+            assert git(paths.worktree, 'rev-parse', 'HEAD').decode().strip() == old
+        else:
+            v4.ensure_worktree(paths, log)
+            assert git(paths.worktree, 'rev-parse', 'HEAD').decode().strip() == new
+            shutil.rmtree(paths.worktree)
+            v4.ensure_worktree(paths, log)
+            assert git(paths.worktree, 'rev-parse', 'HEAD').decode().strip() == new
+        assert git(paths.repo, 'rev-parse', 'HEAD').decode().strip() == new
+    finally:
+        os.close(log)
+
+
+@pytest.mark.parametrize('body,passed', [(b'old shell', False), (b'new shell', True)])
+def test_g_live_token_is_not_proof_of_deployed_shell(monkeypatch, body, passed):
+    from types import SimpleNamespace
+
+    connections = []
+    expected = 's3pPLMBiTxaQ9kYGzzhZRbK+xOo='
+    responses = iter([SimpleNamespace(status=101, getheader=lambda _key: expected),
+                      SimpleNamespace(status=200, read=lambda _bound: body)])
+
+    class Connection:
+        def __init__(self, *args, **kwargs):
+            connections.append(self)
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return next(responses)
+
+        def close(self):
+            pass
+
+    # Pin the random challenge rather than accepting a fake HTTP 101 alone.
+    monkeypatch.setattr(v4.os, 'urandom', lambda _n: b'the sample nonce')
+    monkeypatch.setattr(v4.http.client, 'HTTPConnection', Connection)
+    monkeypatch.setattr(v4, 'SHELL_SHA', hashlib.sha256(b'new shell').hexdigest())
+    assert v4.live_pairing('http://127.0.0.1:8744/#pair=' + 'a' * 43) is passed
+    assert len(connections) == 2

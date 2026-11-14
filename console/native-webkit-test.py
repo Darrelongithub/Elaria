@@ -19,10 +19,24 @@ LOOKS = [(1920, 1080), (1440, 900), (1024, 768), (800, 600), (390, 844), (320, 4
 SNAPSHOT = r"""(() => {
  const f=document.getElementById('console'), w=f && f.contentWindow, d=w && w.document;
  if(!d || !w.ElariaShell || !w.ElariaShell.state.daemon) return null;
+ // F25: inspect actual WebKit HTTP origin/storage; return booleans, never the capability.
+ const pair=new URLSearchParams(location.hash.slice(1)).get('pair');
+ const localBlocked=(target)=>{try { target.localStorage.setItem('elaria_probe','synthetic');
+   const absent=target.localStorage.getItem('elaria_probe')!== 'synthetic';
+   target.localStorage.removeItem('elaria_probe'); return absent;
+ } catch(e) { return true; }};
+ const cleanSession=(target)=>{try {return !JSON.stringify(target.sessionStorage).includes(pair);}
+   catch(e) {return true;}};
+ document.cookie='elaria_probe=synthetic; SameSite=Strict; Path=/';
+ const privacy={http:location.protocol==='http:' && location.hostname==='127.0.0.1',
+   fragment:!!pair && /^[A-Za-z0-9_-]{43}$/.test(pair) && !location.search.includes(pair),
+   localBlocked:localBlocked(window) && localBlocked(w),
+   sessionClean:cleanSession(window) && cleanSession(w),
+   cookieClean:!document.cookie.includes(pair)};
  const rect=s=>d.querySelector(s).getBoundingClientRect();
  const chat=rect('.term'), orb=rect('.orb'), stage=rect('#stage'), footer=rect('.console-footer');
  const canvas=d.querySelector('#stage canvas'), lamps=rect('.lamps'), input=rect('#input');
- return JSON.stringify({width:innerWidth,height:innerHeight,paired:true,
+ return JSON.stringify({width:innerWidth,height:innerHeight,paired:true,privacy,
   overflow:document.documentElement.scrollWidth>innerWidth || document.documentElement.scrollHeight>innerHeight,
   chat:chat.width,orb:orb.width,stage:stage.height,orbHeight:orb.height,
   canvas:!!canvas && canvas.width>0 && canvas.height>0,
@@ -54,7 +68,8 @@ def main():
         state['done'] = True
         os.write(result_fd, json.dumps({'passed': passed, 'looks': rows,
                                        'cross_origin_denied': state['cross'] is True,
-                                       'title': window.get_title() == 'ELARIA'}).encode() + b'\n')
+                                       'title': window.get_title() == 'ELARIA',
+                                       'fresh_cookie_empty': state.get('fresh_cookie') is True}).encode() + b'\n')
         Gtk.main_quit()
 
     def evaluate(target, script, callback):
@@ -78,6 +93,8 @@ socket.onerror=()=>{{window.probe.ws=true}};
 fetch({}).then(()=>{{window.probe.http=false}}).catch(()=>{{window.probe.http=true}});
 '''.format(json.dumps(origin.replace('http:', 'ws:') + '/elaria?token=' + token),
        json.dumps(origin + '/console?token=' + token))
+    fresh = WebKit.WebView.new_with_context(WebKit.WebContext.new_ephemeral())
+    fresh.load_uri(origin + '/')
     foreign.load_html('<!doctype html><script>' + attack + '</script>', origin.replace('127.0.0.1', 'localhost') + '/')
 
     def tick():
@@ -96,7 +113,8 @@ fetch({}).then(()=>{{window.probe.http=false}}).catch(()=>{{window.probe.http=tr
             if (row['width'], row['height']) != (width, height):
                 return  # WM/layout may still be resizing; the overall deadline fails if clamped
             valid = (not row['overflow'] and row['chat'] > width * .35 and row['footer']
-                     and row['honest'] and row['input'] and row['lamps'])
+                     and row['honest'] and row['input'] and row['lamps']
+                     and all(row['privacy'].values()))
             if width > 680:
                 valid = valid and row['canvas']
             if width > 1040:
@@ -123,7 +141,10 @@ fetch({}).then(()=>{{window.probe.http=false}}).catch(()=>{{window.probe.http=tr
                         if 'ws' in flags and 'http' in flags:
                             state['cross'] = flags['ws'] is True and flags['http'] is True
                             rows.append(row)
-                            finish(state['cross'] and window.get_title() == 'ELARIA')
+                            def fresh_cookie(value):
+                                state['fresh_cookie'] = value == 'true'
+                                finish(state['cross'] and state['fresh_cookie'] and window.get_title() == 'ELARIA')
+                            evaluate(fresh, "JSON.stringify(location.protocol==='http:' && document.cookie==='')", fresh_cookie)
                 evaluate(foreign, 'JSON.stringify(window.probe || {})', cross)
         evaluate(view, SNAPSHOT, snapshot)
         return True

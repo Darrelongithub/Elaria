@@ -1,7 +1,7 @@
-> **Owner ruling — native v4 built, wiring/owner acceptance pending:** Chrome app mode is
+> **Task G — native deployment target 25ef8e6; owner execution/acceptance pending:** Chrome app mode is
 > rejected. Historical `--open` instructions below are **not** the Win+Space handoff.
-> Use `docs/phase-reports/console-2026-11-05-native-launcher-v4.md` for the checksummed
-> same-path native replacement, retained historical bridge pins, and hardware-only holds.
+> Use `console/NATIVE-DEPLOYMENT.md` for the checksummed same-path replacement.
+> The Task E report retains historical Appendix A pins; it is not the current install command.
 > Task D's host remains unchanged; no browser fallback is authorised.
 
 # Local text bridge — operator handoff
@@ -265,7 +265,7 @@ its dedicated Yes/No path can call apply. Bare undo is unchanged. Missing seam, 
 snapshot, unknown privacy, stale/expired selection or transport uncertainty fail closed.
 See INTEGRATION.md for exact wire fields and limitations. No daemon/protected change.
 
-**Deployment split remains intentional:** native v4 still uses fcd55ca1 and its ed227a7d
-launcher pin. That older UI has no Task F card; with the pilot daemon it receives the scoped
-undo refusal. This build does not change that pin or claim the card is installed behind
-Win+Space. The updated current-release launcher hash above is NOT the historical v4 pin.
+**Task G explicitly advances the native target to 25ef8e6**, including the F card, with
+launcher SHA594bde66…; see NATIVE-DEPLOYMENT.md. The historical fcd55ca1/ed227a7d
+pair remains recorded in Appendix A. Code availability is not proof of owner installation
+or of an actual Win+Space window; that acceptance is still pending.

@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 
 # Updated only with a committed release, alongside the handoff's installer checksum.
-PINS = {'native_launch.py': 'abe107748dc65b1cd6784fe093a348c7d43999273d26cbdec5413518619c2b44', 'native_window.py': 'e29800e8201e00b34b3d9c73af6b700f085da6ed50c69dcacbe16c0d4aa4771e', 'elaria-console-launch.sh': '8c86ca34bb2aa15fb0f38e40a15e11200def5d3cd046bf3a34aa90e9a47e9da5'}
+PINS = {'native_launch.py': '1f575357774f3eade4fdf7cdc69ee36f2f3998ff94c61f77ab84f28bcbf56bb8', 'native_window.py': 'e29800e8201e00b34b3d9c73af6b700f085da6ed50c69dcacbe16c0d4aa4771e', 'elaria-console-launch.sh': '1a7a54a763039d296111c6ebd843b2f9f79f6152d595ae71fb4ea18293fb0413'}
 OWNER_HOME = Path('/home/darrel')
 
 

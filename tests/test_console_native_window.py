@@ -247,6 +247,8 @@ async def test_real_webkit_pairing_origin_and_six_looks_opt_in(tmp_path, monkeyp
         assert bridge.token.encode() not in output
         result = json.loads(output)
         assert result['passed'] and result['title'] and result['cross_origin_denied']
+        assert result['fresh_cookie_empty']
+        assert all(all(row['privacy'].values()) for row in result['looks'])
         assert len(result['looks']) == 6
         assert len(rpc.says) == 1  # synthetic only; no live model or daemon used
         foreign = bridge.origin.replace('127.0.0.1', 'localhost')

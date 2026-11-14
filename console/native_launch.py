@@ -21,8 +21,11 @@ from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
-COMMIT = 'fcd55ca1bce34d8a1f479bf2d035cc866c4a482f'
-BRIDGE_SHA = 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c'
+HISTORICAL_COMMIT = 'fcd55ca1bce34d8a1f479bf2d035cc866c4a482f'
+HISTORICAL_BRIDGE_SHA = 'ed227a7d50effb874e303f95462f3dc127c9bd79a71a8d9b34f86980815b091c'
+COMMIT = '25ef8e67aee59598999941ff79ee7765e2480135'
+BRIDGE_SHA = '594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791'
+SHELL_SHA = '9f20df8513c5ad7ffdbdc5dd7e430f57999f5fa790b7bc00e873578c6d6e32af'
 NATIVE_SHA = 'e29800e8201e00b34b3d9c73af6b700f085da6ed50c69dcacbe16c0d4aa4771e'
 KEY_PATTERNS = (r'^extensions\.partialclone$', r'^remote\..*\.promisor$',
                 r'^remote\..*\.partialclonefilter$')
@@ -133,7 +136,20 @@ def ensure_worktree(paths, log):
     # Verify target HEAD, not the main checkout; never switch or reset either checkout.
     target = paths._replace(repo=paths.worktree)
     no_promisor(target)
-    if git_read(target, 'rev-parse', 'HEAD').stdout.decode().strip() != COMMIT:
+    head = git_read(target, 'rev-parse', 'HEAD').stdout.decode().strip()
+    if head == HISTORICAL_COMMIT:
+        # Explicit Task G migration only; never overwrite edits or advance a live bridge's files.
+        pinned_file(paths.worktree / 'console/run_bridge.py', HISTORICAL_BRIDGE_SHA)
+        if git_read(target, 'status', '--porcelain', '--untracked-files=all').stdout:
+            raise Stop('STOP: historical worktree has changes; no overwrite.')
+        if git_read(target, 'symbolic-ref', '-q', 'HEAD', ok=(0, 1)).returncode != 1:
+            raise Stop('STOP: historical worktree is not detached; no branch switch.')
+        if listener_pid() is not None:
+            raise Stop('STOP: old bridge still running; Ctrl-C only that bridge, then press again. No replay.')
+        git_read(target, 'checkout', '--detach', COMMIT)
+        note(log, 'clean historical worktree advanced to the explicit 25ef8e6 deployment pin')
+        head = git_read(target, 'rev-parse', 'HEAD').stdout.decode().strip()
+    if head != COMMIT:
         raise Stop('STOP: worktree is not at the exact pinned commit; no reset.')
     launcher = paths.worktree / 'console/run_bridge.py'
     pinned_file(launcher, BRIDGE_SHA)
@@ -219,11 +235,25 @@ def live_pairing(url):
             'Upgrade': 'websocket', 'Connection': 'Upgrade', 'Sec-WebSocket-Version': '13',
             'Sec-WebSocket-Key': key})
         response = connection.getresponse()
-        return response.status == 101 and response.getheader('Sec-WebSocket-Accept') == expected
+        if response.status != 101 or response.getheader('Sec-WebSocket-Accept') != expected:
+            return False
     except (OSError, http.client.HTTPException):
         return False
     finally:
         connection.close()  # no hello, turn, model, or dispatch; just the pairing gate challenge
+    # A live old process can still serve old bytes after an external checkout. Never call it
+    # the deployed console merely because its pathname/token matches.
+    connection = http.client.HTTPConnection('127.0.0.1', PORT, timeout=2)
+    try:
+        connection.request('GET', '/console?token=' + parsed.fragment.removeprefix('pair='),
+                           headers={'Origin': f'http://127.0.0.1:{PORT}'})
+        response = connection.getresponse()
+        body = response.read(1024 * 1024 + 1)
+        return response.status == 200 and hashlib.sha256(body).hexdigest() == SHELL_SHA
+    except (OSError, http.client.HTTPException):
+        return False
+    finally:
+        connection.close()
 
 
 def find_live_file(paths, host):
@@ -291,7 +321,7 @@ def launch(paths, log):
         ensure_worktree(paths, log)
         pid = listener_pid()
         if pid is None:
-            note(log, 'bridge ABSENT; starting detached HEADLESS (no --open)')
+            note(log, 'bridge ABSENT; first press may be slow: booting headless bridge (expected, not broken)')
             link = start_bridge(paths, host, log)
         else:
             if not bridge_identity(pid, paths):

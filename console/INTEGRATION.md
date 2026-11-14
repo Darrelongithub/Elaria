@@ -339,8 +339,9 @@ The bridge adds no RPC; a sampled conversation tail is explicitly not request-bo
 
 ### Single-operation undo review (Task F, e7316b9 / §9 consumer)
 
-Only the current bridge/shell release implements this; native v4's explicitly historical
-fcd55ca1 worktree is NOT silently upgraded. Use a daemon with the landed prepare/apply seam.
+Task G's explicit native deployment target 25ef8e6 includes this card; owner installation
+and keypress acceptance remain pending (NATIVE-DEPLOYMENT.md). The earlier fcd55ca1 target
+did not. Use a daemon with the landed prepare/apply seam.
 Canonical scoped undo text (including existing Swahili aliases) is intercepted before
 console.say and calls only undo.prepare. `undo review #N` prepares exactly that operation.
 Bare undo uses the original console.say text/parameters unchanged. No old-backend fallback.
