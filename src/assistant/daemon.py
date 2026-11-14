@@ -756,6 +756,26 @@ class Daemon:
             return SpeechResult(text=text.strip(), backend="none", voice_id="none",
                                 muted=True, error=str(exc))
 
+    @staticmethod
+    def _labelled_speech(result, route: dict) -> dict:
+        """F33: a reply says what actually reached the ear.
+
+        A 429, a dead backend or a missing player renders LABELLED TEXT — the
+        words are still there, the label says text-only, and the reason is
+        carried. Never bare silence, and never a claim of speech.
+        """
+        payload = {**route, **result.as_dict()}
+        if payload.get("played"):
+            payload["speech_status"] = "spoken"
+        elif payload.get("error"):
+            payload["speech_status"] = "text-only"
+            payload["speech_reason"] = (
+                f"voice unavailable ({payload['error']}) — the reply is shown "
+                f"as text and nothing was spoken")
+        else:
+            payload["speech_status"] = "text-only"
+        return payload
+
     async def _maybe_speak_reply(self, text: str, params: dict) -> dict:
         # Hybrid: try blocking with a short timeout so a fast local render can
         # return its real audio path, but never hang a handler on slow Live TTS
@@ -763,11 +783,21 @@ class Daemon:
         # second `speak()` would double the audio (BH-I4).
         route = {**self.speech.route(text),
                  "session_id": str(params.get("session_id") or "") or None}
+        # F21 (Task L): consent is READ, never spoken. A Yes/No ask has no
+        # voice form anywhere in this product, and the No persona line is
+        # text too — so this guard is a standing refusal, not a toggle.
+        if params.get("consent") is True or params.get("no_speech") is True:
+            reason = ("F21 — consent is asked in text only; there is no voiced "
+                      "Yes/No prompt, and a No is answered in text")
+            self._dictate_log("reply.speech_suppressed", reason=reason)
+            return {**route, "played": False, "queued": False,
+                    "speech_status": "text-only", "speech_suppressed": reason}
         requested = params.get("speak")
         auto = (requested is None
                 and self.config.section("tts").get("speak_replies", False))
         if requested is not True and not auto:
-            return {**route, "played": False, "queued": False}
+            return {**route, "played": False, "queued": False,
+                    "speech_status": "text-only"}
         self._set_speaking(True, text=text)
         task = self._track_task(asyncio.create_task(self._speak_once(text, route)))
         self.audio.start_playback(task)
@@ -777,8 +807,9 @@ class Daemon:
             # Live TTS is slow; the task already owns the speaking flag and
             # will clear it when the real playback finishes.
             return {**route, "played": False, "queued": True,
+                    "speech_status": "pending",
                     "note": "speech continues in the background (timeout)"}
-        return result.as_dict()
+        return self._labelled_speech(result, route)
 
     # -- relationship state persists across restarts (§16) -------------------
     def _load_relationship_state(self) -> None:
@@ -3093,7 +3124,12 @@ class Daemon:
                           f"{len(self._undo_asks)}"))
         return {"token": token, "ask_sha256": ask_sha, "snapshot": snapshot,
                 "prepared_at": iso_now(), "age_s": 0.0,
-                "expires_in_s": self.UNDO_ASK_TTL_S}
+                "expires_in_s": self.UNDO_ASK_TTL_S,
+                # F21: consent is READ. No voiced Yes/No prompt exists, and a
+                # caller cannot make one by asking politely for speech.
+                "spoken": False,
+                "speech_suppressed": ("F21 — consent is asked in text only; "
+                                      "there is no voiced Yes/No prompt")}
 
     async def _undo_apply(self, params: dict) -> dict:
         """Answer one ask. No is terminal; a lapsed ask is terminal; Yes
@@ -3130,7 +3166,10 @@ class Daemon:
                 json.dumps({"ack": "declined",
                             "ask_sha256": ask["ask_sha256"]}))
             return {"undone": 0, "problems": [], "decision": "no",
-                    "ask_sha256": ask["ask_sha256"], "age_s": round(age, 1)}
+                    "ask_sha256": ask["ask_sha256"], "age_s": round(age, 1),
+                    "spoken": False,
+                    "speech_suppressed": ("F21 — the No persona line stays "
+                                          "text; nothing was undone")}
         row = await asyncio.to_thread(
             self.store.get_operation, int(ask["snapshot"]["op_id"]))
         drift = self._undo_drift(ask["snapshot"], row)
@@ -3150,7 +3189,10 @@ class Daemon:
                           f"op_id={ask['snapshot']['op_id']}; age_s={age:.1f}; "
                           f"{actor}; undone={result.get('undone')}"))
         return {**result, "decision": "yes",
-                "ask_sha256": ask["ask_sha256"], "age_s": round(age, 1)}
+                "ask_sha256": ask["ask_sha256"], "age_s": round(age, 1),
+                "spoken": False,
+                "speech_suppressed": ("F21 — consent is text only; the outcome "
+                                      "is reported, not voiced")}
 
     async def _verify(self, params: dict) -> dict:
         from .executor import parse_since

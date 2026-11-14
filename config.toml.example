@@ -189,7 +189,11 @@ command = "piper"
 player = "auto"                     # pw-play/paplay/aplay, or none
 speak_acks = true
 speak_replies = false
-cache_dir = ""
+cache_dir = ""            # default: <data>/voice-cache (F33)
+# Rendered speech is regenerable, so the cache is LRU-capped rather than
+# unbounded; evicting only costs one re-render. `voice-cache/` is excluded from
+# tiering by the indexer and is never a document.
+cache_max_files = 120
 audition_dir = ""
 
 # Voice model files live outside git. The selected voice is first; the

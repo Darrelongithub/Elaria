@@ -363,6 +363,9 @@ DEFAULTS: dict = {
         "speak_acks": True,
         "speak_replies": False,
         "cache_dir": "",
+        # F33 (Task L): rendered speech is LRU-capped and regenerable. The
+        # directory (`voice-cache/`) is permanently outside tiering.
+        "cache_max_files": 120,
         "audition_dir": "",
         "audition_candidates": [
             {

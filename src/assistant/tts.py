@@ -52,6 +52,23 @@ from .proc import child_kwargs
 # recovered 6 of 6 with zero variance. Measured in docs/voice-audition-round3.md
 # ("Round 4 addendum"); `tests/test_phase8_offline_voice.py` pins these strings
 # so a tidy-up cannot quietly re-break the hot path.
+# F33 (Task L): rendered speech lives in exactly one directory, permanently
+# outside tiering (the indexer skips this name — see `indexer.iter_files`) and
+# always regenerable: deleting anything here costs one re-render, never data.
+VOICE_CACHE_DIRNAME = "voice-cache"
+#: F33's settings half of the cache key, split by ROUTE because the two routes
+#: do not share audio settings. VB-2 still holds: a dormant local setting
+#: (pace, the Piper voice, its model file) must never invalidate a Flare
+#: render, or an edit in the sleeping path silences the hotkey path.
+AUDIO_SETTING_KEYS = {
+    "gemini": ("online_voice",),
+    "local": ("online_voice", "offline_voice", "backend", "voice_id", "model",
+              "config", "speaker", "length_scale"),
+}
+#: How many render files the cache keeps (LRU by mtime). Regenerable, so the
+#: cap is a disk courtesy, never a correctness condition.
+DEFAULT_CACHE_MAX_FILES = 120
+
 STANDARD_ACKS = {
     "on_it": "On it.",
     "done": "That is done.",
@@ -482,7 +499,7 @@ class SpeechService:
         settings = config.section("tts") if config else {}
         cache_setting = settings.get("cache_dir")
         self.cache_dir = (Path(cache_setting).expanduser() if cache_setting
-                          else config.data_dir / "voice-cache")
+                          else config.data_dir / VOICE_CACHE_DIRNAME)
         audition_setting = settings.get("audition_dir")
         self.audition_dir = (Path(audition_setting).expanduser() if audition_setting
                              else config.data_dir / "voice-auditions")
@@ -583,6 +600,7 @@ class SpeechService:
             "voice": self.voice_identity()["effective"],
             "model": config_voice_model(self.config),
             "sample_rate": int(gemini.get("voice_sample_rate", 24000)),
+            "settings": self.settings_hash(),
         }
 
     # -- status / routing ---------------------------------------------------------
@@ -617,6 +635,7 @@ class SpeechService:
             "class_mode": (self._presence.status().as_dict()
                            if self._presence is not None else None),
             "voice_identity": identity,
+            "cache": self.cache_report(),
             "cache_identity": (self.cloud_cache_identity() if speaking_gemini else
                                {"voice": backend.voice_id,
                                 "model": Path(self.descriptor().model).name,
@@ -654,6 +673,7 @@ class SpeechService:
                 mode, backend.name),
             "voice_id": (self.voice_identity()["effective"] if mode == "gemini"
                         else ("none" if mode == "silent" else backend.voice_id)),
+            "cache": self.cache_report(),
             "voice_mode": self.voice_mode_label(mode),
             "local": mode == "local",
             "cloud_voice": mode == "gemini",
@@ -662,6 +682,76 @@ class SpeechService:
         }
 
     # -- synthesis + playback -------------------------------------------------------
+    def settings_hash(self, route: str | None = None) -> str:
+        """F33: the settings half of the cache key, per route.
+
+        Text and voice identity are already in the key; this adds the settings
+        that change how the SAME words sound on THAT route. A change to any of
+        them makes a new key, so the owner never hears a stale pace or a
+        previous voice — and a change in the other (dormant) route changes
+        nothing here (VB-2).
+        """
+        settings = self.config.section("tts") if self.config else {}
+        route = route or self.voice_route()[0]
+        keys = AUDIO_SETTING_KEYS["local" if route == "local" else "gemini"]
+        payload = {key: str(settings.get(key, "")) for key in keys}
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]
+
+    def cache_cap(self) -> int:
+        settings = self.config.section("tts") if self.config else {}
+        try:
+            cap = int(settings.get("cache_max_files", DEFAULT_CACHE_MAX_FILES))
+        except (TypeError, ValueError):
+            cap = DEFAULT_CACHE_MAX_FILES
+        return max(1, cap)
+
+    def cache_files(self) -> list[Path]:
+        """Render files only — the session cue is not a render and is kept."""
+        if not self.cache_dir.exists():
+            return []
+        return sorted((p for p in self.cache_dir.glob("speech-*.wav")
+                       if p.is_file()), key=lambda p: p.stat().st_mtime)
+
+    def cache_report(self) -> dict:
+        """F33 as a reading, not a story: where renders live and how many."""
+        files = self.cache_files()
+        return {
+            "dir": str(self.cache_dir),
+            "name": VOICE_CACHE_DIRNAME,
+            "files": len(files),
+            "bytes": sum(p.stat().st_size for p in files),
+            "cap": self.cache_cap(),
+            "settings_hash": {"gemini": self.settings_hash("gemini"),
+                              "local": self.settings_hash("local")},
+            "policy": "regenerable; permanently excluded from tiering (F33)",
+        }
+
+    def enforce_cache_cap(self, keep: Path | None = None) -> dict:
+        """F33 LRU: keep the newest `cache_max_files` renders, delete the rest.
+
+        Never deletes `keep` (the render this call just produced). Deletion is
+        always safe here: the directory is declared regenerable, so an evicted
+        line is re-synthesized next time it is said.
+        """
+        cap = self.cache_cap()
+        files = self.cache_files()
+        if len(files) <= cap:
+            return {"deleted": 0, "files": len(files), "cap": cap}
+        doomed = [p for p in files[:len(files) - cap]
+                  if keep is None or Path(p) != Path(keep)]
+        deleted = 0
+        for path in doomed:
+            try:
+                path.unlink()
+                deleted += 1
+            except OSError:
+                continue          # a file that will not go is not an error
+        if deleted:
+            log_event("tts.cache_pruned", verdict="pruned",
+                      detail=(f"{deleted} evicted, {len(files) - deleted} kept "
+                              f"(cap {cap}) in {self.cache_dir} — regenerable"))
+        return {"deleted": deleted, "files": len(files) - deleted, "cap": cap}
     def _cache_path(self, text: str, descriptor: VoiceDescriptor, backend_name: str,
                     *, identity: dict | None = None) -> Path:
         """Where this text's audio for `backend_name` lives.
@@ -676,7 +766,10 @@ class SpeechService:
                 "voice": descriptor.voice_id, "model": Path(descriptor.model).name,
                 "speaker": descriptor.speaker, "length_scale": descriptor.length_scale,
             }
-        key = json.dumps({"text": text, "backend": backend_name, **identity},
+        key = json.dumps({"text": text, "backend": backend_name,
+                          "settings": self.settings_hash(
+                              "local" if backend_name != "gemini-native-audio"
+                              else "gemini"), **identity},
                          sort_keys=True)
         return self.cache_dir / f"speech-{hashlib.sha256(key.encode()).hexdigest()[:20]}.wav"
 
@@ -900,7 +993,10 @@ class SpeechService:
                                 audio_path=str(path), cached=True,
                                 local=route != "gemini", cloud_voice=route == "gemini")
         if route == "gemini":
-            return self._speak_with_gemini(text, path, on_chunk=on_chunk)
+            result = self._speak_with_gemini(text, path, on_chunk=on_chunk)
+            if path == route_cache:
+                self.enforce_cache_cap(keep=path)
+            return result
         try:
             backend.synthesize(text, path)
         except Exception as exc:
@@ -908,6 +1004,8 @@ class SpeechService:
                       detail=(f"{backend.name} synthesis failed: {exc} — "
                               "reported silence; no substitution"))
             raise
+        if path == route_cache:
+            self.enforce_cache_cap(keep=path)
         log_event("tts.synthesised", verdict="synthesised",
                   detail=f"{backend.name} wrote {path}")
         return SpeechResult(text=text, backend=backend.name, voice_id=backend.voice_id,
