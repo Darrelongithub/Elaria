@@ -33,8 +33,9 @@ from contextvars import ContextVar
 from pathlib import Path
 
 from . import __version__
+from . import capture as capture_mod
 from .asr import local_asr_status
-from .capture import PipeWireCapture, SimulatedCapture
+from .audio_gateway import AudioGateway, GatewayRefused
 from .config import DEFAULTS, Config, load_config, load_humour_profile
 from .console import ConsoleService, SessionService
 from .cost import day_start_iso, iso_now, month_start_iso
@@ -67,6 +68,28 @@ from .tts import SESSION_CUE_KIND, STANDARD_ACKS, SpeechResult, SpeechService
 
 MAX_PTT_WAIT_S = 90.0
 
+
+# The fake-device seam. Tests patch capture classes either here (the BUG-6
+# habit) or on `assistant.capture`; both must describe exactly what a session
+# would really have opened (F17). `_capture_cls` below resolves at call time.
+PipeWireCapture = capture_mod.PipeWireCapture
+SimulatedCapture = capture_mod.SimulatedCapture
+_CAPTURE_ORIGINALS = {"PipeWireCapture": PipeWireCapture,
+                      "SimulatedCapture": SimulatedCapture}
+
+
+def _capture_cls(name: str):
+    """The capture class a session would actually construct, seams included.
+
+    A name patched on THIS module wins (and is what the pins assert on); an
+    untouched alias defers to `assistant.capture`, so patching there also
+    works. Resolving at call time is the point: an import-time binding would
+    silently ignore both seams.
+    """
+    own = getattr(sys.modules[__name__], name, None)
+    if own is not None and own is not _CAPTURE_ORIGINALS.get(name):
+        return own
+    return getattr(capture_mod, name)
 
 class ChatTimeout(TimeoutError):
     """A chat turn that hit a deadline — with WHICH deadline attached.
@@ -145,6 +168,18 @@ class Daemon:
         except (TypeError, ValueError):
             history_limit = 200
         self.sessions = SessionService(self.store, history_limit=history_limit)
+        # TASK K/G1: one owner for capture and playback (F16/F17/F28/F30).
+        # The factories read this module's globals at call time on purpose, so
+        # the existing fake-device pins (monkeypatched PipeWireCapture) still
+        # describe exactly what a session would have opened.
+        self.audio = AudioGateway(
+            config,
+            capture_factory=lambda target, frame_ms, stall: _capture_cls(
+                "PipeWireCapture")(target, frame_ms=frame_ms,
+                                   stall_timeout_s=stall),
+            simulated_factory=lambda frame_ms: _capture_cls(
+                "SimulatedCapture")(speech_frames=100_000, frame_ms=frame_ms,
+                                    realtime=True))
         self.speech = SpeechService(
             config, self.store, client=self.client,
             # INTERIM online voice: Flare speaks only while actually online. Offline
@@ -483,7 +518,7 @@ class Daemon:
 
     def is_speaking(self) -> bool:
         return bool(self._ack_playbacks or self._speech_playbacks) or (
-            time.monotonic() < self._speaking_until)
+            time.monotonic() < self._speaking_until) or self.audio.is_playing()
 
     def speaking_guard_remaining(self) -> float:
         active_playback = bool(self._ack_playbacks or self._speech_playbacks)
@@ -504,6 +539,7 @@ class Daemon:
         self._set_speaking(True, text=text)
         playback = asyncio.create_task(asyncio.to_thread(self.speech.play_ack, kind))
         self._ack_playbacks.add(playback)
+        self.audio.start_playback(playback)
         session_id = str(self._ptt_session_id or "")
 
         def finished(task: asyncio.Task) -> None:
@@ -734,6 +770,7 @@ class Daemon:
             return {**route, "played": False, "queued": False}
         self._set_speaking(True, text=text)
         task = self._track_task(asyncio.create_task(self._speak_once(text, route)))
+        self.audio.start_playback(task)
         try:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
         except TimeoutError:
@@ -938,6 +975,8 @@ class Daemon:
             # plus the dropout count. Doctor prints these; the limiter is not
             # allowed to be the only witness to what it did.
             "capture_diag": getattr(self, "_last_capture_diag", None),
+            "gateway": (self.audio.status() if getattr(self, "audio", None)
+                        else None),
             # W7a (2026-10-31): `ptt_session_id` names a LIVE session only
             # — exactly while a holder row exists (the scene-7 evidence:
             # a closed session's id kept being advertised 14 s later with
@@ -1418,13 +1457,11 @@ class Daemon:
                 "simulated", "mock", "fake"):
             # Same hermeticity seam as ptt.start (owner order 2026-10-26):
             # bug6-class tests never open the real mic, wake path included.
-            from .capture import SimulatedCapture
 
-            return SimulatedCapture(speech_frames=100_000,
+            return _capture_cls("SimulatedCapture")(speech_frames=100_000,
                                     frame_ms=int(self.config.section(
                                         "capture").get("chunk_ms", 30)),
                                     realtime=True)
-        from .capture import PipeWireCapture
 
         capture_cfg = self.config.section("capture")
         target = (capture_cfg.get("mic_target")
@@ -1433,7 +1470,7 @@ class Daemon:
         # TypeError on every real hotword start, invisible to tests that
         # replace the factory), and the [hotword] stall timeout must reach
         # the capture or a wedged pw-record streams for the 8s default.
-        return PipeWireCapture(
+        return _capture_cls("PipeWireCapture")(
             target=target or None,
             sample_rate=int(capture_cfg.get("sample_rate", 16000)),
             frame_ms=int(capture_cfg.get("chunk_ms", 30)),
@@ -1809,6 +1846,22 @@ class Daemon:
                                "cached": False, "played": False,
                                "suppressed": "already listening — no second ack"},
                     "note": "already listening"}
+        # F17, before any sound: a deployment that cannot name the node it is
+        # configured to record does not get an earcon promising a listener.
+        wants_device = (str(params.get("source")
+                            or self.config.section("capture").get("source", "mic")
+                            or "mic").lower()
+                        != "simulated") and (
+            os.environ.get("ASSIST_CAPTURE", "").strip().lower()
+            not in ("simulated", "mock", "fake"))
+        if wants_device:
+            try:
+                self.audio.resolve_target(params.get("target"))
+            except GatewayRefused as exc:
+                self._ptt_log("ptt.start.refused_policy", reason=str(exc)[:200])
+                return {"listening": False, "refused": str(exc),
+                        "gateway": self.audio.status(),
+                        "note": "no earcon played — the session never started"}
         # Session open is a neutral earcon, never a full spoken sentence.
         ack = await self._ack({"kind": SESSION_CUE_KIND})
         self._ptt_log("ptt.start.ack_done")
@@ -1835,24 +1888,45 @@ class Daemon:
                   or None)
         stall_timeout_s = float(capture_cfg.get("stall_timeout_s", 8.0))
         self._ptt_log("ptt.start.target_resolved", target=str(target or "default"), source_kind=str(source_kind))
+        # F28: arbitration lives in the gateway, and a refusal is an ANSWER —
+        # no ack, no session, one clear line.
+        arbitration = self.audio.request_ptt()
+        if not arbitration.allowed:
+            self._ptt_log("ptt.start.refused_arbitration", reason=arbitration.reason)
+            return {"listening": False, "refused": arbitration.reason,
+                    "gateway": arbitration.as_dict(),
+                    "note": "the microphone has one owner; nothing started"}
         simulated = False
-        if source_kind == "simulated":
-            self._capture_source = SimulatedCapture(speech_frames=100_000,
-                                                    frame_ms=frame_ms, realtime=True)
+        try:
+            opened = self.audio.open_capture(
+                params={"target": target},
+                source_kind=("simulated" if source_kind == "simulated" else "mic"),
+                frame_ms=frame_ms, stall_timeout_s=stall_timeout_s)
+            self._capture_source = opened["source"]
+            simulated = bool(opened["simulated"])
+            self._ptt_log("ptt.start.capture_spawn", target=opened["target"],
+                          simulated=simulated,
+                          kind=type(self._capture_source).__name__,
+                          node_policy=opened["node_policy"])
+        except GatewayRefused as exc:
+            if getattr(exc, "refusal", "device") == "policy":
+                # A policy refusal is an ANSWER, never a silent simulation.
+                self.audio.end_ptt()
+                self._ptt_log("ptt.start.refused_policy", reason=str(exc)[:200])
+                return {"listening": False, "refused": str(exc),
+                        "gateway": self.audio.status(),
+                        "note": "nothing captured — the node is not configured"}
+            # A device refusal is not a fallback to the system default either:
+            # with no PipeWire here the pipeline is exercised on simulated
+            # frames and the receipt says exactly that.
+            opened = self.audio.open_capture(source_kind="simulated",
+                                             frame_ms=frame_ms)
+            self._capture_source = opened["source"]
             simulated = True
-            self._ptt_log("ptt.start.capture_spawn", target="simulated", simulated=True, kind="SimulatedCapture")
-        else:
-            try:
-                self._capture_source = PipeWireCapture(
-                    target, frame_ms=frame_ms, stall_timeout_s=stall_timeout_s)
-                self._ptt_log("ptt.start.capture_spawn", target=str(target or "default"), simulated=False, kind="PipeWireCapture", stall_timeout_s=stall_timeout_s)
-            except RuntimeError as exc:
-                # No PipeWire (headless/containers): simulated frames keep
-                # the full pipeline exercisable; status reports it honestly.
-                self._capture_source = SimulatedCapture(speech_frames=100_000,
-                                                        frame_ms=frame_ms, realtime=True)
-                simulated = True
-                self._ptt_log("ptt.start.capture_spawn_fallback", target=str(target or "default"), reason=str(exc)[:120], kind="SimulatedCapture")
+            self._ptt_log("ptt.start.capture_spawn_fallback",
+                          target=str(target or "unconfigured"),
+                          reason=str(exc)[:160], kind="SimulatedCapture")
+        self.audio.begin_ptt()
         self._stop_event = asyncio.Event()
         # J4/F30: Escape is a different signal from release, and it must reach
         # the session that is already capturing.
@@ -1889,7 +1963,7 @@ class Daemon:
         # it has always read the stop event from this call site.
         try:
             self.dictation.cancel_event = self._cancel_event
-        except Exception as exc:  # noqa: S110 - a stub without the attribute
+        except Exception as exc:
             # A dictation double that refuses attributes simply cannot be
             # cancelled; the session still stops on release. Logged, never
             # silent, because a cancel that cannot reach the session is a
@@ -2112,6 +2186,8 @@ class Daemon:
                 except Exception:
                     result = None
                 zeroized = bool(getattr(result, "cancelled", False))
+        self.audio.end_ptt(cancelled=True)
+        self.audio.release_capture()
         source, self._capture_source = self._capture_source, None
         released = False
         if source is not None:
@@ -2181,6 +2257,7 @@ class Daemon:
             self._ptt_log("ptt.stop.stop_event_set", session_id=str(session_id or ""))
         self._dictation_task = None
 
+        self.audio.end_ptt()
         if task is not None:
             self._ptt_released_at = time.monotonic()
             self._ptt_log("ptt.stop.finish_spawn", session_id=str(session_id or ""))
@@ -3179,17 +3256,17 @@ class Daemon:
         diarization is exact. Same idle-safe rules as ptt."""
         if self._meeting is not None:
             return {"state": "already-meeting"}
-        from .capture import DualCapture, PipeWireCapture, SimulatedCapture
+        from .capture import DualCapture
 
         meeting_cfg = self.config.section("meeting")
 
         def make_source(target: str | None):
             if params.get("source") == "simulated" or params.get("simulation"):
-                return SimulatedCapture(speech_frames=100_000, frame_ms=30, realtime=True)
+                return _capture_cls("SimulatedCapture")(speech_frames=100_000, frame_ms=30, realtime=True)
             try:
-                return PipeWireCapture(target, frame_ms=30)
+                return _capture_cls("PipeWireCapture")(target, frame_ms=30)
             except RuntimeError:  # headless: simulated keeps pipeline exercisable
-                return SimulatedCapture(speech_frames=100_000, frame_ms=30, realtime=True)
+                return _capture_cls("SimulatedCapture")(speech_frames=100_000, frame_ms=30, realtime=True)
 
         # BH-K21: [meeting] mic_target overrides, but the documented
         # [capture] mic_target is the fallback (dictate/hotword resolve

@@ -147,7 +147,10 @@ def test_rolling_buffer_zeroize_destroys_the_audio():
 
 def test_cancel_journals_and_claims_zeroization_only_when_proven(tmp_path, capsys):
     """A cancel whose session did not report zeroizing must SAY so."""
+    from assistant.audio_gateway import AudioGateway
+
     daemon = object.__new__(Daemon)
+    daemon.audio = AudioGateway(load_config())
     daemon._ptt_session_id = "sess-cancel"
     daemon._cancel_event = asyncio.Event()
     daemon._stop_event = asyncio.Event()
@@ -188,7 +191,10 @@ def test_cancel_journals_and_claims_zeroization_only_when_proven(tmp_path, capsy
 
 
 def test_cancel_reports_zeroized_when_the_session_did_it(tmp_path):
+    from assistant.audio_gateway import AudioGateway
+
     daemon = object.__new__(Daemon)
+    daemon.audio = AudioGateway(load_config())
     daemon._ptt_session_id = "sess-cancel-2"
     daemon._cancel_event = asyncio.Event()
     daemon._stop_event = asyncio.Event()
