@@ -125,6 +125,8 @@ def readiness(status: dict) -> str | None:
 
 def reply_message(result: dict, request_id: int) -> dict:
     """Never relabel fixture, queued, withheld or fallback text as model output."""
+    # F29: daemon gateway is the sole playback owner. Explicitly omit result.audio;
+    # no URL/bytes/element reaches the renderer and no second playback path is mounted.
     reply = {'t': 'reply', 'id': request_id}
     via = result.get('via')
     if not isinstance(via, str):
@@ -212,8 +214,8 @@ CAPABILITIES = {
     'cost': 'Recorded usage/quota snapshot; not a live billing guarantee.',
     'where': 'Indexed references, with possible model fallback; no fresh-file read.',
     'search': 'Indexed matches, with possible model fallback; no fresh-file analysis.',
-    'remember': 'Existing typed fact storage; fact ID/kind receipt is missing on this wire.',
-    'forget': 'Existing typed matching-fact deactivation, not erasure; affected IDs missing.',
+    'remember': 'Existing typed fact storage; structured receipt displayed when supplied by daemon.',
+    'forget': 'Existing typed matching-fact deactivation, not erasure; structured affected-ID receipt when supplied.',
     'halt': 'Existing daemon halt route; acknowledgement is not proof of every effect stopping.',
     'undo': 'Single-op private prepare/review/apply card; bare undo unchanged. No approval in chat.',
     'organise': 'Existing configured-root index/plan building; metadata writes, no apply here.',
@@ -275,6 +277,64 @@ def positive_id(value):
     return type(value) is int and 0 < value <= 2**53 - 1
 
 
+def fact_receipt_rows(value):
+    """Consume 4218ef0/7b374d1 producer receipts, not prose or sampled history.
+
+    Only bounded metadata is displayed; stored fact text and unknown fields are never copied.
+    These are daemon-reported readbacks, not independent verification or durable receipts.
+    """
+    if not isinstance(value, dict):
+        return None
+
+    def label(item):
+        return isinstance(item, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,80}', item)
+
+    if value.get('receipt') == 'remember':
+        confidence = value.get('confidence')
+        if not (positive_id(value.get('fact_id')) and label(value.get('kind'))
+                and label(value.get('source')) and value.get('active') is True
+                and (confidence is None or (type(confidence) in (float, int)
+                     and 0 <= confidence <= 1))
+                and value.get('retention') == 'until_forgotten'
+                and value.get('restore') == 'row_preserved_no_api'):
+            return None
+        return [(f"Remember receipt (daemon active-row readback): fact #{value['fact_id']}; "
+                f"kind={value['kind']}; source={value['source']}; active=true; confidence={confidence}."),
+                'Retention: until_forgotten. Restore: row_preserved_no_api; no restore API or erasure guarantee.']
+    if value.get('receipt') == 'forget':
+        ids, facts = value.get('fact_ids'), value.get('facts')
+        count = value.get('forgotten')
+        if not (type(count) is int and 0 <= count <= 1000
+                and isinstance(ids, list) and len(ids) == count
+                and all(positive_id(fid) for fid in ids) and len(set(ids)) == count
+                and isinstance(facts, list) and len(facts) == count
+                and isinstance(value.get('corr_id'), str)
+                and re.fullmatch(r'[a-f0-9]{32}', value['corr_id'])
+                and isinstance(value.get('corr_ts'), str)
+                and re.fullmatch(r'[0-9T:.+Z-]{10,40}', value['corr_ts'])):
+            return None
+        indexed = {}
+        for fact in facts:
+            if not (isinstance(fact, dict) and positive_id(fact.get('id'))
+                    and fact['id'] in ids and fact['id'] not in indexed
+                    and isinstance(fact.get('state'), str)
+                    and fact['state'] in {'inactive', 'still-active', 'unknown'}
+                    and (fact.get('kind') is None or label(fact['kind']))):
+                return None
+            indexed[fact['id']] = fact
+        rows = [f'Forget receipt (daemon-reported): {count} fact(s) affected.' if count
+                else 'Forget receipt: no match; no fact was deactivated.',
+                f"Decision correlation: {value['corr_id']} at {value['corr_ts']}."]
+        for fid in ids[:8]:
+            fact = indexed[fid]
+            rows.append(f"Fact #{fid}: kind={fact.get('kind')}; readback={fact['state']}.")
+        if count > 8:
+            rows.append(f'{count - 8} further affected IDs omitted from this bounded display; not a complete list.')
+        rows.append('Producer declares versions and durable receipt absent; corr_id + corr_ts is the decision identity.')
+        return rows
+    return None
+
+
 def attribution(result, reply, text, observation):
     """Bounded metadata separate from model prose. No extra RPCs or hidden content leakage.
 
@@ -298,16 +358,23 @@ def attribution(result, reply, text, observation):
         rows.append(f'Daemon conversation reference: #{cid} (not an operation reference).')
     else:
         rows.append('Daemon conversation reference: unavailable.')
-    messages = conversation.get('messages') if isinstance(conversation, dict) else None
-    tail = messages[0] if isinstance(messages, list) and len(messages) == 1 else None
-    if (positive_id(cid) and isinstance(conversation, dict) and conversation.get('id') == cid and isinstance(tail, dict)
-            and positive_id(tail.get('id')) and tail.get('role') == 'assistant'
-            and tail.get('channel') == 'console' and tail.get('via') == via
-            and tail.get('text') == result.get('reply')):
-        rows.append(f'Returned conversation-tail message: #{tail["id"]}; matching text, '
-                    'NOT request-bound (concurrent turns may race).')
+    if 'message_id' in result or 'user_message_id' in result:
+        for field, name in [('message_id', 'assistant'), ('user_message_id', 'user')]:
+            mid = result.get(field)
+            rows.append(f'Causal {name} message: #{mid} (producer turn append, not an operation ID).'
+                        if positive_id(mid) else f'Causal {name} message: absent or invalid; not inferred.')
     else:
-        rows.append('Message reference: unavailable or tail not correlated; no attribution inferred.')
+        # Legacy producer compatibility only. Never replace causal IDs with a sampled tail.
+        messages = conversation.get('messages') if isinstance(conversation, dict) else None
+        tail = messages[0] if isinstance(messages, list) and len(messages) == 1 else None
+        if (positive_id(cid) and isinstance(conversation, dict) and conversation.get('id') == cid
+                and isinstance(tail, dict) and positive_id(tail.get('id'))
+                and tail.get('role') == 'assistant' and tail.get('channel') == 'console'
+                and tail.get('via') == via and tail.get('text') == result.get('reply')):
+            rows.append(f'Returned conversation-tail message: #{tail["id"]}; matching text, '
+                        'NOT request-bound (concurrent turns may race).')
+        else:
+            rows.append('Message reference: unavailable or tail not correlated; no attribution inferred.')
     local = reply.get('provenance') == 'local-daemon'
     body = result.get('reply', '')
     if kind in {'where', 'search'}:
@@ -328,14 +395,19 @@ def attribution(result, reply, text, observation):
                 rows.extend('Daemon-reported hit text (unstructured): ' + x[2:] for x in lines[1:])
             else:
                 rows.append('Structured indexed refs: unavailable; inspect the local reply, not an inferred receipt.')
-    if kind == 'remember':
-        rows.extend(['Fact ID and kind: not supplied on this wire; mainline receipt seam required.',
-                     ('Retention limit: deactivation is not erasure; stored text/history can remain. '
-                     'No retention duration or exact restore guarantee is supplied.')])
-    if kind == 'forget':
+    receipt = result.get('receipt')
+    fact_rows = fact_receipt_rows(receipt) if local and via == 'local-intent' else None
+    if fact_rows:
+        rows.extend(fact_rows)
+        rows.append('Deactivation-not-erasure: fact text and conversation history may remain.')
+    elif kind == 'remember':
+        rows.extend(['Fact ID and kind: not supplied or invalid in this reply; not inferred from prose.',
+                     'Retention limit: deactivation is not erasure; no valid structured receipt supplied.'])
+    elif kind == 'forget':
         count = re.fullmatch(r'Forgotten \(([0-9]{1,19}) fact\(s\) deactivated\).', body)
         rows.append('Affected count (daemon-reported, not independently verified): ' +
                     (count[1] if local and via == 'local-intent' and count else 'unavailable') + '.')
+        rows.append('Affected-ID receipt absent or invalid in this reply; not inferred from prose.')
         rows.append('Deactivation-not-erasure: fact text and conversation history may remain.')
     if kind == 'organise':
         rows.append('Resolved root set: not supplied on this wire; do not infer it from the request.')

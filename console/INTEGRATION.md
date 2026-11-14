@@ -50,13 +50,13 @@ paragraph is the correction. The repo takes ownership by calling into this objec
 in the page is API.
 
 ```js
-ElariaShell.connect(adapter)        // adapter = { name, send(text, ctx) -> string | {text, audio} }
-                                    //   ctx = { session, history } ; audio = URL or <audio> element
+ElariaShell.connect(adapter)        // adapter = { name, send(text, ctx) -> string | {text, attribution} }
+                                    //   ctx = { session, history }; reply audio is explicitly DROPPED (F29)
 ElariaShell.disconnect()            // wire lost: lamps, offline state, notification
 ElariaShell.attachSocket(url?)      // THE WIRE. defaults to ws://127.0.0.1:8744/elaria  (see §5)
 ElariaShell.notify({ text, speak }) // proactive tap on the shoulder: mini-orb toast + rail pip
 ElariaShell.say(text)               // push an unprompted reply into the log
-ElariaShell.setState(name)          // idle | listening | thinking | speaking | offline
+ElariaShell.setState(name)          // idle | listening | thinking | offline; speaking only via output levels
 ElariaShell.levels(role, level)     // push amplitude 0..1, role 'input' | 'output'
 ElariaShell.transcript(rows)        // rows: { ts, id, who, text, peak, verdict }  -> transcript pane goes LIVE
 ElariaShell.audio(rows)             // rows: { name, size, age, tier }              -> audio pane goes LIVE
@@ -74,9 +74,9 @@ does-not-exist-yet, and a pane with no data says so instead of showing nothing.
 ## 4. What the wire has to feed, in priority order
 
 1. **replies** — `send(text, ctx)`; the shell types them out and drives the orb from `levels`.
-2. **state** — push `setState` on wake / voice-end / model-start / tts-start / tts-end so her shape is true.
+2. **state** — lifecycle only; speaking is entered only through output levels, never a reply/audio/state flag.
 3. **transcript rows** — the daemon journal, seven-field contract (`ts level event session_id peak verdict detail`).
-4. **audio rows** — the storage manifest (file, size, age, tier hot/cold/never-retry).
+4. **audio rows** — deferred; the generic metadata/sample renderer is not a production manifest feed or player.
 5. **memory cards** — her live store, replacing the baked shell copy.
 
 Each of 3–5 flips its pane badge from `pending` to `live` the moment real rows arrive, and demo rows are
@@ -101,7 +101,7 @@ daemon → client
 
 ```jsonc
 { "t": "hello-ok", "v": 1, "name": "elaria-daemon" }
-{ "t": "reply", "id": 7, "text": "…", "audio": "optional url or omitted" }
+{ "t": "reply", "id": 7, "text": "…" }
 { "t": "reply", "id": 7, "error": "reason" }                 // rejected promise, shown as [BROKEN]
 { "t": "state",  "name": "listening" }
 { "t": "levels", "role": "input", "level": 0.42 }
@@ -135,11 +135,13 @@ and transcription-confidence gating. It does not repair those paths or prove mod
 
 **Minimum implemented:** hello/hello-ok (v1), same-ID send/reply, state, levels.
 **Levels are SYNTHESISED TEXT CADENCE, NOT measured audio.** This is the owner's explicit
-ruling for text turns. Both the bridge frames (`source: synthesised-text`, `measured: false`)
-and the shell's typewriter levels are labelled accordingly in code. The wrapper permanently
-labels them; the engine's public `setLevels` consumer path is used unchanged. The named
-speaking state during text display does **not** assert TTS playback. A future audio path
-must replace synthesis with measured levels/`attachElement`; audio is not implemented here.
+ruling for text turns. Bridge frames (`source: synthesised-text`, `measured: false`) drive speaking on the wire;
+standalone previews use labelled synthetic typewriter levels. A reply or `state:speaking`
+frame alone does not enter speaking. The engine's public `setLevels` API is unchanged.
+**F29: the daemon gateway is the sole playback owner.** Reply `audio` is explicitly dropped
+at bridge, wire adapter and renderer boundaries. No client Audio/play/attachElement path
+exists. A future measured-level feed must not introduce a second mouth. Audio pane work
+remains deferred; no live manifest feed or playback proof is claimed.
 
 Readiness contract correction (2026-11-03): use the nested
 `connectivity.effective_mode == "ONLINE"`, the preference-resolved enum used by
@@ -238,9 +240,9 @@ loop and uSizeScale lines, no `beatT`, no floors) and the palette rows.
 { simulate: true, fit: 1.8 })` — `fit: 1.8` is the maker's snippet verbatim, his own number for a
 narrow side panel; `simulate` is the maker's designed option and the console needs it pre-wire so she
 reads "simulated" honestly instead of frozen. Everything else is shell-side: layout, panes, commands,
-lamps, sessions, wire consumers. When the wire lands, her voice enters through the maker's sanctioned
-hooks — `setLevels('output', {level})` per audio frame, or `attachElement(audioEl)` — consumer-side,
-and the priority path for §5 wire consumers. Call `destroy()` if the panel is ever removed (the
+lamps, sessions, wire consumers. Output uses the maker's sanctioned
+`setLevels('output', {level})` API. F29 forbids console playback/attachElement even though
+the unchanged maker engine offers that API; playback belongs solely to the daemon gateway. Call `destroy()` if the panel is ever removed (the
 console never removes the rail; the floating mini-orb is a move, not a removal). The maker's cautions
 are verified shell-side: the container has a real height (`.stage-box` is `flex: 1 1 auto;
 min-height: 0` inside a definite grid row, with an 80% maximum stage height; no floating
@@ -335,7 +337,11 @@ Reply frames may include `attribution`, an array of bounded plain-text observati
 from `text`/`error`. The shell renders at most 24 strings of at most 1000 characters using
 textContent, persists them with the displayed message, and tolerates absent/invalid metadata.
 These observations are not model prose, journal events, approvals or inferred effect receipts.
-The bridge adds no RPC; a sampled conversation tail is explicitly not request-bound.
+The bridge adds no RPC. On the 4218ef0 producer contract, direct `message_id` and
+`user_message_id` are causal turn-append IDs; a sampled legacy history tail remains
+explicitly noncausal. Structured remember/forget receipts show actual fact IDs, readback
+states and correlation identity, with absent versions/durable receipts labelled. No prose
+parsing invents an ID. See `console/CONSUMER-CONTRACT.md`.
 
 ### Single-operation undo review (Task F, e7316b9 / §9 consumer)
 

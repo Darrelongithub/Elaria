@@ -33,13 +33,13 @@ hard stop, not permission to fetch, install or reconstruct something from chat.
 
 Committed executable: **`console/run_bridge.py`**.
 
-SHA256: **`594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791`**.
+SHA256: **`b1f7a632e060d329a702cb99fe88b2f5663d2beede3beb3ee32b59a23c2da8ed`**.
 
 From a copy containing this release's `console/` payload and the existing `.venv` interpreter,
 this is one physical command line. It checks the launcher before Python runs; the launcher
 then checks all five payload hashes before importing the bridge. A mismatch stops.
 
-`test "$(sha256sum console/run_bridge.py)" = '594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --open`
+`test "$(sha256sum console/run_bridge.py)" = 'b1f7a632e060d329a702cb99fe88b2f5663d2beede3beb3ee32b59a23c2da8ed  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --open`
 
 `-I` isolates Python import paths; `-B` avoids bytecode writes. No standalone install, branch
 switch or mainline deployment is performed by this command. If using an extracted bundle
@@ -52,13 +52,13 @@ existing interpreter is `/home/darrel/Elaria/.venv/bin/python`, this alternative
 uses it without copying files into or switching that checkout. A missing interpreter or
 checksum mismatch stops; there is no install/repair fallback.
 
-`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = '594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py --open`
+`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = 'b1f7a632e060d329a702cb99fe88b2f5663d2beede3beb3ee32b59a23c2da8ed  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py --open`
 
 Optional **`--check`** performs artifact/dependency checks and one existing-daemon `status`
 RPC, then exits; it creates no launch file/profile, opens no browser/server, and sends no
 chat/model/voice turn. It is mutually exclusive with `--open`. Exact checkout preflight:
 
-`test "$(sha256sum console/run_bridge.py)" = '594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --check`
+`test "$(sha256sum console/run_bridge.py)" = 'b1f7a632e060d329a702cb99fe88b2f5663d2beede3beb3ee32b59a23c2da8ed  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --check`
 
 `--socket` accepts an explicit absolute existing socket path when XDG_RUNTIME_DIR is
 unavailable. There is no guessed socket, alternate host, auto-start, paid/model fallback or
@@ -83,7 +83,7 @@ A 0700 `elaria-console-<random>` directory is created beside the daemon socket, 
 For manual mode, use the following verified invocation and open that local file on the same
 machine as the daemon. Do not share/read its contents into logs; it contains the live token.
 
-`test "$(sha256sum console/run_bridge.py)" = '594bde664e62da42f391bf83b09a4b1ae913387d1ee27031f0e1376dace71791  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
+`test "$(sha256sum console/run_bridge.py)" = 'b1f7a632e060d329a702cb99fe88b2f5663d2beede3beb3ee32b59a23c2da8ed  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
 
 The browser is detached with a new POSIX session, closed inherited FDs and null standard
 streams. Only desktop/session/locale environment is passed; model keys, SSH agents and shell
@@ -138,7 +138,9 @@ A green connection is not proof of a model answer. No empty placeholder arrays f
 badges LIVE. The shell footer labels text-only operation and synthesised cadence; the wrapper has no
 normal-operation banner. Locked/expired-link failures remain explicit.
 The original engine is byte-identical under `gate_verbatim`; no visualizer knob/shader edit.
-The browser audio consumer hook `attachElement` exists, but this bridge does not deliver audio.
+F29: the daemon gateway is the sole playback owner. Reply audio is explicitly dropped;
+the shell has no playback/attachElement path. Speaking follows output levels only. The
+audio pane remains deferred (metadata samples are not a production feed).
 
 The shell's browser tabs do **not** create independent daemon conversations. Browser history
 is capped/trimmed display context and is not injected into model history; the existing daemon
@@ -198,7 +200,7 @@ and one pane cannot promote another. The shared-conversation fact is documented 
 not repeated in the visible shell. Explicit samples are still labelled samples.
 
 `history_limit=1` is unchanged: it trims console.say's returned conversation envelope, which
-is not rendered as history (Task A only labels a matching ID noncausal). It does not control _ask's separate eight-message retrieval /
+is not rendered as history (legacy matching tails are noncausal; producer causal IDs are separate). It does not control _ask's separate eight-message retrieval /
 six-message prompt window. Increasing it alone would not cure unsupported capability claims.
 
 **WS2 boundary adopted and implemented:** the fixed registry below supplies capability
@@ -217,15 +219,17 @@ model prose and not a newly invented operation journal. Input-shape recognition 
 not a dispatcher; unclassified/local-awareness/guest outcomes remain visible through actual
 reply provenance. No added RPC, database lookup or daemon change.
 
-Available: bridge observation ID; actual reply provenance; returned conversation ID; a
-matching history-tail message ID explicitly **not request-bound**; local lookup hit text
-labelled unstructured versus model fallback; exact forget count when its local reply matches
-the producer's format, with **deactivation-not-erasure**; organise plan IDs reported in its
-reply and audited write-kind semantics, not completed-write evidence.
+Available: bridge observation ID; reply provenance and conversation ID; direct producer
+message_id/user_message_id from the actual turn appends (4218ef0/7b374d1), not a sampled tail.
+Remember receipts show fact ID/kind/source/confidence/active, until_forgotten retention and
+row_preserved_no_api restore limits. Forget receipts show affected IDs and readback states,
+correlation ID/time, zero-match honestly, and declared absence of versions/durable receipts.
+These are daemon-reported receipts, not independent effect verification. Bounded output
+explicitly counts omitted IDs. Legacy/malformed/missing replies disclose only their actual gaps.
+Local indexed hit text and organise references retain their earlier qualified semantics.
 
-Missing on console.say: executed-intent identity, request-bound message/operation journal
-refs, structured index refs, remember fact ID/kind, and organise resolved roots/write receipt.
-Those gaps are visible and requested as mainline seams, not inferred from neighbouring rows.
+Still missing: general executed-intent identity, operation journal refs, structured index refs,
+and organise resolved roots/write receipts. No neighbouring row is used to invent these.
 Withheld/fixture/invalid replies expose no hidden history or effect details. See
 `docs/phase-reports/console-2026-11-04-task-a-attribution.md`.
 

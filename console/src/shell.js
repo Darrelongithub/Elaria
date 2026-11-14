@@ -11,8 +11,8 @@
  *
  * INTEGRATION POINTS (nothing below pretends a backend exists)
  *   ElariaShell.connect({ name, send(text, ctx) })   daemon wire. send resolves to a string or
- *                                                    { text, audio } where audio is a URL or an
- *                                                    <audio> element (CORS-enabled) for her voice.
+ *                                                    { text, attribution }; reply audio is DROPPED.
+ *                                                    F29: daemon gateway is sole playback owner.
  *   ElariaShell.disconnect()                         wire lost: lamps, offline state, notification.
  *   ElariaShell.notify({ text, speak })              proactive tap on the shoulder from the daemon.
  *   ElariaShell.say(text)                            push an unprompted reply into the log.
@@ -117,7 +117,7 @@
   const statusText = () => 'lamps, honestly:\n\n' +
     '  console   [ON]              this window, running, local\n' +
     '  daemon    [' + (daemon ? 'CONNECTED' : 'NOT CONNECTED') + ']   ' + (daemon ? 'adapter attached' : 'connection not established') + '\n' +
-    '  voice     [' + (micOn || clip ? 'CONNECTED' : 'NOT CONNECTED') + ']   ' + (micOn ? 'microphone live' : clip ? 'her voice playing' : 'no audio path from this window') + '\n' +
+    '  voice     [' + (micOn ? 'CONNECTED' : 'NOT CONNECTED') + ']   ' + (micOn ? 'microphone live' : 'no audio path from this window') + '\n' +
     '  wire      [' + (daemon ? 'CONNECTED' : 'ABSENT') + ']          ' + (daemon ? 'bridge up' : 'connection not established') + '\n\n' +
     'Text replies use the attached adapter. Connection is not a claim that journal, manifest, memory or speech feeds are present; each pane keeps its own status.';
 
@@ -135,7 +135,7 @@
   /* ------------------------------------------------------------------ runtime state */
   let V = null, vizErr = '';
   let state = 'idle', busy = false, forcedOffline = false, micOn = false, simOn = true;
-  let daemon = null, clip = null, endClip = null, skip = false, voiceTimer = 0, typeT = 0;
+  let daemon = null, skip = false, voiceTimer = 0, typeT = 0;
   let pinned = true, demoOn = false, wipeArmed = false, away = null;
   let openSec = null;          // which sidebar section is folded open
   let fullPane = null;         // which pane is full screen
@@ -159,15 +159,26 @@
     el.rs.classList.remove('sw'); void el.rs.offsetWidth; el.rs.classList.add('sw');
     syncOrb();
   }
-  function setState(s) { if (s === state) return; state = s; if (V) V.setState(s); paintState(s); }
-  const setLevels = (role, level) => { if (V) V.setLevels(role, { level }); };
+  // F29: only output levels can enter speaking. A reply/state flag is not playback evidence.
+  function setState(s, fromLevels = false) {
+    if ((s === 'speaking' && !fromLevels) || s === state) return;
+    state = s; if (V) V.setState(s); paintState(s);
+  }
+  const setLevels = (role, level) => {
+    if (!['input', 'output'].includes(role) || !Number.isFinite(level) || level < 0 || level > 1) return;
+    if (V) V.setLevels(role, { level });
+    if (role === 'output' && !forcedOffline) {
+      if (level > 0) setState('speaking', true);
+      else if (state === 'speaking') setState(busy ? 'thinking' : micOn ? 'listening' : 'idle');
+    }
+  };
   function settle() { if (busy || voiceTimer) return; setState(forcedOffline ? 'offline' : micOn ? 'listening' : 'idle'); }
   function lamps() {
-    const on = { console: 'ok', daemon: daemon ? 'ok' : 'wait', voice: (micOn || clip) ? 'ok' : 'wait', wire: daemon ? 'ok' : 'gone' };
+    const on = { console: 'ok', daemon: daemon ? 'ok' : 'wait', voice: (micOn) ? 'ok' : 'wait', wire: daemon ? 'ok' : 'gone' };
     const titles = {
       console: 'console — this local window is running',
       daemon: daemon ? 'daemon — adapter attached' : 'daemon — not connected',
-      voice: micOn ? 'microphone input live' : clip ? 'adapter audio attached' : 'voice — no audio path from this window',
+      voice: micOn ? 'microphone input live' : 'voice — no audio path from this window',
       wire: daemon ? 'wire — connected; not proof of model output or an action' : 'wire — not connected'
     };
     document.querySelectorAll('[data-lamp]').forEach((li) => {
@@ -277,11 +288,11 @@
   }
   function pulseVoice(ms) {
     if (busy || forcedOffline) return;
-    clearInterval(voiceTimer); setState('speaking');
+    clearInterval(voiceTimer); // labelled synthetic levels below, never a speech request
     const end = performance.now() + ms;
     voiceTimer = setInterval(() => {
       const t = performance.now();
-      if (t >= end) { clearInterval(voiceTimer); voiceTimer = 0; settle(); return; }
+      if (t >= end) { clearInterval(voiceTimer); voiceTimer = 0; setLevels('output', 0); settle(); return; }
       setLevels('output', .3 + .5 * Math.abs(Math.sin(t / 110)) * Math.random());
     }, 45);
   }
@@ -454,7 +465,7 @@
       });
     } else {
       const rows = liveAU || (demoOn ? DEMO_AU : null);
-      b.append(h('p', 'mini', rows ? rows.length + ' rows shown.' : 'No audio manifest rows received. ' + AU_COLS + '.'));
+      b.append(h('p', 'mini', rows ? rows.length + ' rows shown.' : 'Deferred — no production audio pane feed. No audio manifest rows received. ' + AU_COLS + '.'));
       b.append(h('p', 'mini', CENSUS));
       const mb = h('button', 'sbtn'); mb.type = 'button';
       mb.textContent = micOn ? 'stop microphone' : 'use microphone';
@@ -579,8 +590,7 @@
      by the wire, the microphone, or her typing. /state and /sim stay as hidden commands for testing,
      and nothing on screen pretends otherwise. */
   function syncOrb() {
-    el.orbnote.textContent = clip ? 'adapter audio attached; playback is not guaranteed'
-      : (micOn ? 'microphone input live · text output: ' : '') +
+    el.orbnote.textContent = (micOn ? 'microphone input live · text output: ' : '') +
         'synthesised text cadence, not measured audio · text-only, no speech';
   }
 
@@ -646,6 +656,7 @@
     { n: 'state', u: '/state NAME', d: 'her orb: idle, listening, thinking, speaking, offline', f: (a) => {
       const s = (a || '').toLowerCase();
       if (!LABEL[s]) return out('states: ' + Object.keys(LABEL).join(', '));
+      if (s === 'speaking') return out('Speaking follows output levels only; synthetic cadence is not speech.');
       forcedOffline = s === 'offline'; setState(s); } },
     { n: 'notify', u: '/notify TEXT', d: 'preview the mini-orb notification', f: (a) => notify({ text: a || 'Elaria here. I look like this when I have something to say.', speak: true, log: false }) },
     { n: 'mic', u: '/mic', d: 'attach or release the microphone', f: () => toggleMic() },
@@ -684,7 +695,7 @@
   }
 
   /* ------------------------------------------------------------------ conversation */
-  // SYNTHESISED TEXT CADENCE, never measured audio. Audio uses attachElement instead.
+  // SYNTHESISED TEXT CADENCE, never measured audio. F29: no client playback/attachElement.
   const levelFor = (ch) => (/[\s.,;:!?]/.test(ch) ? .06 : .38 + Math.random() * .5);
   let abortType = null;
   function typeInto(body, text) {
@@ -692,13 +703,13 @@
       let i = 0; const per = Math.max(1, Math.ceil(text.length / 260));
       const finish = () => {
         clearTimeout(typeT); typeT = 0; abortType = null;
-        body.innerHTML = paintHer(text); pin(); res();
+        body.innerHTML = paintHer(text); if (!wireRequested) setLevels('output', 0); pin(); res();
       };
       abortType = finish;
       (function tick() {
         i = skip ? text.length : Math.min(text.length, i + per);
         body.textContent = text.slice(0, i);
-        setLevels('output', skip ? 0 : levelFor(text[i - 1] || ' '));
+        if (!wireRequested) setLevels('output', skip ? 0 : levelFor(text[i - 1] || ' '));
         pin();
         if (i >= text.length) return finish();
         typeT = setTimeout(tick, 24);
@@ -711,19 +722,7 @@
   function interrupt() {
     if (!busy) return;
     skip = true;
-    if (clip) { try { clip.pause(); } catch (e) { /* already gone */ } }
-    if (endClip) endClip();
     if (abortType) abortType();
-  }
-  function playClip(src) {
-    const a = typeof src === 'string' ? new Audio(src) : src;
-    if (V) { try { V.attachElement(a); } catch (e) { /* cross-origin audio cannot be analysed */ } }
-    clip = a; lamps(); syncOrb();
-    return new Promise((r) => {
-      endClip = () => { endClip = null; clip = null; lamps(); syncOrb(); r(); };
-      a.onended = a.onerror = endClip;
-      a.play().catch(endClip);
-    });
   }
   /* Undo pilot: private, memory-only, connection-bound. Never stored in sessions or notifications. */
   let undoCard = null, undoPrivate = false;
@@ -817,12 +816,13 @@
 
   async function deliver(rep, owner) {
     const s = owner || cur();                       // bound at send time: an interrupt or a session
-    const text = typeof rep === 'string' ? rep : String(rep.text || ''), audio = rep && rep.audio;  // switch must not
+    // F29: deliberately DROP reply.audio without reading it (URL, element or getter).
+    // The daemon gateway is the sole playback owner; the console must never double-play.
+    const text = typeof rep === 'string' ? rep : String(rep.text || '');  // switch must not
     const m = msgEl('ai', ''), body = m.querySelector('.body');                                    // move her reply
     body.classList.add('typing'); el.pad.append(m); pin();                                          // into another session
-    el.log.setAttribute('aria-busy', 'true'); setState('speaking');
-    const ended = audio ? playClip(audio) : Promise.resolve();
-    await typeInto(body, text); await ended;
+    el.log.setAttribute('aria-busy', 'true');
+    await typeInto(body, text);
     body.classList.remove('typing'); el.log.removeAttribute('aria-busy'); skip = false;
     const receipt = receiptEl(rep && rep.attribution); if (receipt) m.append(receipt);
     pushTo(s, 'ai', text, rep && rep.attribution);
@@ -980,7 +980,8 @@
         const id = ++n;
         pend.set(id, (m) => {
           if (m.error) { const error = new Error(m.error); error.attribution = receiptRows(m.attribution); rej(error); }
-          else res({ text: m.text || '', audio: m.audio, attribution: receiptRows(m.attribution), undoReview:m.undo_review });
+          // F29: drop audio at the wire boundary as well as the adapter renderer.
+          else res({ text: m.text || '', attribution: receiptRows(m.attribution), undoReview:m.undo_review });
         });
         const message = { t: 'send', id, text, session: ctx && ctx.session,
           history: ctx && ctx.history ? ctx.history.slice(-20) : [] };
