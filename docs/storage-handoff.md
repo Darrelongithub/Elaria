@@ -2336,3 +2336,42 @@ mover, an injectable clock, and a `Verification` object rather than a bare bool 
 flip's reason names `local-path-fixture, hash` instead of `opaque-verifier`. The grace
 clock produces zero actions on day 13 of 14 and purges on day 15. Against a local-path
 fixture. **The one thing it does not prove is the network, and it says so.**
+
+---
+
+## 2026-11-04 - FIRING NINE, and F24 pre-flights built
+
+**FIRING NINE (a full re-clone, the ninth).** The sandbox re-cloned onto
+`arena/e7a1cca5-elaria` @ `ed20344` with the SAME 30 files of foreign uncommitted work -
+the 177,646-byte patch is byte-identical to firings seven and eight. Ran the report-020
+method as a checklist with the preserve step first; frozen hash verified before and after;
+explicit-URL fetch; integrity check (`9bf19c5`, all four files present); local-only
+checkout; verify after. **The preserve step has now earned its keep five times.**
+
+**THE THREE BLOCKERS RE-MEASURED, unchanged:** MEGA still network-blocked (curl exit 35
+while github.com returns 200); restic and rclone still absent; the named wav
+`20261102-100558-61258b` and `audio/` still absent. The owner's grant is real and his wav
+is named; the environment is still fenced against acting on it.
+
+**F24 PRE-FLIGHTS BUILT** (`src/assistant/preflight.py`, new; wired into `backup_cli.py`).
+
+1. **The remote headroom gate.** Reads `remote_free` and refuses to start below
+   scratch-plus-margin. An UNREADABLE `remote_free` is a refusal, not a pass - the same
+   posture as a missing restic being a declared skip. The scratch is DERIVED from the
+   benchmark's own parameters rather than asserted: 500 MiB x 2 repos of payload, plus
+   128 MiB x (4+1) of restic temp space = 1,719,664,640 B (1.60 GiB); +1 GB margin =
+   2,719,664,640 B (2.53 GiB) required.
+2. **The local headroom gate.** Before a drill writes a restored artifact, check the
+   destination's free space and name the required headroom in the record. Verified live:
+   with an absurd margin the drill refuses at exit 2 and the record reads
+   `required=10000000000008044 (scratch=8044 + margin=10000000000000000)`.
+
+**The gate PREVENTS, it does not interrupt.** It runs before any planning, so a run that
+cannot finish never starts. A dry run is exempt - it makes no remote traffic, so gating it
+on the remote would be the gate over-reaching. Pinned by test.
+
+**ONE EXISTING TEST NEEDED A REAL FIX, AND IT WAS THE RIGHT ONE:**
+`test_run_refuses_without_a_verifier` set `ctx.verifier = None` but left
+`remote_free_bytes = None`, so since F24 it now refuses at the headroom gate first. The
+test now supplies ample headroom so it reaches the verifier check it was always testing.
+The original refusal is still covered; the new precedence is pinned separately.

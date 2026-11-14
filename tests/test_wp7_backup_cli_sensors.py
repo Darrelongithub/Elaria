@@ -428,10 +428,17 @@ def test_run_dry_run_changes_nothing_and_contacts_nothing(tmp_path):
 
 
 def test_run_refuses_without_a_verifier(tmp_path):
-    """Increment 2's refusal, still standing: no verifier, no flip."""
+    """Increment 2's refusal, still standing: no verifier, no flip.
+
+    Headroom is supplied explicitly so this test reaches the verifier check at all.
+    Since F24 the remote headroom gate runs FIRST, so an unknown `remote_free` now
+    refuses earlier — which is the point of a gate that prevents rather than
+    interrupts. `test_run_refuses_before_starting_without_headroom` pins that.
+    """
 
     ctx, art = _fixture_ctx(tmp_path, state=UPLOADED)
     _age(art, days=30)          # past the window, so the refusal path is reached
+    ctx.with_remote_free(20 * 1000 ** 3)   # ample headroom: get past the F24 gate
     ctx.verifier = None
     out = io.StringIO()
     code = backup_command(_Args(backup_action="run", dry_run=False), None,

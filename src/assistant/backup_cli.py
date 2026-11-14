@@ -34,7 +34,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from . import sensors
+from . import preflight, sensors
 from .backup import plan_reconcile, reconcile_all
 from .remote import LocalPathBackend, Verification, make_verifier
 from .storage import StorageManifest
@@ -165,6 +165,40 @@ class BackupContext:
     def with_remote_free(self, value: int | None) -> BackupContext:
         self.remote_free_bytes = value
         return self
+
+    # -- F24 pre-flights ---------------------------------------------------------------
+    # The capacity-floor knock must PREVENT, not interrupt. A gate read after the
+    # upload has already cost the owner the upload.
+
+    def remote_preflight(self, *, scratch_bytes: int | None = None,
+                         margin_bytes: int | None = None) -> preflight.HeadroomDecision:
+        """Whether the remote has room for this run's scratch, before it starts.
+
+        `scratch_bytes` defaults to the benchmark's own derived figure; `margin_bytes`
+        defaults to the `[backup] bench_headroom_margin_gb` key. Both are named in the
+        decision, so a refusal can be checked rather than re-measured.
+        """
+
+        if scratch_bytes is None:
+            scratch_bytes = preflight.bench_scratch_bytes(
+                pack_mib=int(self.section.get("restic_pack_size_mib", 128)),
+                connections=preflight.RESTIC_BACKEND_CONNECTIONS)
+        if margin_bytes is None:
+            margin_bytes = int(self.section.get("bench_headroom_margin_gb", 1)) * 1000 ** 3
+        return preflight.remote_headroom(
+            self.remote_free_bytes, scratch_bytes=scratch_bytes,
+            margin_bytes=margin_bytes)
+
+    def local_preflight(self, *, required_bytes: int,
+                        artifact_bytes: int = 0, margin_bytes: int = 0,
+                        directory: str | Path | None = None
+                        ) -> preflight.HeadroomDecision:
+        """Whether the local filesystem can hold a restore of `required_bytes`."""
+
+        target = Path(directory) if directory is not None else self.data_dir
+        return preflight.local_headroom(target, required_bytes=required_bytes,
+                                        artifact_bytes=artifact_bytes,
+                                        margin_bytes=margin_bytes)
 
     # -- derived ------------------------------------------------------------------------
 
@@ -303,6 +337,15 @@ def _run(ctx: BackupContext, *, out, dry_run: bool = False) -> int:
         print("dry run: no manifest change, no remote traffic", file=out)
         return 0
 
+    # F24 remote pre-flight, before any planning. The capacity-floor knock must
+    # prevent, not interrupt: reading it here means a run that cannot finish never
+    # starts, rather than stopping halfway and having already cost the upload.
+    gate = ctx.remote_preflight()
+    if not gate.ok:
+        sensors.backup_failed(reason=f"headroom refused ({gate.reason})", stream=out)
+        print(f"backup run: REFUSED - {gate.detail()}", file=out)
+        return 2
+
     if ctx.verifier is None:
         sensors.backup_failed(reason="no remote verifier configured", stream=out)
         print("backup run: no remote verifier configured; refusing to plan a flip "
@@ -387,6 +430,27 @@ def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
         return 0
     else:
         chosen = (rng or random.Random()).choice(cold)
+
+    # F24 local pre-flight, before the restore write. A restore that dies at 90%
+    # because the disk filled has written a partial file and proved nothing, so the
+    # required headroom is named in the record rather than left to be discovered.
+    margin = int(ctx.section.get("restore_headroom_margin_gb", 1)) * 1000 ** 3
+    required = preflight.restore_headroom_bytes(
+        chosen.size if chosen.size is not None else 0, margin_bytes=margin)
+    local_gate = ctx.local_preflight(required_bytes=required,
+                                      artifact_bytes=chosen.size or 0,
+                                      margin_bytes=margin)
+    if not local_gate.ok:
+        sensors.backup_check(kind=kind, ok=False,
+                             detail=f"reason=local headroom ({local_gate.reason}); "
+                                    f"required={required}B",
+                             stream=out)
+        print(f"backup check: REFUSED - {local_gate.detail()}", file=out)
+        _record_drill(journal, kind=kind, ok=False, ctx=ctx, restic=restic,
+                      detail=f"refused=local headroom; required={required}B; "
+                             f"reason={local_gate.reason}",
+                      now=now)
+        return 2
 
     target = Path(tempfile.mkdtemp(prefix="elaria-drill-")) / Path(
         chosen.artifact).name
