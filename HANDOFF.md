@@ -1,14 +1,30 @@
 # HANDOFF — cold-resume state (Blueprint v2 wiring spec build)
 
-Last updated: 2026-10-26 (scene-3b evidence triaged: streams A–C; the
-release-path probe is the owner's next scene; merge gate RESTATED unchanged
-and still red)
+Last updated: 2026-11-14 (Tasks J/K/L landed on separate commits — EARS
+`7d0d3ca`, GATEWAY `b38b1b1`, MOUTH `b1897ff`; suite 2,120 passed / 6 skipped
+in 183.67 s; report `docs/phase-reports/2026-11-14-tasks-j-k-l.md`. Owner
+hardware acceptance for K and L is PENDING; merge gate RESTATED unchanged and
+still red)
 Branch: `arena/c2a7085d-elaria` · base `ed20344` (main)
 Authority: MASTER BUILD PROMPT — ELARIA, BLUEPRINT V2 WIRING SPEC (2026-10-25)
 
 Read this first after any interruption. Phase reports live in
 `docs/phase-reports/` (DONE / DEFECTS FOUND / NEXT GATE / OPEN QUESTIONS in
 each).
+
+## 0. Tasks J/K/L (2026-11-14) — landed, awaiting the owner's ears
+
+| task | commit | what it now does | evidence |
+| --- | --- | --- | --- |
+| J EARS | `7d0d3ca` | silence stripped before ASR by the capture `FrameGate`; local faster-whisper is the dictation primary (tier `base`); escalation below 0.65 local confidence through the existing chain and labelled `double-pass` only when both legs produced words; per-leg provenance (never text); mutating intents still 0.85; cancel zeroizes + releases + journals; soft-limiter with raw AND processed peaks + xruns in doctor; model downloads pinned by revision+hash | 20 pins `tests/test_task_j_ears.py`; one owner dictation run still owed |
+| K GATEWAY | `b38b1b1` | `audio_gateway.py` is the one owner of PTT/dictation capture and whole-reply playback (F17 node policy, F28 arbitration table + bounded reply claim, F16 whole replies, F30 cancel); daemon capture + both playback paths rewired; `status.gateway` reports it | 16 fake-device pins `tests/test_task_k_gateway.py`; **owner hardware is the only audio acceptance** |
+| L MOUTH | `b1897ff` | cache key = text + voice + per-route settings hash; `voice-cache/` declared, LRU-capped (`[tts] cache_max_files`, 120) and excluded from tiering; 429/failure renders LABELLED text (`speech_status`), never silence or a speech claim; consent (undo ask / No line) can never be voiced — F21 | 12 pins `tests/test_task_l_mouth.py`; one spoken reply on hardware pending |
+
+Installer's single config touch for these tasks:
+`bind = , Escape, exec, assist ptt cancel`.
+Still deliberately outside the gateway (needs its own grant): the always-on
+hotword capture, `event.py`'s event capture, `_meeting_start`'s dual capture,
+and `live_client.py`'s live stream (PROTECTED).
 
 ## 1. Where the build is
 
