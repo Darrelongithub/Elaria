@@ -454,7 +454,11 @@ def test_shape_200_empty_then_local_lands(config, tmp_path, monkeypatch):
     ])
     assert result.raw_text == "Recovered words from the saved audio."
     marks = [ln for ln in lines.splitlines() if "transcription.backend" in ln]
-    assert marks and "empty" in marks[0] and "gemini_batch" in marks[0]
+    # J3 (2026-11-05): dictation is LOCAL FIRST now, so the primary leg's own
+    # mark is written before the chain runs. The chain's gemini_batch mark is
+    # still the one that must say "empty".
+    gemini_mark = next(ln for ln in marks if "gemini_batch" in ln)
+    assert "empty" in gemini_mark
     assert "fallback.outcome" in lines and "landed" in lines
     assert "transcription.starvation" not in lines
     order = [ln for ln in lines.splitlines()
@@ -472,8 +476,10 @@ def test_shape_429_falls_through_to_local(config, tmp_path, monkeypatch):
         _FakeBackend("local", text="Whispered after the rate refusal."),
     ])
     assert result.raw_text == "Whispered after the rate refusal."
-    mark = next(ln for ln in lines.splitlines() if "transcription.backend" in ln)
-    assert "failed" in mark and "429" in mark and "gemini_batch" in mark
+    # J3: local runs first, so select the chain's gemini_batch class-mark.
+    mark = next(ln for ln in lines.splitlines()
+                if "transcription.backend" in ln and "gemini_batch" in ln)
+    assert "failed" in mark and "429" in mark
 
 
 def test_shape_all_backends_failed_starves_legibly(config, tmp_path,

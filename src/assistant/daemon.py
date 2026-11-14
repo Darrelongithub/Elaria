@@ -231,6 +231,7 @@ class Daemon:
         self._dictation_task: asyncio.Task | None = None
         self._dictation_session_mode = "narration"
         self._capture_source = None
+        self._last_capture_diag: dict | None = None
         # Single-op undo review pilot (owner ruling 2026-11-04): token ->
         # immutable ask. Memory only, single-use, expires (UNDO_ASK_TTL_S).
         self._undo_asks: dict[str, dict] = {}
@@ -933,6 +934,10 @@ class Daemon:
             "outstanding_intents": len(self.store.outstanding_intents()),
             "dictation_active": bool(self._dictation_task and not self._dictation_task.done()),
             "dictation_processing": self._ptt_processing,
+            # J5: the last session's measured levels — raw and processed peaks
+            # plus the dropout count. Doctor prints these; the limiter is not
+            # allowed to be the only witness to what it did.
+            "capture_diag": getattr(self, "_last_capture_diag", None),
             # W7a (2026-10-31): `ptt_session_id` names a LIVE session only
             # — exactly while a holder row exists (the scene-7 evidence:
             # a closed session's id kept being advertised 14 s later with
@@ -1849,6 +1854,9 @@ class Daemon:
                 simulated = True
                 self._ptt_log("ptt.start.capture_spawn_fallback", target=str(target or "default"), reason=str(exc)[:120], kind="SimulatedCapture")
         self._stop_event = asyncio.Event()
+        # J4/F30: Escape is a different signal from release, and it must reach
+        # the session that is already capturing.
+        self._cancel_event = asyncio.Event()
         self._dictation_session_mode = str(params.get("mode") or "narration")
         self.mode = "listening"
         self._ptt_log("ptt.start.mode_listening", mode=self.mode)
@@ -1864,6 +1872,9 @@ class Daemon:
             # landed, so a silent session never queues this playback at all.
             if event.get("event") == "session.checkin" and self.speech.cached_ack("checkin"):
                 self._queue_ack_playback("checkin")
+            if event.get("event") == "session.ended" and event.get("capture"):
+                # J5: both peaks and the dropout count, kept for doctor.
+                self._last_capture_diag = dict(event["capture"])
             if event.get("event") == "session.silent_close":
                 # Rule 1: carry the plain line to console status live — a
                 # session that closed itself must not wait for a release.
@@ -1874,6 +1885,17 @@ class Daemon:
         # gets the same playback probe so its own uplink gate agrees with the
         # daemon's half-duplex state, instead of relying on the wrapper alone.
         muted_source = self._wrap_muted(self._capture_source)
+        # J4: the session reads the cancel event off the service, the same way
+        # it has always read the stop event from this call site.
+        try:
+            self.dictation.cancel_event = self._cancel_event
+        except Exception as exc:  # noqa: S110 - a stub without the attribute
+            # A dictation double that refuses attributes simply cannot be
+            # cancelled; the session still stops on release. Logged, never
+            # silent, because a cancel that cannot reach the session is a
+            # capability gap the owner should be able to see.
+            self._ptt_log("ptt.start.cancel_unavailable",
+                          error=f"{type(exc).__name__}: {exc}"[:200])
         session_id = uuid.uuid4().hex[:12]
         old_session_id = self._ptt_session_id
         self._ptt_session_id = session_id
@@ -2033,6 +2055,86 @@ class Daemon:
                 f"parameter 'wait_s' must not exceed {MAX_PTT_WAIT_S:g} seconds")
         return wait_s
 
+    #: How long a cancel waits for the session to destroy its own buffer.
+    CANCEL_JOIN_TIMEOUT_S = 2.0
+
+    async def _cancel_dictation(self, params: dict, *,
+                                cancel_source: str | None = None) -> dict:
+        """Escape: end the capture, destroy the partial audio, keep nothing.
+
+        Three things must be true before this answers, and the answer says
+        which of them were (never assumes the third):
+
+        1. the session stopped capturing (cancel_event + stop_event set);
+        2. the partial buffer was ZEROIZED — done by the session itself, so
+           the claim is only made when the session actually reports it;
+        3. the capture node was released (aclose), so the mic is not held by
+           a session nobody wants.
+
+        No transcript, no dispatch, no speech. The journal carries a
+        `capture.cancel` line from the session (F30) and a `cancel.release`
+        line from here.
+        """
+        session_id = self._ptt_session_id
+        self._ptt_log("ptt.cancel.received",
+                      session_id=str(session_id or ""),
+                      source=str(params.get("stop_source") or "cli"))
+        log_event("cancel.requested", session_id=str(session_id or ""),
+                  verdict="cancelled",
+                  detail=f"source={params.get('stop_source') or 'cli'}")
+        cancel_event = getattr(self, "_cancel_event", None)
+        if cancel_event is None:
+            cancel_event = asyncio.Event()
+            self._cancel_event = cancel_event
+        cancel_event.set()
+        if self._stop_event:
+            self._stop_event.set()
+        task, self._dictation_task = self._dictation_task, None
+        zeroized = False
+        cancelled_task = False
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task),
+                                       timeout=self.CANCEL_JOIN_TIMEOUT_S)
+            except TimeoutError:
+                # The session did not stop in time: kill the task and say so.
+                # Claiming zeroization here would be exactly the kind of
+                # unverified claim this lane exists to delete.
+                task.cancel()
+                cancelled_task = True
+                await asyncio.gather(task, return_exceptions=True)
+            except asyncio.CancelledError:
+                cancelled_task = True
+            else:
+                result = None
+                try:
+                    result = task.result()
+                except Exception:
+                    result = None
+                zeroized = bool(getattr(result, "cancelled", False))
+        source, self._capture_source = self._capture_source, None
+        released = False
+        if source is not None:
+            try:
+                await source.aclose()
+                released = True
+            except Exception as exc:
+                self._ptt_log("ptt.cancel.release_failed",
+                              error=f"{type(exc).__name__}: {exc}"[:200])
+        if self.mode == "listening":
+            self.mode = "idle"
+            await self.broadcast({"event": "status.changed", "mode": self.mode})
+        log_event("cancel.release", session_id=str(session_id or ""),
+                  verdict="released" if released else "release_unproven",
+                  detail=(f"zeroized={zeroized}; task_killed={cancelled_task}; "
+                          f"node_released={released}; nothing transcribed"))
+        self._ptt_log("ptt.cancel.done", session_id=str(session_id or ""),
+                      zeroized=zeroized, released=released)
+        return {"cancelled": True, "session_id": session_id,
+                "zeroized": zeroized, "task_killed": cancelled_task,
+                "node_released": released, "transcribed": False,
+                "mode": self.mode}
+
     async def _ptt_stop(self, params: dict) -> dict:
         """Release: acknowledge in-process, finish the session in the background.
 
@@ -2049,6 +2151,11 @@ class Daemon:
         open for a moment, more of her own audio to transcribe. `speak=False`
         also means the reply cannot wait on the boot-time ack cache warm.
         """
+        if params.get("cancel"):
+            # Not a dispatch entry: a cancel rides ptt.stop with a flag, so the
+            # bind needs no second route (and the handler table stays honest).
+            return await self._cancel_dictation(
+                params, cancel_source=params.get("stop_source"))
         wait_s = self._ptt_wait_budget(params)
         self._ptt_log("ptt.stop.received", session_id=str(self._ptt_session_id or ""))
         # Scene-3b sensor (2026-10-26): every stop entry leaves a schema line
@@ -2426,6 +2533,9 @@ class Daemon:
                             "text": result["text"],
                             "speak": params.get("speak", True),
                             "session_id": str(session_id or ""),
+                            # J3: the command floor needs to know how well this
+                            # text was heard; None (unknown) never clears it.
+                            "voice_confidence": result.get("confidence"),
                         }
                         if session_mode == "command":
                             # Known local commands keep their existing grammar
@@ -3664,6 +3774,23 @@ class Daemon:
             via = "local-awareness"
         intent = (None if company_command is not None or unparsed_command
                   else route(route_text))
+        # J3: a MUTATING voice intent must clear the command floor (0.85) until
+        # the owner rules otherwise. The confidence rides in from the dictation
+        # session; a typed turn carries none because it was not heard.
+        voice_confidence = params.get("voice_confidence")
+        if intent is not None and voice_confidence is not None:
+            from .asr import voice_command_allowed
+
+            allowed, why = voice_command_allowed(intent.kind, voice_confidence,
+                                                 self.config)
+            if not allowed:
+                log_event("command.floor", level="warn",
+                          session_id=str(params.get("session_id") or ""),
+                          verdict="refused",
+                          detail=f"intent={intent.kind}; {why}")
+                reply, via = (f"Not run: {why}. Say it again, or type it.", 
+                              "local-refused")
+                intent = None
         if intent is not None:
             reply, via, receipt = await self._run_intent(intent)
         if (reply is None and wake is not None and wake.is_checkin

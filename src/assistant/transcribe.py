@@ -49,6 +49,7 @@ from . import asr
 from .capture import (
     FrameGate,
     RollingAudioBuffer,
+    SoftLimiter,
     WavSink,
     frame_rms,
     pcm_peak,
@@ -191,6 +192,11 @@ class SessionResult:
     # per session — "captured nothing" must be provable, not guessable.
     capture: dict | None = None
     no_speech: bool = False
+    # J5: capture-side limiter and dropout evidence for this session.
+    limiter: dict | None = None
+    xruns: int = 0
+    # J4/F30: a cancelled session produced nothing and kept nothing.
+    cancelled: bool = False
     # A missing Live final is distinct from silence: the saved WAV may still
     # contain speech and is retained for a later retry/re-transcription.
     no_final: bool = False
@@ -265,6 +271,30 @@ def _landed_real_words(events) -> bool:
     """
     return any(event.type in ("interim", "final") and _has_real_word(event.text)
                for event in events)
+
+
+def _dictation_leg(config, client, audio_path: str, *, offline: bool = False,
+                   local_backend=None, session_id: str | None = None):
+    """The dictation fallback leg: local first, Gemini only below the floor.
+
+    Returns an `asr.Transcript` (so callers keep their existing surface) with
+    the gateway outcome attached as `.dictation` — path, label, escalation and
+    both legs' provenance.
+    """
+    outcome = asr.transcribe_dictation(
+        config, client, audio_path, offline=offline,
+        local_backend=local_backend, session_id=session_id)
+    transcript = asr.Transcript(
+        text=outcome.text, language=outcome.language, backend=outcome.backend,
+        confidence=outcome.confidence, language_ok=outcome.language_ok)
+    transcript.dictation = outcome
+    log_event("dictation.path", session_id=str(session_id or ""),
+              verdict=outcome.path,
+              detail=(f"labelled={outcome.labelled or '-'}; "
+                      f"escalation={outcome.escalation}; "
+                      f"confidence={outcome.confidence}; "
+                      f"tier={outcome.provenance.get('tier')}"))
+    return transcript
 
 
 class DictationService:
@@ -542,7 +572,8 @@ class DictationService:
                       is_playback_active: Callable[[], bool] | None = None,
                       session_id: str | None = None,
                       clock: Callable[[], float] | None = None,
-                      on_final_text: Callable[[str], None] | None = None) -> SessionResult:
+                      on_final_text: Callable[[str], None] | None = None,
+                      cancel_event: asyncio.Event | None = None) -> SessionResult:
         session_id = session_id or uuid.uuid4().hex[:12]
         emit = sink or _noop_sink
         self._log("dictate.enter", session_id=session_id, mode=mode, source_target=str(getattr(source, "target", None) or "default"))
@@ -569,7 +600,17 @@ class DictationService:
             wav_sink = WavSink(audio_path)
             self._log("dictate.wav_sink", session_id=session_id, audio_path=str(audio_path))
 
+        if cancel_event is None:
+            # Set by the daemon at session open (a ptt.stop{cancel} branch);
+            # an explicit argument always wins over the service attribute.
+            cancel_event = getattr(self, "cancel_event", None)
         buffer = RollingAudioBuffer(seconds=self.replay_s)
+        # J5/E5: capture-side soft limiter, applied to every frame BEFORE the
+        # VAD, the Live uplink and the archive. Raw peak is measured first, so
+        # the limiter can never hide how hot the input was.
+        limiter = SoftLimiter()
+        cancelled = False
+        zeroized_bytes = 0
         gate = FrameGate(rms_threshold=self.vad_threshold)
         ladder = SilenceLadder(
             float(self.checkin_after.get(mode, 20)), speech_rms=self.vad_threshold,
@@ -767,6 +808,12 @@ class DictationService:
             while True:
                 if stop_event and stop_event.is_set():
                     break
+                # J4/F30: Escape is not a release. A cancel ends the session
+                # and destroys what was captured; nothing reaches the uplink
+                # from here on, and the buffer is zeroized below.
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
                 try:
                     frame = await self._next_frame(frame_iter, stop_event)
                 except StopAsyncIteration:
@@ -775,10 +822,14 @@ class DictationService:
                     break                # PTT released mid-read
                 frames_seen += 1
                 captured_bytes += len(frame)
+                # Measure the RAW frame before the limiter touches it (the
+                # silence_floor verdict reads the input peak; a limiter that
+                # moved the number it is judged by would be concealing).
                 level = frame_rms(frame)
                 peak_rms = max(peak_rms, level)
                 frame_peak = pcm_peak(frame)
                 session_peak = max(session_peak, frame_peak)
+                frame = limiter.apply(frame)
                 frame_s = len(frame) / 2 / 16000
                 # H.4: press→first-frame latency and where in the kept
                 # wav the first non-silent frame sits (HDA DSP power-up
@@ -969,7 +1020,7 @@ class DictationService:
                 speculative_fallback = asyncio.create_task(
                     asyncio.wait_for(
                         asyncio.to_thread(
-                            asr.transcribe_file, self.config, self.client,
+                            _dictation_leg, self.config, self.client,
                             str(audio_path),
                             offline=offline_at_start or network_drop,
                             local_backend=self.local_backend,
@@ -1191,6 +1242,11 @@ class DictationService:
                 "stalled": stalled, "no_speech": no_speech,
                 "first_frame_latency_ms": first_frame_latency_ms,
                 "first_speech_frame_s": first_speech_frame_s,
+                # J5: both peaks forever — the limiter mitigates, never hides.
+                "limiter": limiter.stats(),
+                "raw_peak": round(session_peak, 4),
+                "processed_peak": round(limiter.processed_peak, 4),
+                "xruns": int(getattr(source, "xruns", 0) or 0),
             }
             if stalled:
                 notes.append("capture stalled — the capture process delivered no data")
@@ -1398,7 +1454,7 @@ class DictationService:
                         fallback = await self._await_lifecycle(
                             "dictate.saved_wav_fallback",
                             asyncio.to_thread(
-                                asr.transcribe_file, self.config, self.client,
+                                _dictation_leg, self.config, self.client,
                                 str(audio_path), offline=use_offline_chain,
                                 local_backend=self.local_backend,
                                 session_id=session_id),
@@ -1555,6 +1611,26 @@ class DictationService:
             self._log("dictate.offline_queue_failed", session_id=session_id,
                       error=f"{type(exc).__name__}: {exc}"[:200])
         result.capture = capture_stats
+        result.limiter = limiter.stats()
+        result.xruns = int(getattr(source, "xruns", 0) or 0)
+        result.cancelled = cancelled
+        if cancelled:
+            # A cancel keeps nothing: the audio goes, the text goes, and the
+            # release of the mic is already the source's business.
+            zeroized_bytes = buffer.zeroize()
+            result.raw_text = ""
+            result.cleaned_text = None
+            log_event("capture.cancel", session_id=session_id, verdict="cancelled",
+                      detail=(f"zeroized_bytes={zeroized_bytes}; "
+                              f"frames_discarded={frames_seen}; "
+                              f"node={capture_label}; nothing transcribed"))
+            notes.append("cancelled by the owner — partial audio zeroized, "
+                         "nothing transcribed")
+        log_event("capture.levels", session_id=session_id, verdict="measured",
+                  detail=(f"raw_peak={capture_stats.get('raw_peak')}; "
+                          f"processed_peak={capture_stats.get('processed_peak')}; "
+                          f"limited_samples={limiter.limited_samples}; "
+                          f"xruns={result.xruns}; node={capture_label}"))
         result.no_speech = no_speech
         result.no_final = no_final
         # BH-K1: there is deliberately NO post-hoc "filler echo" filter here.
@@ -1619,6 +1695,9 @@ class DictationService:
 
         connectivity = self._connectivity()
         offline = bool(connectivity and connectivity.is_offline)
+        # The post tier (§3.6) is the ACCURATE pass and keeps its own chain
+        # (cloud first). Dictation's fallback leg is the local-first one — see
+        # the `asr.transcribe_dictation` call sites below.
         transcript = await asyncio.to_thread(
             asr.transcribe_file, self.config, self.client, str(audio_path),
             offline=offline, local_backend=self.local_backend,

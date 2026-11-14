@@ -701,6 +701,25 @@ def run_doctor(config) -> dict:
         status = call(config.socket_path, "status", timeout=2.0)
         daemon_detail = f"running, mode={status.get('mode')}, uptime={status.get('uptime_s')}s"
         daemon_ok = True
+        # J5: both peaks and the dropout count, from the last session that
+        # actually ran. "not measured yet" is a real answer; a fabricated 0.0
+        # would read as a silent room.
+        diag = status.get("capture_diag") or {}
+        if diag:
+            limiter = diag.get("limiter") or {}
+            checks.append(_check(
+                "capture levels", True,
+                f"raw peak {diag.get('raw_peak', limiter.get('raw_peak'))} · "
+                f"processed peak {diag.get('processed_peak', limiter.get('processed_peak'))} · "
+                f"limited samples {limiter.get('limited_samples', 0)} · "
+                f"xruns/dropouts {diag.get('xruns', 0)} · "
+                f"node {diag.get('node')} (the limiter mitigates, it never "
+                f"conceals: both peaks are kept)"))
+        else:
+            checks.append(_check(
+                "capture levels", True,
+                "no session measured yet — one `assist ptt start` fills this; "
+                "raw and processed peaks are journalled as capture.levels"))
     except DaemonUnavailable as exc:
         daemon_detail, daemon_ok = f"down ({exc})", False
     except DaemonError as exc:
@@ -2010,7 +2029,7 @@ def build_parser() -> argparse.ArgumentParser:
              "listening")
     hotword_sub.add_parser("stop", help="disarm and zero the RAM buffers")
     hotword_sub.add_parser("purge", help="delete saved wake clips now")
-    ptt_p.add_argument("action", choices=["start", "stop", "toggle"])
+    ptt_p.add_argument("action", choices=["start", "stop", "cancel", "toggle"])
     ptt_p.add_argument("--mode", choices=["narration", "conversation", "command"],
                        help="session mode for start; command routes via the local ladder")
     ptt_p.add_argument("--source", help="capture source override")
@@ -2592,6 +2611,15 @@ def main(argv: list[str] | None = None) -> int:
             if action == "toggle":
                 action = "stop" if call(config.socket_path, "status", timeout=3.0).get("mode") == "listening" else "start"
             params = {}
+            if action == "cancel":
+                # F30/J4: Escape. A cancel is a stop with destruction, never a
+                # release — the wire call is the same method with a flag so the
+                # bind never needs a second daemon route.
+                params["cancel"] = True
+                params["stop_source"] = args.stop_source or "bind"
+                result = call(config.socket_path, "ptt.stop", params, timeout=5.0)
+                print(json.dumps(result))
+                return 0
             if action == "start":
                 if args.mode:
                     params["mode"] = args.mode

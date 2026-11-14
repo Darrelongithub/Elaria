@@ -24,6 +24,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -215,11 +216,15 @@ class LocalWhisperBackend:
 
     name = "local"
 
-    def __init__(self, config=None, *, model_loader=None, runner=None):
+    def __init__(self, config=None, *, model_loader=None, runner=None,
+                 model_name: str | None = None):
         self.config = config
         settings = config.section("asr") if config else {}
         self.engine = str(settings.get("offline_backend", "faster-whisper")).lower()
-        self.model_name = str(settings.get("offline_model", "small"))
+        # J3: dictation runs at a latency tier (base/tiny), batch keeps small.
+        # The override is explicit so a caller can never silently shrink the
+        # batch model by reusing this class.
+        self.model_name = str(model_name or settings.get("offline_model", "small"))
         self.device = str(settings.get("offline_device", "cpu"))
         self.compute_type = str(settings.get("offline_compute_type", "int8"))
         self.whisper_cpp_command = str(settings.get("whisper_cpp_command", "whisper-cli"))
@@ -396,6 +401,270 @@ def transcribe_file(config, client, audio_path: str, *, offline: bool = False,
     if last_flagged is not None:
         return last_flagged
     raise RuntimeError("all ASR backends failed — " + " | ".join(errors))
+
+
+# --------------------------------------------------------------------------
+# J3/E3 — the dictation gateway: local first, Gemini only below the floor
+# --------------------------------------------------------------------------
+#: Smallest-to-largest Whisper tiers that could serve push-to-talk.
+DICTATION_TIERS = ("tiny", "base", "small")
+DEFAULT_DICTATION_TIER = "base"
+
+#: Intent kinds that CHANGE state. A voice command in this set must clear the
+#: command floor before it executes; everything else may route on the local
+#: result alone.
+MUTATING_INTENTS = frozenset({
+    "organise", "undo", "remember", "forget", "halt",
+    "mode_offline", "mode_online", "mode_auto",
+})
+
+
+class PinMismatch(RuntimeError):
+    """A model tier already pinned at one hash came back at another (J6)."""
+
+
+def dictation_tier(config) -> str:
+    """The tier dictation runs at — base by default, never the batch model."""
+    settings = config.section("asr") if config is not None else {}
+    tier = str(settings.get("dictation_tier", DEFAULT_DICTATION_TIER)).lower()
+    if tier not in DICTATION_TIERS:
+        raise ValueError(
+            f"asr.dictation_tier={tier!r} is not one of {list(DICTATION_TIERS)}")
+    return tier
+
+
+def dictation_confidence_floor(config) -> float:
+    """Below this, a local dictation result is escalated (default 0.65)."""
+    settings = config.section("asr") if config is not None else {}
+    return float(settings.get("dictation_confidence_floor",
+                              settings.get("offline_low_confidence_threshold", 0.65)))
+
+
+def command_min_confidence(config) -> float:
+    """The floor a MUTATING voice command must clear (0.85 until the ruling)."""
+    settings = config.section("asr") if config is not None else {}
+    return float(settings.get("command_min_confidence", 0.85))
+
+
+def voice_command_allowed(kind: str, confidence: float | None, config) -> tuple[bool, str]:
+    """Is this voice-routed intent allowed to execute?
+
+    Only mutating intents are gated, and an UNKNOWN confidence is not a pass:
+    a command that cannot prove how well it was heard does not run (§12.7's
+    confidence discipline, applied to commands).
+    """
+    if kind not in MUTATING_INTENTS:
+        return True, "not a mutating intent"
+    floor = command_min_confidence(config)
+    if confidence is None:
+        return False, (f"no confidence on a mutating voice command "
+                       f"(needs >= {floor:.2f}) — not executed")
+    if float(confidence) < floor:
+        return False, (f"confidence {float(confidence):.2f} below the "
+                       f"{floor:.2f} command floor — not executed")
+    return True, "cleared the command floor"
+
+
+@dataclass
+class DictationOutcome:
+    """What dictation produced, and exactly which path produced it."""
+
+    text: str
+    language: str
+    backend: str                 # local | gemini_batch
+    confidence: float | None
+    path: str                    # local | local+escalation | none
+    labelled: str | None         # "double-pass" when both legs ran
+    escalation: str              # not_needed | quarantine reason | quota | offline | failed: …
+    provenance: dict             # legs with backend/model/latency/confidence/chars/sha16
+    language_ok: bool = True
+
+    def as_dict(self) -> dict:
+        return {"text": self.text, "language": self.language,
+                "backend": self.backend, "confidence": self.confidence,
+                "path": self.path, "labelled": self.labelled,
+                "escalation": self.escalation,
+                "language_ok": self.language_ok,
+                "provenance": self.provenance}
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in
+               ("429", "quota", "resource_exhausted", "rate limit", "rate_limit"))
+
+
+def _leg(backend: str, model: str | None, latency_ms: float, audio_s: float,
+         confidence: float | None, text: str) -> dict:
+    """One leg's receipt. Chars + sha16 where text exists — never the text."""
+    import hashlib
+
+    return {"leg": backend, "model": model,
+            "latency_ms": round(latency_ms, 1),
+            "audio_s": round(audio_s, 3),
+            "rtf": round(latency_ms / 1000 / audio_s, 3) if audio_s else None,
+            "confidence": confidence,
+            "chars": len(text or ""),
+            "sha16": hashlib.sha256((text or "").encode()).hexdigest()[:16] if text else None}
+
+
+def _audio_seconds(audio_path: str) -> float:
+    try:
+        import wave
+
+        with wave.open(str(audio_path), "rb") as wav:
+            return wav.getnframes() / wav.getframerate()
+    except Exception:
+        return 0.0
+
+
+def transcribe_dictation(config, client, audio_path: str, *, offline: bool = False,
+                         local_backend: BatchBackend | None = None,
+                         session_id: str | None = None,
+                         tier: str | None = None) -> DictationOutcome:
+    """Local first; Gemini batch only below the confidence floor.
+
+    The rules, in order:
+    * local is PRIMARY and runs at the dictation latency tier;
+    * a local result at or above the floor (0.65) is final — no Gemini call;
+    * below the floor (or unknown), escalate to Gemini batch and label the
+      outcome `double-pass`, with both legs' provenance on the wire;
+    * forced offline never escalates;
+    * a quota wall or 429 is NON-BLOCKING: the local text stands, carrying
+      `escalation="quota"` so nobody mistakes it for a double-pass;
+    * silence produces NO text and says so (`path="none"`), never an
+      unparsed-as-text transcript and never a confident empty.
+    """
+    tier = tier or dictation_tier(config)
+    floor = dictation_confidence_floor(config)
+    language = primary_language(config)
+    audio_s = _audio_seconds(audio_path)
+    legs: list[dict] = []
+    provenance = {"tier": tier, "confidence_floor": floor,
+                  "policy": "local-first; gemini batch only below the floor",
+                  "legs": legs}
+
+    def outcome(**fields) -> DictationOutcome:
+        return DictationOutcome(language=language, provenance=provenance, **fields)
+
+    started = time.monotonic()
+    local = local_backend or LocalWhisperBackend(config, model_name=tier)
+    try:
+        local_result = local.transcribe(audio_path, language)
+    except Exception as exc:
+        reason = f"failed: {error_text(exc)}"
+        legs.append({**_leg("local", tier, (time.monotonic() - started) * 1000,
+                            audio_s, None, ""), "outcome": reason})
+        log_backend_mark(session_id, "local", "failed", error=reason)
+        local_result = None
+        local_failure = reason
+    else:
+        elapsed_ms = (time.monotonic() - started) * 1000
+        legs.append({**_leg("local", tier, elapsed_ms, audio_s,
+                            local_result.confidence, local_result.text),
+                     "outcome": "empty" if not local_result.text.strip() else "text"})
+        log_backend_mark(session_id, "local",
+                         "empty" if not local_result.text.strip() else "ok",
+                         text=local_result.text or "")
+        local_failure = None
+
+    local_text = (local_result.text if local_result else "") or ""
+    confidence = local_result.confidence if local_result else None
+    needs_escalation = (not local_text.strip()
+                        or confidence is None
+                        or float(confidence) < floor)
+
+    if not needs_escalation:
+        return outcome(text=local_text, backend="local", confidence=confidence,
+                       path="local", labelled=None, escalation="not_needed")
+    if offline:
+        return outcome(text=local_text, backend="local", confidence=confidence,
+                       path="local" if local_text.strip() else "none",
+                       labelled=None, escalation="offline")
+    escalation_started = time.monotonic()
+    try:
+        # The escalation leg is the EXISTING accurate chain (gemini_batch then
+        # local), not a private copy of it: one place owns the fallback order,
+        # and a deployment that reorders [asr] fallback keeps working.
+        cloud = transcribe_file(config, client, audio_path, offline=False,
+                                local_backend=local_backend,
+                                session_id=session_id)
+    except Exception as exc:
+        elapsed_ms = (time.monotonic() - escalation_started) * 1000
+        if _is_quota_error(exc):
+            legs.append({**_leg("gemini_batch", None, elapsed_ms, audio_s, None, ""),
+                         "outcome": "quota"})
+            log_backend_mark(session_id, "gemini_batch", "quota",
+                             error=error_text(exc))
+            if not local_text.strip():
+                # Nothing landed anywhere: a wall with no local words is a
+                # FAILURE, and the caller's starvation/defer path must see it.
+                # "Non-blocking" only means the wall cannot cost us a result
+                # we already had.
+                raise
+            return outcome(text=local_text, backend="local", confidence=confidence,
+                           path="local", labelled=None, escalation="quota")
+        reason = f"failed: {error_text(exc)}"
+        legs.append({**_leg("gemini_batch", None, elapsed_ms, audio_s, None, ""),
+                     "outcome": reason})
+        log_backend_mark(session_id, "gemini_batch", "failed", error=reason)
+        if not local_text.strip():
+            # Never swallow a total failure: the dictate layer owns the
+            # legible starvation line and the retained WAV.
+            raise
+        return outcome(text=local_text, backend="local", confidence=confidence,
+                       path="local", labelled=None,
+                       escalation=(local_failure or reason))
+    elapsed_ms = (time.monotonic() - escalation_started) * 1000
+    legs.append({**_leg("gemini_batch", None, elapsed_ms, audio_s,
+                        cloud.confidence, cloud.text),
+                 "outcome": "text" if cloud.text.strip() else "empty"})
+    log_backend_mark(session_id, "gemini_batch",
+                     "ok" if cloud.text.strip() else "empty", text=cloud.text or "")
+    if not cloud.text.strip():
+        return outcome(text=local_text, backend="local", confidence=confidence,
+                       path="local" if local_text.strip() else "none",
+                       labelled=None, escalation="gemini_batch: empty transcript")
+    # `double-pass` means the local words were HEARD and then checked against
+    # the cloud. When the local leg produced nothing, this is a fallback, not
+    # a second opinion — and it must not wear the double-pass label.
+    if local_text.strip():
+        return outcome(text=cloud.text, backend="gemini_batch",
+                       confidence=cloud.confidence, path="local+escalation",
+                       labelled="double-pass", escalation="low-confidence",
+                       language_ok=cloud.language_ok)
+    return outcome(text=cloud.text, backend="gemini_batch",
+                   confidence=cloud.confidence, path="escalation", labelled=None,
+                   escalation=(local_failure or "local: empty transcript"),
+                   language_ok=cloud.language_ok)
+
+
+def tier_latency_report(measurements: list[dict], *, budget_s: float = 1.2) -> dict:
+    """Pick the dictation tier from MEASURED round trips, not from guesses.
+
+    `measurements` are `{tier, audio_s, latency_s}` samples from real presses.
+    The chosen tier is the largest whose median round trip fits `budget_s`;
+    with no measurements the answer is "unmeasured" — never a default dressed
+    up as a finding.
+    """
+    usable = [m for m in measurements if m.get("latency_s") is not None]
+    if not usable:
+        return {"tier": None, "measured": False,
+                "reason": "no measured dictation round trips — hardware pending"}
+    by_tier: dict[str, list[float]] = {}
+    for sample in usable:
+        by_tier.setdefault(str(sample["tier"]), []).append(float(sample["latency_s"]))
+    chosen = None
+    for tier in DICTATION_TIERS:          # smallest first: tiny < base < small
+        latencies = sorted(by_tier.get(tier, []))
+        if not latencies:
+            continue
+        median = latencies[len(latencies) // 2]
+        if median <= budget_s:
+            chosen = {"tier": tier, "median_s": round(median, 3),
+                      "samples": len(latencies)}
+    return {"tier": (chosen or {}).get("tier"), "measured": True,
+            "budget_s": budget_s, "chosen": chosen, "by_tier": by_tier}
 
 
 def local_asr_status(config) -> dict:
