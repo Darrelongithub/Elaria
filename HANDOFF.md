@@ -1,10 +1,11 @@
 # HANDOFF — cold-resume state (Blueprint v2 wiring spec build)
 
-Last updated: 2026-11-14 (Tasks J/K/L landed on separate commits — EARS
-`7d0d3ca`, GATEWAY `b38b1b1`, MOUTH `b1897ff`; suite 2,120 passed / 6 skipped
-in 183.67 s; report `docs/phase-reports/2026-11-14-tasks-j-k-l.md`. Owner
-hardware acceptance for K and L is PENDING; merge gate RESTATED unchanged and
-still red)
+Last updated: 2026-11-15 (owner rulings applied — F17 refuses an unnamed node
+unconditionally `d24564f`; `claim_reply` is the sole reply authority and the
+bind snippet is emitted Lua-first `de7fcd1`; suite 2,136 passed / 6 skipped in
+179.30 s; addendum `docs/phase-reports/2026-11-15-tasks-jkl-addendum.md`.
+Owner hardware acceptance is PENDING for the corrected binds, K's playback, L's
+spoken reply and J's dictation run; merge gate RESTATED unchanged and red)
 Branch: `arena/c2a7085d-elaria` · base `ed20344` (main)
 Authority: MASTER BUILD PROMPT — ELARIA, BLUEPRINT V2 WIRING SPEC (2026-10-25)
 
@@ -20,8 +21,22 @@ each).
 | K GATEWAY | `b38b1b1` | `audio_gateway.py` is the one owner of PTT/dictation capture and whole-reply playback (F17 node policy, F28 arbitration table + bounded reply claim, F16 whole replies, F30 cancel); daemon capture + both playback paths rewired; `status.gateway` reports it | 16 fake-device pins `tests/test_task_k_gateway.py`; **owner hardware is the only audio acceptance** |
 | L MOUTH | `b1897ff` | cache key = text + voice + per-route settings hash; `voice-cache/` declared, LRU-capped (`[tts] cache_max_files`, 120) and excluded from tiering; 429/failure renders LABELLED text (`speech_status`), never silence or a speech claim; consent (undo ask / No line) can never be voiced — F21 | 12 pins `tests/test_task_l_mouth.py`; one spoken reply on hardware pending |
 
-Installer's single config touch for these tasks:
-`bind = , Escape, exec, assist ptt cancel`.
+Installer's single config touch (CORRECTED 2026-11-15 — the legacy line was
+dead syntax): the emitted Lua snippet, `ui/hyprland/elaria-binds.lua`, which
+includes `hl.bind("Escape", hl.dsp.exec_cmd("assist ptt cancel"))`. Emission is
+Lua-first (`assistant.hypr_binds`), legacy `.conf` only on a positively-detected
+pre-0.55 compositor; `assist doctor` prints the `emit` text for the detected
+syntax.
+
+Follow-ups that changed behaviour after the report:
+- **F17 is unconditional** (`d24564f`): an unnamed capture node is refused on
+  every machine, before the earcon. A fresh install must set
+  `[capture] mic_target`; doctor now fails on an empty node and skips the
+  default-source probe it would never capture from.
+- **`claim_reply` is the sole reply authority** (`de7fcd1`): the daemon's local
+  single-claim is deleted, the early dispatch and the late gate both ask the
+  gateway, and a taken claim is answered with the fact instead of a second
+  generation.
 Still deliberately outside the gateway (needs its own grant): the always-on
 hotword capture, `event.py`'s event capture, `_meeting_start`'s dual capture,
 and `live_client.py`'s live stream (PROTECTED).
