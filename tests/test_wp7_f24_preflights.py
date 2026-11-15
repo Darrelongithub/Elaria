@@ -190,6 +190,182 @@ class DrillLocalGateTests(unittest.TestCase):
             self.assertIn(f"scratch={art.stat().st_size}", out.getvalue())
 
 
+class QuotaProducerTests(unittest.TestCase):
+    """The gate needs a READING, and something has to produce it.
+
+    Found while building the owner packets: `build_context` never populated
+    `remote_free_bytes`, so the F24 gate would have refused every real run forever —
+    nothing produced its input. A gate that can never open is a gate that has been
+    silently switched off, which is the same failure as a gate that never closes.
+    """
+
+    def _fake_rclone(self, tmp: str, payload: str) -> str:
+        path = os.path.join(tmp, "rclone")
+        with open(path, "w") as fh:
+            fh.write(f"#!/bin/sh\necho '{payload}'\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def test_the_quota_is_parsed_from_the_pinned_about_verb(self):
+        from assistant.remote import RcloneBackend
+        with tempfile.TemporaryDirectory() as tmp:
+            self._fake_rclone(tmp, '{"total":21474836480,"used":3221225472,'
+                                   '"free":18253611008}')
+            old_path = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = tmp + os.pathsep + old_path
+                backend = RcloneBackend("elaria-mega", path="elaria-restic")
+                self.assertEqual(backend.remote_free(), 18253611008)
+            finally:
+                os.environ["PATH"] = old_path
+
+    def test_the_about_argv_is_the_pinned_one_not_an_improvised_command(self):
+        from assistant.remote import RcloneBackend
+        backend = RcloneBackend("elaria-mega", path="elaria-restic")
+        self.assertEqual(backend.argv("about"),
+                         ["rclone", "about", "elaria-mega:elaria-restic", "--json"])
+
+    def test_a_malformed_payload_yields_none_rather_than_a_guess(self):
+        from assistant.remote import RcloneBackend
+        with tempfile.TemporaryDirectory() as tmp:
+            self._fake_rclone(tmp, "not json at all")
+            old_path = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = tmp + os.pathsep + old_path
+                backend = RcloneBackend("elaria-mega", path="elaria-restic")
+                self.assertIsNone(backend.remote_free())
+            finally:
+                os.environ["PATH"] = old_path
+
+    def test_an_absent_rclone_yields_none(self):
+        """No rclone on PATH: the reading is unreadable, which is a refusal at the
+        gate — never a pass, and never a zero."""
+        from assistant.remote import RcloneBackend
+        backend = RcloneBackend("elaria-mega", path="elaria-restic",
+                                binary="rclone-that-does-not-exist")
+        self.assertIsNone(backend.remote_free())
+
+    def test_a_fixture_backend_has_no_quota_and_says_so(self):
+        from assistant.remote import LocalPathBackend
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(LocalPathBackend(tmp).remote_free())
+
+    def test_build_context_reads_the_quota_when_a_remote_is_configured(self):
+        """The wiring. Without it the gate's input is never produced."""
+        from assistant.backup_cli import build_context
+
+        class _Cfg:
+            data_dir = Path(".")
+            def section(self, name):
+                return {"rclone_remote": "elaria-mega", "rclone_path": "elaria-restic"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._fake_rclone(tmp, '{"total":21474836480,"used":0,"free":21474836480}')
+            old_path = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = tmp + os.pathsep + old_path
+                ctx = build_context(_Cfg(), read_quota=True)
+                self.assertEqual(ctx.remote_free_bytes, 21474836480)
+                self.assertTrue(ctx.remote_preflight().ok)
+            finally:
+                os.environ["PATH"] = old_path
+
+    def test_build_context_can_skip_the_quota_read(self):
+        """`read_quota=False` lets a caller build a context without touching the
+        remote — which is what a dry run and a fixture need."""
+        from assistant.backup_cli import build_context
+
+        class _Cfg:
+            data_dir = Path(".")
+            def section(self, name):
+                return {"rclone_remote": "elaria-mega", "rclone_path": "elaria-restic"}
+
+        with tempfile.TemporaryDirectory():
+            ctx = build_context(_Cfg(), read_quota=False)
+            self.assertIsNone(ctx.remote_free_bytes)
+
+
+class PacketNumberDriftTests(unittest.TestCase):
+    """The owner packets quote numbers. These tests stop the docs drifting from the code.
+
+    A packet that says 2.53 GiB while the gate enforces something else is worse than no
+    packet: the owner would act on a figure that was never true.
+    """
+
+    DOCS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "docs", "live-scene")
+
+    def _read(self, name: str) -> str:
+        with open(os.path.join(self.DOCS, name), encoding="utf-8") as fh:
+            return fh.read()
+
+    def _read_folded(self, name: str) -> str:
+        """Case-folded, so a heading's capitals do not read as a missing fact."""
+        return self._read(name).casefold()
+
+    def test_every_packet_exists(self):
+        for name in ("op3-cold-flip-packet.md", "op5-monthly-drill-packet.md",
+                     "owner-sitting-sheet.md"):
+            self.assertTrue(os.path.exists(os.path.join(self.DOCS, name)), name)
+
+    def test_the_packets_quote_the_derived_scratch_not_a_round_number(self):
+        """Both the bare and the comma-grouped form are accepted, because a packet
+        written for a human reads 2,719,664,640 and a test should not fail on the comma."""
+        scratch = preflight.bench_scratch_bytes()
+        required = scratch + 1 * 1000 ** 3
+        def forms(v):
+            return {str(v), f"{v:,}"}
+
+        # Markdown emphasis rides along with the token, so strip it before comparing.
+        def tokens(text):
+            return {t.strip("`*_> ") for t in text.split()}
+
+        for name in ("op3-cold-flip-packet.md", "owner-sitting-sheet.md"):
+            text = self._read(name)
+            self.assertTrue(forms(scratch) & tokens(text),
+                            f"{name} must quote the derived scratch")
+            self.assertTrue(any(f in text for f in forms(required)),
+                            f"{name} must quote the derived requirement")
+
+    def test_the_drill_packet_quotes_the_local_margin(self):
+        text = self._read("op5-monthly-drill-packet.md")
+        self.assertIn("1 GB margin", text)
+        self.assertIn("scratch=", text)
+
+    def test_the_packets_state_the_window_arithmetic_for_the_named_wav(self):
+        """The single most important fact in packet 3: run before the window elapses
+        and the flip silently does nothing."""
+        text = self._read("op3-cold-flip-packet.md")
+        self.assertIn("2026-11-02 10:05:58", text)
+        self.assertIn("2026-11-16", text)
+        self.assertIn("14 days", text)
+
+    def test_the_sitting_sheet_names_the_order_and_does_not_reorder_it(self):
+        text = self._read("owner-sitting-sheet.md")
+        order = [text.index(f"**{n}**") for n in ("0", "1", "3", "5", "4", "2")]
+        self.assertEqual(order, sorted(order),
+                         "the sitting sheet must list the steps in execution order")
+
+    def test_the_sitting_sheet_repeats_the_mega_trash_caveat(self):
+        text = self._read_folded("owner-sitting-sheet.md")
+        self.assertIn("mega-trash", text)
+        self.assertIn("--mega-hard-delete", text)
+
+    def test_every_packet_states_cleanup_is_never_automatic(self):
+        for name in ("op3-cold-flip-packet.md", "op5-monthly-drill-packet.md",
+                     "owner-sitting-sheet.md"):
+            self.assertIn("never automatic", self._read_folded(name), name)
+
+    def test_no_packet_contains_a_credential(self):
+        """The privacy fence, pinned. No packet may carry a secret-shaped assignment."""
+        import re
+        pattern = re.compile(r"(password|passphrase|secret|api_key|token)"
+                             r"\s*=\s*[\"'][^\"']{8,}[\"']", re.IGNORECASE)
+        for name in ("op3-cold-flip-packet.md", "op5-monthly-drill-packet.md",
+                     "owner-sitting-sheet.md"):
+            self.assertIsNone(pattern.search(self._read(name)), name)
+
+
 class _Args:
     def __init__(self, backup_action, *, dry_run=True, **kw):
         self.backup_action = backup_action

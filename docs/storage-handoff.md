@@ -2375,3 +2375,51 @@ on the remote would be the gate over-reaching. Pinned by test.
 `remote_free_bytes = None`, so since F24 it now refuses at the headroom gate first. The
 test now supplies ample headroom so it reaches the verifier check it was always testing.
 The original refusal is still covered; the new precedence is pinned separately.
+
+---
+
+## 2026-11-08 - FIRING TEN, the quota producer found missing, and the owner packets issued
+
+**FIRING TEN (a full re-clone, the tenth).** The sandbox re-cloned onto
+`arena/e7a1cca5-elaria` @ `ed20344` with the SAME 30 files of foreign uncommitted work -
+the 177,646-byte patch is byte-identical to firings seven, eight and nine. Ran the
+report-020 method as a checklist with the preserve step first; frozen hash verified before
+and after; explicit-URL fetch; integrity check (`fc207d1`); local-only checkout; verify
+after. **The preserve step has now earned its keep six times.**
+
+**THE RULING, recorded:** the sandbox is incapable of the live operations **by policy, not by
+omission**. That is a measured environmental fact and it decides the execution model:
+**OPERATIONS 1 THROUGH 5 ARE OWNER-RUN PACKETS ON THE OWNER'S MACHINE.** The grant was
+permission; it was never a route, and the builder said so first.
+
+**A REAL DEFECT FOUND WHILE BUILDING THE PACKETS: the F24 gate had no producer for its
+input.** `build_context` never populated `remote_free_bytes`, so the gate would have refused
+EVERY real run forever - a gate that can never open is a gate that has been silently switched
+off, which is the same failure as a gate that never closes. Fixed by adding
+`RemoteBackend.remote_free()` to the seam (default None, the honest refusal), implementing it
+on `RcloneBackend` by running the ALREADY-PINNED `rclone about <remote>:<path> --json` verb
+and reading `free`, and wiring it into `build_context` behind `read_quota=True`. Verified:
+a real `about` payload parses to 18,253,611,008 B; malformed output yields None; an absent
+rclone yields None. A `LocalPathBackend` fixture returns None because a fixture has no quota.
+
+**A SECOND REAL FINDING, and the most consequential fact in packet 3: the named wav is not
+yet cold.** `20261102-100558-61258b` encodes a capture of 2026-11-02 10:05:58, and the hot
+window is 14 days. **It becomes sendable cold on 2026-11-16 after 10:06.** Run operation 3 on
+the grant date and it reports `send_cold=0` and changes nothing - the window holding, not a
+failure. The packet leads with this, because an owner who ran it early would believe a flip
+had happened when none had.
+
+**THREE PACKETS ISSUED** (`docs/live-scene/`), all checksummed in
+`live-scene.SHA256SUMS` (10 entries, all verified OK): `op3-cold-flip-packet.md`,
+`op5-monthly-drill-packet.md`, and `owner-sitting-sheet.md`. Both embed the F24 gates, the
+stop conditions, numbers-only-or-records-only returns, and cleanup-never-automatic.
+
+**The sitting sheet names the order:** step 0 tools (restic/rclone present, `dnf install` if
+absent) -> step 1 the benchmark -> step 3 the cold flip (after the window) -> step 5 the
+drill -> step 4 the fetch line and the owner's ear -> step 2 the ratio, computed by the
+builder from step 1's numbers with no new traffic.
+
+**Expected duration named honestly rather than invented:** the wall-clock is the unknown the
+benchmark exists to measure. What is named is the work - ~1 GB up, ~500 MB down per repo, two
+`restic check` passes, four slow MEGA listings - and Sheet 1's own guidance to leave it
+running and come back.

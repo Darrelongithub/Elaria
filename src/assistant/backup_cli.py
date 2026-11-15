@@ -209,7 +209,7 @@ class BackupContext:
             remote_free_bytes=self.remote_free_bytes)
 
 
-def build_context(config, *, now=None) -> BackupContext:
+def build_context(config, *, now=None, read_quota: bool = True) -> BackupContext:
     """Build a context from the live config. Talks to no remote until told to.
 
     `rclone_remote` empty means not configured yet, and the verifier is left `None` —
@@ -222,11 +222,18 @@ def build_context(config, *, now=None) -> BackupContext:
     remote = (section.get("rclone_remote") or "").strip()
     verifier = None
     backend = None
+    remote_free_bytes = None
     if remote:
         from .remote import RcloneBackend
 
         backend = RcloneBackend(remote, path=section.get("rclone_path") or "")
         verifier = make_verifier(backend)
+        # F24: the headroom gate needs a READING, not an assumption. Without this the
+        # gate would refuse every real run forever, because nothing produced its input —
+        # and a gate that can never open is a gate that has been silently switched off.
+        # `read_quota=False` lets a caller build a context without touching the remote.
+        if read_quota:
+            remote_free_bytes = backend.remote_free()
     return BackupContext(
         manifest,
         data_dir=config.data_dir,
@@ -238,6 +245,7 @@ def build_context(config, *, now=None) -> BackupContext:
         window_gb=int(section.get("hot_window_gb", DEFAULT_WINDOW_GB)),
         floor_bytes=int(section.get("capacity_floor_gb", 10)) * 1000 ** 3,
         grace_days=int(section.get("trim_grace_days", 14)),
+        remote_free_bytes=remote_free_bytes,
     )
 
 

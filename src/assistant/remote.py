@@ -290,6 +290,17 @@ class RemoteBackend:
 
         raise NotImplementedError
 
+    def remote_free(self) -> int | None:
+        """Free bytes on this backend, or None when it cannot say.
+
+        Part of the seam so the F24 headroom gate can ask ANY backend for a quota
+        reading and get an honest answer. The default is None, because a backend that
+        does not implement a quota read genuinely cannot produce one — and a gate that
+        treats that as plenty of room is the failure increment 4 exists to prevent.
+        """
+
+        return None
+
     def describe(self) -> dict:
         return {"backend": self.name, "kind": type(self).__name__}
 
@@ -435,6 +446,32 @@ class RcloneBackend(RemoteBackend):
             return [part.format(**values) for part in pin.argv]
         except KeyError as exc:
             raise KeyError(f"pinned verb {verb!r} needs substitution {exc}") from exc
+
+    # -- the quota -----------------------------------------------------------------------
+
+    def remote_free(self) -> int | None:
+        """Free bytes from the pinned `about` verb, or None when it cannot say.
+
+        Runs `rclone about <remote>:<path> --json` — already in the pinned command
+        surface, so no command is improvised here — and reads the `free` field. Any
+        failure returns None rather than a guess: an unreadable quota is a refusal at
+        the F24 gate, which is the correct posture. A gate that treats an unread
+        reading as plenty of room is not a gate.
+        """
+
+        try:
+            proc = subprocess.run(self.argv("about"), capture_output=True, text=True,
+                                  timeout=self.timeout_s, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return None
+        free = payload.get("free")
+        return free if isinstance(free, int) else None
 
     # -- the probe -----------------------------------------------------------------------
 
