@@ -32,6 +32,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import load_config, load_humour_profile
+from .hypr_binds import detect as hypr_binds_detect
 from .ipc import DaemonError, DaemonOutcomeUnknown, DaemonUnavailable, call
 
 # BH-K8: total time `assist plan build` will poll a daemon build before
@@ -214,36 +215,34 @@ def _deployment_drift_checks(repo_root: Path, home: Path, environ: dict, *,
             except OSError:
                 break
             missing = [m for m in ("assist ptt start", "assist ptt stop",
-                                   "assist halt") if m not in text]
+                                   "assist ptt cancel", "assist halt")
+                       if m not in text]
             checks.append(_check(
                 "hyprland binds", not missing,
                 (f"{hypr_cfg} carries the Elaria binds" if not missing else
                  f"{hypr_cfg} is missing bind(s) for: {', '.join(missing)} — "
-                 "append ui/hyprland/elaria-binds.conf (or .lua)")))
+                 "append the emitted snippet for your syntax "
+                 "(ui/hyprland/elaria-binds.lua is the Lua-first one; "
+                 "`assist doctor` prints which format this compositor reads)")))
             break
     return checks
 
 
 def hyprland_info(runner=subprocess.run) -> dict:
-    """Parse `hyprctl version` -> config-syntax verdict (§3.3, §11.4)."""
-    if not shutil.which("hyprctl"):
-        return {"present": False, "detail": "hyprctl not found — not a Hyprland "
-                "session (expected inside containers/SSH; run doctor on the "
-                "Fedora desktop for the real answer)"}
-    try:
-        out = runner(["hyprctl", "version"], capture_output=True, text=True, timeout=10)
-        match = re.search(r"v?(\d+)\.(\d+)", out.stdout)
-        if not match:
-            return {"present": True, "version": out.stdout.strip().splitlines()[0]
-                    if out.stdout else "unknown", "syntax": "unknown"}
-        major, minor = int(match.group(1)), int(match.group(2))
-        lua = (major, minor) >= (0, 55)
-        return {"present": True, "version": f"{major}.{minor}",
-                "syntax": "lua (hl.bind)" if lua else "legacy .conf (bind/bindr)",
-                "detail": "use the " + ("Lua" if lua else ".conf") +
-                          " bind snippet from README/GETTING-STARTED Step 6"}
-    except Exception as exc:
-        return {"present": True, "detail": f"hyprctl failed: {exc}"}
+    """`hyprctl version` -> config-syntax verdict + the emitted bind snippet.
+
+    Detection lives in `hypr_binds` (one parser, Lua-first — see the owner
+    ruling 2026-11-15 in that module). The `emit` field is the exact text an
+    installer should append: legacy `bind = ...` syntax silently does nothing on
+    Hyprland 0.57, which reads only `hl.bind`.
+    """
+    from .hypr_binds import emit_binds
+
+    info = hypr_binds_detect(runner=runner)
+    info["emit"] = emit_binds(info.get("syntax", "lua"))
+    info["syntax"] = ("lua (hl.bind)" if info.get("syntax") == "lua"
+                      else "legacy .conf (bind/bindr)")
+    return info
 
 
 def run_doctor(config) -> dict:

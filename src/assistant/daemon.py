@@ -488,12 +488,22 @@ class Daemon:
         text (a late strip-to-empty cancels it).
         """
         sid = str(session_id or "")
-        if not sid or sid in self._early_reply_tasks:
+        if not sid:
             return False
         if self._dictation_session_mode not in ("conversation", "narration"):
             return False
         stripped = self._strip_self_echo(text)
         if not stripped:
+            return False
+        # F28 (owner ruling 2026-11-15): the gateway is the SOLE authority for
+        # "one utterance, one reply". This used to be a local dict-membership
+        # check; a shadow gate proves arbitration in tests while production
+        # runs something else, which is the double-reply bug F28 exists to
+        # kill. The claim set is the only ledger.
+        allowed, why = self.audio.claim_reply(sid)
+        if not allowed:
+            self._dictate_log("dictate.reply_refused_duplicate",
+                              session_id=sid, reason=why)
             return False
         started = time.monotonic()
         self._dictate_log("dictate.reply_generation_start", session_id=sid,
@@ -513,7 +523,13 @@ class Daemon:
         return True
 
     def _claim_early_reply(self, session_id: str):
-        """Pop this session's early reply (single-fire: one claim wins)."""
+        """Hand over this session's early reply task, if one was dispatched.
+
+        This is a TASK HANDOVER, not a permission: whether a reply may exist at
+        all was already decided by `AudioGateway.claim_reply` when the dispatch
+        happened (F28, owner ruling 2026-11-15). Popping here is what makes the
+        late gate reuse the SAME task instead of starting a second reply.
+        """
         return self._early_reply_tasks.pop(str(session_id or ""), None)
 
     def is_speaking(self) -> bool:
@@ -2607,7 +2623,22 @@ class Daemon:
                     reply_timeout_s = max(
                         0.1, min(10.0, float(self._chat_timeout_s)))
                     early = self._claim_early_reply(session_id)
-                    if early is not None:
+                    reply_allowed, reply_why = (
+                        (True, "early reply reused") if early is not None
+                        else self.audio.claim_reply(session_id))
+                    if not reply_allowed:
+                        # The gate's own duplication guard: this session already
+                        # has its one reply. Answer with the fact, not a second
+                        # generation (F28).
+                        self._dictate_log("dictate.reply_refused_duplicate",
+                                          session_id=str(session_id or ""),
+                                          reason=reply_why)
+                        result["command"] = {
+                            "reply": None, "suppressed": reply_why,
+                            "note": "one utterance, one reply (F28) — the "
+                                    "earlier reply for this session stands"}
+                        reply_task = None
+                    elif early is not None:
                         # M-4 early dispatch: chat started the moment the
                         # leg landed — reuse the SAME task (exactly one
                         # reply per session) with its true start mark.
@@ -2652,47 +2683,52 @@ class Daemon:
                             # stock ack/greeting.
                             ask_params["unparsed_command"] = parsed_intent is None
                         reply_task = asyncio.create_task(self._ask(ask_params))
-                    try:
-                        done, _pending = await asyncio.wait(
-                            {reply_task}, timeout=reply_timeout_s,
-                            return_when=asyncio.FIRST_COMPLETED)
-                        if not done:
-                            reply_task.cancel()
-                            reply_task.add_done_callback(self._consume_task_result)
+                    # F28: a refused claim has no reply to wait on — the
+                    # sentence already in `result["command"]` is the answer.
+                    if reply_task is not None:
+                        try:
+                            done, _pending = await asyncio.wait(
+                                {reply_task}, timeout=reply_timeout_s,
+                                return_when=asyncio.FIRST_COMPLETED)
+                            if not done:
+                                reply_task.cancel()
+                                reply_task.add_done_callback(
+                                    self._consume_task_result)
+                                self._dictate_log(
+                                    "dictate.reply_generation_timeout",
+                                    session_id=str(session_id or ""),
+                                    timeout_s=reply_timeout_s,
+                                    elapsed_s=round(time.monotonic() - reply_started, 3))
+                                result["command"] = {
+                                    "reply": ("Dictation saved, but reply generation "
+                                              "timed out."),
+                                    "error": "reply generation timed out",
+                                }
+                            else:
+                                result["command"] = reply_task.result()
+                                self._dictate_log(
+                                    "dictate.reply_generation_done",
+                                    session_id=str(session_id or ""),
+                                    elapsed_s=round(time.monotonic() - reply_started, 3))
+                        except asyncio.CancelledError:
+                            if not reply_task.done():
+                                reply_task.cancel()
+                                reply_task.add_done_callback(
+                                    self._consume_task_result)
                             self._dictate_log(
-                                "dictate.reply_generation_timeout",
+                                "dictate.reply_generation_cancelled",
+                                session_id=str(session_id or ""))
+                            raise
+                        except Exception as exc:
+                            self._dictate_log(
+                                "dictate.reply_generation_failed",
                                 session_id=str(session_id or ""),
-                                timeout_s=reply_timeout_s,
-                                elapsed_s=round(time.monotonic() - reply_started, 3))
+                                error=f"{type(exc).__name__}: {exc}"[:200])
                             result["command"] = {
                                 "reply": ("Dictation saved, but reply generation "
-                                          "timed out."),
-                                "error": "reply generation timed out",
+                                          "failed."),
+                                "error": str(exc)[:200],
                             }
-                        else:
-                            result["command"] = reply_task.result()
-                            self._dictate_log(
-                                "dictate.reply_generation_done",
-                                session_id=str(session_id or ""),
-                                elapsed_s=round(time.monotonic() - reply_started, 3))
-                    except asyncio.CancelledError:
-                        if not reply_task.done():
-                            reply_task.cancel()
-                            reply_task.add_done_callback(self._consume_task_result)
-                        self._dictate_log(
-                            "dictate.reply_generation_cancelled",
-                            session_id=str(session_id or ""))
-                        raise
-                    except Exception as exc:
-                        self._dictate_log(
-                            "dictate.reply_generation_failed",
-                            session_id=str(session_id or ""),
-                            error=f"{type(exc).__name__}: {exc}"[:200])
-                        result["command"] = {
-                            "reply": ("Dictation saved, but reply generation "
-                                      "failed."),
-                            "error": str(exc)[:200],
-                        }
                 # Narration (the dictation pillar) keeps its factual
                 # report as the narration line — her spoken answer rides
                 # in the reply. Command and conversation let the reply

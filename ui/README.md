@@ -122,5 +122,10 @@ panel never steals a keystroke you didn't give it.
 
 ## Hyprland binds
 
-`assist doctor` prints your syntax. Lua (0.55+): append `ui/hyprland/elaria-binds.lua`.
-Older: append `elaria-binds.conf`. `SUPER+grave` hold-to-talk, `SUPER+SHIFT+F12` halt.
+`assist doctor` prints your syntax. **Lua first** (0.55+, and the ONLY format
+0.57 reads): append `ui/hyprland/elaria-binds.lua`. Append `elaria-binds.conf`
+only when doctor positively reports a compositor older than 0.55 — a legacy
+`bind = ...` line on a Lua-only Hyprland is silently ignored. Both files are
+generated from `assistant.hypr_binds.emit_binds()` and pinned by
+`tests/test_task_m_followup.py`. `SUPER+grave` hold-to-talk, `Escape` cancel
+(zeroizes the partial buffer, releases the node), `SUPER+SHIFT+F12` halt.
