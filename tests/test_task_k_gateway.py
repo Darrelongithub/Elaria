@@ -156,14 +156,30 @@ def test_f17_refuses_a_default_device_when_a_device_could_be_opened(monkeypatch)
     assert gateway.status()["state"] == "idle"
 
 
-def test_f17_without_any_device_the_question_does_not_arise(monkeypatch):
-    # Containers/CI: no pw-record, so no default source can be grabbed; the
-    # daemon's existing no-device fallback answers (and logs why).
-    monkeypatch.setattr("assistant.audio_gateway.tool_available", lambda _t: False)
-    gateway = _gateway()
-    target, provenance = gateway.resolve_target(None)
-    assert target is None
-    assert "no device can be opened" in provenance
+def test_f17_refuses_an_unnamed_node_on_a_device_lesson_machine_too(monkeypatch):
+    """Owner ruling 2026-11-15: the refusal is UNCONDITIONAL.
+
+    A gateway that quietly fell back to the system default on a real machine
+    is the wrong-mic bug in a fallback costume; on a machine with no capture
+    device at all the refusal is equally true — there is still no node this
+    deployment asked for. Both shapes must say the SAME thing.
+    """
+    reasons = []
+    for device_present in (True, False):
+        monkeypatch.setattr("assistant.audio_gateway.tool_available",
+                            lambda _t, present=device_present: present)
+        gateway = _gateway()
+        seen: list = []
+        gateway.capture_factory = _fake_factory(seen)
+        with pytest.raises(GatewayRefused) as refusal:
+            gateway.resolve_target(None)
+        assert refusal.value.refusal == "policy"
+        reasons.append(str(refusal.value))
+        with pytest.raises(GatewayRefused):
+            gateway.open_capture()
+        assert seen == [], "no device may be opened when the node is unnamed"
+    assert reasons[0] == reasons[1], (
+        "the refusal must not depend on whether this machine can open a device")
 
 
 def test_f17_a_node_that_will_not_open_is_refused_by_name():
@@ -348,22 +364,29 @@ def test_ptt_start_opens_the_configured_node_through_the_gateway(
     assert daemon.audio.state == "idle"
 
 
-def test_ptt_start_refuses_instead_of_grabbing_a_default_device(
-        config, running_daemon, monkeypatch):
+@pytest.mark.parametrize("device_present", [True, False])
+def test_ptt_start_refuses_an_unnamed_node_before_the_earcon(
+        config, running_daemon, monkeypatch, device_present):
+    """Both machine shapes: refused, no device opened, NO earcon played."""
     monkeypatch.delenv("ASSIST_CAPTURE", raising=False)
     daemon, _server = running_daemon
-    # A machine that CAN open a device, with no node configured: refusal.
-    monkeypatch.setattr("assistant.audio_gateway.tool_available", lambda _t: True)
+    monkeypatch.setattr("assistant.audio_gateway.tool_available",
+                        lambda _t: device_present)
     monkeypatch.setattr(daemon_mod, "PipeWireCapture", FakeDevice)
     daemon.config.raw.setdefault("capture", {})["mic_target"] = ""
     daemon.config.raw.setdefault("meeting", {})["mic_target"] = ""
+    acked: list = []
+    monkeypatch.setattr(daemon, "_ack", lambda params: acked.append(params) or {})
 
     started = call(config.socket_path, "ptt.start", {}, timeout=5.0)
 
     assert started["listening"] is False
-    assert "F17" in started["refused"]
+    assert "F17" in started["refused"], "the reason must be the node policy"
+    assert started["note"].startswith("no earcon played")
+    assert acked == [], "a refused session must not beep as if it had started"
     assert FakeDevice.opened == [], "F17: no unnamed device may be opened"
     assert daemon.audio.state == "idle"
+    assert daemon._capture_source is None
 
 
 def test_playback_paths_register_with_the_gateway(config, monkeypatch):

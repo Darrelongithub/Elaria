@@ -450,7 +450,15 @@ def run_doctor(config) -> dict:
 
     mic_target = (config.section("capture").get("mic_target")
                   or config.section("meeting").get("mic_target") or None)
-    level = live_level_check(mic_target, seconds=1.2)
+    # F17 (owner ruling 2026-11-15): an unnamed node is refused on EVERY
+    # machine, so doctor must not measure one the daemon would never open —
+    # probing the default source would be the same wrong-mic habit wearing a
+    # diagnostic costume. With no node the answer is the refusal itself.
+    level = (live_level_check(mic_target, seconds=1.2) if mic_target else
+             {"available": False, "target": None,
+              "reason": "no capture node configured — capture is refused "
+                        "(F17); set [capture] mic_target to the node the "
+                        "doctor reports (wpctl status + wpctl inspect)"})
     if level.get("available"):
         level_detail = (
             f"node={level.get('target')} · {level.get('bytes', 0)} bytes "
@@ -474,14 +482,15 @@ def run_doctor(config) -> dict:
     mic2_named = "mic2" in mic_pin.lower().replace(" ", "")
     checks.append(_check(
         "capture node (Mic1)",
-        not mic2_named and bool(mic_pin or level.get("available")),
+        bool(mic_pin) and not mic2_named,
         ("MIC2 CONFIGURED — Mic2 is silent; set [capture] mic_target to the "
          "Mic1 node.name (wpctl status + wpctl inspect)" if mic2_named else
          (f"mic_target={mic_pin!r} (matched by node.name)"
           if mic_pin else
-          "mic_target empty — the PipeWire default source is used; pin "
-          "node.name Mic1 explicitly ([capture] mic_target) so a silent node "
-          "can never become the default"))))
+          "mic_target empty — capture is REFUSED on every machine (F17, "
+          "owner ruling 2026-11-15); pin node.name Mic1 explicitly "
+          "([capture] mic_target) so a silent node can never become the "
+          "default"))))
 
     # §4.8: the quickshell binary (the console/overlay are quickshell panels).
     checks.append(_check(

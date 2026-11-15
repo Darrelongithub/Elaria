@@ -133,17 +133,15 @@ class AudioGateway:
                   or section("meeting").get("mic_target"))
         if target:
             return str(target), "configured"
-        # F17: on a machine that CAN open a device, an unnamed node is a
-        # refusal — never "whatever the system picked". Where no device can be
-        # opened at all (no pw-record: containers, CI, fake-device pins) the
-        # question does not arise and the caller's existing no-device fallback
-        # answers, with its reason logged.
-        if tool_available("pw-record"):
-            raise GatewayRefused(
-                "no capture node configured — default-device grabbing is "
-                "forbidden (F17); set [capture] mic_target to the node the "
-                "doctor reports", refusal="policy")
-        return None, "unconfigured (no device can be opened here)"
+        # F17 (owner ruling 2026-11-15): UNCONDITIONAL. An unnamed node is a
+        # refusal on every machine. A gateway that quietly fell back to the
+        # system default on a real machine would be the wrong-mic bug wearing
+        # a fallback costume; on a device-less machine the refusal is equally
+        # true, because there is still no node this deployment asked for.
+        raise GatewayRefused(
+            "no capture node configured — default-device grabbing is "
+            "forbidden (F17); set [capture] mic_target to the node the "
+            "doctor reports", refusal="policy")
 
     def open_capture(self, *, params: dict | None = None, source_kind: str = "mic",
                      frame_ms: int = 30, stall_timeout_s: float = 8.0) -> dict:

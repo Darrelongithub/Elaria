@@ -57,7 +57,13 @@ def journal_stream(monkeypatch):
 def config():
     from assistant.config import load_config
 
-    return load_config()
+    config = load_config()
+    # F17 (owner ruling 2026-11-15): an unnamed capture node is refused on
+    # EVERY machine, so a fixture daemon that expects to capture describes a
+    # machine whose node is named — exactly like the owner's laptop, where
+    # `[capture] mic_target` is the node the doctor reports.
+    config.raw.setdefault("capture", {})["mic_target"] = "test-mic"
+    return config
 
 
 def pytest_pyfunc_call(pyfuncitem):

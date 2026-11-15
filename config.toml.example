@@ -257,6 +257,10 @@ source = "mic"                      # §10.1 OPEN — blueprint recommendation:
 # (then [meeting] mic_target). Node.name / object.serial — NOT object.id.
 # Find it with `wpctl status` + `wpctl inspect <id>`. Empty = default source.
 mic_target = ""
+# F17 (owner ruling 2026-11-15): REQUIRED for capture. An unnamed node is
+# refused on every machine, before the session-open earcon — never the
+# PipeWire default source. The doctor names the node: `wpctl status` +
+# `wpctl inspect <id>` (node.name, not object.id).
 sample_rate = 16000
 chunk_ms = 30
 # No bytes at all for this long = a dead capture process (pw-record emits
