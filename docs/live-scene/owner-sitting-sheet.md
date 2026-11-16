@@ -146,6 +146,6 @@ The rclone MEGA backend puts deletions into MEGA's trash unless `--mega-hard-del
 5daedf0d540c9392af7ce4bc938748fd30d5a31d36497e3d056897839e9faf22  scripts/storage-census-check.py
 3b896526f1bde522e37e51d8804add0012490f30d7b12ef5d546c3dc8cf913bb  scripts/warm-cold-transition.py
 dfbc44efbce3be1c45a45f3d8dec1ee2a4572bb35e5023279691d715a28b0362  src/assistant/preflight.py
-4052ad568985ac3906e2bfa73955c2f789d1ef7cfec726884bb1e0dab4d3482c  src/assistant/backup_cli.py
+31c9e602337ef7b3233f4115ff8116ab55b358f2106f5698c014607dd9cf8086  src/assistant/backup_cli.py
 c7c8cfc985afa997d734865cfff0d37d01559d625e216c8ef49860bd1e7fce4e  src/assistant/remote.py
 ```

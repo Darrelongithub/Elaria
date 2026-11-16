@@ -7,6 +7,24 @@
 
 ---
 
+## READ THIS FIRST — this drill is gated by operation 3
+
+**This drill has nothing to drill until operation 3 has flipped something cold.** And operation 3 is itself time-gated: the named wav `20261102-100558-61258b` is sendable cold **only from 2026-11-16 after 10:06**, because it was captured 2026-11-02 10:05:58 and the hot window is 14 days.
+
+**So if you run this drill before then, it will report `nothing cold to drill` and exit 0.** That is a **pass-shaped answer that proves nothing** — the machinery ran, and nothing about your audio was shown to be retrievable.
+
+**That is the gate holding, not a pass.** Do not record it, and do not let it stand in for, a monthly drill that actually restored and hash-verified something. The exit code cannot tell the difference; only the record's `detail` can, which is why the record carries the reason.
+
+Check first:
+
+```bash
+cd ~/Elaria && assist backup status
+```
+
+**The cold count must be at least 1.** If it is 0, operation 3 has not landed yet — go back to `op3-cold-flip-packet.md` and check the window.
+
+---
+
 ## The one line
 
 ```bash
@@ -98,6 +116,6 @@ The drill restores to a **temp directory** and leaves it there for you to inspec
 5daedf0d540c9392af7ce4bc938748fd30d5a31d36497e3d056897839e9faf22  scripts/storage-census-check.py
 3b896526f1bde522e37e51d8804add0012490f30d7b12ef5d546c3dc8cf913bb  scripts/warm-cold-transition.py
 dfbc44efbce3be1c45a45f3d8dec1ee2a4572bb35e5023279691d715a28b0362  src/assistant/preflight.py
-4052ad568985ac3906e2bfa73955c2f789d1ef7cfec726884bb1e0dab4d3482c  src/assistant/backup_cli.py
+31c9e602337ef7b3233f4115ff8116ab55b358f2106f5698c014607dd9cf8086  src/assistant/backup_cli.py
 c7c8cfc985afa997d734865cfff0d37d01559d625e216c8ef49860bd1e7fce4e  src/assistant/remote.py
 ```

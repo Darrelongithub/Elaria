@@ -2423,3 +2423,48 @@ builder from step 1's numbers with no new traffic.
 benchmark exists to measure. What is named is the work - ~1 GB up, ~500 MB down per repo, two
 `restic check` passes, four slow MEGA listings - and Sheet 1's own guidance to leave it
 running and come back.
+
+---
+
+## 2026-11-08 - FIRING ELEVEN, and the honesty doctrine applied to the packet set
+
+**FIRING ELEVEN (a full re-clone, the eleventh).** The sandbox re-cloned onto
+`arena/e7a1cca5-elaria` @ `ed20344` with the SAME 30 files of foreign uncommitted work -
+the 177,646-byte patch is byte-identical to firings seven through ten. Ran the report-020
+method as a checklist with the preserve step first; frozen hash verified before and after;
+explicit-URL fetch; integrity check (`6c972de`); local-only checkout; verify after. **The
+preserve step has now earned its keep seven times.**
+
+**ACCEPTANCES RECORDED.** Two sentences enter house doctrine verbatim: *a gate that can
+never open is a gate that has been silently switched off - the same failure as a gate that
+never closes*; and *an owner who ran the flip early would believe a flip had happened when
+none had, which is why the packet leads with the window*. The quota-producer fix is accepted
+as built. The window arithmetic is accepted as the most consequential fact in packet 3, and
+**the leading placement of that fact is approved as the honesty pattern for every
+time-gated deliverable hereafter.**
+
+**THE DOCTRINE APPLIED, not merely recorded.** An audit of the packet set found a real gap:
+**packet 5 opened with "The one line" and buried its gate in a pre-flight table.** Run before
+operation 3 has flipped something cold, the drill reports `nothing cold to drill` and **exits
+0** - a pass-shaped answer that proves nothing. Exactly the failure the doctrine names.
+Restructured so packet 5 now leads with "READ THIS FIRST - this drill is gated by operation 3".
+
+**THE LAST UNISSUED PACKET BUILT:** `op4-fetch-line-packet.md`, the fetch line and the owner's
+ear, issued now so the line is ready the moment the window opens. It leads with the same
+pattern: run early and it says `that artifact is <state>, not cold; nothing to restore` and
+exits 2 - the gate holding, not a failed restore.
+
+**A THIRD REAL FINDING, in the fetch path itself: `_fetch` matched the manifest key by exact
+expanded path**, so the owner would have had to retype an absolute path to get their own audio
+back - a poor trade. Fixed with `_resolve_artifact`, which tries the string as given, then
+resolved against the filesystem, then relative to the audio root. **Each step is
+deterministic and never searches for a similar name**, because a basename match across several
+captures would be a silent substitution and this lane's rule is no substitution. Verified: a
+bare filename and an audio-relative path both resolve; a name the manifest never saw still
+refuses with exit 2.
+
+**THE DOCTRINE MADE STRUCTURAL:** `test_every_time_gated_packet_leads_with_its_gate` asserts
+that for every time-gated packet the gate section appears BEFORE the one-line command, and
+names the gate date before it. `test_every_time_gated_packet_says_early_action_proves_nothing`
+asserts each packet says early action is the gate holding - accepting either "gate holding" or
+"window holding", because each packet names its own gate and the phrasing follows.

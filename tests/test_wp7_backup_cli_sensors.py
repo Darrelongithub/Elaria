@@ -322,6 +322,47 @@ def test_fetch_restores_and_hash_verifies(tmp_path):
     assert "hash: verified" in out.getvalue()
 
 
+def test_fetch_resolves_a_bare_filename(tmp_path):
+    """Asking an owner to retype an absolute path to get their own audio back is a poor
+    trade. A bare name resolves against the manifest key — deterministically, never by
+    searching for a similar one, because a basename match across several captures would
+    be a silent substitution and this lane's rule is no substitution."""
+    ctx, art = _fixture_ctx(tmp_path, state=FLIPPED)
+    ctx.backend.store(art)
+    out = io.StringIO()
+    dest = tmp_path / "restored" / "a.wav"
+    code = backup_command(_Args(backup_action="fetch", artifact=art.name, out=str(dest)),
+                          None, out=out, ctx=ctx)
+    assert code == 0, out.getvalue()
+    assert dest.read_bytes() == art.read_bytes()
+    assert "hash: verified" in out.getvalue()
+
+
+def test_fetch_resolves_an_audio_relative_path(tmp_path):
+    ctx, art = _fixture_ctx(tmp_path, state=FLIPPED)
+    ctx.backend.store(art)
+    out = io.StringIO()
+    dest = tmp_path / "restored" / "a.wav"
+    code = backup_command(
+        _Args(backup_action="fetch", artifact=f"audio/{art.name}", out=str(dest)),
+        None, out=out, ctx=ctx)
+    assert code == 0, out.getvalue()
+    assert dest.read_bytes() == art.read_bytes()
+
+
+def test_fetch_resolution_never_substitutes_a_similar_name(tmp_path):
+    """Two captures, one named in the manifest. A resolution that matched the wrong one
+    would hand the owner audio they did not ask for, so an unknown name is a refusal."""
+    ctx, art = _fixture_ctx(tmp_path, state=FLIPPED)
+    ctx.backend.store(art)
+    (tmp_path / "audio" / "looks-similar.wav").write_bytes(b"x" * 44)
+    out = io.StringIO()
+    code = backup_command(_Args(backup_action="fetch", artifact="looks-similar.wav",
+                                out=None), None, out=out, ctx=ctx)
+    assert code == 2, "a name the manifest never saw is a refusal, not a search"
+    assert "no manifest record" in out.getvalue()
+
+
 def test_fetch_refuses_an_artifact_the_manifest_never_saw(tmp_path):
     ctx, _ = _fixture_ctx(tmp_path)
     out = io.StringIO()

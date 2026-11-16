@@ -270,11 +270,48 @@ def _status(ctx: BackupContext, out) -> int:
     return 0
 
 
+def _resolve_artifact(ctx: BackupContext, artifact: str) -> tuple[Path | None, str]:
+    """Find the manifest key for a user-supplied artifact name.
+
+    The manifest keys are absolute paths, and asking an owner to retype an absolute path
+    to get their own audio back is a poor trade. So the lookup tries, in order:
+
+    1. the string exactly as given, expanded;
+    2. that path resolved against the filesystem (symlinks, `..`, a relative path);
+    3. the same name relative to the audio root this context scans.
+
+    Each step is deterministic — it never searches for a *similar* name, because a
+    basename match across several captures would be a silent substitution, and this lane's
+    rule is no substitution. If none of the three hit, the caller refuses.
+    """
+
+    current = ctx.manifest.current()
+    given = Path(artifact).expanduser()
+    tried = [str(given)]
+    candidates = [given]
+    try:
+        resolved = given.resolve()
+        if str(resolved) not in tried:
+            tried.append(str(resolved))
+            candidates.append(resolved)
+    except OSError:
+        pass
+    audio_relative = ctx.data_dir / "audio" / given.name
+    if str(audio_relative) not in tried:
+        tried.append(str(audio_relative))
+        candidates.append(audio_relative)
+    for candidate in candidates:
+        record = current.get(str(candidate))
+        if record is not None:
+            return candidate, str(candidate)
+    return None, "no manifest record"
+
+
 def _fetch(ctx: BackupContext, artifact: str, *, dest: str | None, out) -> int:
     """The cold read path: manifest lookup, restore, hash-verify."""
 
-    path = Path(artifact).expanduser()
-    record = ctx.manifest.current().get(str(path))
+    path, _key = _resolve_artifact(ctx, artifact)
+    record = ctx.manifest.current().get(str(path)) if path is not None else None
     if record is None:
         print("backup fetch: no manifest record for that artifact", file=out)
         return 2

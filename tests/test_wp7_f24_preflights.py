@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
@@ -303,10 +304,48 @@ class PacketNumberDriftTests(unittest.TestCase):
         """Case-folded, so a heading's capitals do not read as a missing fact."""
         return self._read(name).casefold()
 
+    # The packets whose action is gated by something that has not happened yet. The
+    # doctrine (ruled 2026-11-08) is that a time-gated deliverable LEADS with its gate,
+    # because an owner who acted early would believe something had happened when it had
+    # not. This test makes that structural rather than a habit.
+    TIME_GATED: ClassVar[dict[str, str]] = {
+        "op3-cold-flip-packet.md": "2026-11-16",
+        "op5-monthly-drill-packet.md": "2026-11-16",
+        "op4-fetch-line-packet.md": "2026-11-16",
+    }
+
     def test_every_packet_exists(self):
         for name in ("op3-cold-flip-packet.md", "op5-monthly-drill-packet.md",
-                     "owner-sitting-sheet.md"):
+                     "op4-fetch-line-packet.md", "owner-sitting-sheet.md"):
             self.assertTrue(os.path.exists(os.path.join(self.DOCS, name)), name)
+
+    def test_every_time_gated_packet_leads_with_its_gate(self):
+        """The honesty pattern, pinned. The gate must appear BEFORE the command that
+        would silently do nothing — not after it, and not only in a pre-flight table."""
+        for name, gate_date in self.TIME_GATED.items():
+            text = self._read(name)
+            gate_at = text.find("READ THIS FIRST")
+            command_at = text.find("## The one line")
+            self.assertGreaterEqual(gate_at, 0, f"{name} has no leading gate section")
+            self.assertGreater(command_at, 0, f"{name} has no one-line command")
+            self.assertLess(gate_at, command_at,
+                            f"{name} must state its gate BEFORE the command that would "
+                            f"silently do nothing")
+            self.assertIn(gate_date, text[:command_at],
+                          f"{name} must name the gate date before the command")
+
+    def test_every_time_gated_packet_says_early_action_proves_nothing(self):
+        """The reason the doctrine exists, stated in each packet in its own words.
+
+        The phrasing differs per packet — op3 says "the window holding", op5 and op4 say
+        "the gate holding" — because each names its own gate. What is pinned is that each
+        says it, not that they all use one sentence.
+        """
+        for name in self.TIME_GATED:
+            text = self._read_folded(name)
+            self.assertTrue(
+                any(p in text for p in ("gate holding", "window holding")),
+                f"{name} must say that early action is the gate holding")
 
     def test_the_packets_quote_the_derived_scratch_not_a_round_number(self):
         """Both the bare and the comma-grouped form are accepted, because a packet
