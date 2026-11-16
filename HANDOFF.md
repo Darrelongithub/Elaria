@@ -41,13 +41,40 @@ Still deliberately outside the gateway (needs its own grant): the always-on
 hotword capture, `event.py`'s event capture, `_meeting_start`'s dual capture,
 and `live_client.py`'s live stream (PROTECTED).
 
+## 0a. Capture clipping — D-A (pop) vs D-B (voice), 2026-11-15
+
+Commit `6785860` (branch `arena/c2a7085d-elaria`; nothing merged, PR #23 hold
+unchanged). Suite: **2150 passed, 6 skipped in 173.04 s** (was 2136/6 in
+179.30 s); `ruff check .` clean. Report:
+`docs/phase-reports/2026-11-15-clipping-pop-vs-voice.md`.
+
+Issued: `scripts/frame_probe.py` + `scripts/frame_probe.py.sha256` (stdlib,
+no network, numbers-only, one physical line), the `peak_full`/`peak_steady`
+split in doctor + session stats, and the start-transient gate in the capture
+path. **The verdict is owed, not taken** — the three kept takes decide it:
+
+```
+sha256sum -c scripts/frame_probe.py.sha256
+python3 scripts/frame_probe.py ~/…/20261027-064450-77cc4e.wav
+python3 scripts/frame_probe.py ~/…/20261031-145603-94129e.wav
+python3 scripts/frame_probe.py ~/…/20261102-100558-61258b.wav
+```
+
+`verdict pop_at_start` → D-A: set `[capture] start_pop_ms` to the largest
+`recommended_start_pop_ms`, doctor once, done. `steady_clip`/`mixed` → D-B:
+the voice is at full scale and **WP1's input-gain review is reinstated with
+evidence**. `clean` on all three → neither; look at what differed between
+those sessions and the ones that read 0.9981/1.0. No cause is attributed
+until the numbers arrive. The owner may press F2 tonight as a datapoint;
+no expectation is set for it.
+
 ## 1. Where the build is
 
 | phase | state |
 | --- | --- |
 | Phase 0 (model-ID audit) | DONE — report `docs/phase-reports/2026-10-25-phase0-model-id-audit.md`. Owner approved the full §4.1 pin set (2026-10-25); applied. |
 | WP0 EYES | CODE COMPLETE. Scene 2 (2026-10-26) found the bind rungs still lying (root cause: the real `hyprctl -j binds` payload carries only `modmask` — stream-2 rebuild landed on the dumped shape). **GATE: scene 3 — ladder rerun (A/C truthful) + THE PRESS (Win+F2, one sentence, release) → journalctl tail with `model_version`.** PR #23 merges when stream-1 tests are green in sandbox AND the scene-3 ladder is truthful AND the press produces schema lines with `model_version`. |
-| WP1 VOICE AND IDENTITY | **parked until the scene-3 report lands.** On its plate: Flare TTS-side check (live side of unknown #4 is CLOSED — Flare is in the gemini-3.8-live 40-voice catalogue); earcon before capture; echo-cancel (AEC) measurement; TTS cache hit-ratio split; mic input-gain review (mic peak 1.0 clipping); silence-verdict review. BH-H9 landed early in stream 1 (owner-joined). |
+| WP1 VOICE AND IDENTITY | **parked until the scene-3 report lands.** On its plate: Flare TTS-side check (live side of unknown #4 is CLOSED — Flare is in the gemini-3.8-live 40-voice catalogue); earcon before capture; echo-cancel (AEC) measurement; TTS cache hit-ratio split; mic input-gain review — **UNPROVEN, not cancelled** (2026-11-15: the mute test proves a full-scale sample survives node mute, so peak never proved voice clipping; `scripts/frame_probe.py` decides D-A pop vs D-B clip on the owner's three takes); silence-verdict review. BH-H9 landed early in stream 1 (owner-joined). |
 | WP2 HOME | not started (fix eventSnap first: unqualified `eventSnap` in nested scopes of `ui/quickshell/console/shell.qml` lines ~563–975; qualify as `panel.eventSnap`. Then the qmllint pre-gate productised). |
 | WP4 EARS | not started. Strictly additive; hotkey PTT is the proven wake mechanism. |
 | WP5 FLIGHT | not started. `[event] segment_minutes` is still 30.0 — §4.7 wants 25 (range 10–30) + Files API transport + reserve of the last 2 calls of each LA-day. Also owns the event-smoke segment-rotation timing defect (see §5). |
@@ -359,10 +386,27 @@ self-certified): `docs/scene-cards/2026-10-31-latency-scene.md`.
    --user restart assistant` right after checkout/sync, before doctor,
    ladder, and the press. (The WP0 report checklist is reordered
    accordingly.)
-2. **Mic peak 1.0 — clipping watch (scene 2).** The proven Mic1 input is
-   now hitting full scale (scene 1: 0.9981; scene 2: 1.0, clipping).
-   **WP1 owns the input-gain review.** Anything that reads `peak` on the
-   schema lines should be read against this baseline.
+2. **Mic peak 1.0 — ANNOTATED 2026-11-15 (was: "clipping watch").**
+   The scene-1/2 readings (0.9981, 1.0) were recorded as "clipping". The
+   owner-hardware mute test **retired that reading as stated**: with the
+   node muted, rms 0.007 but **peak 0.9981** — a full-scale sample survives
+   a volume stage that provably owns the signal, so it is injected at or
+   after stream open (start pop / DSP power-up click). Peak alone can no
+   longer separate pop from voice, so:
+   * `peak` on the schema lines is now **`peak_full`**; doctor and
+     `capture.stats` also print **`peak_steady`** (all non-transient
+     frames) — read those two, never the bare peak, to say anything about
+     the voice;
+   * a **start transient** (full-scale inside `[capture] start_pop_ms`,
+     default 100 ms) is kept in the WAV and replay buffer but **never
+     uploaded** to Live/ASR, and never counts as `first_speech_frame_s`;
+   * the silence verdict reads the steady peak, so a pop-only take is
+     silence;
+   * the question "is a hot voice clipped?" (rms 0.35 at 31 % while
+     talking) stays **OPEN, unproven either way**;
+   * the verdict instrument is `scripts/frame_probe.py` (+ `.sha256`),
+     owner-runnable, numbers-only. Report:
+     `docs/phase-reports/2026-11-15-clipping-pop-vs-voice.md`.
 3. **Suite triage (scene-1 failures), one verdict per test:**
    - bug6 dictate ("no speech captured" instead of the mock transcript):
      **REOPENED 2026-10-26 — the earlier silence_floor mechanism claim is
