@@ -257,6 +257,12 @@ source = "mic"                      # §10.1 OPEN — blueprint recommendation:
 # (then [meeting] mic_target). Node.name / object.serial — NOT object.id.
 # Find it with `wpctl status` + `wpctl inspect <id>`. Empty = default source.
 mic_target = ""
+# Start transient hold-off (owner measurement 2026-11-15): a full-scale sample
+# survives node mute, so it is injected at or after stream open. Frames in the
+# first `start_pop_ms` are recorded but never uploaded full-scale and can never
+# be called "first speech"; the steady peak starts after them. Derive the value
+# from `python3 scripts/frame_probe.py <wav>` -> `recommended_start_pop_ms`.
+start_pop_ms = 100
 # F17 (owner ruling 2026-11-15): REQUIRED for capture. An unnamed node is
 # refused on every machine, before the session-open earcon — never the
 # PipeWire default source. The doctor names the node: `wpctl status` +

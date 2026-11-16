@@ -142,8 +142,105 @@ def pcm_peak(pcm: bytes) -> float:
     return max((abs(s) for s in samples), default=0) / 32768
 
 
+#: How long after stream open a sample can still be called a START transient
+#: (owner measurement 2026-11-15). The mute test proved the full-scale sample
+#: survives node mute — rms 0.007 with peak 0.9981 — so it is injected at or
+#: after stream open, not carried by room sound. 100 ms is the synthetic
+#: worst case (a one-frame pop at 50 ms) plus one frame of margin; the owner's
+#: three kept takes re-derive it with `scripts/frame_probe.py`, whose
+#: `recommended_start_pop_ms` is the number to set here. Changing it moves no
+#: audio: it only decides which frames may be called "the first speech frame"
+#: and which full-scale frames are transport rather than the owner.
+START_POP_MS = 100
+
+
+def split_peak(pcm: bytes, sample_rate: int = SAMPLE_RATE,
+               skip_ms: int = START_POP_MS, *,
+               full_scale: float = 0.99, frame_ms: int = 50) -> dict:
+    """Peak of EVERYTHING vs peak with the start transient removed.
+
+    A single `peak` cannot tell a start pop from a hot voice, and the mute test
+    showed exactly that: rms said the node was silent, peak said full scale.
+    Both readings are reported — the full one is never hidden, the steady one
+    is the one a diagnosis may anchor on.
+
+    "Steady" is deliberately not "everything after N ms": that would throw away
+    a real first syllable and it would report a silent steady span for a take
+    shorter than the window. It is **every frame that is not a start
+    transient** — a full-scale frame inside the first `skip_ms`. Speech inside
+    the window is kept, so the steady peak always describes the person, and a
+    pop never describes anything.
+    """
+    frame_bytes = max(2, int(sample_rate * frame_ms / 1000) * BYTES_PER_SAMPLE)
+    frame_bytes -= frame_bytes % BYTES_PER_SAMPLE
+    steady_peak = 0.0
+    steady_bytes = 0
+    for start in range(0, len(pcm), frame_bytes):
+        frame = pcm[start:start + frame_bytes]
+        if len(frame) < 2:
+            continue
+        start_ms = start / BYTES_PER_SAMPLE / sample_rate * 1000
+        is_transient = start_ms < skip_ms and pcm_peak(frame) >= full_scale
+        if is_transient:
+            continue
+        steady_peak = max(steady_peak, pcm_peak(frame))
+        steady_bytes += len(frame)
+    return {
+        "peak_full": round(pcm_peak(pcm), 4),
+        "peak_steady": round(steady_peak, 4),
+        "start_pop_ms": int(skip_ms),
+        "steady_bytes": steady_bytes,
+    }
+
+
+class StartTransientGate:
+    """Separates a stream-open transient from the person speaking.
+
+    The gate exists because one full-scale sample at stream open persuaded the
+    whole capture path that speech had begun: `first_speech_frame_s` read 0.0
+    on real takes and the energy gate opened on a click. It answers both
+    without touching the audio — every frame is still recorded (audio is never
+    lost), and a SPEECH-LEVEL frame inside the hold-off is kept for the uplink,
+    because a hold-off that costs a syllable is a worse bug than the pop:
+
+    * no frame inside the hold-off can be the FIRST SPEECH FRAME;
+    * a FULL-SCALE frame inside the hold-off is transport, not the owner, and
+      is recorded but not uploaded;
+    * nothing here changes `peak`/`rms` accounting: the limiter and the peaks
+      still see the true signal, transient included.
+    """
+
+    FULL_SCALE = 0.99
+
+    def __init__(self, *, sample_rate: int = SAMPLE_RATE,
+                 holdoff_ms: int = START_POP_MS,
+                 full_scale: float = FULL_SCALE) -> None:
+        self.sample_rate = sample_rate
+        self.holdoff_ms = max(0, int(holdoff_ms))
+        self.full_scale = float(full_scale)
+        self.holdoff_frames = 0
+        self.transients = 0
+
+    def classify(self, frame: bytes, start_ms: float) -> dict:
+        """What this frame is, and whether the hold-off covers it."""
+        in_holdoff = start_ms < self.holdoff_ms
+        peak = pcm_peak(frame)
+        transient = bool(in_holdoff and peak >= self.full_scale)
+        if in_holdoff:
+            self.holdoff_frames += 1
+        if transient:
+            self.transients += 1
+        return {"in_holdoff": in_holdoff, "transient": transient, "peak": peak}
+
+    def stats(self) -> dict:
+        return {"holdoff_ms": self.holdoff_ms, "full_scale": self.full_scale,
+                "holdoff_frames": self.holdoff_frames,
+                "transients": self.transients}
+
+
 def live_level_check(target: str | None = None, seconds: float = 1.2,
-                     runner=subprocess.run) -> dict:
+                     runner=subprocess.run, *,
+                     skip_ms: int = START_POP_MS) -> dict:
     """Brief real-microphone level probe for `assist doctor` (BUG 6).
 
     Records ~`seconds` of raw PCM from the configured (or default) source and
@@ -173,12 +270,17 @@ def live_level_check(target: str | None = None, seconds: float = 1.2,
         return {"available": False, "target": target or "(default source)",
                 "reason": f"{type(exc).__name__}: {exc}"}
     peak = pcm_peak(data)
+    split = split_peak(data, SAMPLE_RATE, skip_ms)
     return {
         "available": True,
         "target": target or "(default source)",
         "seconds": round(len(data) / BYTES_PER_SAMPLE / SAMPLE_RATE, 2),
         "bytes": len(data),
+        # `peak` stays for every existing reader; the split is the honest pair.
         "peak": round(peak, 4),
+        "peak_full": split["peak_full"],
+        "peak_steady": split["peak_steady"],
+        "start_pop_ms": split["start_pop_ms"],
         "rms": round(frame_rms(data), 4),
         # Anything under the frame gate is digital silence / a dead node.
         "signal": bool(data) and peak >= 0.01,

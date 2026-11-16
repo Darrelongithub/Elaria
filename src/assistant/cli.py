@@ -453,7 +453,9 @@ def run_doctor(config) -> dict:
     # machine, so doctor must not measure one the daemon would never open —
     # probing the default source would be the same wrong-mic habit wearing a
     # diagnostic costume. With no node the answer is the refusal itself.
-    level = (live_level_check(mic_target, seconds=1.2) if mic_target else
+    start_pop_ms = int(config.section("capture").get("start_pop_ms", 100))
+    level = (live_level_check(mic_target, seconds=1.2, skip_ms=start_pop_ms)
+             if mic_target else
              {"available": False, "target": None,
               "reason": "no capture node configured — capture is refused "
                         "(F17); set [capture] mic_target to the node the "
@@ -461,7 +463,10 @@ def run_doctor(config) -> dict:
     if level.get("available"):
         level_detail = (
             f"node={level.get('target')} · {level.get('bytes', 0)} bytes "
-            f"({level.get('seconds', 0)}s) · peak {level.get('peak')} · "
+            f"({level.get('seconds', 0)}s) · "
+            f"peak full {level.get('peak_full', level.get('peak'))} · "
+            f"peak steady {level.get('peak_steady')} "
+            f"(first {level.get('start_pop_ms')} ms excluded) · "
             f"rms {level.get('rms')}"
             + (" — SIGNAL present (speak now: peak should move)"
                if level.get("signal") else
@@ -715,14 +720,20 @@ def run_doctor(config) -> dict:
         diag = status.get("capture_diag") or {}
         if diag:
             limiter = diag.get("limiter") or {}
+            # 2026-11-15: peak is SPLIT. A start transient at full scale
+            # survives node mute, so "peak 1.0" alone proved nothing about the
+            # voice — the steady reading is the one a diagnosis may use.
             checks.append(_check(
                 "capture levels", True,
-                f"raw peak {diag.get('raw_peak', limiter.get('raw_peak'))} · "
+                f"peak full {diag.get('peak_full', diag.get('raw_peak'))} · "
+                f"peak steady {diag.get('peak_steady')} "
+                f"(first {diag.get('start_pop_ms')} ms excluded) · "
+                f"start transients {diag.get('start_transient', {}).get('transients', 0)} · "
                 f"processed peak {diag.get('processed_peak', limiter.get('processed_peak'))} · "
                 f"limited samples {limiter.get('limited_samples', 0)} · "
                 f"xruns/dropouts {diag.get('xruns', 0)} · "
                 f"node {diag.get('node')} (the limiter mitigates, it never "
-                f"conceals: both peaks are kept)"))
+                f"conceals: full and steady peaks are both kept)"))
         else:
             checks.append(_check(
                 "capture levels", True,

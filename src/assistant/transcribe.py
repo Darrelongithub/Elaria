@@ -47,9 +47,11 @@ from pathlib import Path
 
 from . import asr
 from .capture import (
+    START_POP_MS,
     FrameGate,
     RollingAudioBuffer,
     SoftLimiter,
+    StartTransientGate,
     WavSink,
     frame_rms,
     pcm_peak,
@@ -346,6 +348,14 @@ class DictationService:
         self.silence_floor = float(
             config.section("voice").get(
                 "silence_floor", DEFAULTS["voice"]["silence_floor"]))
+        # Owner measurement 2026-11-15: the node's mute test left a full-scale
+        # sample behind (rms 0.007, peak 0.9981), so a start transient exists
+        # at or after stream open. The hold-off below is how long a frame may
+        # still be called transport rather than the owner; frames within it
+        # are recorded, never uploaded full-scale, and can never be "first
+        # speech". Derived from `scripts/frame_probe.py` on real takes.
+        self.start_pop_ms = int(config.section("capture").get(
+            "start_pop_ms", START_POP_MS))
         self.checkin_after = settings.get("checkin_after_s") or {}
         # How long speech must last before the ladder treats it as a resumption,
         # and how much silence after the one check-in closes the session (VB-5/6).
@@ -612,6 +622,10 @@ class DictationService:
         cancelled = False
         zeroized_bytes = 0
         gate = FrameGate(rms_threshold=self.vad_threshold)
+        # The start-transient gate (2026-11-15): same audio, honest onset.
+        start_gate = StartTransientGate(holdoff_ms=self.start_pop_ms)
+        start_transients = 0
+        session_peak_steady = 0.0
         ladder = SilenceLadder(
             float(self.checkin_after.get(mode, 20)), speech_rms=self.vad_threshold,
             resume_s=self.resume_s, grace_s=self.grace_s,
@@ -820,6 +834,10 @@ class DictationService:
                     break
                 if frame is None:
                     break                # PTT released mid-read
+                # Position of this frame in the recorded take, measured BEFORE
+                # the length is added (the start-transient gate needs it).
+                frame_start_ms = round(
+                    captured_bytes / 2 / 16000 * 1000, 3)
                 frames_seen += 1
                 captured_bytes += len(frame)
                 # Measure the RAW frame before the limiter touches it (the
@@ -829,6 +847,13 @@ class DictationService:
                 peak_rms = max(peak_rms, level)
                 frame_peak = pcm_peak(frame)
                 session_peak = max(session_peak, frame_peak)
+                # The steady reading ignores START TRANSIENTS only (a
+                # full-scale frame inside the hold-off): a real first syllable
+                # still counts, so this can never report a person as silence
+                # and a pop can never report itself as speech.
+                transient_view = start_gate.classify(frame, frame_start_ms)
+                if not transient_view["transient"]:
+                    session_peak_steady = max(session_peak_steady, frame_peak)
                 frame = limiter.apply(frame)
                 frame_s = len(frame) / 2 / 16000
                 # H.4: press→first-frame latency and where in the kept
@@ -837,8 +862,14 @@ class DictationService:
                 if frames_seen == 1:
                     first_frame_latency_ms = round(
                         (time.monotonic() - dictate_started_mono) * 1000, 1)
-                if first_speech_frame_s is None and (
-                        frame_peak >= self.silence_floor):
+                # A start TRANSIENT is not the first speech frame (2026-11-15:
+                # real takes reported 0.0 because a full-scale pop counted as
+                # instant speech). Only the transient is excluded — a real
+                # first syllable inside the hold-off is still the onset, so
+                # this sensor keeps telling the truth about the owner.
+                if (first_speech_frame_s is None
+                        and not transient_view["transient"]
+                        and frame_peak >= self.silence_floor):
                     first_speech_frame_s = round(
                         (captured_bytes - len(frame)) / 2 / 16000, 3)
                 # BUG6: half-duplex inside the Live session. While her output
@@ -902,7 +933,14 @@ class DictationService:
                         notes.append("closed by the endpointing window — "
                                      "no speech ever landed")
                     break
-                if transport is None or not gate.allows(frame):
+                allowed = gate.allows(frame)
+                if transient_view["transient"]:
+                    # Recorded above (wav + buffer: audio is never lost), not
+                    # uploaded: a full-scale frame at stream open is the
+                    # transport, not the owner.
+                    start_transients += 1
+                    continue
+                if transport is None or not allowed:
                     continue
                 try:
                     # Rotation: never ride a session into its lifetime cap.
@@ -999,7 +1037,7 @@ class DictationService:
                     self._log("dictate.wav_close_failed", session_id=session_id,
                               error=error_text(exc)[:120])
             prelim_no_speech = (captured_bytes == 0 or peak_rms < 0.003
-                                or session_peak < self.silence_floor)
+                                or session_peak_steady < self.silence_floor)
             # W6 cost guard (the scene-3b/BH-K1 contract): never spend the
             # speculative call when the Live primary ALREADY covers the
             # audio — a committed final with no speech after it. The gate
@@ -1230,13 +1268,21 @@ class DictationService:
             # from room noise — garbage transcripts included. The §8
             # near-zero-RMS rule stays: it catches peaky ticks that clear
             # the floor but carry no audible speech.
+            # The verdict reads the STEADY peak (2026-11-15): a start pop at
+            # full scale must not make an empty take look like speech. Both
+            # readings are reported below, so nothing is hidden.
             no_speech = (captured_bytes == 0 or peak_rms < 0.003
-                         or session_peak < self.silence_floor)
+                         or session_peak_steady < self.silence_floor)
             capture_stats = {
                 "session_id": session_id,
                 "node": capture_label, "bytes": captured_bytes,
                 "peak_rms": round(peak_rms, 4), "frames": frames_seen,
                 "peak": round(session_peak, 4),
+                "peak_full": round(session_peak, 4),
+                "peak_steady": round(session_peak_steady, 4),
+                "start_transient": {**start_gate.stats(),
+                                    "transients": start_transients},
+                "start_pop_ms": start_gate.holdoff_ms,
                 "silence_floor": round(self.silence_floor, 4),
                 "duration_s": round(duration_s, 3), "gated_frames": gated_frames,
                 "stalled": stalled, "no_speech": no_speech,
@@ -1626,8 +1672,14 @@ class DictationService:
                               f"node={capture_label}; nothing transcribed"))
             notes.append("cancelled by the owner — partial audio zeroized, "
                          "nothing transcribed")
+        # Both peaks and the split (2026-11-15): the full reading is never
+        # hidden, the steady reading is the one a diagnosis may anchor on.
         log_event("capture.levels", session_id=session_id, verdict="measured",
                   detail=(f"raw_peak={capture_stats.get('raw_peak')}; "
+                          f"peak_full={capture_stats.get('peak_full')}; "
+                          f"peak_steady={capture_stats.get('peak_steady')}; "
+                          f"start_pop_ms={capture_stats.get('start_pop_ms', self.start_pop_ms)}; "
+                          f"start_transients={start_transients}; "
                           f"processed_peak={capture_stats.get('processed_peak')}; "
                           f"limited_samples={limiter.limited_samples}; "
                           f"xruns={result.xruns}; node={capture_label}"))
