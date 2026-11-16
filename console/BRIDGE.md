@@ -8,7 +8,7 @@
 
 **Owner accepted the prior live demo (eight replies and orb) by relay. New sizing/labels
 and detached launcher are TESTED-ONLY pending owner visual/app-window review. No speech/audio
-proof is claimed. WS2 has a bounded registry/refusal surface; unrestricted prose is not guaranteed honest. WS5 new hands remain held.**
+proof is claimed. WS2 has a bounded registry/refusal surface; unrestricted prose is not guaranteed honest. Task I adds a bounded dedicated-instance hands adapter; broader families remain contract-blocked.**
 The standalone v6.15 shell remains the honest fallback if owner verification fails.
 
 ## What runs
@@ -33,13 +33,13 @@ hard stop, not permission to fetch, install or reconstruct something from chat.
 
 Committed executable: **`console/run_bridge.py`**.
 
-SHA256: **`b1f7a632e060d329a702cb99fe88b2f5663d2beede3beb3ee32b59a23c2da8ed`**.
+SHA256: **`eb580bace404f5774b2a675a11e7d3e1bb0a16fc47036ddbba878a8ae40b70ad`**.
 
 From a copy containing this release's `console/` payload and the existing `.venv` interpreter,
 this is one physical command line. It checks the launcher before Python runs; the launcher
 then checks all five payload hashes before importing the bridge. A mismatch stops.
 
-`test "$(sha256sum console/run_bridge.py)" = 'b1f7a632e060d329a702cb99fe88b2f5663d2beede3beb3ee32b59a23c2da8ed  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --open`
+`test "$(sha256sum console/run_bridge.py)" = 'eb580bace404f5774b2a675a11e7d3e1bb0a16fc47036ddbba878a8ae40b70ad  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
 
 `-I` isolates Python import paths; `-B` avoids bytecode writes. No standalone install, branch
 switch or mainline deployment is performed by this command. If using an extracted bundle
@@ -52,20 +52,20 @@ existing interpreter is `/home/darrel/Elaria/.venv/bin/python`, this alternative
 uses it without copying files into or switching that checkout. A missing interpreter or
 checksum mismatch stops; there is no install/repair fallback.
 
-`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = 'b1f7a632e060d329a702cb99fe88b2f5663d2beede3beb3ee32b59a23c2da8ed  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py --open`
+`test -x /home/darrel/Elaria/.venv/bin/python && test "$(sha256sum console/run_bridge.py)" = 'eb580bace404f5774b2a675a11e7d3e1bb0a16fc47036ddbba878a8ae40b70ad  console/run_bridge.py' && /home/darrel/Elaria/.venv/bin/python -IB console/run_bridge.py`
 
 Optional **`--check`** performs artifact/dependency checks and one existing-daemon `status`
 RPC, then exits; it creates no launch file/profile, opens no browser/server, and sends no
 chat/model/voice turn. It is mutually exclusive with `--open`. Exact checkout preflight:
 
-`test "$(sha256sum console/run_bridge.py)" = 'b1f7a632e060d329a702cb99fe88b2f5663d2beede3beb3ee32b59a23c2da8ed  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --check`
+`test "$(sha256sum console/run_bridge.py)" = 'eb580bace404f5774b2a675a11e7d3e1bb0a16fc47036ddbba878a8ae40b70ad  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py --check`
 
 `--socket` accepts an explicit absolute existing socket path when XDG_RUNTIME_DIR is
 unavailable. There is no guessed socket, alternate host, auto-start, paid/model fallback or
 key setup. The socket's parent directory must be owner-owned/private (0700) to hold launch
 files; the launcher refuses rather than changing its permissions.
 
-## Open it — detached, no printed token
+## Historical Chromium behavior — NOT the native owner launch procedure
 
 `--open` chooses installed Chrome/Chromium (stable Google Chrome, Google Chrome, Chromium,
 then chromium-browser), or an explicit absolute `--browser` executable. No download/install.
@@ -83,7 +83,7 @@ A 0700 `elaria-console-<random>` directory is created beside the daemon socket, 
 For manual mode, use the following verified invocation and open that local file on the same
 machine as the daemon. Do not share/read its contents into logs; it contains the live token.
 
-`test "$(sha256sum console/run_bridge.py)" = 'b1f7a632e060d329a702cb99fe88b2f5663d2beede3beb3ee32b59a23c2da8ed  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
+`test "$(sha256sum console/run_bridge.py)" = 'eb580bace404f5774b2a675a11e7d3e1bb0a16fc47036ddbba878a8ae40b70ad  console/run_bridge.py' && .venv/bin/python -IB console/run_bridge.py`
 
 The browser is detached with a new POSIX session, closed inherited FDs and null standard
 streams. Only desktop/session/locale environment is passed; model keys, SSH agents and shell
@@ -145,7 +145,7 @@ audio pane remains deferred (metadata samples are not a production feed).
 The shell's browser tabs do **not** create independent daemon conversations. Browser history
 is capped/trimmed display context and is not injected into model history; the existing daemon
 owns conversation and authority. The bridge forwards only text, speak=false, history_limit=1.
-It mounts no new hands routes and never parses generated words back into actions. **Typed
+Task I adds hands.request and a fixed typed hands grammar; generated words are never parsed back into actions. **Typed
 input is different:** existing console.say routing can write/forget memory, change posture,
 build/index plans, drain the cloud queue, and run explicitly scoped undo. The typed route
 bypasses ASR confidence; scoped undo has executor checks but no fresh Yes dialogue. Do not
@@ -206,15 +206,16 @@ six-message prompt window. Increasing it alone would not cure unsupported capabi
 **WS2 boundary adopted and implemented:** the fixed registry below supplies capability
 answers, with deterministic refusals on its defined input surface. Unrestricted conversational
 prose remains untrusted for capabilities/effects; this is not a universal semantic filter.
-No new execution adapter or WS5 hands route is implemented.
+Task I mounts the separate dedicated-instance hands path described in `docs/hands-headless.md`.
+It does not turn this registry or model prose into an execution authority.
 
 Drafts first remains binding for any future messaging: compose → owner review/approval →
 only then send; no send adapter or autonomy tier first. Draft review itself is not yet built.
 
 ## Task A — attribution surface (2026-11-04)
 
-Each completed wire reply has a separate **Bridge attribution** block, persisted with its
-browser display record. Errors with available observations retain them too. This is not
+Each completed wire reply has **Bridge attribution** metadata, persisted with its
+browser display record and rendered only in the sessions sidebar (F34), never in centre chat. Errors with available observations retain them too. This is not
 model prose and not a newly invented operation journal. Input-shape recognition is advisory,
 not a dispatcher; unclassified/local-awareness/guest outcomes remain visible through actual
 reply provenance. No added RPC, database lookup or daemon change.
@@ -273,3 +274,11 @@ See INTEGRATION.md for exact wire fields and limitations. No daemon/protected ch
 launcher SHA594bde66…; see NATIVE-DEPLOYMENT.md. The historical fcd55ca1/ed227a7d
 pair remains recorded in Appendix A. Code availability is not proof of owner installation
 or of an actual Win+Space window; that acceptance is still pending.
+
+## Task I — bounded headless hands
+
+See `docs/hands-headless.md` for authority, exact-argv-v1, private consent/journal storage,
+missing-marker unknown semantics, dedicated Kitty lifecycle and owner-hardware holds.
+Hands asks and denial/action/observation summaries live only in the sessions sidebar.
+A missing backend is refused before typed hands text reaches console.say; no model fallback.
+The native G target remains 25ef8e6; it does not silently acquire this I payload.

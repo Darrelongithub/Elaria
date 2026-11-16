@@ -334,8 +334,9 @@ the GLSL gate passes.
 ### Optional attribution metadata (Task A, 2026-11-04)
 
 Reply frames may include `attribution`, an array of bounded plain-text observations separate
-from `text`/`error`. The shell renders at most 24 strings of at most 1000 characters using
-textContent, persists them with the displayed message, and tolerates absent/invalid metadata.
+from `text`/`error`. The shell retains at most 24 strings of at most 1000 characters using textContent, persists
+them with the displayed message, and renders the latest eight receipt groups in the sessions
+sidebar only (F34). No attribution block is placed in centre chat; invalid metadata is ignored.
 These observations are not model prose, journal events, approvals or inferred effect receipts.
 The bridge adds no RPC. On the 4218ef0 producer contract, direct `message_id` and
 `user_message_id` are causal turn-append IDs; a sampled legacy history tail remains
@@ -382,3 +383,14 @@ Collateral and reversal limits are clearly labelled audited executor semantics, 
 prepared targets or a claim of exact restore. Receipt count is daemon-reported, not independent
 effect verification. Unknown outcomes are spent/no-replay; no automatic retry/reconciliation
 write. Global CLI/direct-executor containment is not claimed.
+
+### Task I hands wire
+
+`hands-control` frames use the same monotonic request IDs and bounded pending-reply lifecycle.
+Actions are only status/open/close or answer. Answer carries review_id, digest and one of
+allow-once/allow-always/deny; the daemon token stays in bridge memory, connection-bound.
+Replies carry hands metadata or hands_error, never a spoken ask or centre-chat denial.
+Status/refresh returns a bounded journal summary; full replay remains in the private JSONL.
+`hands …` text goes through the minimal daemon typed mount only after a hands.request status
+contract preflight; an old backend cannot receive it as a model prompt. No engine modification.
+See `docs/hands-headless.md` for the exact effect and consent contract, not a general shell.

@@ -67,3 +67,11 @@ No live model, real task subprocess or desktop notification adapter exists.
 [UNVERIFIED] QML loading/rendering/focus, production posture and hardware gate
 remain unproven. See `ui/quickshell/hands/README.md`, the bridge report and the
 unscheduled scene card. A screenshot is never an approval or execution proof.
+
+## Separate Task I mount
+
+The synthetic core above is not relabelled production. The separately mounted
+`headless/` module implements the owner-authorised dedicated-Kitty empty-directory
+adapter and exact-argv consent contract. See `docs/hands-headless.md` for its explicit
+limits, eight-line daemon call-out, inventory pin, sidebar and hardware-pending gates.
+It never attaches adapters to the legacy Kitty mount or the owner's daily terminal.

@@ -16,6 +16,10 @@ from assistant.hands.gate import adjudicate
 from assistant.hands.plan import Plan, Step
 
 DATA = Path(__file__).with_name("data")
+# F31 / Task I owner ruling: pin the verified committed bytes, not the foundation
+# report's a8d9… value. A future revision requires explicit re-pin AND re-approval;
+# standing consent must bind this hash, never silently inherit a catalogue update.
+INVENTORY_SHA256 = "7e0f01ff2396c292f05528261d349142f1c6e08eed948847ee1300633a1aafcd"
 
 
 def canonical(value):
@@ -28,7 +32,11 @@ def digest(value):
 
 
 def inventory():
-    data = json.loads((DATA / "inventory.json").read_text())
+    # Parse the very bytes whose pin was checked, not a second potentially changed read.
+    raw = (DATA / "inventory.json").read_bytes()
+    if hashlib.sha256(raw).hexdigest() != INVENTORY_SHA256:
+        raise ValueError("inventory hash drift: execution denied; explicit re-pin and re-approval required")
+    data = json.loads(raw)
     if data["schema_version"] != 1 or data["unknown_verb_tier"] != "K3":
         raise ValueError("unsupported inventory")
     for entry in data["verbs"].values():

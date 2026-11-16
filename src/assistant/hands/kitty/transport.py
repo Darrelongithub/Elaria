@@ -112,13 +112,17 @@ class Transport:
     """Connect for exactly one command. The trusted caller selects its tier password."""
 
     def __init__(self, path: Path, runtime: Path, passwords: dict[str, Path], public_key: str,
-                 *, timeout: float = 5, max_response_bytes: int = 8 * 1024 * 1024):
+                 *, timeout: float = 5, max_response_bytes: int = 8 * 1024 * 1024,
+                 expected_pid: int | None = None):
         if not 0 < timeout <= 60 or not 1024 <= max_response_bytes <= 64 * 1024 * 1024:
             raise ValueError("invalid transport bounds")
         if set(passwords) != {"K1", "K2", "K3"}:
             raise ValueError("three password paths required")
         self.path, self.runtime, self.passwords = path, runtime, dict(passwords)
         self.public_key, self.timeout, self.max_response_bytes = public_key, timeout, max_response_bytes
+        if expected_pid is not None and (type(expected_pid) is not int or expected_pid <= 0):
+            raise ValueError('invalid dedicated process identity')
+        self.expected_pid = expected_pid  # F26: dedicated instance binds every connection to its child
 
     def request(self, verb: str, payload: dict, tier: str, *, no_response: bool = False,
                 async_id: str | None = None, cancel: bool = False, stream: bool = False, cancel_event=None):
@@ -147,9 +151,10 @@ class Transport:
                 deadline = time.monotonic() + self.timeout
                 conn.settimeout(self.timeout)
                 conn.connect(f"/proc/self/fd/{fd}/{self.path.name}")
-                _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                pid, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
                 after = os.lstat(self.path.name, dir_fd=fd)
-                if uid != os.getuid() or (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+                if (uid != os.getuid() or self.expected_pid is not None and pid != self.expected_pid
+                        or (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino)):
                     raise PermissionError("endpoint identity changed")
                 for frame in frames:
                     if cancel_event is not None and cancel_event.is_set():

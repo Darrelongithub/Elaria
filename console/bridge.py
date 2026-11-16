@@ -64,7 +64,7 @@ async def daemon_call(path: Path, method: str, params: dict, timeout: float) -> 
     Verify the socket and Linux peer UID before sending. A lost response after a send is
     uncertain, NOT a cancellation/rollback. No daemon error body or event content is forwarded.
     """
-    if method not in {'status', 'console.say', 'undo.prepare', 'undo.apply'}:
+    if method not in {'status', 'console.say', 'undo.prepare', 'undo.apply', 'hands.request'}:
         raise ValueError('bridge IPC method not allowed')
     writer = None
     sent = False
@@ -98,7 +98,8 @@ async def daemon_call(path: Path, method: str, params: dict, timeout: float) -> 
                 return frame['result']
             raise EOFError()
     except (OSError, ValueError, TypeError, RecursionError, EOFError, TimeoutError, IPCFailure) as exc:
-        raise IPCFailure(uncertain=sent and method in {'console.say', 'undo.apply'}) from exc
+        raise IPCFailure(uncertain=sent and (method in {'console.say', 'undo.apply'}
+                         or method == 'hands.request' and params.get('action') != 'status')) from exc
     finally:
         if writer is not None:
             writer.close()
@@ -485,6 +486,60 @@ def validate_undo(result):
     return snap
 
 
+def validate_hands(value):
+    """Bounded sidebar metadata. No daemon tokens, arbitrary fields or raw output retained."""
+    if not isinstance(value, dict) or len(json.dumps(value).encode()) > 32000:
+        raise ValueError('invalid hands envelope')
+    if (not isinstance(value.get('instance'), str) or not re.fullmatch('[a-f0-9]{32}', value['instance'])
+            or value.get('inventory_sha256') != '7e0f01ff2396c292f05528261d349142f1c6e08eed948847ee1300633a1aafcd'
+            or type(value.get('open')) is not bool or type(value.get('prompt_always')) is not bool
+            or value.get('askFallback') != 'deny' or not isinstance(value.get('events'), list)
+            or len(value['events']) > 32):
+        raise ValueError('invalid hands metadata')
+    result = {k: value[k] for k in ('instance', 'inventory_sha256', 'open', 'prompt_always', 'askFallback')}
+    result['total_events'] = value.get('total_events', len(value['events']))
+    if type(result['total_events']) is not int or not len(value['events']) <= result['total_events'] <= 2000:
+        raise ValueError('invalid hands journal count')
+    result['events'] = []
+    for row in value['events']:
+        if (not isinstance(row, dict) or row.get('phase') not in {'PLAN', 'ASK', 'CONSENT', 'DENIAL', 'ACTION', 'OBSERVATION', 'READ'}
+                or not positive_id(row.get('seq')) or not isinstance(row.get('reason'), str)
+                or not re.fullmatch('[a-z0-9-]{1,100}', row['reason'])):
+            raise ValueError('invalid hands event')
+        result['events'].append({k: row[k] for k in ('seq', 'instance', 'phase', 'reason', 'action',
+            'plan_hash', 'verification', 'exit_code', 'stdout_sha256', 'target_sha256') if k in row})
+    ask = value.get('ask')
+    result['ask'] = None
+    if ask is not None:
+        if (not isinstance(ask, dict) or set(ask) != {'token', 'digest', 'plan', 'remaining_s', 'allow_always', 'default', 'askFallback'}
+                or not isinstance(ask['token'], str) or not re.fullmatch('[a-f0-9]{32}', ask['token'])
+                or type(ask['remaining_s']) not in {int, float} or not 0 < ask['remaining_s'] <= 120
+                or ask['default'] != 'allow-once' or ask['askFallback'] != 'deny'
+                or type(ask['allow_always']) is not bool or not isinstance(ask['plan'], dict)):
+            raise ValueError('invalid hands ask')
+        plan = ask['plan']
+        if (set(plan) != {'contract', 'inventory_sha256', 'plan', 'cwd_identity', 'evidence'}
+                or plan['contract'] != 'headless-exact-argv-v1'
+                or plan['inventory_sha256'] != value['inventory_sha256']
+                or not isinstance(plan['plan'], dict) or set(plan['plan']) != {'steps'}
+                or not isinstance(plan['plan']['steps'], list) or not 1 <= len(plan['plan']['steps']) <= 4
+                or not isinstance(plan['evidence'], list) or len(plan['evidence']) != len(plan['plan']['steps'])):
+            raise ValueError('unknown hands plan contract')
+        for step in plan['plan']['steps']:
+            if (not isinstance(step, dict) or set(step) != {'i', 'tier', 'tool', 'argv', 'cwd', 'env_diff'}
+                    or step['tier'] != 2 or step['tool'] != 'exec' or step['env_diff'] != {}
+                    or not isinstance(step['argv'], list) or len(step['argv']) != 3
+                    or any(not isinstance(a, str) or len(a) > 4096 for a in step['argv'])
+                    or not isinstance(step['cwd'], str) or len(step['cwd']) > 4096):
+                raise ValueError('invalid hands argv disclosure')
+        sha = hashlib.sha256(json.dumps(ask['plan'], sort_keys=True, separators=(',', ':'),
+                                       ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+        if ask['digest'] != sha:
+            raise ValueError('hands plan digest mismatch')
+        result['ask'] = {k: ask[k] for k in ('digest', 'plan', 'remaining_s', 'allow_always', 'default', 'askFallback')}
+    return result
+
+
 class Bridge:
     def __init__(self, socket_path: Path, assets: Path, *, port=8744, rpc=daemon_call):
         self.socket_path, self.assets, self.port, self.rpc = socket_path, assets, port, rpc
@@ -497,6 +552,7 @@ class Bridge:
         self.observation_n = 0
         self.undo_asks = {}  # connection-bound, memory only; daemon tokens never enter the browser
         self.review_private = False
+        self.hands_asks = {}  # connection-bound ephemeral tokens; never browser storage
         # Load only exact assets, never route a caller-controlled filesystem path.
         engine = (assets / 'elaria-visualizer.js').read_bytes()
         if hashlib.sha256(engine).hexdigest() != ENGINE_SHA:
@@ -694,6 +750,46 @@ background:#110d1c;color:#e3bd80;z-index:1}
         finally:
             self.busy = False
 
+    async def hands_reply(self, ws, request_id, result, started):
+        value = validate_hands(result)
+        self.hands_asks.pop(ws, None)
+        if value['ask']:
+            ask = value['ask']
+            remaining = ask['remaining_s'] - (asyncio.get_running_loop().time() - started)
+            if remaining <= 0:
+                value['ask'] = None
+            else:
+                review = secrets.token_hex(16)
+                self.hands_asks[ws] = {'token': result['ask']['token'], 'digest': ask['digest'],
+                                      'review_id': review, 'deadline': started + result['ask']['remaining_s']}
+                ask.update(review_id=review, remaining_s=remaining)
+        await self.emit(ws, t='reply', id=request_id, hands=value)
+
+    async def hands_control(self, ws, message):
+        started = asyncio.get_running_loop().time()
+        try:
+            if await self.probe() or not self.review_private:
+                raise ValueError('private-posture-unavailable')
+            action = message['action']
+            params = {'action': action}
+            if action == 'answer':
+                ask = self.hands_asks.pop(ws, None)  # terminal before dispatch; no retry on uncertainty
+                if (not ask or ask['review_id'] != message['review_id'] or ask['digest'] != message['digest']
+                        or started >= ask['deadline']):
+                    raise ValueError('stale-or-expired-hands-selection')
+                params.update(token=ask['token'], digest=ask['digest'], decision=message['decision'])
+            result = await self.rpc(self.socket_path, 'hands.request', params, TURN_SECONDS)
+            await self.hands_reply(ws, message['id'], result, started)
+        except IPCFailure as exc:
+            self.uncertain = self.uncertain or exc.uncertain
+            self.hands_asks.pop(ws, None)
+            await self.emit(ws, t='reply', id=message['id'], hands_error='Hands unavailable/outcome unknown; inspect sidebar journal; no replay.')
+        except Exception:
+            self.hands_asks.pop(ws, None)
+            await self.emit(ws, t='reply', id=message['id'], hands_error='Hands request refused; no usable private selection or backend contract.')
+        finally:
+            self.busy = False
+
     async def turn(self, ws, message):
         request_id = message['id']
         self.observation_n += 1
@@ -703,6 +799,23 @@ background:#110d1c;color:#e3bd80;z-index:1}
             if ask['state'] == 'pending':
                 ask['state'] = 'stale'  # any new chat input invalidates the selected act
         try:
+            if message['text'].lower().startswith('hands '):
+                self.hands_asks.pop(ws, None)
+                started = asyncio.get_running_loop().time()
+                if await self.probe() or not self.review_private:
+                    await self.emit(ws, t='reply', id=request_id, hands_error='Hands requires private ready posture; no dispatch.')
+                    return
+                # Prove the new mount exists before sending typed hands text. An old backend
+                # must never interpret this as a model prompt or paid fallback.
+                status = await self.rpc(self.socket_path, 'hands.request', {'action': 'status'}, PROBE_SECONDS)
+                validate_hands(status)
+                result = await self.rpc(self.socket_path, 'console.say',
+                    {'text': message['text'], 'speak': False, 'history_limit': 1}, TURN_SECONDS)
+                try:
+                    await self.hands_reply(ws, request_id, result.get('hands'), started)
+                except (ValueError, TypeError):
+                    await self.emit(ws, t='reply', id=request_id, hands_error='Hands backend unavailable or invalid; no fabricated receipt.')
+                return
             scope = undo_scope(message['text'])
             if scope is not None:
                 await self.prepare_undo(ws, request_id, scope)
@@ -748,6 +861,9 @@ background:#110d1c;color:#e3bd80;z-index:1}
             await self.emit(ws, t='state', name='idle')
         except IPCFailure as exc:
             self.uncertain = self.uncertain or exc.uncertain
+            if message['text'].lower().startswith('hands '):
+                await self.emit(ws, t='reply', id=request_id, hands_error='Hands outcome unknown; no replay. Inspect journal.')
+                return
             with suppress(ConnectionClosed, TimeoutError):
                 await self.emit(ws, t='reply', id=request_id, attribution=notes,
                                 error=('Outcome unknown; daemon may have processed the turn. '
@@ -757,6 +873,10 @@ background:#110d1c;color:#e3bd80;z-index:1}
         except (ConnectionClosed, TimeoutError):
             pass  # Connection loss is NOT a reason to replay a completed or pending turn.
         except Exception:
+            if message['text'].lower().startswith('hands '):
+                self.hands_asks.pop(ws, None)
+                await self.emit(ws, t='reply', id=request_id, hands_error='Hands backend contract unavailable; no replay.')
+                return
             # Unexpected bridge failures are visible and never become an implicit retry.
             self.uncertain = True
             with suppress(ConnectionClosed, TimeoutError):
@@ -796,7 +916,7 @@ background:#110d1c;color:#e3bd80;z-index:1}
             async for raw in ws:
                 message = json.loads(raw)
                 if (not isinstance(raw, str) or not isinstance(message, dict)
-                        or message.get('t') not in {'send', 'undo-decision'} or type(message.get('id')) is not int
+                        or message.get('t') not in {'send', 'undo-decision', 'hands-control'} or type(message.get('id')) is not int
                         or not 0 < message['id'] <= 2**53 - 1):
                     await self.emit(ws, t='bye', reason='Invalid §5 send message.')
                     return
@@ -807,6 +927,13 @@ background:#110d1c;color:#e3bd80;z-index:1}
                            and isinstance(message.get('ask_sha256'), str)
                            and message.get('decision') in ('yes', 'no')
                            else 'Invalid review decision; no dispatch.')
+                if message['t'] == 'hands-control':
+                    simple = set(message) == {'t', 'id', 'action'} and message.get('action') in ('status', 'open', 'close')
+                    answer = (set(message) == {'t', 'id', 'action', 'review_id', 'digest', 'decision'}
+                              and message.get('action') == 'answer'
+                              and isinstance(message.get('review_id'), str) and isinstance(message.get('digest'), str)
+                              and message.get('decision') in ('allow-once', 'allow-always', 'deny'))
+                    problem = None if simple or answer else 'Invalid hands control; no dispatch.'
                 if request_id <= last_id:
                     problem = 'Duplicate or stale ID; no replay sent.'
                 last_id = max(last_id, request_id)
@@ -815,10 +942,12 @@ background:#110d1c;color:#e3bd80;z-index:1}
                 if self.uncertain:
                     problem = 'Previous outcome unknown. Inspect daemon conversation before restarting bridge.'
                 if problem:
-                    await self.emit(ws, t='reply', id=request_id, error=problem)
+                    await self.emit(ws, t='reply', id=request_id, **({'hands_error': problem}
+                                    if message['t'] == 'hands-control' else {'error': problem}))
                     continue
                 self.busy = True
                 task = asyncio.create_task(self.turn(ws, message) if message['t'] == 'send'
+                                           else self.hands_control(ws, message) if message['t'] == 'hands-control'
                                            else self.decide_undo(ws, message))
                 self.turns.add(task)
                 task.add_done_callback(self.turns.discard)
@@ -833,6 +962,7 @@ background:#110d1c;color:#e3bd80;z-index:1}
                 await asyncio.gather(monitor, return_exceptions=True)
             self.clients.discard(ws)
             self.undo_asks.pop(ws, None)
+            self.hands_asks.pop(ws, None)
             # Do NOT cancel/replay the daemon turn when the browser disconnects.
 
     async def start(self):

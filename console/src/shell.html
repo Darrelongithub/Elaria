@@ -10,6 +10,17 @@
 
     <div class="sec grow open" id="sec-sessions">
       <div class="sec-b" id="sList"></div>
+      <section class="session-evidence" aria-label="Session attribution and hands">
+        <details><summary>Attribution</summary><div id="session-attribution"></div></details>
+        <details id="hands-panel"><summary>Hands · actions and denials</summary>
+          <p id="hands-state">Hands pending — no backend evidence received.</p>
+          <button type="button" data-hands-control="status">Refresh journal</button>
+          <button type="button" data-hands-control="open">Open dedicated hand</button>
+          <button type="button" data-hands-control="close">Close hand</button>
+          <p class="mini">Silent asks · allow once by default · missing prompt denies. No daily-terminal access.</p>
+          <div id="hands-review"></div><div id="hands-events"></div>
+        </details>
+      </section>
     </div>
 
     <div class="sec" id="sec-transcript">

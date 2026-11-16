@@ -419,3 +419,13 @@ table.grid tr[hidden] { display: none; }
 .undo-review button, .undo-review input { margin:6px; padding:8px; color:inherit; background:#292033; border:1px solid #ab8cbd; }
 .undo-review button:focus, .undo-review input:focus { outline:2px solid #e4c2ff; }
 .undo-review [hidden] { display:none!important; }
+
+/* F34: one attribution home under sessions; never overlay the centre chat. */
+.session-evidence { padding:8px 12px; border-top:1px solid var(--line); font-size:11px; overflow-wrap:anywhere; }
+.session-evidence summary { cursor:pointer; padding:6px 0; }
+#session-attribution, #hands-events { max-height:240px; overflow:auto; }
+.session-evidence .attribution { margin:8px 0; }
+.hands-ask { border:1px solid #8f79ae; padding:8px; margin:8px 0; }
+.hands-ask pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:220px; overflow:auto; }
+.hands-ask button, .hands-ask input { max-width:100%; margin:4px 0; white-space:normal; }
+.hands-event small { display:block; font-size:9px; }

@@ -434,6 +434,16 @@ table.grid tr[hidden] { display: none; }
 .undo-review button:focus, .undo-review input:focus { outline:2px solid #e4c2ff; }
 .undo-review [hidden] { display:none!important; }
 
+/* F34: one attribution home under sessions; never overlay the centre chat. */
+.session-evidence { padding:8px 12px; border-top:1px solid var(--line); font-size:11px; overflow-wrap:anywhere; }
+.session-evidence summary { cursor:pointer; padding:6px 0; }
+#session-attribution, #hands-events { max-height:240px; overflow:auto; }
+.session-evidence .attribution { margin:8px 0; }
+.hands-ask { border:1px solid #8f79ae; padding:8px; margin:8px 0; }
+.hands-ask pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:220px; overflow:auto; }
+.hands-ask button, .hands-ask input { max-width:100%; margin:4px 0; white-space:normal; }
+.hands-event small { display:block; font-size:9px; }
+
 </style>
 </head>
 <body>
@@ -449,6 +459,17 @@ table.grid tr[hidden] { display: none; }
 
     <div class="sec grow open" id="sec-sessions">
       <div class="sec-b" id="sList"></div>
+      <section class="session-evidence" aria-label="Session attribution and hands">
+        <details><summary>Attribution</summary><div id="session-attribution"></div></details>
+        <details id="hands-panel"><summary>Hands · actions and denials</summary>
+          <p id="hands-state">Hands pending — no backend evidence received.</p>
+          <button type="button" data-hands-control="status">Refresh journal</button>
+          <button type="button" data-hands-control="open">Open dedicated hand</button>
+          <button type="button" data-hands-control="close">Close hand</button>
+          <p class="mini">Silent asks · allow once by default · missing prompt denies. No daily-terminal access.</p>
+          <div id="hands-review"></div><div id="hands-events"></div>
+        </details>
+      </section>
     </div>
 
     <div class="sec" id="sec-transcript">
@@ -1650,7 +1671,6 @@ table.grid tr[hidden] { display: none; }
     const body = h('div', 'body');
     body.innerHTML = r === 'me' ? paintYou(text || '') : paintHer(text || '');
     m.append(hd, body);
-    const receipt = receiptEl(attribution); if (receipt) m.append(receipt);
     return m;
   }
   const pin = () => { if (pinned) el.log.scrollTop = el.log.scrollHeight; };
@@ -1662,6 +1682,12 @@ table.grid tr[hidden] { display: none; }
   }
   const pushTo = (s, r, t, attribution) => { if (s) { s.msgs.push({ r, t, ts: Date.now(), attribution: receiptRows(attribution) }); save(); renderSess(); } };
   function push(r, t) { pushTo(cur(), r, t); }
+  function renderAttribution() {
+    const home=$('session-attribution'); home.replaceChildren();
+    const messages=cur().msgs.filter(m=>receiptRows(m.attribution).length).slice(-8);
+    if(!messages.length) home.append(h('p','mini','No reply attribution received for this session.'));
+    messages.forEach(m=>{ const box=receiptEl(m.attribution); if(box) {box.prepend(h('time','',fmt(m.ts)));home.append(box);} });
+  }
   function renderLog() {
     el.pad.replaceChildren();
     cur().msgs.forEach((m) => el.pad.append(msgEl(m.r, m.t, m.ts, m.attribution)));
@@ -1681,6 +1707,7 @@ table.grid tr[hidden] { display: none; }
     data.sessions.push(s); data.active = s.id; save(); return s;
   }
   function renderSess() {
+    renderAttribution();
     el.sList.replaceChildren();
     data.sessions.forEach((s, i) => {
       const b = h('button', 'row'); b.type = 'button';
@@ -1706,6 +1733,7 @@ table.grid tr[hidden] { display: none; }
     const from = cur();
     const cut = busy;
     if (cut) { interrupt(); await sleep(50); }
+    clearHandsAsk();
     data.active = target.id; save(); renderLog(); renderSess();
     if (cut) {
       const note = '[note] she was mid-sentence in ' + (from ? from.name : 'that session') + ' — you switched, so it stopped. the full reply is stored there, nothing was lost.';
@@ -1714,6 +1742,7 @@ table.grid tr[hidden] { display: none; }
     el.ta.focus();
   }
   async function createSession() {
+    clearHandsAsk();
     const cut = busy;
     if (cut) { interrupt(); await sleep(50); }
     const from = cur();
@@ -2055,6 +2084,105 @@ table.grid tr[hidden] { display: none; }
     skip = true;
     if (abortType) abortType();
   }
+  /* F21/F34: silent, memory-only consent cards and replayable denial summaries, sidebar ONLY. */
+  let handsCard = null;
+  function clearHandsAsk() {
+    if (!handsCard) return;
+    clearInterval(handsCard.timer); handsCard.box.remove(); handsCard = null;
+  }
+  function hideHandsAsk() {
+    if (!handsCard) return;
+    handsCard.selected = false; handsCard.details.replaceChildren();
+    handsCard.reveal.hidden = false;
+  }
+  function handsError(message) {
+    clearHandsAsk(); $('hands-state').textContent = message;
+  }
+  function renderHands(value, elapsedBeforePaint = 0) {
+    clearHandsAsk();
+    if (!value || !Array.isArray(value.events)) return handsError('Hands unavailable — no backend receipt.');
+    $('hands-state').textContent = (value.open ? 'Dedicated hand open' : 'Hand closed or faulted') +
+      ' · instance ' + value.instance + ' · showing ' + value.events.length + ' of ' +
+      (value.total_events || value.events.length) + ' journal events · ask fallback: deny · owner hardware acceptance pending';
+    const events = $('hands-events'); events.replaceChildren();
+    value.events.forEach(row => {
+      const item = h('p', 'hands-event');
+      item.textContent = '#' + row.seq + ' ' + row.phase + ' · ' + row.reason +
+        (row.verification ? ' · ' + row.verification : '') + (row.action ? ' · action #' + row.action : '');
+      item.append(h('small', '', ' instance ' + (row.instance || value.instance)));
+      if (row.plan_hash) item.append(h('small', '', ' plan ' + row.plan_hash));
+      if (row.stdout_sha256) item.append(h('small', '', ' stdout SHA256 ' + row.stdout_sha256));
+      if (row.target_sha256) item.append(h('small', '', ' target SHA256 ' + row.target_sha256));
+      if (row.exit_code != null) item.append(h('small', '', ' exit ' + row.exit_code));
+      events.append(item);
+    });
+    if (!value.ask || !daemon || typeof daemon.handsControl !== 'function') return;
+    const ask = {...value.ask, remaining_s:value.ask.remaining_s-elapsedBeforePaint};
+    if(!(ask.remaining_s>0)) return handsError('Hands ask expired — fallback deny. Prepare again.');
+    const box = h('section', 'hands-ask'), reveal = h('button', '', 'elaria needs a yes — review hands privately');
+    reveal.type = 'button'; const details = h('div'), age = h('p');
+    box.append(reveal, age, details); $('hands-review').append(box);
+    const card = {ask, box, reveal, details, started:performance.now(), wall:Date.now(),
+      session:cur().id, selected:false, spent:false, control:daemon.handsControl};
+    handsCard = card;
+    const elapsed = () => Math.max(performance.now()-card.started, Date.now()-card.wall, 0)/1000;
+    const fresh = () => handsCard === card && !card.spent && cur().id === card.session &&
+      !document.hidden && document.hasFocus() && elapsed() < ask.remaining_s;
+    reveal.onclick = () => {
+      if (!fresh()) return;
+      reveal.hidden = true; card.selected = true; details.replaceChildren();
+      details.append(h('h3', '', 'Whole-plan consent · silent · default allow once'));
+      details.append(h('p', '', 'Only the daemon-started dedicated instance; never your daily terminal.'));
+      const disclosure = h('pre'); disclosure.textContent = JSON.stringify(ask.plan, null, 2); details.append(disclosure);
+      details.append(h('p', '', 'Plan digest ' + ask.digest + '. No means terminal refusal. Missing marker means unknown, never success.'));
+      const hint = h('p'), once = h('button', '', 'Yes — allow once'), no = h('button', '', 'No — deny');
+      once.type = no.type = 'button'; once.dataset.handsDecision='allow-once'; no.dataset.handsDecision='deny';
+      async function answer(decision) {
+        if (!fresh() || !card.selected || !details.contains(document.activeElement)) {
+          hint.textContent = 'No fresh private ask is selected.'; return;
+        }
+        card.spent = true;
+        clearHandsAsk(); $('hands-state').textContent='Decision submitted once; awaiting observation. No automatic replay.';
+        try { const response = await card.control({action:'answer', review_id:ask.review_id, digest:ask.digest, decision});
+          if(response.hands) renderHands(response.hands); else handsError(response.hands_error || 'Outcome unknown; inspect journal.');
+        } catch(e) {handsError('Outcome unknown; no automatic replay.');}
+      }
+      once.onclick=()=>answer('allow-once'); no.onclick=()=>answer('deny');
+      details.append(once,no);
+      if(ask.allow_always === true) {
+        const always=h('button','','Allow always — this exact argv and binary/inventory hashes');
+        always.type='button'; always.dataset.handsDecision='allow-always'; always.onclick=()=>answer('allow-always'); details.append(always);
+      }
+      const entry=h('input'); entry.setAttribute('aria-label','Focused hands decision: exact yes or no');
+      entry.autocomplete='off'; entry.addEventListener('keydown',event=>{
+        if(event.key!=='Enter') return;
+        event.preventDefault(); event.stopPropagation();
+        const v=entry.value.trim().toLowerCase();
+        if(v==='yes'||v==='no') answer(v==='yes'?'allow-once':'deny'); else hint.textContent='Exact yes or no only.';
+      });
+      details.append(entry,hint); no.focus();
+    };
+    card.timer=setInterval(()=>{
+      if(elapsed()>=ask.remaining_s) {handsError('Hands ask expired — fallback deny. Prepare again.');return;}
+      age.textContent='Ask age '+Math.floor(elapsed())+'s · expires in '+Math.max(0,Math.floor(ask.remaining_s-elapsed()))+'s';
+      if(document.hidden||!document.hasFocus()) hideHandsAsk();
+    },200);
+  }
+  window.addEventListener('blur',hideHandsAsk);
+  document.addEventListener('visibilitychange',()=>{if(document.hidden)hideHandsAsk();});
+  document.addEventListener('keydown',event=>{if(event.key==='Escape')hideHandsAsk();});
+  document.querySelectorAll('[data-hands-control]').forEach(button=>{
+    button.onclick=async()=>{
+      clearHandsAsk();
+      if(!daemon||typeof daemon.handsControl!=='function') return handsError('Hands backend not connected; no action sent.');
+      button.disabled=true;
+      try {const response=await daemon.handsControl({action:button.dataset.handsControl});
+        if(response.hands)renderHands(response.hands);else handsError(response.hands_error||'Hands unavailable.');
+      } catch(e) {handsError('Hands outcome unknown; no replay.');}
+      finally {button.disabled=false;}
+    };
+  });
+
   /* Undo pilot: private, memory-only, connection-bound. Never stored in sessions or notifications. */
   let undoCard = null, undoPrivate = false;
   function clearUndo(reason) {
@@ -2155,7 +2283,6 @@ table.grid tr[hidden] { display: none; }
     el.log.setAttribute('aria-busy', 'true');
     await typeInto(body, text);
     body.classList.remove('typing'); el.log.removeAttribute('aria-busy'); skip = false;
-    const receipt = receiptEl(rep && rep.attribution); if (receipt) m.append(receipt);
     pushTo(s, 'ai', text, rep && rep.attribution);
     pin();
     if (!document.hasFocus() || document.hidden) { away = text; document.title = '\u25cf Elaria'; }
@@ -2183,6 +2310,7 @@ table.grid tr[hidden] { display: none; }
     if (!daemon && wireRequested) return out('[WARN] daemon wire unavailable — no turn sent and no stub reply.');
     if (forcedOffline) return out('[WARN] I am marked offline. /state idle wakes me.');
     if (busy) return out('still answering the last one. Esc skips ahead.');
+    clearHandsAsk();
     clearUndo('New chat input invalidated the previous review; prepare fresh.');
     const s = cur();
     pinned = true; el.pad.append(msgEl('me', text)); pushTo(s, 'me', text); pin(); calmWants();
@@ -2192,9 +2320,14 @@ table.grid tr[hidden] { display: none; }
       const rep = daemon ? await daemon.send(text, { session: s.name, history: s.msgs.slice(-20) }) : respond(text);
       const left = 700 - (performance.now() - t0);   // hold "thinking" long enough to read as a state change
       if (left > 0) await sleep(left);
+      if (rep && (rep.hands || rep.hands_error)) {
+        if(rep.hands)renderHands(rep.hands,(performance.now()-t0)/1000);else handsError(rep.hands_error);
+        return;
+      }
       if (rep && rep.undoReview) renderUndo(rep.undoReview, daemon && daemon.decideUndo, (performance.now()-t0)/1000);
       await deliver(rep, s);
     } catch (err) {
+      if(text.toLowerCase().startsWith('hands ')) {handsError('Hands unavailable/outcome unknown; no replay.');return;}
       const message = '[BROKEN] the daemon call failed: ' + ((err && err.message) || 'unknown error');
       el.pad.append(msgEl('err', message, null, err && err.attribution));
       pushTo(s, 'err', message, err && err.attribution); pin();
@@ -2293,7 +2426,7 @@ table.grid tr[hidden] { display: none; }
       if (m.t === 'hello-ok') {
         if (m.v !== WIRE_V) { dead = true; ws.close(); window.ElariaShell.disconnect(); return; }
         tries = 0;  // reset only AFTER a real handshake, not every failed TCP reconnect
-        return window.ElariaShell.connect({ name: m.name || 'daemon', send: sendOver, decideUndo });
+        return window.ElariaShell.connect({ name: m.name || 'daemon', send: sendOver, decideUndo, handsControl });
       }
       if (m.t === 'undo-privacy') { undoPrivate = m.allowed === true; if (undoCard) { undoCard.allowed = m.allowed === true; if (!undoCard.allowed) hideUndo(); } return; }
       if (m.t === 'reply') { const p = pend.get(m.id); pend.delete(m.id); if (p) { if (m.undo_review) undoPrivate = true; p(m); } return; }
@@ -2312,7 +2445,7 @@ table.grid tr[hidden] { display: none; }
         pend.set(id, (m) => {
           if (m.error) { const error = new Error(m.error); error.attribution = receiptRows(m.attribution); rej(error); }
           // F29: drop audio at the wire boundary as well as the adapter renderer.
-          else res({ text: m.text || '', attribution: receiptRows(m.attribution), undoReview:m.undo_review });
+          else res({ text: m.text || '', attribution: receiptRows(m.attribution), undoReview:m.undo_review, hands:m.hands, hands_error:m.hands_error });
         });
         const message = { t: 'send', id, text, session: ctx && ctx.session,
           history: ctx && ctx.history ? ctx.history.slice(-20) : [] };
@@ -2326,6 +2459,15 @@ table.grid tr[hidden] { display: none; }
         }
         ws.send(encoded);
         setTimeout(() => { if (pend.delete(id)) rej(new Error('daemon went quiet')); }, 45000);
+      });
+    }
+    function handsControl(control) {
+      return new Promise((res,rej)=>{
+        if(!ws||ws.readyState!==1)return rej(new Error('hands wire unavailable'));
+        const id=++n;
+        pend.set(id,m=>res(m));
+        ws.send(JSON.stringify({t:'hands-control',id,...control}));
+        setTimeout(()=>{if(pend.delete(id))rej(new Error('hands outcome unknown; no replay'));},45000);
       });
     }
     function decideUndo(decision) {
@@ -2355,6 +2497,7 @@ table.grid tr[hidden] { display: none; }
       out('[OK] wire up. replies use the attached adapter; each pane keeps its own data status.');
     },
     disconnect() {
+      clearHandsAsk();
       undoPrivate = false; clearUndo('Disconnected; old card invalidated.');
       if (!daemon) return;
       daemon = null; forcedOffline = true; lamps(); setState('offline'); syncOrb();

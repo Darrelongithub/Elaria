@@ -57,3 +57,11 @@ Local H gate: **2698 passed, 9 skipped**, 141.66 seconds; Ruff **0.17.2** green.
 The WebKitGTK probe remains an explicit skip without system GI/runtime/display. All
 protected producer files, history_limit and the maker engine are unchanged. NectarLink is
 out; no additional daemon, model call, audio backend or window orchestration was added.
+
+## Subsequent Task I placement
+
+F34 moves the retained reply-attribution metadata into the sessions sidebar, alongside
+bounded hands ACTION/OBSERVATION/DENIAL summaries and silent private consent cards.
+No attribution block remains in centre chat. Task I's separately quoted eight-line daemon
+call-out is the only new protected-file edit; the protected-byte statement above describes H.
+See `docs/hands-headless.md` and the combined final report for the later gate results.

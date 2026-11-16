@@ -73,6 +73,17 @@ Pinned-source inventory regeneration: byte-identical
 Inventory SHA256: a8d9a11f03e80cdf07f860f0ac4e5b6e37c1f630d16fb9783b3e4e6bb581dc4d
 ```
 
+**Task I owner/design correction (historical value above retained, not silently replaced):**
+
+> the foundation report's a8d9… hash matches no committed artifact, and design chat's earlier ruling that the 7e0f01ff gate was stale is HEREBY CORRECTED — the gate matched reality and the report's hash was the fiction.
+
+Design chat reports independent origin verification at 25ef8e6: 514,801 bytes, SHA256
+`7e0f01ff2396c292f05528261d349142f1c6e08eed948847ee1300633a1aafcd`.
+Builder local reads at that same immutable commit and in the working tree agree. The
+inventory bytes stay unchanged. Task I pins those exact bytes before execution; F31 requires
+future inventory revisions to invalidate standing consent until explicitly re-pinned and
+re-approved. This annotation corrects the report, not the inventory or its provenance.
+
 These are **local-runner-only** gates. No automated CI was wired or claimed. Existing
 six skips are retained; new tests were not skipped in this environment. Optional local
 cryptography/jsonschema dependencies were installed only into ignored `.venv`; frozen

@@ -26,9 +26,9 @@ from pathlib import Path
 
 # Payload pins updated as part of the committed release, never repaired at runtime.
 PAYLOAD_SHA256 = {
-    'bridge.py': 'f186529f6a6de29b8332211c5383ecb35175c32301476fbde7901c008b797fc1',
+    'bridge.py': '95e9ce88ba01829c6a9bdc19ae89dd36c0ad10b7706c3c5a60cc0471e0797b5d',
     'bridge-client.js': '2499ab87625c06cbb2691e616641b0c2d1ca3b24dfdabd9f3cd4abeb7c2538b4',
-    'index.html': '354e1c29d079efd3f3372b8e88403a73350da1334b4a5bfd4eb6b24d029d1bda',
+    'index.html': '8d4ed20c656f3b60d4c63f41293377509ded0ae5faa46bb9c72c5e747967077c',
     'elaria-visualizer.js': '5e32329105aac85368806d06f98ace0d2c04681f324b5d7349a9763f1efb6447',
     'requirements-bridge.txt': '933f7c32527437c77992e09403255a1a4d15078bd00d3200c7d62dad4c6b36ea',
 }
