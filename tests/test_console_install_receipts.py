@@ -59,10 +59,13 @@ def test_installed_check_stops_visibly_on_each_defect(tmp_path, monkeypatch, cap
         shim.unlink(); shim.symlink_to(ROOT / 'console/elaria-console-launch.sh')
     else: os.link(shim, home / 'linked')
     monkeypatch.setattr(installer, 'OWNER_HOME', home)
-    assert installer.main(['--check-installed']) == 2
+    assert installer.main(['--check-installed']) == (4 if defect == 'missing' else 2)
     output = capsys.readouterr()
-    assert 'PASS exit=0' not in output.out and 'STOP exit=2 action=check-installed' in output.err
-    assert str(shim) in output.err
+    assert 'PASS exit=0' not in output.out
+    if defect == 'missing':
+        assert 'PARTIAL_INSTALL exit=4' in output.out and str(shim) in output.out
+    else:
+        assert 'STOP exit=2 action=check-installed' in output.err and str(shim) in output.err
 
 
 def test_install_partial_write_is_not_reported_as_success(tmp_path, monkeypatch, capsys):

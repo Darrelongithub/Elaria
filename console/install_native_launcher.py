@@ -88,11 +88,65 @@ def installed_digest(path, expected):
 
 
 def check_installed(home=OWNER_HOME, report=None):
-    owned_directory(home)
+    """Inspect every fixed target independently; missing is not a verification error.
+
+    Exit 3 describes current absence, never historical proof of 'never installed'.
+    Invalid/unreadable targets take precedence over absence or partial installation.
+    """
+    rows = []
     for path, name in targets_for(home).items():
-        digest = installed_digest(path, PINS[name])
-        if report:
-            report('VERIFIED', path, digest)
+        row = {'path': str(path), 'expected': PINS[name]}
+        try:
+            owned_directory(home)
+            owned_directory(home / '.config')
+            owned_directory(path.parent)
+            if name != 'elaria-console-launch.sh' and stat.S_IMODE(path.parent.stat().st_mode) != 0o700:
+                raise ValueError('native bundle directory must be private 0700: ' + str(path.parent))
+            digest = installed_digest(path, PINS[name])
+        except FileNotFoundError as exc:
+            # A dangling symlink is invalid, not absent: owned_directory and
+            # O_NOFOLLOW reject those before this branch can call it missing.
+            row.update(status='MISSING', reason=('target_file_absent' if exc.filename == str(path)
+                                                else 'target_directory_absent'))
+        except (OSError, ValueError) as exc:
+            row.update(status='INVALID', reason=f'{type(exc).__name__}: {exc}')
+        else:
+            row.update(status='VERIFIED', sha256=digest)
+            if report:
+                report('VERIFIED', path, digest)
+        rows.append(row)
+    missing = sum(row['status'] == 'MISSING' for row in rows)
+    invalid = sum(row['status'] == 'INVALID' for row in rows)
+    code = 2 if invalid else 3 if missing == 3 else 4 if missing else 0
+    return {'exit': code, 'rows': rows, 'verified': 3 - missing - invalid,
+            'missing': missing, 'invalid': invalid}
+
+
+def report_installed_check(result):
+    for row in result['rows']:
+        if row['status'] != 'VERIFIED':
+            print(f"{row['status']} path={row['path']} reason={row['reason']}",
+                  file=sys.stderr if row['status'] == 'INVALID' else sys.stdout, flush=True)
+    code = result['exit']
+    counts = (f"completed file receipts={result['verified']} missing={result['missing']} "
+              f"invalid={result['invalid']}")
+    if code == 0:
+        print('PASS exit=0: 3 installed files verified; read-only, nothing written. This does not prove the active bind.', flush=True)
+    elif code == 3:
+        reasons = {row['reason'] for row in result['rows']}
+        reason = next(iter(reasons)) if len(reasons) == 1 else 'all_targets_absent'
+        print(f'NOT_INSTALLED exit=3 reason={reason}; {counts}. '
+              'All three targets are absent now; prior installation history is unknown. '
+              'Read-only, nothing written; no rollback/fallback.', flush=True)
+    elif code == 4:
+        print(f'PARTIAL_INSTALL exit=4 reason=some_targets_absent; {counts}. '
+              'Partial writes may remain from an earlier install; read-only, nothing written; '
+              'no rollback/fallback.', flush=True)
+    else:
+        print(f'STOP exit=2 action=check-installed reason=installed_state_invalid; {counts}. '
+              'Partial writes may remain from an earlier install; read-only, nothing written; '
+              'no rollback/fallback. See every target verdict above.', file=sys.stderr, flush=True)
+    return code
 
 
 def emit_bind():
@@ -130,7 +184,10 @@ def install(root, home=OWNER_HOME, report=None):
             os.fsync(fd)
         finally:
             os.close(fd)
-    check_installed(home)  # verify all destinations again after directory durability barriers
+    result = check_installed(home)  # recheck all targets after directory durability barriers
+    if result['exit']:
+        problems = [row for row in result['rows'] if row['status'] != 'VERIFIED']
+        raise ValueError('final installed readback failed: ' + json.dumps(problems, sort_keys=True))
 
 
 def main(argv=None):
@@ -162,17 +219,17 @@ def main(argv=None):
             install(root, home=OWNER_HOME, report=report)
             print('PASS exit=0: 3 installed files verified; no config edit or reload. Bind verification is a separate step.', flush=True)
         elif args.check_installed:
-            check_installed(home=OWNER_HOME, report=report)
-            print('PASS exit=0: 3 installed files verified; read-only, nothing written. This does not prove the active bind.', flush=True)
+            return report_installed_check(check_installed(home=OWNER_HOME, report=report))
         else:
             verified_sources(root)
             print('PASS exit=0: native installer payload pins only; nothing installed or launched.', flush=True)
         return 0
     except Exception as exc:
+        next_step = ('Use --check-installed for read-only installed state.' if args.install
+                     else 'Read-only operation failed; no install attempted.')
         print(f'STOP exit=2 action={action}: {type(exc).__name__}: {exc}; '
               f'completed file receipts={len(receipts)}. Partial writes may remain if install began; '
-              'no rollback/fallback. Use --check-installed for read-only installed state.',
-              file=sys.stderr, flush=True)
+              f'no rollback/fallback. {next_step}', file=sys.stderr, flush=True)
         return 2
 
 
