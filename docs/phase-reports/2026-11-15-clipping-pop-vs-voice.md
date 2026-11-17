@@ -32,7 +32,7 @@ own).
 | **Capture-path source check** (node, monitor state, volume) | `scripts/capture_source_check.py` + `.sha256` | 13 |
 | **Owner packet** for the gain change (gates, lines, acceptance, restore) | `docs/packets/2026-11-15-capture-gain-reduction.md` | — |
 
-Suite **2168 passed, 6 skipped in 181.85 s** (from 2150/6 in 171.67 s; +18
+Suite **2168 passed, 6 skipped in 177.48 s** (from 2150/6 in 171.67 s; +18
 pins), `ruff check .` clean. F36 trend continues.
 
 ### 1. The packet (the instrument, not the reading)

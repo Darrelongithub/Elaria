@@ -45,7 +45,7 @@ and `live_client.py`'s live stream (PROTECTED).
 
 Branch `arena/c2a7085d-elaria`; instruments `6785860` / `606ffc0` / `d765626`,
 this phase's code and packet uncommitted at time of writing. Nothing merged;
-PR #23 hold unchanged. Suite **2168 passed, 6 skipped in 181.85 s** (was
+PR #23 hold unchanged. Suite **2168 passed, 6 skipped in 177.48 s** (was
 2136/6 in 179.30 s); `ruff check .` clean. Report:
 `docs/phase-reports/2026-11-15-clipping-pop-vs-voice.md`.
 
