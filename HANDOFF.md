@@ -45,7 +45,7 @@ and `live_client.py`'s live stream (PROTECTED).
 
 Branch `arena/c2a7085d-elaria`; instruments `6785860` / `606ffc0` / `d765626`,
 this phase's code and packet uncommitted at time of writing. Nothing merged;
-PR #23 hold unchanged. Suite **2191 passed, 6 skipped in 170.72 s** (was
+PR #23 hold unchanged. Suite **2199 passed, 6 skipped in 179.00 s** (was
 2136/6 in 179.30 s); `ruff check .` clean. Report:
 `docs/phase-reports/2026-11-15-clipping-pop-vs-voice.md`.
 
@@ -96,9 +96,14 @@ prints no criterion lines at all on such a take. Cause of the silence
 **Limiter, answered from the code:** `SoftLimiter` is wired and enabled, static
 curve (knee 0.6, ceiling 0.89, no attack), applied **before** the take is
 written — a pinned full-scale run reads back at ≤ 0.89. So a
-dictate-produced take **cannot** show 1.0000; the owner's does. Contradiction
-surfaced, not resolved: packet Gate 4b asks for that session's
-`capture.levels` line (`raw_peak` / `processed_peak` / `limited_samples`).
+dictate-produced take **cannot** show 1.0000; the owner's does. Contradiction surfaced, not resolved. **The journal grep came back empty**
+(2026-11-17) — which discriminates nothing by itself: a stale daemon (the
+likeliest, since `capture.levels` exists only on branch code), another unit, or
+no session on that unit all look the same. Gate 4b now reads in an order that
+cannot be stale: `assist doctor`'s `capture levels` line (in-memory last
+session: `processed peak`, `limited samples`), then `scripts/limiter_readings.py`
+(the store's `capture.stats` rows, read-only, `limiter_effective` 1 only when
+input was hotter than output), and only then the journal.
 
 **VAD headroom, measured:** room tone at 18 % is 0.049–0.074 against
 `vad_rms_threshold` 0.01, so 12 % (~0.025–0.037) is still above the gate — the

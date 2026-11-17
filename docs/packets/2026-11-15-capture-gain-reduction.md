@@ -230,30 +230,50 @@ not keep lowering gain.
 ## Gate 4b — the limiter's own numbers (only if a take still clips)
 
 The design chat asked, correctly: if a limiter were active, nothing should read
-1.0000 — and 38 frames do. The answer from the code is sharper than either
-"wired" or "not wired", and it needs one measurement from the journal:
+1.0000 — and 38 frames do. The code's answer is sharper than "wired" or "not
+wired", and it needs a measurement from your machine, not another theory:
 
 - the capture limiter (`capture.SoftLimiter`, E5/F18/F27) **is** wired into the
-  dictate loop, is enabled unconditionally, and is a **static** curve — knee
-  0.6, ceiling 0.89, no attack and no lookahead, so it cannot swallow an onset;
-- it is applied **before** the take is written (`frame = limiter.apply(frame)`
-  then `wav_sink.write(frame)`), so a take produced this way **cannot contain a
-  sample above ~0.89**. A pinned test runs a full-scale source through
-  `dictate` and reads the saved WAV back at ≤ 0.89.
+  dictate loop, enabled **unconditionally**, and is a **static** curve — knee
+  0.6, ceiling 0.89, no attack, no lookahead, so it cannot swallow an onset;
+- it is applied **before** the take is written (`frame = limiter.apply(frame)`,
+  then `wav_sink.write(frame)`), so a dictate-produced take **cannot contain a
+  sample above ~0.855**. A pinned test runs a full-scale source through
+  `dictate` and reads the saved WAV back at ≤ 0.89, with `raw_peak 1.0` still
+  reported.
 
-Which means: **if the take you probed really shows `peak_full 1.0000`, then that
-file did not come through the limiting path** (it predates the wiring, or it was
-written by another writer). Do not conclude "no limiter" from the WAV. The
-evidence is the session's own line:
+So if the take you probed really shows `peak_full 1.0000`, **that file did not
+come through the limiting path**. Read the numbers in this order — the first two
+cannot be stale:
 
 ```
-journalctl --user -u assistant --since "today" --no-pager | grep capture.levels | tail -3
+assist doctor | grep -A1 "capture levels"          # 1. the running daemon's last session
+python3 scripts/limiter_readings.py                # 2. the store, newest first (durable)
+journalctl --user -u assistant --since today --no-pager | grep capture.levels | tail -3
 ```
 
-Look for `raw_peak`, `processed_peak`, `limited_samples` (and `peak_full` /
-`peak_steady`). `raw_peak 1.0` with `processed_peak` ≈ 0.85-0.89 is a working
-limiter on a hot input; `processed_peak 1.0` would mean it is not. Send the
-line as printed.
+1. **doctor** prints `peak full`, `peak steady`, `processed peak`, `limited
+   samples`, `xruns`, `node` from the last session the daemon ran — in memory,
+   so it is current by construction.
+2. **`limiter_readings.py`** reads the `capture.stats` row every `dictate`
+   writes (read-only, newest first): `raw_peak`, `processed_peak`,
+   `limited_samples`, and `limiter_effective` — `1` only when the input was
+   hotter than what went out. A pre-verified manifest sits beside it.
+
+Reading it: `raw_peak 1.0` with `processed_peak` ≈ 0.85–0.89 and
+`limiter_effective 1` is a working limiter on a hot input — the take's 1.0000
+then means the file is not the limited take. `processed_peak 1.0` or
+`limiter_effective 0` **with** `raw_peak 1.0` would mean the limiter is not on
+that path after all.
+
+3. **The journal came back empty on 2026-11-17** (`grep capture.levels` →
+   nothing). That discriminates nothing on its own: a daemon not restarted on
+   branch code, a different unit, or no `ptt`/`dictate` session on that unit all
+   look the same. It is listed third for exactly that reason. If 1 and 2 are
+   also empty, the daemon is stale — `systemctl --user restart assistant` — and
+   that is its own finding, not a limiter reading.
+
+Send whichever of the three answers, as printed.
 
 ## Gate 4c — the VAD headroom, before going lower
 

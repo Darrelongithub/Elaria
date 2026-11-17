@@ -39,7 +39,7 @@ own).
 | **Capture-path source check** (node, monitor state, volume, F17 refusal) | `scripts/capture_source_check.py` + `.sha256` | 20 |
 | **Owner packet** for the gain change (gates, lines, acceptance, restore) | `docs/packets/2026-11-15-capture-gain-reduction.md` | — |
 
-Suite **2191 passed, 6 skipped in 170.72 s** (from 2150/6 in 171.67 s; +41
+Suite **2199 passed, 6 skipped in 179.00 s** (from 2150/6 in 171.67 s; +49
 pins), `ruff check .` clean. F36 trend continues.
 
 ### 1. The packet (the instrument, not the reading)
@@ -496,6 +496,59 @@ room tone ~0.025–0.037 — still above the gate, so the VAD is **not** the
 constraint on going lower; the peaks are. The no-speech verdict reads the steady
 **peak** against `[voice] silence_floor` 0.05, and even at 12 % a moderate
 passage peaks ~0.3. Pinned in the fixture file.
+
+## ADDENDUM 4 — the limiter grep came back empty (2026-11-17)
+
+The owner ran the packet's Gate 4b line:
+
+```
+journalctl --user -u assistant --since "today" --no-pager | grep capture.levels | tail -3
+```
+
+**Result: nothing.** That is a measurement, and it is worth stating what it does
+and does not discriminate. An empty result is the same shape for three different
+worlds:
+
+1. **the daemon is not running branch code** — `capture.levels` exists only in
+   this branch (`transcribe.py:1683`, emitted unconditionally at the end of
+   every `dictate`), so a stale daemon that transcribed the 09:32 turn
+   perfectly well would still print no such line. This is the daemon-was-stale
+   lesson from scene 1, and it is the likeliest of the three;
+2. **a different unit** — the line is only on `assistant.service` if that is the
+   unit that runs the daemon on this machine;
+3. **no `ptt`/`dictate` session on that unit since midnight** — but the 09:32
+   turn transcribed, so *some* session ran somewhere.
+
+**It does not say anything about the limiter.** Nothing in the empty grep is
+evidence for or against the limiter running, and it must not be cited as such.
+
+### The instrument that cannot be stale
+
+The durable record is the store: every `dictate` writes a `capture.stats`
+persona event carrying `raw_peak`, `processed_peak`, `limited_samples`,
+`peak_full`, `peak_steady` and the limiter's own block. `scripts/limiter_readings.py`
+reads the newest of those, **read-only** (`sqlite3` URI `mode=ro`, no DDL, no
+migration, pinned byte-identical), and prints one `key value` line per session
+plus `limiter_effective`:
+
+- `1` — `processed_peak < raw_peak` **and** `limited_samples > 0`, i.e. the
+  input was hotter than what went out;
+- `0` — nothing needed limiting, or the limiter did not see that audio.
+
+The packet's Gate 4b now reads in the order that cannot lie: **doctor** (the
+running daemon's in-memory last session: `processed peak`, `limited samples`),
+then **`limiter_readings.py`** (the store, durable), and only then the journal —
+with the empty-journal caveat written down beside it so no future reader treats
+silence as a limiter verdict.
+
+### What is still true from the code
+
+Unchanged and pinned: the limiter is wired, unconditional, static (knee 0.6,
+ceiling 0.89, no attack), applied **before** the take is written, and a
+full-scale fake source read back from disk peaks at ≤ 0.89. So the open question
+is narrower than "is there a limiter": it is **which writer produced the file
+that reads 1.0000**, and the store's `capture.stats` row (or doctor's line) for
+that session settles it without another theory.
 
 ## OPEN QUESTIONS
 

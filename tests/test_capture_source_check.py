@@ -317,6 +317,7 @@ def test_the_gain_packet_leads_with_its_reversibility_gate_and_its_acceptance():
     assert "scripts/capture_source_check.py --pin-line" in text      # Ask 13
     assert "after the next reboot" in text                           # Finding 1
     assert "--gain-check" in text
+    assert "scripts/limiter_readings.py" in text
     for criterion in ("peak_steady", "rms_steady", "rms_variation",
                       "full_scale_share"):
         assert f"`{criterion}`" in text, criterion
