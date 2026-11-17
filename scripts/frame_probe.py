@@ -68,6 +68,14 @@ ACCEPT_VARIATION_MIN = 0.25
 #: full-scale for a take to count as unclipped.
 ACCEPT_FULL_SCALE_SHARE_MAX = 0.05
 
+#: Below this steady rms a take is not quiet speech, it is a signal that never
+#: arrived (2026-11-17: the packet's capture line recorded 5.95 s of 0.0003 rms
+#: while the production path recorded the same mic fine). Speech at any gain
+#: swings by orders of magnitude; 0.005 is far below a whisper and far above a
+#: converter's noise floor, and the verdict is `no_signal`, never `clean` —
+#: a silent file must never read as a partial success.
+NO_SIGNAL_RMS = 0.005
+
 
 def _frames(pcm: bytes, sample_rate: int, frame_ms: int) -> list[dict]:
     """Decode s16le mono into per-frame peak/rms rows."""
@@ -109,7 +117,12 @@ def analyse(path: Path, *, frame_ms: int = FRAME_MS) -> dict:
 
     last_full = full[-1]["start_ms"] if full else None
     first_full = full[0]["start_ms"] if full else None
-    if not full:
+    steady_rms = frame_rms_of(steady_rows)
+    if steady_rms < NO_SIGNAL_RMS:
+        # Nothing to be clean about: no signal reached the file at all. This
+        # outranks every other verdict, including a pop with silence behind it.
+        verdict = "no_signal"
+    elif not full:
         verdict = "clean"
     elif not after_start:
         verdict = "pop_at_start"
@@ -137,7 +150,7 @@ def analyse(path: Path, *, frame_ms: int = FRAME_MS) -> dict:
         "peak_full": round(max((row["peak"] for row in rows), default=0.0), 4),
         "peak_steady": round(max((row["peak"] for row in steady_rows), default=0.0), 4),
         "rms_full": round(frame_rms_of(rows), 4),
-        "rms_steady": round(frame_rms_of(steady_rows), 4),
+        "rms_steady": round(steady_rms, 4),
         "full_scale_frames": len(full),
         "full_scale_after_start": len(after_start),
         "first_full_scale_ms": first_full,
@@ -167,6 +180,10 @@ def _percentile(values: list[float], fraction: float) -> float:
 
 def gain_acceptance(result: dict) -> dict:
     """The packet's acceptance test, as numbers plus pass/fail per criterion."""
+    if result["verdict"] == "no_signal":
+        # Fail closed with its own verdict: a silent take is a capture-line or
+        # device failure, and no gain conclusion may be drawn from it.
+        return {"checks": {}, "pass": False, "silent": True}
     steady = [row for row in result["rows"]
               if row["start_ms"] >= result["start_window_ms"]]
     rms_values = [row["rms"] for row in steady] or [0.0]
@@ -188,6 +205,12 @@ def gain_acceptance(result: dict) -> dict:
 def render_acceptance(result: dict) -> str:
     """One line per criterion, then the verdict. Numbers and pass/fail only."""
     acceptance = gain_acceptance(result)
+    if acceptance.get("silent"):
+        # No criterion lines at all: on a silent take they would read as a
+        # partial pass, and that is exactly how a capture-line failure nearly
+        # became a gain conclusion on 2026-11-17.
+        return ("gain_accept no_signal\n"
+                "note silent_take_is_not_a_gain_reading")
     lines = []
     for name, (ok, value) in acceptance["checks"].items():
         shown = f"{value:.4f}" if isinstance(value, float) else str(value)

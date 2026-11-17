@@ -45,7 +45,7 @@ and `live_client.py`'s live stream (PROTECTED).
 
 Branch `arena/c2a7085d-elaria`; instruments `6785860` / `606ffc0` / `d765626`,
 this phase's code and packet uncommitted at time of writing. Nothing merged;
-PR #23 hold unchanged. Suite **2175 passed, 6 skipped in 171.52 s** (was
+PR #23 hold unchanged. Suite **2191 passed, 6 skipped in 170.72 s** (was
 2136/6 in 179.30 s); `ruff check .` clean. Report:
 `docs/phase-reports/2026-11-15-clipping-pop-vs-voice.md`.
 
@@ -75,6 +75,34 @@ What that changes here:
 - **Open and measured, not attributed:** the 20261102 take's constant envelope.
   (a) gain so hot that quiet passages saturate, or (b) a steady loud source
   beside the voice (monitor/loopback). The packet separates them.
+
+**GAIN APPLIED: 35.0 → 18.0, kept (2026-11-17).** Production take at 18 %:
+`rms_steady` **0.2311** (mid-band), `rms_variation` **1.6178** (~6.5x the
+threshold) — **the acceptance band is validated on real speech** — while
+`peak_steady` 1.0000 and `full_scale_after_start` 37 (share 0.2284) mean loud
+syllables still clip. Candidate B (12 %) in flight via the production recorder.
+**Clipping is graded**: that take transcribed verbatim at 22.8 % full-scale
+frames, so severity, not presence, is fatal. The 35.0 restore value is recorded
+and unused.
+
+**The packet's old Gate 3 line was a capture-line failure, not a gain result**
+(2026-11-17): `pw-record --target <node>` exited 0 with 5.95 s of rms 0.0003
+while production recorded the same mic. Fixed: `scripts/record_probe_take.py`
+records through `capture.pw_record_pcm_stream_command` (production's own argv),
+exits 3 with `silent 1`; the probe now has `verdict no_signal` (rms < 0.005) and
+prints no criterion lines at all on such a take. Cause of the silence
+[UNVERIFIED]; `--compare` reproduces both invocations in one sitting.
+
+**Limiter, answered from the code:** `SoftLimiter` is wired and enabled, static
+curve (knee 0.6, ceiling 0.89, no attack), applied **before** the take is
+written — a pinned full-scale run reads back at ≤ 0.89. So a
+dictate-produced take **cannot** show 1.0000; the owner's does. Contradiction
+surfaced, not resolved: packet Gate 4b asks for that session's
+`capture.levels` line (`raw_peak` / `processed_peak` / `limited_samples`).
+
+**VAD headroom, measured:** room tone at 18 % is 0.049–0.074 against
+`vad_rms_threshold` 0.01, so 12 % (~0.025–0.037) is still above the gate — the
+VAD is not the constraint; the peaks are.
 
 **GATE 1 RAN 2026-11-17 — two of my own probe's defects, both fixed.**
 `node_is_monitor 0`, `node_is_mic1 1`, four monitor sources (normal) →

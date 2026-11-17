@@ -7,10 +7,14 @@ investigation. Branch `arena/c2a7085d-elaria`; instruments at `6785860`
 (+`606ffc0`, `d765626`), this phase uncommitted at time of writing. Nothing
 merged; PR #23's hold is unchanged.
 
-**Status: EVIDENCE COMPLETE — D-B CONFIRMED. Gate 1 ran 2026-11-17 and found
-two defects in my own probe** (no default config path; the system default
-source presented as a capture target, which F17 refuses). Both fixed, Gate 1
-re-issued with a pin step; Gates 2–4 pending the owner. The voice is at full scale on all
+**Status: D-B FIXED AT 18 % AND STILL CLIPPING ON LOUD SYLLABLES.** Gate 1 ran
+2026-11-17 and found two defects in my own probe (fixed); Gate 2 set 35.0 → 18.0
+and the production take at 18 % reads `rms_steady` 0.2311 (mid-band) with
+`rms_variation` 1.6178 — the band is validated on real speech. But
+`peak_steady` is still 1.0000 with 37 full-scale frames (`full_scale_share`
+0.2284), and the packet's own capture line produced six seconds of silence while
+production recorded the same mic (fixed: the take is now recorded through
+production's argv). Candidate B (12 %) is in flight. The voice is at full scale on all
 three kept takes; the start pop is real, one frame, and already handled; the fix
 is the owner's input gain, issued as a packet
 (`docs/packets/2026-11-15-capture-gain-reduction.md`), not daemon code.
@@ -35,7 +39,7 @@ own).
 | **Capture-path source check** (node, monitor state, volume, F17 refusal) | `scripts/capture_source_check.py` + `.sha256` | 20 |
 | **Owner packet** for the gain change (gates, lines, acceptance, restore) | `docs/packets/2026-11-15-capture-gain-reduction.md` | — |
 
-Suite **2175 passed, 6 skipped in 171.52 s** (from 2150/6 in 171.67 s; +25
+Suite **2191 passed, 6 skipped in 170.72 s** (from 2150/6 in 171.67 s; +41
 pins), `ruff check .` clean. F36 trend continues.
 
 ### 1. The packet (the instrument, not the reading)
@@ -182,7 +186,10 @@ Consequences carried into the docs, the packet and HANDOFF:
 
 1. `[capture] start_pop_ms = 100` stays and the measurement is recorded in
    `config.toml.example`. The gate stays, described as hygiene.
-2. The gain change is an **owner-run packet**, not daemon code
+2. **Applied and accepted:** 35.0 → **18.0** on the Mic1 node, kept; the 35.0
+   restore value is recorded and unused. 18 % halves the level (0.4988 → 0.2311)
+   but leaves loud syllables at full scale, so candidate B (12 %) follows.
+   The gain change is an **owner-run packet**, not daemon code
    (`docs/packets/2026-11-15-capture-gain-reduction.md`): record the current
    value, change to 18 % (then 12 % if needed), one fresh take through the
    production chain, `--gain-check` twice, restore line, and the (a)/(b)
@@ -229,35 +236,52 @@ Consequences carried into the docs, the packet and HANDOFF:
    Gate 1 reading has to be re-taken. This is the second time in this
    investigation that the instrument, not the system, was the fault (see
    DEFECTS 2 and 3) — worth remembering before a reading is believed.
-8. **No hardware evidence in the sandbox.** Every number in the pins is
+8. **The packet's capture line was accepted and silent** (2026-11-17): `pw-record
+   --target <node>` exited 0 with 5.95 s of rms 0.0003 while production recorded
+   the same mic. Fixed by recording through production's own argv
+   (`scripts/record_probe_take.py`), by `no_signal` in the probe, and by words in
+   the packet. The *cause* of the silence remains [UNVERIFIED]; `--compare`
+   reproduces both invocations in one sitting to settle it.
+9. **A contradiction, surfaced not resolved:** the dictate path writes the
+   limited audio to disk, and a pinned full-scale run reads back at ≤ 0.89, yet
+   the owner's take shows 1.0000. Either that file predates the wiring or another
+   writer produced it. Discriminator: the `capture.levels` journal line.
+10. **No hardware evidence in the sandbox.** Every number in the pins is
    synthetic; the owner's three takes and the packet run are the measurement.
 
 ## NEXT GATE
 
-**Owner-run: the gain packet.** `docs/packets/2026-11-15-capture-gain-reduction.md`
+**Candidate B — 12 %, measured through the production path** (in flight).
 
 ```
-sha256sum -c scripts/frame_probe.py.sha256
-sha256sum -c scripts/capture_source_check.py.sha256
-python3 scripts/capture_source_check.py        # Gate 1: config_path, node, refusal, volume, monitor state
-python3 scripts/capture_source_check.py --pin-line   # Gate 1b, only if capture_would_refuse 1
-pactl set-source-volume <that node> 18%        # Gate 2
-timeout 6 pw-record --target <that node> --rate 16000 --channels 1 --format s16 /tmp/gain-18.wav
-python3 scripts/frame_probe.py /tmp/gain-18.wav --gain-check
-python3 scripts/capture_source_check.py        # Gate 5: end of sitting, and again after reboot
+python3 scripts/record_probe_take.py /tmp/gain-12.wav --seconds 5   # exit 3 = capture-line failure, not a gain result
+python3 scripts/frame_probe.py /tmp/gain-12.wav --gain-check
 ```
 
-Accepted when all four `ACCEPT` lines pass (`peak_steady < 1.0`, `rms_steady`
-0.15–0.30, `rms_variation ≥ 0.25`, `full_scale_share ≤ 0.05`). If not, 12 % and
-repeat. If `node_is_monitor 1`, stop — that is (b).
+Acceptance: all four `ACCEPT` lines pass. `rms_steady` 0.15–0.30 is now
+demonstrated achievable by the 18 % take (0.2311); what 12 % has to fix is
+`peak_steady`/`full_scale_share` **without** spending the headroom the quiet
+passages need (measured: room tone ~0.03 at 12 %, still above the 0.01 VAD
+gate).
 
-Report back: the Gate-1 output **as printed by the corrected script**, old → new
-volume, the `--gain-check` output per take, and the two Gate 5 re-reads.
-Nothing else is required, and no audio leaves the machine.
+**If 12 % still clips, the answer is not more gain reduction.** Then the
+question moves to the limiter's numbers (packet Gate 4b, one journal grep) and,
+if the limiter is genuinely absent from that path, to wiring it — because the
+owner's goal is an always-on mic feeding a 5 s pre-roll ring, and a ring that
+stores clipped syllables stores damaged audio continuously.
 
-**What would falsify D-B**: a take at reduced gain that still flat-tops with a
-narrow envelope at two different gains — that is (b), a steady source beside
-the voice, and the answer changes from "gain" to "wiring".
+`[capture] start_pop_ms = 100`: four independent confirmations (three kept takes
++ the production take), shipped default unchanged.
+
+### Follow-ups still open, unchanged in kind
+
+- Ask 13 / `mic_target`: now *narrower* — production capture succeeded, and
+  `audio_gateway.resolve_target` refuses without a named node, so a node **is**
+  named; `configured_node -1` was the probe's blindness. The corrected script
+  confirms it on the next run. Nothing to pin until then.
+- Two unsplit fields stay documented, not renamed (limiter
+  `raw_peak`/`processed_peak`, journal `session.close peak`).
+- Sub-100 ms presses: a take whose only frames are transient reads as silence.
 
 ## POST-RULING ADDENDUM — Gate 1 on the owner's machine (2026-11-17)
 
@@ -355,6 +379,123 @@ save, then acceptance is `configured_node` == `node`, `capture_would_refuse 0`,
 `node_is_mic1 1`, and doctor's `capture node (Mic1)` ok. `--pin-line` prints `-1`
 rather than a line when the node it would pin is a `.monitor` — pinning a
 loopback would make (b) permanent. Packet Gate 1b carries this.
+
+## ADDENDUM 2 — Gates 2–4 (2026-11-17): the gain worked, the packet's line did not
+
+**Gate 2:** `35.0 → 18.0` on the Mic1 node; every other field identical
+(`node_is_monitor 0`, `node_is_mic1 1`, 4 monitor sources, 6 sources). The 35.0
+restore value is recorded and **unused** — 18 % is kept.
+
+**Gate 3 failed as an instrument, not as a measurement.** The packet's
+`pw-record --target <node> … /tmp/gain-18.wav` exited 0 and wrote 5.95 s of
+`rms_steady 0.0003`, `peak 0.0055`, `verdict clean` — and the ACCEPT block read
+"2 pass, 2 fail", which looks like a partial success and nearly became the
+conclusion "18 % is too quiet". In the same sitting, same gain, `assist talk`
+transcribed a voice turn verbatim. The syntax was *accepted* and opened
+something silent: a refusal would have been information.
+
+Fixes, in the order the design chat asked for them:
+
+1. **The take is now recorded by the production path.**
+   `scripts/record_probe_take.py` delegates its argv to
+   `capture.pw_record_pcm_stream_command` — the same function the daemon uses —
+   writes the stdout PCM to a WAV, and exits **3** with `silent 1` when a take
+   is silent. `--compare` records the old line alongside it
+   (`legacy_peak`/`legacy_silent`/`same`), which is the experiment that would
+   say whether the silence was the invocation spelling (it is a diagnosis, not
+   an attribution). A pin asserts the argv equality, so the two dialects cannot
+   drift apart again.
+2. **Silence fails closed in the probe.** `verdict no_signal` when `rms_steady`
+   < 0.005 — outranking `clean` — and `--gain-check` on such a take prints
+   **no** criterion lines at all, only `gain_accept no_signal` and
+   `note silent_take_is_not_a_gain_reading`. A silent file can no longer read
+   as partial success.
+3. **The packet says it in words**: a silent take is a capture-line failure,
+   never a gain result.
+
+**Withdrawal.** Nothing in this lane's conclusions is drawn from that
+`gain_accept fail`. The acceptance band was **not** evaluated by it.
+
+## ADDENDUM 3 — the production take (2026-11-17 09:32, 18 %): band validated
+
+| reading | value |
+| --- | --- |
+| duration / frames | 8190.0 ms / 164 |
+| `peak_full` / `peak_steady` | 1.0000 / 1.0000 |
+| `rms_full` / `rms_steady` | 0.2297 / **0.2311** |
+| `full_scale_frames` / `after_start` | 38 / **37** (share 0.2284) |
+| `first` / `last_full_scale_ms` | 0 / 4050 |
+| `rms_variation` | **1.6178** |
+| `verdict` | mixed · `recommended_start_pop_ms` 100 |
+
+Envelope: frame 0 is the start pop with the October signature (0.9981/0.0554),
+frames 1–2 silent, frames 3–17 a quiet lead-in, frames 18–81 loud passages with
+full-scale hits interleaved with dips, frames 90–142 **2.4 s of room tone**
+(rms 0.049–0.074), frames 143–155 a moderate passage peaking 0.60 with **no**
+clipping, frames 156–163 decay.
+
+**The band is validated.** `rms_steady` 0.2311 is mid-band and `rms_variation`
+1.6178 is ~6.5x the 0.25 threshold, while the flat 20261102 rail scores ~0.17
+and fails. The criteria are achievable by real speech; two of four pass.
+
+**Clipping is graded, not binary — the report's own claim refined on evidence.**
+This take was transcribed **verbatim** ("Testing testing, can you hear me?" →
+"Loud and clear. What's on your mind?") while 22.8 % of its frames sat at full
+scale. The October/November files that returned empty transcripts were 65–100 %
+full-scale at `rms_steady` 0.48–0.57. Destroyed input remains a sufficient cause
+for those empties, but the relationship is **severity, not presence**: partial
+clipping can still transcribe. Any future sentence in this repo implying "one
+full-scale frame is fatal" is wrong and should cite this.
+
+**18 % halved the level as predicted and is still too hot for loud syllables.**
+`rms_steady` 0.4988/0.4797/0.5747 at 31–35 % → 0.2311 at 18 %, but the peaks are
+unchanged at 1.0000. The full-scale hits concentrate in the first four seconds
+and the 7.2–7.7 s passage peaks at 0.60 with none, so this is transient loud
+speech, not a steady source.
+
+**The start pop is confirmed a fourth time** in a production take at the current
+gain (frame 0, 0.9981/0.0554, then two silent frames) with
+`recommended_start_pop_ms` 100 again. The 100 ms default and the gate are right.
+
+**The 2.4 s interior room tone is a fixture now.** A speech → long silence →
+speech take is exactly what the VAD strip and the no-speech path must survive;
+`tests/test_gain_shape_fixture.py` freezes the shape (synthesised from the
+reported numbers, never the owner's audio) and pins: band achievable, clipping
+still present, the pop at frame 0, `recommended_start_pop_ms` 100, room tone
+above the VAD floor, and the flat rail failing variation.
+
+### The limiter question, answered from the code — and the contradiction it leaves
+
+The design chat's ask was right and the code's answer is more interesting than a
+yes/no:
+
+- `capture.SoftLimiter` is **wired** into the dictate loop and **enabled
+  unconditionally**; it is a **static** curve (knee 0.6, ceiling 0.89, no
+  attack, no lookahead), so it cannot swallow an onset;
+- it is applied **before the take is written** (`frame = limiter.apply(frame)`
+  at `transcribe.py:857`, `wav_sink.write(frame)` at `:902`), so a
+  dictate-produced WAV **cannot contain a sample above ~0.855**. A new pin runs
+  a full-scale fake source through `DictationService.dictate` and reads the
+  saved WAV back at ≤ 0.89, with `raw_peak 1.0` and `peak_full 1.0` still
+  reported from the pre-limiter measurement.
+
+So the owner's take reading `peak_full 1.0000` **cannot have come through this
+path** — unless it predates the wiring or was written by another writer. This is
+a contradiction, surfaced rather than resolved: the discriminator is the
+session's journal line, `capture.levels`, which carries `raw_peak`,
+`processed_peak` and `limited_samples` for that exact take. `raw_peak 1.0` with
+`processed_peak` ≈ 0.85–0.89 is a working limiter on a hot input;
+`processed_peak 1.0` would mean it is not in that path after all. Packet Gate 4b
+asks for that line, one grep, before any further gain step is interpreted.
+
+### VAD headroom, measured
+
+At 18 % the quiet passages run rms ~0.05–0.10 and the room tone 0.049–0.074,
+while `[transcribe] vad_rms_threshold` is **0.01**. Halving the gain again leaves
+room tone ~0.025–0.037 — still above the gate, so the VAD is **not** the
+constraint on going lower; the peaks are. The no-speech verdict reads the steady
+**peak** against `[voice] silence_floor` 0.05, and even at 12 % a moderate
+passage peaks ~0.3. Pinned in the fixture file.
 
 ## OPEN QUESTIONS
 
