@@ -110,13 +110,19 @@ def _run_packet(path: Path) -> dict:
 def test_packet_is_a_committed_single_line_runner_with_a_matching_checksum():
     assert PACKET.exists() and MANIFEST.exists()
     digest, name = MANIFEST.read_text().split()
-    assert name == "frame_probe.py"
+    # Repo-relative, so `sha256sum -c` works from the root like every other pin.
+    assert name == "scripts/frame_probe.py"
     import hashlib
 
     assert hashlib.sha256(PACKET.read_bytes()).hexdigest() == digest, (
         "frame_probe.py changed without regenerating its manifest — run "
         "`python3 scripts/frame_probe.py --checksum`")
     assert PACKET.read_text().startswith("#!/usr/bin/env python3")
+    # And it actually verifies from the root, which the bare name never did.
+    check = subprocess.run(["sha256sum", "-c", "scripts/frame_probe.py.sha256"],
+                           cwd=REPO, capture_output=True, text=True,
+                           timeout=60, check=False)
+    assert check.returncode == 0, check.stdout + check.stderr
 
 
 def test_packet_output_is_numbers_only_and_has_one_row_per_frame(tmp_path):

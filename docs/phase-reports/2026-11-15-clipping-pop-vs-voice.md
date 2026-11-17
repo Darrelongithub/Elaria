@@ -41,9 +41,14 @@ Summary keys that decide the question:
 - `recommended_start_pop_ms` — the hold-off the numbers imply (0 when clean,
   rounded up to a frame and capped at 100 ms when a start pop exists).
 
-Checksum: `sha256sum -c scripts/frame_probe.py.sha256` from the repo root.
-`286977be…` at this commit, and a pin recomputes it, so an edit that forgets
-to regenerate the manifest fails the suite.
+Checksum: `sha256sum -c scripts/frame_probe.py.sha256` from the repo root. The
+manifest names the file **repo-relative** (`scripts/frame_probe.py`) so that
+line verifies from the root, as every other pin in this house does; a pin both
+recomputes the digest and runs `sha256sum -c` itself. Two digests are in play
+and neither is an error: `286977be…` is commit `6785860` (the copy the owner
+ran, cross-checked byte-identical against tip `606ffc0`), and `47dc0e65…` is
+the current tip after the manifest-name fix — the analysis path was not touched,
+only the name the manifest writes.
 
 Sandbox verification (pins, synthetic takes — [TESTED-ONLY]):
 
@@ -145,6 +150,9 @@ python3 scripts/frame_probe.py ~/…/20261102-100558-61258b.wav
 
 Verification first: `sha256sum -c scripts/frame_probe.py.sha256`.
 
+**Run 1 of 3 is in (2026-11-15, PARTIAL EVIDENCE — no fix ruling yet).** See
+"Owner run 1" below; files 2 and 3 (the two newer kept wavs) decide it.
+
 Then the reading:
 
 - **D-A (pop)** — `verdict pop_at_start` on the takes: the historical `peak`
@@ -166,6 +174,61 @@ confirmed on live hardware without waiting for the packet.
 **Tonight's F2 press:** no expectation is set here. It is a datapoint — the
 journal `capture.levels` line now carries both peaks and the transient count,
 so whatever it shows is readable. No claim is made about what it will show.
+
+## OWNER RUN 1 OF 3 (partial evidence — 2026-11-15)
+
+Recorded, not ruled. Worktree detached at `6785860`; `sha256sum -c
+scripts/frame_probe.py.sha256` OK (`286977be…`), cross-checked byte-identical
+against tip `606ffc0`; interpreter the owner's venv. Files 2 and 3 pending in
+the same sitting — **do not act on file 1 alone.**
+
+`20261027-064450-77cc4e.wav` (October 27 capture, 9.75 s, 16 kHz mono,
+195 frames) — numbers as printed:
+
+| reading | value |
+| --- | --- |
+| `peak_full` / `peak_steady` | 1.0000 / 1.0000 |
+| `rms_full` / `rms_steady` | 0.4963 / 0.4988 |
+| `full_scale_frames` / `full_scale_after_start` | 128 / 127 |
+| `first_full_scale_ms` / `last_full_scale_ms` | 0 / 7700 |
+| `start_window_ms` / `recommended_start_pop_ms` | 100 / 100 |
+| `verdict` | **mixed** |
+
+Shape: `FRAME 0` is 0.9981 peak at 0.0554 rms (one frame — the power-up pop);
+frame 1 is digital silence, frame 2 is 0.0313; the voice enters around 150 ms
+and sits at or within 0.01 of full scale for ~7.5 s; only frames 155–194 fall
+back to 0.28–0.97.
+
+Reading (mine, on the numbers above, and it is not the ruling): for **this
+file** the dominant defect is **steady clipping, not the pop**. A hold-off
+alone would trim frame 0 and leave 127 full-scale frames of distorted voice —
+so D-A is not sufficient here; the file is D-B territory. The `mixed` verdict
+is correctly carried by the pop, and that is exactly why the verdict alone was
+never allowed to decide: `full_scale_after_start 127` is what decides.
+
+One corroboration worth recording: frame 0 reads **0.9981**, and the
+muted-node doctor probe read **0.9981**. That makes it plausible that the
+muted reading *was* the pop and nothing else — the strongest hint yet that the
+mute test and this take share one mechanism. Identity is inference, not proof
+(same number, different sessions); files 2–3 may confirm or dissolve it.
+
+Whatever the other two say, this file's `recommended_start_pop_ms` is **100**,
+which is already the shipped default, so no config change is implied by run 1.
+
+### The decision once files 2–3 land
+
+- **2 and 3 also `steady_clip`/`mixed` with material `full_scale_after_start`**
+  → D-B confirmed for the *current* config: WP1's input-gain review is
+  reinstated with evidence. The remedy is an **owner-run** line dropping input
+  31 % → 15–20 %, then one doctor line and one fresh capture showing
+  `rms_steady` ~0.25–0.35 with `peak_full < 1.0`. A gain change is the owner's
+  action, not daemon code, and this session does not touch it.
+- **2 and 3 `clean`/`pop_at_start`** → the October clipping is a historical
+  artefact of that session's gain and voice; current captures are acceptable;
+  remaining work is pop hygiene (the gate already built at `6785860`) and,
+  optionally, recording what the October config was.
+- **the pop default** stays 100 ms; if 2–3 recommend otherwise, the largest of
+  the three sets it, and the measurement is recorded here.
 
 ## OPEN QUESTIONS
 

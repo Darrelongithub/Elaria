@@ -49,9 +49,11 @@ unchanged). Suite: **2150 passed, 6 skipped in 173.04 s** (was 2136/6 in
 `docs/phase-reports/2026-11-15-clipping-pop-vs-voice.md`.
 
 Issued: `scripts/frame_probe.py` + `scripts/frame_probe.py.sha256` (stdlib,
-no network, numbers-only, one physical line), the `peak_full`/`peak_steady`
-split in doctor + session stats, and the start-transient gate in the capture
-path. **The verdict is owed, not taken** — the three kept takes decide it:
+no network, numbers-only, one physical line, manifest names the file
+**repo-relative** so `sha256sum -c` verifies from the root), the
+`peak_full`/`peak_steady` split in doctor + session stats, and the
+start-transient gate in the capture path. **The verdict is owed, not taken** —
+the three kept takes decide it:
 
 ```
 sha256sum -c scripts/frame_probe.py.sha256
@@ -67,6 +69,18 @@ evidence**. `clean` on all three → neither; look at what differed between
 those sessions and the ones that read 0.9981/1.0. No cause is attributed
 until the numbers arrive. The owner may press F2 tonight as a datapoint;
 no expectation is set for it.
+
+**RUN 1 OF 3 IS IN (2026-11-15) — partial evidence, no ruling.**
+`20261027-064450-77cc4e` (October 27, 9.75 s): `verdict mixed`, `peak_full`
+1.0000 / `peak_steady` 1.0000, `rms_steady` 0.4988, `full_scale_frames` 128,
+`full_scale_after_start` **127**, `first_full_scale_ms` 0, `last_full_scale_ms`
+7700, `recommended_start_pop_ms` 100. Frame 0 is the pop (0.9981 — the same
+number the muted-node probe read, so the muted reading is plausibly the pop
+alone); the voice then rides full scale for ~7.5 s. **For this file the defect
+is steady clipping, not the pop** — D-B territory. Files 2 and 3 (the two newer,
+cooler takes: rms 0.2754 / 0.3485 at 31 %) decide whether that is historical or
+current. Nothing changes on one file: no gain lines proposed, no config change
+(run 1 recommends exactly the 100 ms already shipped).
 
 ## 1. Where the build is
 
