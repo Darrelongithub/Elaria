@@ -127,6 +127,16 @@ are future feature gates, not claims made by today's passing installer tests.
 
 ## Decisions needed before protected voice implementation
 
+> **Supersession note (asks 35–40):** the three questions below record the preflight
+> state at a26dbdc, not current holds. The full revised spec and owner rulings have
+> now been read. Part 2 prevails; console capture/upload is forbidden while the
+> daemon's authorized remote transcription and cloud synthesis remain unchanged.
+> Mainline owns producer implementation; this lane requests the interface and
+> implements only its consumer after publication. See
+> [the producer contract request](../design/console-voice-producer-contract-v1.md)
+> and [hands ruling transition](../design/hands-owner-ruling-transition.md).
+> No protected producer grant, source repin or deployed feature is implied.
+
 1. **Full spec:** Drive exact-title, broader-title and full-text searches found no accessible
    `CONSOLE-VOICE-SURFACE.md`. Attach it or provide its link. The supplied four rulings are
    recorded; no unseen details are assumed approved.

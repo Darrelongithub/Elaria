@@ -4,6 +4,16 @@
 window orchestration, model call, phone sidecar or NectarLink was exercised. This is a
 bounded effect adapter, not certification of arbitrary terminal automation.
 
+> **Owner Ruling C supersession:** this document describes the accepted Task I
+> implementation, which still asks on an allowlist miss. The new required policy
+> removes that ask: only exact on-list, assessed reversible work may execute;
+> off-list/irreversible/unknown work receives an immediate recorded refusal.
+> Independent classification, hashes, inventory binding, dedicated-instance
+> restrictions and action/readback evidence remain. See
+> [asks 35–39 transition and current-code gaps](design/hands-owner-ruling-transition.md).
+> The transition is not yet implemented or hardware-proven. Historical card and
+> prompt semantics below are retained as history, not reaffirmed as the new policy.
+
 ## Authority and merge boundary
 
 Owner-supplied §1c, §1d, §1e and §1g govern. §1g supersedes F12: all routing/consent machinery
