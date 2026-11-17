@@ -1303,9 +1303,15 @@ class DictationService:
                     notes.append(
                         "transcript discarded: the session captured no usable audio (§8)")
                 final_text = ""
+                # `peak_rms` is the peak of the per-FRAME rms — a third
+                # metric, neither a sample peak nor an rms — so it is named
+                # for what it is and the split is printed beside it. A bare
+                # `peak=` here is how 0.2754 and 0.3485 became unreadable.
                 notes.append(
-                    f"no speech captured (node={capture_label}, bytes={captured_bytes}, "
-                    f"peak={peak_rms:.4f})")
+                    f"no speech captured (node={capture_label}, "
+                    f"bytes={captured_bytes}, peak_rms={peak_rms:.4f}, "
+                    f"peak_full={session_peak:.4f}, "
+                    f"peak_steady={session_peak_steady:.4f})")
                 # Rule 1: the plain-language line, in the session's own words.
                 notes.append(HEARD_NOTHING)
             try:

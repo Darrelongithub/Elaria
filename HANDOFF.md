@@ -41,46 +41,51 @@ Still deliberately outside the gateway (needs its own grant): the always-on
 hotword capture, `event.py`'s event capture, `_meeting_start`'s dual capture,
 and `live_client.py`'s live stream (PROTECTED).
 
-## 0a. Capture clipping — D-A (pop) vs D-B (voice), 2026-11-15
+## 0a. Capture clipping — D-B CONFIRMED, gain packet issued (2026-11-15)
 
-Commit `6785860` (branch `arena/c2a7085d-elaria`; nothing merged, PR #23 hold
-unchanged). Suite: **2150 passed, 6 skipped in 173.04 s** (was 2136/6 in
-179.30 s); `ruff check .` clean. Report:
+Branch `arena/c2a7085d-elaria`; instruments `6785860` / `606ffc0` / `d765626`,
+this phase's code and packet uncommitted at time of writing. Nothing merged;
+PR #23 hold unchanged. Suite **2168 passed, 6 skipped in 181.85 s** (was
+2136/6 in 179.30 s); `ruff check .` clean. Report:
 `docs/phase-reports/2026-11-15-clipping-pop-vs-voice.md`.
 
-Issued: `scripts/frame_probe.py` + `scripts/frame_probe.py.sha256` (stdlib,
-no network, numbers-only, one physical line, manifest names the file
-**repo-relative** so `sha256sum -c` verifies from the root), the
-`peak_full`/`peak_steady` split in doctor + session stats, and the
-start-transient gate in the capture path. **The verdict is owed, not taken** —
-the three kept takes decide it:
+**The verdict is in and it is D-B.** The owner ran the pinned packet
+(`286977be…`, commit `6785860`, cross-checked byte-identical to `606ffc0`) on
+all three kept wavs at 31 % on the named Mic1 node. All three: `verdict mixed`,
+`peak_steady` 1.0000, `full_scale_after_start` **127 / 158 / 197** of 195 / 207
+/ 199 frames, `rms_steady` 0.4988 / 0.4797 / 0.5747, `last_full_scale_ms`
+7700 / 10300 / 9900. The voice itself is at full scale for 7.5–10 s. **D-A (the
+hold-off) is not the fix**: it trims one 50 ms frame and leaves the rest.
 
-```
-sha256sum -c scripts/frame_probe.py.sha256
-python3 scripts/frame_probe.py ~/…/20261027-064450-77cc4e.wav
-python3 scripts/frame_probe.py ~/…/20261031-145603-94129e.wav
-python3 scripts/frame_probe.py ~/…/20261102-100558-61258b.wav
-```
+What that changes here:
 
-`verdict pop_at_start` → D-A: set `[capture] start_pop_ms` to the largest
-`recommended_start_pop_ms`, doctor once, done. `steady_clip`/`mixed` → D-B:
-the voice is at full scale and **WP1's input-gain review is reinstated with
-evidence**. `clean` on all three → neither; look at what differed between
-those sessions and the ones that read 0.9981/1.0. No cause is attributed
-until the numbers arrive. The owner may press F2 tonight as a datapoint;
-no expectation is set for it.
+- **WP1's input-gain review is REINSTATED with evidence** — no longer
+  "unproven". The fix is the owner's gain, issued as a packet, not daemon code.
+- **The start pop is real, small and handled.** One frame at index 0 (0.9981,
+  the same number the muted-node probe read), then silence. All three takes
+  recommend 100 ms, which is the shipped default; `[capture] start_pop_ms = 100`
+  stays. **The gate is hygiene, not the clipping fix** — never describe it as
+  one.
+- **Retired:** "the newer takes are cooler (rms 0.2754 / 0.3485)". Those numbers
+  do not match the probe (0.4797 / 0.5747) and have no reproducible producer in
+  this tree; the two readers that printed a frame-rms peak under the name
+  `peak` are renamed. Neither retired number may be cited again.
+- **The Gemini emptiness now has a sufficient cause in evidence** (destroyed
+  input, upstream of the model). Sufficient, not proven unique.
+- **Open and measured, not attributed:** the 20261102 take's constant envelope.
+  (a) gain so hot that quiet passages saturate, or (b) a steady loud source
+  beside the voice (monitor/loopback). The packet separates them.
 
-**RUN 1 OF 3 IS IN (2026-11-15) — partial evidence, no ruling.**
-`20261027-064450-77cc4e` (October 27, 9.75 s): `verdict mixed`, `peak_full`
-1.0000 / `peak_steady` 1.0000, `rms_steady` 0.4988, `full_scale_frames` 128,
-`full_scale_after_start` **127**, `first_full_scale_ms` 0, `last_full_scale_ms`
-7700, `recommended_start_pop_ms` 100. Frame 0 is the pop (0.9981 — the same
-number the muted-node probe read, so the muted reading is plausibly the pop
-alone); the voice then rides full scale for ~7.5 s. **For this file the defect
-is steady clipping, not the pop** — D-B territory. Files 2 and 3 (the two newer,
-cooler takes: rms 0.2754 / 0.3485 at 31 %) decide whether that is historical or
-current. Nothing changes on one file: no gain lines proposed, no config change
-(run 1 recommends exactly the 100 ms already shipped).
+**NEXT ACTION — owner-run gain packet:**
+`docs/packets/2026-11-15-capture-gain-reduction.md`. Gate 1 records the current
+volume with `python3 scripts/capture_source_check.py` (read-only; also answers
+`node_is_monitor`, i.e. (b)); Gate 2 changes to 18 % (12 % if still clipping);
+Gate 3 one fresh take; Gate 4 `python3 scripts/frame_probe.py <take> --gain-check`.
+Accepted only when all four ACCEPT lines pass (`peak_steady < 1.0`,
+`rms_steady` 0.15–0.30, `rms_variation ≥ 0.25`, `full_scale_share ≤ 0.05`) —
+a lower number with a flat envelope is not acceptance. Restore line included.
+Order stays: capture fix (this packet) → pre-roll → wake word; pre-roll is not
+built on a clipping path.
 
 ## 1. Where the build is
 
@@ -88,7 +93,7 @@ current. Nothing changes on one file: no gain lines proposed, no config change
 | --- | --- |
 | Phase 0 (model-ID audit) | DONE — report `docs/phase-reports/2026-10-25-phase0-model-id-audit.md`. Owner approved the full §4.1 pin set (2026-10-25); applied. |
 | WP0 EYES | CODE COMPLETE. Scene 2 (2026-10-26) found the bind rungs still lying (root cause: the real `hyprctl -j binds` payload carries only `modmask` — stream-2 rebuild landed on the dumped shape). **GATE: scene 3 — ladder rerun (A/C truthful) + THE PRESS (Win+F2, one sentence, release) → journalctl tail with `model_version`.** PR #23 merges when stream-1 tests are green in sandbox AND the scene-3 ladder is truthful AND the press produces schema lines with `model_version`. |
-| WP1 VOICE AND IDENTITY | **parked until the scene-3 report lands.** On its plate: Flare TTS-side check (live side of unknown #4 is CLOSED — Flare is in the gemini-3.8-live 40-voice catalogue); earcon before capture; echo-cancel (AEC) measurement; TTS cache hit-ratio split; mic input-gain review — **UNPROVEN, not cancelled** (2026-11-15: the mute test proves a full-scale sample survives node mute, so peak never proved voice clipping; `scripts/frame_probe.py` decides D-A pop vs D-B clip on the owner's three takes); silence-verdict review. BH-H9 landed early in stream 1 (owner-joined). |
+| WP1 VOICE AND IDENTITY | **input-gain review ACTIVE — D-B CONFIRMED 2026-11-15** (three kept takes: `full_scale_after_start` 127/158/197, `rms_steady` 0.48-0.57). Owner-run packet issued: `docs/packets/2026-11-15-capture-gain-reduction.md`. Also on its plate: Flare TTS-side check (live side of unknown #4 CLOSED); earcon before capture; echo-cancel (AEC) measurement; TTS cache hit-ratio split; silence-verdict review. BH-H9 landed early in stream 1. |
 | WP2 HOME | not started (fix eventSnap first: unqualified `eventSnap` in nested scopes of `ui/quickshell/console/shell.qml` lines ~563–975; qualify as `panel.eventSnap`. Then the qmllint pre-gate productised). |
 | WP4 EARS | not started. Strictly additive; hotkey PTT is the proven wake mechanism. |
 | WP5 FLIGHT | not started. `[event] segment_minutes` is still 30.0 — §4.7 wants 25 (range 10–30) + Files API transport + reserve of the last 2 calls of each LA-day. Also owns the event-smoke segment-rotation timing defect (see §5). |
@@ -400,7 +405,7 @@ self-certified): `docs/scene-cards/2026-10-31-latency-scene.md`.
    --user restart assistant` right after checkout/sync, before doctor,
    ladder, and the press. (The WP0 report checklist is reordered
    accordingly.)
-2. **Mic peak 1.0 — ANNOTATED 2026-11-15 (was: "clipping watch").**
+2. **Mic peak 1.0 — RESOLVED 2026-11-15 (D-B confirmed; was "clipping watch").**
    The scene-1/2 readings (0.9981, 1.0) were recorded as "clipping". The
    owner-hardware mute test **retired that reading as stated**: with the
    node muted, rms 0.007 but **peak 0.9981** — a full-scale sample survives
@@ -416,10 +421,14 @@ self-certified): `docs/scene-cards/2026-10-31-latency-scene.md`.
      uploaded** to Live/ASR, and never counts as `first_speech_frame_s`;
    * the silence verdict reads the steady peak, so a pop-only take is
      silence;
-   * the question "is a hot voice clipped?" (rms 0.35 at 31 % while
-     talking) stays **OPEN, unproven either way**;
+   * the question "is a hot voice clipped?" is **ANSWERED YES for the current
+     config**: all three kept takes flat-top at `rms_steady` 0.48-0.57 with
+     127/158/197 full-scale frames after the start window. The owner-run gain
+     packet is the remedy, not another reading;
    * the verdict instrument is `scripts/frame_probe.py` (+ `.sha256`),
-     owner-runnable, numbers-only. Report:
+     owner-runnable, numbers-only, with `--gain-check` for acceptance;
+     `scripts/capture_source_check.py` records the node, its monitor state and
+     the current volume. Report:
      `docs/phase-reports/2026-11-15-clipping-pop-vs-voice.md`.
 3. **Suite triage (scene-1 failures), one verdict per test:**
    - bug6 dictate ("no speech captured" instead of the mock transcript):

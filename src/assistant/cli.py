@@ -2578,9 +2578,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(result.get("text") or result.get("error") or "(no transcript)")
             capture = result.get("capture") or {}
             if capture and (result.get("no_speech") or result.get("no_final")):
+                # peak_rms is the peak of the per-frame rms, not a sample
+                # peak; the split is printed beside it so no reader has to
+                # guess which number it is looking at.
                 print(f"[capture: node={capture.get('node')} · "
                       f"bytes={capture.get('bytes')} · "
-                      f"peak={capture.get('peak_rms')} · "
+                      f"peak_rms={capture.get('peak_rms')} · "
+                      f"peak_full={capture.get('peak_full')} · "
+                      f"peak_steady={capture.get('peak_steady')} · "
                       f"audio={result.get('audio_path')}]", file=sys.stderr)
             print(f"[inbox: {result.get('inbox_path')} · clipboard: "
                   f"{(result.get('clipboard') or {}).get('copied')}]", file=sys.stderr)

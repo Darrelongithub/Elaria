@@ -22,6 +22,12 @@ Read the SUMMARY block: `verdict`, `first_full_scale_ms`, `last_full_scale_ms`,
 `FRAME` lines is the raw table, one row per frame, for anyone who wants to see
 it rather than trust it.
 
+Acceptance (`--gain-check`, owner ruling 2026-11-15): the gain-reduction packet
+is accepted on the SHAPE, not on a smaller number — `peak_steady < 1.0`,
+`rms_steady` in 0.15..0.30, and an envelope that VARIES (a flat rail is not
+speech, however low the number). One `ACCEPT <criterion> <value> pass|fail`
+line per criterion and a final `gain_accept pass|fail`.
+
 Integrity: `scripts/frame_probe.py.sha256` holds this file's digest under its
 REPOSITORY-RELATIVE name, so `sha256sum -c scripts/frame_probe.py.sha256`
 verifies from the repository root exactly as every other pin in this house does
@@ -48,6 +54,19 @@ FULL_SCALE = 0.99
 #: Two frames: a power-up click is milliseconds, and anything later than this
 #: is either the person or a genuinely broken stream.
 START_WINDOW_MS = 2 * FRAME_MS
+
+#: Gain-reduction acceptance (owner ruling 2026-11-15). Speech is accepted on
+#: its shape: a lower peak with a flat envelope is a quieter rail, not a voice.
+ACCEPT_RMS_MIN = 0.15
+ACCEPT_RMS_MAX = 0.30
+#: (p90 - p10) / rms_steady. Speech swings widely; a saturated rail sits in a
+#: narrow band. 0.25 is the line this packet draws, and the flat-rail fixture
+#: in the tests (rms 0.51..0.65 around 0.575) scores ~0.17 against it.
+ACCEPT_VARIATION_MIN = 0.25
+#: Guard added HERE, not in the ruling: `peak_steady < 1.0` alone would accept a
+#: take whose peaks all sit at 0.995. At most 5% of steady frames may be
+#: full-scale for a take to count as unclipped.
+ACCEPT_FULL_SCALE_SHARE_MAX = 0.05
 
 
 def _frames(pcm: bytes, sample_rate: int, frame_ms: int) -> list[dict]:
@@ -137,6 +156,46 @@ def frame_rms_of(rows: list[dict]) -> float:
     return math.sqrt(sum(row["rms"] ** 2 for row in rows) / len(rows))
 
 
+def _percentile(values: list[float], fraction: float) -> float:
+    """Nearest-rank percentile; no numpy, no interpolation, no surprises."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))
+    return ordered[index]
+
+
+def gain_acceptance(result: dict) -> dict:
+    """The packet's acceptance test, as numbers plus pass/fail per criterion."""
+    steady = [row for row in result["rows"]
+              if row["start_ms"] >= result["start_window_ms"]]
+    rms_values = [row["rms"] for row in steady] or [0.0]
+    p10 = _percentile(rms_values, 0.10)
+    p90 = _percentile(rms_values, 0.90)
+    variation = (p90 - p10) / max(result["rms_steady"], 1e-9)
+    share = result["full_scale_after_start"] / max(1, len(steady))
+    checks = {
+        "peak_steady": (result["peak_steady"] < 1.0, result["peak_steady"]),
+        "rms_steady": (ACCEPT_RMS_MIN <= result["rms_steady"] <= ACCEPT_RMS_MAX,
+                       result["rms_steady"]),
+        "rms_variation": (variation >= ACCEPT_VARIATION_MIN, round(variation, 4)),
+        "full_scale_share": (share <= ACCEPT_FULL_SCALE_SHARE_MAX, round(share, 4)),
+    }
+    return {"checks": checks, "pass": all(ok for ok, _ in checks.values()),
+            "rms_p10": round(p10, 4), "rms_p90": round(p90, 4)}
+
+
+def render_acceptance(result: dict) -> str:
+    """One line per criterion, then the verdict. Numbers and pass/fail only."""
+    acceptance = gain_acceptance(result)
+    lines = []
+    for name, (ok, value) in acceptance["checks"].items():
+        shown = f"{value:.4f}" if isinstance(value, float) else str(value)
+        lines.append(f"ACCEPT {name} {shown} {'pass' if ok else 'fail'}")
+    lines.append(f"gain_accept {'pass' if acceptance['pass'] else 'fail'}")
+    return "\n".join(lines)
+
+
 def _num(value) -> str:
     """Numbers only: a missing reading is -1, never the word `None`."""
     return "-1" if value is None else str(value)
@@ -187,7 +246,8 @@ def write_manifest(target: Path | None = None) -> Path:
 
 def main(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
-        print("usage: frame_probe.py <file.wav> | --checksum", file=sys.stderr)
+        print("usage: frame_probe.py <file.wav> [--gain-check] | --checksum",
+              file=sys.stderr)
         return 2
     if argv[0] == "--checksum":
         print(write_manifest())
@@ -202,6 +262,8 @@ def main(argv: list[str]) -> int:
         print(f"error unreadable {exc}", file=sys.stderr)
         return 2
     print(render(result))
+    if "--gain-check" in argv[1:]:
+        print(render_acceptance(result))
     return 0
 
 

@@ -262,6 +262,16 @@ mic_target = ""
 # first `start_pop_ms` are recorded but never uploaded full-scale and can never
 # be called "first speech"; the steady peak starts after them. Derive the value
 # from `python3 scripts/frame_probe.py <wav>` -> `recommended_start_pop_ms`.
+#
+# MEASURED (2026-11-15, three kept wavs, pinned probe `286977be…`, 31% input):
+# all three recommended 100 ms, so this default is the measurement, not a guess.
+# The pop is ONE 50 ms frame at full scale, then silence, then the voice.
+# THIS IS NOT THE CLIPPING FIX. The same three takes carry sustained full-scale
+# flat-topping for 7.5-10 s (`full_scale_after_start` 127/158/197, `rms_steady`
+# 0.48-0.57) — that is the voice at the input (D-B), and the remedy is the
+# owner-run input-gain packet (docs/packets/2026-11-15-capture-gain-reduction.md),
+# not a longer hold-off. Do not raise this value to mask clipping: it would trim
+# the pop and leave the rest, and it would eat real first syllables.
 start_pop_ms = 100
 # F17 (owner ruling 2026-11-15): REQUIRED for capture. An unnamed node is
 # refused on every machine, before the session-open earcon — never the

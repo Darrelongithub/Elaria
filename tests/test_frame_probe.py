@@ -11,14 +11,19 @@ Three things are pinned here:
 
 1. **The packet** (`scripts/frame_probe.py`) — sandbox-verified against three
    synthetic takes: a clean sine, a sine with an added start-pop, and a
-   sustained clip. The owner runs the same file on his three kept wavs; the
-   numbers decide D-A (pop at start) vs D-B (steady clip).
+   sustained clip. **The owner's three takes answered on 2026-11-15: all three
+   `mixed`, `full_scale_after_start` 127/158/197 — D-B confirmed** (sustained
+   voice clipping, current config). The packet now also carries the
+   gain-reduction acceptance test (`--gain-check`), which accepts on SHAPE:
+   a lower peak with a flat envelope is a quieter rail, not a repaired voice.
 2. **The split** — `peak_full` and `peak_steady`, so no future diagnosis
    anchors on a pop, in both doctor's live probe and a session's capture stats.
 3. **The transient gate** — a full-scale frame inside the hold-off is recorded
    but never uploaded, and can never be the first speech frame; a speech-level
    frame inside the hold-off is kept (a hold-off that costs a syllable is worse
-   than the pop).
+   than the pop). It is **hygiene, not the clipping fix**: D-B says the voice
+   itself is at full scale, and a hold-off would have trimmed one 50 ms frame
+   and left 7.5-10 s of clipped audio in place.
 
 [TESTED-ONLY]: synthetic fixtures. The owner's takes are the measurement.
 """
@@ -82,6 +87,46 @@ def _clipped(tmp_path) -> Path:
     samples = _sine(0.20, 0.25)          # a quiet lead-in, no start pop
     samples += _sine(0.40, 0.999)
     return _write(tmp_path, "clipped.wav", samples)
+
+
+def _speechlike(tmp_path) -> Path:
+    """A voice at a sane level: loud-ish, and the envelope MOVES."""
+    amplitudes = (0.22, 0.45, 0.28, 0.50, 0.24, 0.40)   # per 100 ms block
+    samples: list[int] = []
+    for amplitude in amplitudes:
+        samples += _sine(0.10, amplitude)
+    return _write(tmp_path, "speech.wav", samples)
+
+
+def _rail(tmp_path) -> Path:
+    """The 20261102 shape: peak pinned at full scale, envelope never moves.
+
+    A 1-in-3 duty pulse train is a caricature, but the readings it produces are
+    the file's: peak 1.0000 every frame, rms ~0.577 every frame, no variation.
+    """
+    samples = [32767 if index % 3 == 0 else 0
+               for index in range(int(SAMPLE_RATE * 0.60))]
+    return _write(tmp_path, "rail.wav", samples)
+
+
+def _run_gain(path: Path) -> tuple[dict, dict]:
+    out = subprocess.run([sys.executable, str(PACKET), str(path), "--gain-check"],
+                         capture_output=True, text=True, timeout=60, check=False)
+    assert out.returncode == 0, out.stderr
+    summary: dict = {}
+    accept: dict = {}
+    for line in out.stdout.splitlines():
+        if line.startswith("ACCEPT "):
+            _, criterion, value, verdict = line.split()
+            accept[criterion] = {"value": float(value), "verdict": verdict}
+        elif line.startswith("gain_accept "):
+            accept["overall"] = line.split()[1]
+        elif line.startswith("FRAME "):
+            continue
+        elif line.strip():
+            key, _, value = line.partition(" ")
+            summary[key] = value
+    return summary, accept
 
 
 def _run_packet(path: Path) -> dict:
@@ -332,3 +377,55 @@ def test_session_stats_carry_the_split_and_the_transient_count(
     assert "peak_full=" in detail and "peak_steady=" in detail
     assert "start_pop_ms=100" in detail
     assert "start_transients=" in detail
+
+
+# ---------------------------------------------------------------------------
+# 5. gain-reduction acceptance: shape, not a smaller number (D-B ruling)
+# ---------------------------------------------------------------------------
+def test_gain_check_accepts_a_speech_shaped_take(tmp_path):
+    summary, accept = _run_gain(_speechlike(tmp_path))
+    assert 0.15 <= float(summary["rms_steady"]) <= 0.30
+    assert float(summary["peak_steady"]) < 1.0
+    for criterion in ("peak_steady", "rms_steady", "rms_variation",
+                      "full_scale_share"):
+        assert accept[criterion]["verdict"] == "pass", (criterion, accept)
+    assert accept["overall"] == "pass"
+
+
+def test_gain_check_rejects_a_flat_rail_even_with_a_lower_number(tmp_path):
+    """20261102's shape: nothing dips, nothing varies, the peak never leaves 1.0."""
+    summary, accept = _run_gain(_rail(tmp_path))
+    assert summary["peak_steady"] == "1.0000"
+    assert accept["peak_steady"]["verdict"] == "fail"
+    assert accept["rms_steady"]["verdict"] == "fail"        # 0.577 > 0.30
+    assert accept["rms_variation"]["verdict"] == "fail"      # a rail does not vary
+    assert accept["overall"] == "fail"
+
+
+def test_gain_check_rejects_a_steady_tone_with_good_levels(tmp_path):
+    """Levels can be perfect and the take still not be speech: no variation."""
+    _summary, accept = _run_gain(_clean(tmp_path))
+    assert accept["peak_steady"]["verdict"] == "pass"
+    assert accept["rms_steady"]["verdict"] == "pass"
+    assert accept["rms_variation"]["verdict"] == "fail"
+    assert accept["overall"] == "fail"
+
+
+def test_gain_check_is_opt_in_and_absent_from_the_plain_run(tmp_path):
+    plain = subprocess.run([sys.executable, str(PACKET), str(_clean(tmp_path))],
+                           capture_output=True, text=True, timeout=60, check=False)
+    assert "ACCEPT " not in plain.stdout
+    assert "gain_accept" not in plain.stdout
+
+
+def test_gain_acceptance_thresholds_are_the_rulings_and_one_guard():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("frame_probe_pins", PACKET)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert (module.ACCEPT_RMS_MIN, module.ACCEPT_RMS_MAX) == (0.15, 0.30)
+    assert module.ACCEPT_VARIATION_MIN == 0.25
+    # Not in the ruling: peak_steady < 1.0 alone would pass a take peaking at
+    # 0.995 everywhere. The guard is disclosed in the script and here.
+    assert module.ACCEPT_FULL_SCALE_SHARE_MAX == 0.05
