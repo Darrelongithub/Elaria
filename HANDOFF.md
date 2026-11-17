@@ -45,7 +45,7 @@ and `live_client.py`'s live stream (PROTECTED).
 
 Branch `arena/c2a7085d-elaria`; instruments `6785860` / `606ffc0` / `d765626`,
 this phase's code and packet uncommitted at time of writing. Nothing merged;
-PR #23 hold unchanged. Suite **2168 passed, 6 skipped in 177.48 s** (was
+PR #23 hold unchanged. Suite **2175 passed, 6 skipped in 171.52 s** (was
 2136/6 in 179.30 s); `ruff check .` clean. Report:
 `docs/phase-reports/2026-11-15-clipping-pop-vs-voice.md`.
 
@@ -75,6 +75,30 @@ What that changes here:
 - **Open and measured, not attributed:** the 20261102 take's constant envelope.
   (a) gain so hot that quiet passages saturate, or (b) a steady loud source
   beside the voice (monitor/loopback). The packet separates them.
+
+**GATE 1 RAN 2026-11-17 — two of my own probe's defects, both fixed.**
+`node_is_monitor 0`, `node_is_mic1 1`, four monitor sources (normal) →
+**explanation (b) is DEAD**. Volume read **35.0**, not 31 (packet now says use
+Gate 1's own number; **Gate 5** re-reads it at the end of the sitting and after
+the next reboot, because WirePlumber can restore a stored level).
+`configured_node -1` was **my bug, not a fact about the config**: the script had
+no default config path and printed the system default source as something
+capture would open, which F17 forbids. Now it reads `$ASSIST_CONFIG` →
+`$XDG_CONFIG_HOME/assistant/config.toml` like the daemon, prints
+`config_path`/`config_found`, and answers `node -1` / `capture_would_refuse 1` /
+`refusal f17_no_node` when no node is named. **Gate 1 must be re-taken** before
+Finding 2 is decided.
+
+**Ask 13 — the node is pinned, there is no default fallback.** F17 refuses
+unconditionally when `mic_target` is empty: `ptt.start` refuses before the
+earcon (`refusal="policy"`), doctor's `mic level` reports the refusal instead of
+a level, and the `capture node (Mic1)` check warns. "Cleared" and "never had
+one" are the same state and both refuse — that is RULING 1, not an oversight.
+If the corrected Gate 1 still says `capture_would_refuse 1`, pin the node with
+`python3 scripts/capture_source_check.py --pin-line` (prints
+`mic_target = "<node>"`, or `-1` for a `.monitor`), paste under `[capture]`,
+readback acceptance = `capture_would_refuse 0` + `node_is_mic1 1` + doctor's
+`capture node (Mic1)` ok. Packet Gate 1b.
 
 **NEXT ACTION — owner-run gain packet:**
 `docs/packets/2026-11-15-capture-gain-reduction.md`. Gate 1 records the current

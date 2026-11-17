@@ -24,6 +24,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "capture_source_check.py"
 MANIFEST = REPO / "scripts" / "capture_source_check.py.sha256"
@@ -107,15 +109,104 @@ def test_configured_node_reads_capture_mic_target_and_never_raises(tmp_path):
     assert check.configured_node_from(broken) == ""
 
 
-def test_resolution_order_is_override_then_config_then_default():
-    assert check.resolve_node("override", "configured", "default") == "override"
-    assert check.resolve_node("", "configured", "default") == "configured"
-    assert check.resolve_node("", "", "default") == "default"
+def test_resolution_is_override_then_config_and_never_the_system_default():
+    """F17: an unnamed node is a REFUSAL, not a fallback to the default source."""
+    assert check.resolve_node("override", "configured") == ("override", "")
+    assert check.resolve_node("", "configured") == ("configured", "")
+    assert check.resolve_node("", "") == ("", "f17_no_node")
+
+
+def test_the_gateway_and_this_probe_agree_that_an_unnamed_node_refuses():
+    """The probe must mirror `audio_gateway.resolve_target`, not guess at it."""
+    from assistant.audio_gateway import AudioGateway, GatewayRefused
+
+    class _Cfg:
+        def __init__(self, sections):
+            self._sections = sections
+
+        def section(self, name):
+            return self._sections.get(name, {})
+
+    gateway = AudioGateway(config=_Cfg({"capture": {"mic_target": ""}}))
+    with pytest.raises(GatewayRefused) as refused:
+        gateway.resolve_target()
+    assert refused.value.refusal == "policy"
+    # ...and the probe calls that state a refusal too, never a default source.
+    assert check.resolve_node("", "")[1] == "f17_no_node"
 
 
 # ---------------------------------------------------------------------------
 # the reading
 # ---------------------------------------------------------------------------
+def test_without_a_configured_node_the_probe_reports_a_refusal(tmp_path):
+    """`configured_node -1` must never be papered over with the default source.
+
+    This is the 2026-11-17 Gate 1 defect: the first version fell back to the
+    default and printed a node "capture would open", when F17 means capture
+    would open NOTHING.
+    """
+    result = check.report("pactl", _config(tmp_path, ""), "",
+                          sources=check.parse_json_sources(_json_fixture()),
+                          default=MIC1)
+    assert result["configured_node"] == check.UNKNOWN
+    assert result["node"] == check.UNKNOWN
+    assert result["capture_would_refuse"] == 1
+    assert result["refusal"] == "f17_no_node"
+    assert result["node_is_mic1"] == 0
+    # The default source is still a fact about the machine — reported as one.
+    assert result["default_source"] == MIC1
+    assert result["default_volume_percent"] == "31.0"
+    rendered = check.render(result)
+    assert "capture_would_refuse 1" in rendered
+    assert "refusal f17_no_node" in rendered
+
+
+def test_config_path_and_found_are_reported_so_minus_one_is_readable(tmp_path):
+    present = _config(tmp_path, MIC1)
+    result = check.report("pactl", present, "",
+                          sources=check.parse_json_sources(_json_fixture()),
+                          default=MIC1)
+    assert result["config_path"] == str(present)
+    assert result["config_found"] == 1
+    missing = check.report("pactl", tmp_path / "absent.toml", "",
+                           sources=check.parse_json_sources(_json_fixture()),
+                           default=MIC1)
+    assert missing["config_found"] == 0
+    assert missing["configured_node"] == check.UNKNOWN
+
+
+def test_the_default_config_path_is_the_daemons_own(monkeypatch, tmp_path):
+    monkeypatch.delenv("ASSIST_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert check.default_config_path() == (
+        tmp_path / "xdg" / "assistant" / "config.toml")
+    monkeypatch.setenv("ASSIST_CONFIG", str(tmp_path / "custom.toml"))
+    assert check.default_config_path() == tmp_path / "custom.toml"
+
+
+def test_pin_line_is_paste_exact_and_refuses_a_monitor(tmp_path):
+    sources = check.parse_json_sources(_json_fixture())
+    assert check.pin_line(MIC1, sources) == f'mic_target = "{MIC1}"'
+    assert check.pin_line(MONITOR, sources) == check.UNKNOWN
+    assert check.pin_line("", sources) == check.UNKNOWN
+
+
+def test_pin_line_cli_prints_one_line_for_a_real_mic(tmp_path):
+    (tmp_path / "sources.json").write_text(_json_fixture(), encoding="utf-8")
+    out = subprocess.run([sys.executable, str(SCRIPT), "--pin-line",
+                          "--node", MIC1,
+                          "--pactl-json", str(tmp_path / "sources.json")],
+                         capture_output=True, text=True, timeout=60, check=False)
+    assert out.returncode == 0
+    assert out.stdout.strip() == f'mic_target = "{MIC1}"'
+    monitor = subprocess.run([sys.executable, str(SCRIPT), "--pin-line",
+                              "--node", MONITOR,
+                              "--pactl-json", str(tmp_path / "sources.json")],
+                             capture_output=True, text=True, timeout=60,
+                             check=False)
+    assert monitor.stdout.strip() == check.UNKNOWN
+
+
 def test_the_named_mic1_node_is_not_a_monitor_and_its_volume_is_recorded(tmp_path):
     result = check.report("pactl", _config(tmp_path, MIC1), "",
                           sources=check.parse_json_sources(_json_fixture()),
@@ -210,3 +301,24 @@ def test_manifest_is_repo_relative_and_verifies_from_the_root(tmp_path):
         ["sha256sum", "-c", "scripts/capture_source_check.py.sha256"],
         cwd=REPO, capture_output=True, text=True, timeout=60, check=False)
     assert verified.returncode == 0, verified.stdout + verified.stderr
+
+
+# ---------------------------------------------------------------------------
+# the packet that uses this instrument (anti-drift pins on the operating doc)
+# ---------------------------------------------------------------------------
+PACKET = REPO / "docs" / "packets" / "2026-11-15-capture-gain-reduction.md"
+
+
+def test_the_gain_packet_leads_with_its_reversibility_gate_and_its_acceptance():
+    text = PACKET.read_text(encoding="utf-8")
+    assert "Gate 1" in text and "volume_percent" in text
+    assert "sha256sum -c scripts/frame_probe.py.sha256" in text
+    assert "sha256sum -c scripts/capture_source_check.py.sha256" in text
+    assert "scripts/capture_source_check.py --pin-line" in text      # Ask 13
+    assert "after the next reboot" in text                           # Finding 1
+    assert "--gain-check" in text
+    for criterion in ("peak_steady", "rms_steady", "rms_variation",
+                      "full_scale_share"):
+        assert f"`{criterion}`" in text, criterion
+    # The restored value is Gate 1's number, never a hard-coded one.
+    assert "<gate1 volume>" in text

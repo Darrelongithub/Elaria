@@ -4,16 +4,25 @@
 Owner-runnable, read-only, stdlib only, no network, no credentials. It answers
 the two questions the 2026-11-15 evidence left open and nothing else:
 
-1. Which node would capture open right now (`[capture] mic_target`, else the
-   PipeWire default source), is it the named Mic1 input, and is it a
-   `.monitor` — i.e. is there a monitor/loopback of playback sitting where the
-   microphone should be? That is question (b) for the 20261102 file's flat,
-   never-dipping envelope: a steady loud source beside the voice.
+1. Which node capture would open right now and whether it would open one at
+   all. **F17 (owner ruling 2026-11-15) has no default-source fallback**: with
+   `[capture] mic_target` unset, capture is REFUSED, so this script prints
+   `node -1`, `capture_would_refuse 1`, `refusal f17_no_node` — it never
+   presents the PipeWire default as something capture would use. The default
+   source is still reported, under its own name, because it is a fact about the
+   machine; it is not a capture target while the node is unnamed. The node's
+   monitor state answers question (b) for the 20261102 flat envelope: a steady
+   loud source beside the voice (monitor/loopback of playback).
 2. What is that node's capture volume right now, as a percentage? The
    gain-reduction packet must record the current value before changing it, so
-   the change is reversible.
+   the change is reversible. `default_volume_percent` is reported separately,
+   because the default source's level is still a number the owner may need to
+   record even when capture refuses to use that node.
 
-It never writes, never sets anything, and never needs the daemon.
+The config file is the daemon's own (`$ASSIST_CONFIG`, else
+`$XDG_CONFIG_HOME/assistant/config.toml`), and `config_path` / `config_found`
+say which file was read — a `-1` here means "not read", never "not set". It
+never writes, never sets anything, and never needs the daemon.
 
 Output is one `key value` line each. An unreadable string is `-1`, an
 unreadable number is `-1`; `available 0` means `pactl` is absent or failed and
@@ -23,6 +32,7 @@ answer to (b) being "not a loopback" — for THIS node, at THIS moment.
 Usage:
   capture_source_check.py
   capture_source_check.py --config config.toml --node alsa_input...Mic1__source
+  capture_source_check.py --pin-line                 # the exact mic_target line
   capture_source_check.py --pactl-json sources.json --pactl-info info.txt  # replay
   capture_source_check.py --checksum
 
@@ -35,6 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -117,9 +128,32 @@ def parse_info_default(text: str) -> str:
     return ""
 
 
-def resolve_node(override: str, configured: str, default: str) -> str:
-    """Override, then the configured node, then PipeWire's default."""
-    return override or configured or default
+def resolve_node(override: str, configured: str) -> tuple[str, str]:
+    """The node capture would use, or a refusal — F17 has no default fallback.
+
+    Returns `(node, refusal)`. A configured node (or an explicit override) is
+    the node; nothing else is. The system default source is NOT a capture
+    target: `audio_gateway.resolve_target` refuses on every machine, so a
+    diagnostic that fell back to the default would measure a microphone the
+    daemon would never open.
+    """
+    node = override or configured
+    return (node, "") if node else ("", "f17_no_node")
+
+
+def config_home() -> Path:
+    """Same rule as `assistant.config.config_home` — the daemon's own home."""
+    value = os.environ.get("XDG_CONFIG_HOME", "")
+    return Path(value).expanduser() if value else Path.home() / ".config"
+
+
+def default_config_path(environ: dict | None = None) -> Path:
+    """`$ASSIST_CONFIG`, else `$XDG_CONFIG_HOME/assistant/config.toml`."""
+    env = os.environ if environ is None else environ
+    configured = env.get("ASSIST_CONFIG", "")
+    if configured:
+        return Path(configured).expanduser()
+    return config_home() / "assistant" / "config.toml"
 
 
 def configured_node_from(path: Path | None) -> str:
@@ -204,23 +238,48 @@ def report(pactl: str, config: Path | None, override: str,
 def _report_from(sources: list[dict], default: str, config: Path | None,
                  override: str) -> dict:
     configured = configured_node_from(config)
-    node = resolve_node(override, configured, default)
-    match = next((src for src in sources if src["name"] == node), None)
+    node, refusal = resolve_node(override, configured)
+    match = next((src for src in sources if src["name"] == node), None) if node else None
+    default_match = next((src for src in sources if src["name"] == default), None)
     monitors = [src for src in sources if src["monitor"]]
     return {
         "available": True,
-        "default_source": default or UNKNOWN,
+        "config_path": str(config) if config else UNKNOWN,
+        "config_found": 1 if (config is not None and config.exists()) else 0,
         "configured_node": configured or UNKNOWN,
         "node": node or UNKNOWN,
+        "capture_would_refuse": 0 if node else 1,
+        "refusal": refusal or UNKNOWN,
         "node_found": 1 if match else 0,
         "node_is_monitor": 1 if (match and match["monitor"]) else 0,
-        "node_is_mic1": 1 if "mic1" in node.lower() else 0,
+        # Named after the OWNER's ruling, not a guess: F17 pins Mic1.
+        "node_is_mic1": 1 if node and "mic1" in node.lower() else 0,
         "volume_percent": (f"{match['volume_percent']:.1f}"
                            if match and match["volume_percent"] >= 0 else UNKNOWN),
+        "default_source": default or UNKNOWN,
+        "default_volume_percent": (f"{default_match['volume_percent']:.1f}"
+                                   if default_match
+                                   and default_match["volume_percent"] >= 0
+                                   else UNKNOWN),
         "monitor_sources": len(monitors),
         "sources": len(sources),
         "monitor_names": [src["name"] for src in monitors],
     }
+
+
+def pin_line(node: str, sources: list[dict]) -> str:
+    """The exact `mic_target` line for a real mic node, else -1.
+
+    A paste-exact line beats a transcription: the Ask-13 answer is only as good
+    as the string the owner types into `[capture]`. A `.monitor` is refused
+    here too — pinning a loopback would be (b) made permanent.
+    """
+    if not node:
+        return UNKNOWN
+    match = next((src for src in sources if src["name"] == node), None)
+    if match is None or match["monitor"]:
+        return UNKNOWN
+    return f'mic_target = "{node}"'
 
 
 def render(result: dict) -> str:
@@ -228,13 +287,15 @@ def render(result: dict) -> str:
     if not result.get("available"):
         lines.append(f"reason {result.get('reason') or UNKNOWN}")
         return "\n".join(lines)
-    for key in ("default_source", "configured_node", "node", "node_found",
+    for key in ("config_path", "config_found", "configured_node", "node",
+                "capture_would_refuse", "refusal", "node_found",
                 "node_is_monitor", "node_is_mic1", "volume_percent",
-                "monitor_sources", "sources"):
+                "default_source", "default_volume_percent", "monitor_sources",
+                "sources"):
         lines.append(f"{key} {result[key]}")
     for index, name in enumerate(result["monitor_names"]):
         lines.append(f"monitor_source_{index} {name}")
-    if not result["node_found"]:
+    if result["node_found"] == 0:
         lines.append("note node_not_listed_now")
     lines.append("note read_only")
     return "\n".join(lines)
@@ -243,16 +304,20 @@ def render(result: dict) -> str:
 def main(argv: list[str]) -> int:
     if argv and argv[0] in ("-h", "--help"):
         print("usage: capture_source_check.py [--config PATH] [--node NAME] "
-              "[--pactl BIN] [--pactl-json FILE] [--pactl-info FILE] | --checksum",
-              file=sys.stderr)
+              "[--pactl BIN] [--pactl-json FILE] [--pactl-info FILE] "
+              "[--pin-line] | --checksum", file=sys.stderr)
         return 2
     if argv and argv[0] == "--checksum":
         print(write_manifest())
         return 0
     args = {}
+    flags = {"--pin-line"}
     index = 0
     while index < len(argv):
         token = argv[index]
+        if token in flags:
+            index += 1
+            continue
         if token in ("--config", "--node", "--pactl", "--pactl-json",
                      "--pactl-info"):
             if index + 1 >= len(argv):
@@ -263,7 +328,8 @@ def main(argv: list[str]) -> int:
             continue
         print(f"error unknown_argument {token}", file=sys.stderr)
         return 2
-    config = Path(args["--config"]).expanduser() if "--config" in args else None
+    config = (Path(args["--config"]).expanduser() if "--config" in args
+              else default_config_path())
     sources = None
     default = None
     if "--pactl-json" in args:
@@ -272,6 +338,19 @@ def main(argv: list[str]) -> int:
     if "--pactl-info" in args:
         default = parse_info_default(Path(args["--pactl-info"]).read_text(
             encoding="utf-8"))
+    if "--pin-line" in argv:
+        if sources is None:
+            sources, _ = read_sources(args.get("--pactl", "pactl"))
+        node = args.get("--node") or configured_node_from(config)
+        if node and not any(src["name"] == node for src in sources):
+            # Not listed right now (unplugged, renamed): still a paste-exact
+            # line, because it is what the owner asked to pin — but say so.
+            print(f'mic_target = "{node}"', file=sys.stderr)
+            print(UNKNOWN)
+            return 0
+        line = pin_line(node, sources)
+        print(line)
+        return 0
     result = report(args.get("--pactl", "pactl"), config, args.get("--node", ""),
                     sources=sources, default=default)
     print(render(result))

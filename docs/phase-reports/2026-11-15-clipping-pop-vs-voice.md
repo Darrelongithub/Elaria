@@ -7,7 +7,10 @@ investigation. Branch `arena/c2a7085d-elaria`; instruments at `6785860`
 (+`606ffc0`, `d765626`), this phase uncommitted at time of writing. Nothing
 merged; PR #23's hold is unchanged.
 
-**Status: EVIDENCE COMPLETE — D-B CONFIRMED.** The voice is at full scale on all
+**Status: EVIDENCE COMPLETE — D-B CONFIRMED. Gate 1 ran 2026-11-17 and found
+two defects in my own probe** (no default config path; the system default
+source presented as a capture target, which F17 refuses). Both fixed, Gate 1
+re-issued with a pin step; Gates 2–4 pending the owner. The voice is at full scale on all
 three kept takes; the start pop is real, one frame, and already handled; the fix
 is the owner's input gain, issued as a packet
 (`docs/packets/2026-11-15-capture-gain-reduction.md`), not daemon code.
@@ -29,10 +32,10 @@ own).
 | Peak split (`peak_full` / `peak_steady`) in doctor and in the session | `capture.split_peak`, `live_level_check`, `cli` doctor | 5 |
 | Start-transient gate before VAD/ASR | `capture.StartTransientGate`, `transcribe.dictate` | 4 |
 | **Gain acceptance** (`--gain-check`): shape, not a number | `frame_probe.gain_acceptance` | 5 |
-| **Capture-path source check** (node, monitor state, volume) | `scripts/capture_source_check.py` + `.sha256` | 13 |
+| **Capture-path source check** (node, monitor state, volume, F17 refusal) | `scripts/capture_source_check.py` + `.sha256` | 20 |
 | **Owner packet** for the gain change (gates, lines, acceptance, restore) | `docs/packets/2026-11-15-capture-gain-reduction.md` | — |
 
-Suite **2168 passed, 6 skipped in 177.48 s** (from 2150/6 in 171.67 s; +18
+Suite **2175 passed, 6 skipped in 171.52 s** (from 2150/6 in 171.67 s; +25
 pins), `ruff check .` clean. F36 trend continues.
 
 ### 1. The packet (the instrument, not the reading)
@@ -220,7 +223,13 @@ Consequences carried into the docs, the packet and HANDOFF:
 6. **The 100 ms hold-off interacts with very short presses**: a press shorter
    than the window whose only frames are transient reads as silence (WAV kept).
    Honest, but a behaviour change for sub-100 ms presses.
-7. **No hardware evidence in the sandbox.** Every number in the pins is
+7. **My own probe had two defects, found by the owner's Gate 1** (see the
+   addendum): no default config path, and the system default source printed as
+   a capture target in contradiction of F17. Both fixed and pinned; the 11-17
+   Gate 1 reading has to be re-taken. This is the second time in this
+   investigation that the instrument, not the system, was the fault (see
+   DEFECTS 2 and 3) — worth remembering before a reading is believed.
+8. **No hardware evidence in the sandbox.** Every number in the pins is
    synthetic; the owner's three takes and the packet run are the measurement.
 
 ## NEXT GATE
@@ -228,23 +237,124 @@ Consequences carried into the docs, the packet and HANDOFF:
 **Owner-run: the gain packet.** `docs/packets/2026-11-15-capture-gain-reduction.md`
 
 ```
+sha256sum -c scripts/frame_probe.py.sha256
 sha256sum -c scripts/capture_source_check.py.sha256
-python3 scripts/capture_source_check.py          # Gate 1: record volume, node, monitor state
-pactl set-source-volume <Mic1 node> 18%          # Gate 2 (reversible from Gate 1)
-timeout 6 pw-record --target <node> --rate 16000 --channels 1 --format s16 /tmp/gain-18.wav
+python3 scripts/capture_source_check.py        # Gate 1: config_path, node, refusal, volume, monitor state
+python3 scripts/capture_source_check.py --pin-line   # Gate 1b, only if capture_would_refuse 1
+pactl set-source-volume <that node> 18%        # Gate 2
+timeout 6 pw-record --target <that node> --rate 16000 --channels 1 --format s16 /tmp/gain-18.wav
 python3 scripts/frame_probe.py /tmp/gain-18.wav --gain-check
+python3 scripts/capture_source_check.py        # Gate 5: end of sitting, and again after reboot
 ```
 
 Accepted when all four `ACCEPT` lines pass (`peak_steady < 1.0`, `rms_steady`
 0.15–0.30, `rms_variation ≥ 0.25`, `full_scale_share ≤ 0.05`). If not, 12 % and
 repeat. If `node_is_monitor 1`, stop — that is (b).
 
-Report back: the Gate-1 output, old → new volume, and the `--gain-check` output
-per take. Nothing else is required, and no audio leaves the machine.
+Report back: the Gate-1 output **as printed by the corrected script**, old → new
+volume, the `--gain-check` output per take, and the two Gate 5 re-reads.
+Nothing else is required, and no audio leaves the machine.
 
 **What would falsify D-B**: a take at reduced gain that still flat-tops with a
 narrow envelope at two different gains — that is (b), a steady source beside
 the voice, and the answer changes from "gain" to "wiring".
+
+## POST-RULING ADDENDUM — Gate 1 on the owner's machine (2026-11-17)
+
+Run from a worktree at `f102920`; both manifests verified (`capture_source_check.py`
+OK, `frame_probe.py` OK).
+
+```
+available 1
+default_source alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source
+node alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source
+node_found 1
+node_is_monitor 0
+node_is_mic1 1
+volume_percent 35.0
+monitor_sources 4
+sources 6
+monitor_source_0..3 HDMI3 / HDMI2 / HDMI1 / Speaker .monitor
+note read_only
+```
+
+**Explanation (b) is dead for this configuration [HW-PROVEN].** The node is the
+named Mic1 input, not a `.monitor`; four monitor sources exist because every
+sink has one, and capture is not pointed at any of them. What remains for the
+20261102 flat envelope is (a): gain, tested by the packet.
+
+### Finding 1 — the current value is 35.0, not 31
+
+The packet's example said 31 %; Gate 1 read **35.0**. Not a defect (the packet
+says the numbers are the owner's and Gate 1's value IS the restore gate), but it
+means the input level moved between the earlier readings and now. Two
+candidates, **not attributed**: the owner adjusted it, or WirePlumber restored a
+stored level.
+
+Consequence, now in the packet as **Gate 5**: if something restores levels on
+its own, a manual gain change may not persist, so `volume_percent` is re-read
+**at the end of the sitting and again after the next reboot**. A divergence
+means the fix belongs at the session/WirePlumber level — a separate packet with
+its own grant. Restore value for that sitting was **35.0**.
+
+### Finding 2 — `configured_node -1`, and it was my defect
+
+The addendum read `configured_node -1` as "`mic_target` is unset in the owner's
+config". **That reading is not supported, and the fault is mine.** The script
+had two defects:
+
+1. **It never looked for a config unless `--config` was passed.** No default
+   path at all — so `configured_node -1` was the script's own blindness, not a
+   fact about the config. The daemon reads `$ASSIST_CONFIG`, else
+   `$XDG_CONFIG_HOME/assistant/config.toml`; the script now resolves exactly
+   that and prints `config_path` + `config_found`, so a `-1` can never again be
+   mistaken for "not set".
+2. **It presented the system default source as something capture would open.**
+   `audio_gateway.resolve_target` has **no default-source fallback**: with no
+   node named it raises, `refusal="policy"`, before anything is recorded. The
+   script printed `node alsa_input…Mic1` as "the node capture would open", which
+   contradicts F17 and would have measured a microphone the daemon never opens.
+   Fixed: `node -1`, `capture_would_refuse 1`, `refusal f17_no_node`, with the
+   default source reported under its own name and its own volume
+   (`default_source`, `default_volume_percent`) as a fact about the machine, not
+   a capture target. A pin imports `AudioGateway` and asserts the two agree.
+
+Consequence: **the Gate 1 reading must be re-taken with the corrected script
+before Finding 2 is decided.** Whether the owner's `mic_target` is unset is
+currently unknown — the earlier doctor readings (muted node: rms 0.007, peak
+0.9981) could only have been produced with a node named, which suggests it was
+set then; that is inference, not evidence.
+
+### Ask 13 — should `mic_target` be pinned? Yes, and here is what F17 refuses
+
+**Design intent: the node is pinned; there is no default fallback.** F17's
+implementation (`audio_gateway.resolve_target`) refuses **unconditionally** when
+no node is named — "cleared" and "never had one" are *the same state* in this
+code and **both refuse**, which is what RULING 1 demanded ("refuse an unnamed
+capture node UNCONDITIONALLY; identical reason on both machine shapes"). On this
+machine, F17 refuses:
+
+- `ptt.start` / any real capture open → `GatewayRefused(refusal="policy")`,
+  *before the earcon*;
+- the doctor's live `mic level` probe → reports the refusal text instead of a
+  level;
+- the doctor's `capture node (Mic1)` check → `warn`, detail "mic_target empty —
+  capture is REFUSED on every machine (F17 …)".
+
+So "capture works by default fallback" is not a state this deployment has. If
+Gate 1 (corrected) still reads `capture_would_refuse 1`, the pin is required and
+is issued as an **owner-run line with a readback**, not a chat transcription of a
+node name:
+
+```
+python3 scripts/capture_source_check.py --pin-line      # prints mic_target = "<node>"
+```
+
+paste that line under `[capture]` in the `config_path` the probe printed,
+save, then acceptance is `configured_node` == `node`, `capture_would_refuse 0`,
+`node_is_mic1 1`, and doctor's `capture node (Mic1)` ok. `--pin-line` prints `-1`
+rather than a line when the node it would pin is a `.monitor` — pinning a
+loopback would make (b) permanent. Packet Gate 1b carries this.
 
 ## OPEN QUESTIONS
 
