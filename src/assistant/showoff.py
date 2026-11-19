@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from . import intents as intent_ledger
 from .cost import iso_now
 from .disclosure import is_sensitive
 from .safety import assert_within_sandbox
@@ -85,12 +86,17 @@ MEMORY_DEFLECTION = (
 # A guest turn is a request TO ACT, not a capability question. The verb + object
 # pairing matters: "what can you do" is conversation, "delete his files" is a
 # never-list attempt.
+#
+# Wave-1 C: the file/owner-data verbs were widened after the owner's third
+# question ("give me the file you just made") slipped past "open/read/show me":
+# asking, handing, seeing and looking are all requests for the same object.
 NEVER_LIST_PATTERNS: tuple[tuple[str, str], ...] = (
     ("destructive", (r"\b(rm\s+-rf|format\s+(?:the\s+)?(?:disk|drive)|wipe\s+(?:the\s+)?"
                      r"(?:disk|drive|everything)|delete\s+everything|factory\s+reset)\b")),
-    ("file", (r"\b(move|delete|remove|rename|copy|open|read|show\s+me|find|search|"
-              r"list|organi[sz]e|sort)\b.{0,40}\b(files?|folders?|director(?:y|ies)|"
-              r"drives?|desktop|documents|downloads|photos?|pictures)\b")),
+    ("file", (r"\b(move|delete|remove|rename|copy|open|read|show|see|give|hand|pass|get|"
+              r"list|print|display|find|search|locate|organi[sz]e|sort|let\s+me\s+see|"
+              r"look\s+at|access)\b.{0,40}\b(files?|folders?|director(?:y|ies)|drives?|"
+              r"desktop|documents|downloads|photos?|pictures|attachments?)\b")),
     ("message", r"\b(send|email|text|message|dm|call|whatsapp|telegram)\b"),
     ("settings", (r"\b(change|set|update|install|uninstall|enable|disable|turn\s+"
                   r"(?:on|off)|edit)\b.{0,40}\b(settings?|config|system|permissions?|"
@@ -238,13 +244,48 @@ class ShowoffService:
 
     def build_guest_prompt(self, text: str, *, connectivity_note: str = "") -> str:
         allowlist = self.memory_context()
+        report = self.capability_report()
+        claims = "\n".join(f"- I can {e['claim']}" for e in report["available"])
+        denials = "\n".join(f"- {e['area']}: {e['why']}" for e in report["no_path"])
         return (
             f"{SHOWOFF_PROMPT}\n\n"
             + (f"Demo-safe facts the owner allows:\n{allowlist}\n\n"
                if allowlist else "No owner facts are available in this mode.\n\n")
             + (f"{connectivity_note}\n\n" if connectivity_note else "")
+            # Build order 1: the same list the local answer is composed from,
+            # so the model can only restate claims a path honours. Anything
+            # outside it is stripped from the reply by `sanitise_reply`.
+            + (f"What you may claim, because a path honours it:\n{claims}\n\n"
+               f"What you must deny, because nothing reaches it:\n{denials}\n\n")
             + f"Guest: {text}"
         )
+
+    # -- capability honesty (build order 1) ---------------------------------
+    def capability_report(self, *, probes: dict | None = None,
+                          resolver=None) -> dict:
+        """Per-guest-turn capability ledger (see intents.capability_report)."""
+        return intent_ledger.capability_report(probes=probes, resolver=resolver)
+
+    def capability_answer(self, *, probes: dict | None = None,
+                          resolver=None) -> str:
+        """The deterministic answer to "what can you do?" — never the model's."""
+        return intent_ledger.answer_capability_question(
+            self.capability_report(probes=probes, resolver=resolver))
+
+    def sanitise_reply(self, text: str) -> dict:
+        """Strip any claim the demo cannot honour; journal what was taken out.
+
+        A stripped sentence is a privacy/claim fact worth a row: the demo's
+        own log records that a brag was removed, never its wording.
+        """
+        result = intent_ledger.honest_claims(text, report=self.capability_report())
+        if result["changed"]:
+            self.store.log_persona_event(
+                iso_now(), "showoff",
+                json.dumps({"event": "claim_stripped",
+                            "areas": result["removed"],
+                            "chars": len(str(text or ""))}))
+        return result
 
     # -- owner verification -------------------------------------------------
     def _voiceprint_verifier(self):
@@ -490,8 +531,22 @@ class ShowoffService:
         self.store.update_showoff_counts(
             session_id, guests_heard=self._guests, declined_requests=self._declined
         )
+        capability_question = is_capability_question(text)
+        # IF-6: whatever a guest said arrives as OBSERVATION data. The matched
+        # shape is recorded (and journaled) so it can be planned over; it is
+        # never dispatchable, and the never-list refusal above still owns the
+        # action question.
+        observed = intent_ledger.route(str(text), source="guest")
+        if observed is not None:
+            self.store.log_persona_event(iso_now(), "showoff",
+                                         json.dumps(observed.as_journal()))
         return {"allowed": True, "reply": None, "exited": False, "active": True,
-                "capability_question": is_capability_question(text),
+                "capability_question": capability_question,
+                # The honest answer is local and provable; the model may add
+                # colour but `sanitise_reply` keeps it inside the ledger.
+                "capability_answer": (self.capability_answer()
+                                      if capability_question else None),
+                "observed": (observed.as_journal() if observed is not None else None),
                 "memory_closed": True}
 
     # -- status -------------------------------------------------------------

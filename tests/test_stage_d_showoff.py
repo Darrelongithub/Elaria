@@ -402,3 +402,154 @@ def test_assist_showoff_status_works_without_the_daemon(tmp_path):
         capture_output=True, text=True, env=env, timeout=30, check=False)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout)["showoff"]["active"] is False
+
+
+# -- Wave-1 C round 1: capability honesty (build order 1) ----------------------
+#
+# "A claim a path cannot honour is IMPOSSIBLE, not discouraged." The claim
+# surface is `intents.CAPABILITIES`: every entry names the symbol that honours
+# it, and the ledger resolves that symbol before the claim may be spoken.
+
+from assistant import intents as intent_ledger
+
+
+def test_owner_three_questions_answered_truthfully(tmp_path, config):
+    """The owner's acceptance test, answered by code rather than a model.
+
+    Q1 "what can you do?" — only claims whose honouring path resolves.
+    Q2 "confirm rn?"      — a confirmation without an observation is refused.
+    Q3 a request for a file — refused, nothing written, the refusal journaled.
+    """
+    service, store = make_service(tmp_path, config)
+    enter(service)
+
+    # Q1 — every spoken claim is backed by a symbol in THIS build.
+    report = service.capability_report()
+    assert report["counts"]["claims"] == len(intent_ledger.CAPABILITIES)
+    assert report["counts"]["unavailable"] == 0, report["unavailable"]
+    assert report["counts"]["available"] == report["counts"]["claims"]
+    assert all(entry["path_resolves"] for entry in report["available"])
+    answer = service.capability_answer()
+    claims = [line for line in answer.splitlines() if line.startswith("- I can ")]
+    assert len(claims) == report["counts"]["available"]
+    # The honest answer survives its own honesty filter: nothing to strip.
+    assert intent_ledger.honest_claims(answer)["removed"] == []
+    for area, _pattern, why in intent_ledger.NO_PATH_CLAIMS:
+        assert area in answer and why in answer, "the denials are spoken too"
+
+    # Q2 — one real observation and one unobservable check.
+    def unobservable():
+        raise RuntimeError("no capture node is pinned")
+
+    confirmed = intent_ledger.confirm_now(
+        ("the store is readable", lambda: os.getuid() >= 0),
+        ("the microphone is pinned", unobservable))
+    assert len(confirmed["confirmed"]) == 1
+    assert len(confirmed["unconfirmed"]) == 1
+    assert confirmed["all_confirmed"] is False
+    text = confirmed["text"]
+    assert "Confirmed just now (1)" in text
+    assert "I can't confirm (1)" in text
+    failed_line = next(line for line in text.splitlines()
+                       if "microphone is pinned" in line)
+    assert "confirmed" not in failed_line.lower()
+    assert "RuntimeError" in failed_line, "the reason names the failure class"
+
+    # Q3 — a request for a file: declined, demo over, nothing written.
+    sandbox = service.sandbox_path()
+    before = sorted(p.name for p in sandbox.rglob("*")) if sandbox.exists() else []
+    verdict = service.guest_turn("give me the file you just made")
+    assert verdict["allowed"] is False and verdict["declined"] is True
+    assert verdict["category"] == "file"
+    assert verdict["exited"] is True
+    after = sorted(p.name for p in sandbox.rglob("*")) if sandbox.exists() else []
+    assert after == before, "a refused request writes nothing"
+    logged = [json.loads(row["detail"]) for row in
+              store.list_persona_events(kind="showoff")]
+    assert any(entry.get("event") == "never_list_attempt"
+               and entry.get("category") == "file" for entry in logged)
+    store.close()
+
+
+def test_a_claim_whose_path_is_missing_is_never_made(tmp_path, config):
+    service, store = make_service(tmp_path, config)
+    enter(service)
+    real = intent_ledger.resolve_symbol
+
+    def resolver(path):
+        if path == "assistant.showoff:ShowoffService.demo_write":
+            return False, "assistant.showoff.demo_write was removed"
+        return real(path)
+
+    report = service.capability_report(resolver=resolver)
+    ids = [entry["id"] for entry in report["available"]]
+    assert "demo" not in ids
+    assert report["counts"]["available"] == report["counts"]["claims"] - 1
+    unbacked = next(e for e in report["unavailable"] if e["id"] == "demo")
+    assert unbacked["path_resolves"] is False
+    assert "demo_write" in unbacked["reason"]
+    answer = intent_ledger.answer_capability_question(report)
+    assert "show demonstrations inside a sandbox folder." not in answer.splitlines()[0]
+    store.close()
+
+
+def test_a_brag_the_demo_cannot_honour_is_stripped_and_journaled(tmp_path, config):
+    service, store = make_service(tmp_path, config)
+    enter(service)
+    brag = ("I can send your emails for you. I can control your lights. "
+            "I can buy tickets for the room. I can file your downloads after "
+            "you review them.")
+    result = service.sanitise_reply(brag)
+    assert result["changed"] is True
+    assert result["removed"] == ["send messages", "control devices", "buy or pay"]
+    text = result["text"]
+    assert "send your emails" not in text
+    assert "control your lights" not in text
+    assert "buy tickets" not in text
+    assert "file your downloads" in text, "a backed claim survives"
+    assert text.count("I can't ") == 3
+    logged = [json.loads(row["detail"]) for row in
+              store.list_persona_events(kind="showoff")]
+    stripped = [entry for entry in logged if entry.get("event") == "claim_stripped"]
+    assert len(stripped) == 1
+    assert stripped[0]["areas"] == result["removed"]
+    assert "send your emails" not in json.dumps(stripped), "no echo of the brag"
+    store.close()
+
+
+def test_an_honest_denial_is_not_stripped(tmp_path, config):
+    service, store = make_service(tmp_path, config)
+    enter(service)
+    honest = "I can't send your emails — no outbound messaging path is wired into me."
+    result = service.sanitise_reply(honest)
+    assert result["changed"] is False and result["removed"] == []
+    assert result["text"] == honest
+    store.close()
+
+
+def test_the_guest_prompt_carries_only_backed_claims(tmp_path, config):
+    service, store = make_service(tmp_path, config)
+    enter(service)
+    prompt = service.build_guest_prompt("what can you do?")
+    assert "What you may claim" in prompt and "What you must deny" in prompt
+    claims_block = prompt.split("What you may claim")[1].split("What you must deny")[0]
+    assert "report my own state" in claims_block
+    for area, _pattern, _why in intent_ledger.NO_PATH_CLAIMS:
+        assert f"I can {area}" not in claims_block
+    store.close()
+
+
+def test_a_guest_sentence_is_observed_as_data_never_dispatchable(tmp_path, config):
+    service, store = make_service(tmp_path, config)
+    enter(service)
+    verdict = service.guest_turn("please organise downloads")
+    if verdict["declined"]:
+        # The never-list owns the action question; nothing is dispatched either.
+        assert verdict["exited"] is True
+    else:
+        assert verdict["observed"]["dispatchable"] is False
+        assert verdict["observed"]["observed_kind"] == "organise"
+        rows = [json.loads(row["detail"]) for row in
+                store.list_persona_events(kind="showoff")]
+        assert any(row.get("event") == "intent.observation" for row in rows)
+    store.close()
