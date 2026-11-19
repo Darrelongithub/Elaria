@@ -17,6 +17,9 @@
  *   ElariaShell.notify({ text, speak })              proactive tap on the shoulder from the daemon.
  *   ElariaShell.say(text)                            push an unprompted reply into the log.
  *   ElariaShell.setState(name)                       idle | listening | thinking | speaking | offline.
+ *   ElariaShell.drafts(frame) / .draftResolved(...)   IF-2 draft feed -> draft-review cards;
+ *                                                    approve/reject POST through the gate and the
+ *                                                    card only resolves on the daemon's word.
  *   ElariaShell.transcript(rows) / .memory(cards) / .audio(rows)   feed the three panes live data.
  * Without a daemon the shell answers slash commands and says plainly that nothing is on the wire.
  */
@@ -34,9 +37,26 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const reduced = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   const fmt = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  const LABEL = { idle: 'Idle', listening: 'Listening', thinking: 'Thinking', speaking: 'Speaking', offline: 'Offline' };
+  /* Orb states, each driven by an EXISTING signal (IF-4 + IF-2). "phone-connected" and
+     "pending-draft" are not base states: both are DERIVED from the draft feed (a live
+     phone-connected signal, and outstanding pending count), so a removed signal cannot
+     leave a lying orb behind. The visualizer engine knows five states only, so the two
+     phone states ride the engine's idle world (phoneSocket maps them) while the readout,
+     the panel attribute and aria carry the real name. Unknown names THROW. */
+  const LABEL = { idle: 'Idle', listening: 'Listening', thinking: 'Thinking', speaking: 'Speaking',
+    offline: 'Offline', 'phone-connected': 'Phone connected', 'pending-draft': 'Pending draft' };
+  const BASE_STATE = { 'phone-connected': 'idle', 'pending-draft': 'idle' };
+  const ENGINE_SAFE = (s) => BASE_STATE[s] || s;
   const SIZES = [14, 16, 19];
   const PANES = ['transcript', 'memory', 'audio'];
+  /* IF-1 owner amendment — exactly four renderable draft states. rejected / expired /
+     send-error are CAUSES under failed, never top states. */
+  const DRAFT_STATES = ['pending', 'approved', 'sent', 'failed'];
+  const DRAFT_CAUSES = { rejected: 'rejected', expired: 'expired', 'send-error': 'send error', send_error: 'send error' };
+  const DRAFT_TIME = (ts) => {
+    const n = typeof ts === 'number' ? ts : (typeof ts === 'string' && ts.trim() ? Date.parse(ts) : NaN);
+    return Number.isFinite(n) ? new Date(n).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+  };
 
   const el = {
     app: $('app'), sb: $('sb'), sList: $('sList'), bNew: $('bNew'),
@@ -48,7 +68,7 @@
     fdemo: $('fdemo'), fclose: $('fclose'), fbody: $('fbody'), toasts: $('toasts')
   };
 
-  /* ------------------------------------------------------------------ colour passes
+  /* colour passes
      hers gets the full pass. yours gets white and nothing else except a /command,
      because a command is not a word. Verified: paintYou emits zero spans for plain prose. */
   const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -75,7 +95,7 @@
     .replace(/\n/g, '<br>');
   const paintHer = (s) => paint(s).replace(/\n/g, '<br>');
 
-  /* ------------------------------------------------------------------ baked content (real ledger facts) */
+  /* baked content (real ledger facts) */
   const MEM = [
     { t: 'who she is', v: 'Elaria. Personal assistant, one owner. Not a product, not a demo.', w: '~/BLUEPRINT (v44)' },
     { t: 'voice', v: 'Rasp and bite. Flare, online only. Offline is text — never a spoken fallback voice.', w: '~/BLUEPRINT' },
@@ -121,7 +141,7 @@
     '  wire      [' + (daemon ? 'CONNECTED' : 'ABSENT') + ']          ' + (daemon ? 'bridge up' : 'connection not established') + '\n\n' +
     'Text replies use the attached adapter. Connection is not a claim that journal, manifest, memory or speech feeds are present; each pane keeps its own status.';
 
-  /* ------------------------------------------------------------------ storage */
+  /* storage */
   const KEY = 'elaria.console.v6';
   let data;
   try { data = JSON.parse(localStorage.getItem(KEY)); } catch (e) { data = null; }
@@ -132,7 +152,7 @@
     try { localStorage.setItem(KEY, JSON.stringify(data)); } catch (e) { /* storage blocked */ } }, 250); };
   const cur = () => data.sessions.find((s) => s.id === data.active);
 
-  /* ------------------------------------------------------------------ runtime state */
+  /* runtime state */
   let V = null, vizErr = '';
   let state = 'idle', busy = false, forcedOffline = false, micOn = false, simOn = true;
   let daemon = null, skip = false, voiceTimer = 0, typeT = 0;
@@ -142,7 +162,7 @@
   let liveTR = null, liveAU = null, liveMEM = null;   // real data, once the wire feeds it
   const hist = []; let hi = 0;
 
-  /* ------------------------------------------------------------------ visualizer bridge */
+  /* visualizer bridge */
   function bootVisualizer() {
     if (!window.THREE) return Promise.reject(new Error('[ERR] three.js is missing from this file.'));
     if (!window.Elaria) return Promise.reject(new Error('[ERR] the visualizer engine is missing from this file.'));
@@ -159,20 +179,40 @@
     el.rs.classList.remove('sw'); void el.rs.offsetWidth; el.rs.classList.add('sw');
     syncOrb();
   }
+  /* ---- draft-feed derived states (IF-2). Neither is ever set by hand: they exist while the
+     signals do. Precedence when both hold: pending-draft speaks first — it needs the owner.
+     A removed signal recalculates instead of stranding the orb, and an offline orb outranks
+     both (daemon-down is Ruling D). no second player, no second sender: this only paints. */
+  let phoneConnected = false;   // a daemon signal said the phone link is up
+  /* One derivation, no recursion: a real state (listening / thinking / speaking) is never
+     overridden, so this only runs from a base or a stale phone state. fallback=true is used
+     when a SIGNAL WAS REMOVED, so the orb returns to its base instead of staying derived. */
+  function applyPhone(fallback) {
+    if (state === 'offline') return;                       // daemon-down outranks both (Ruling D)
+    const pend = pendingDrafts().length;
+    if (pend > 0) return setState('pending-draft');        // needs the owner: speaks first
+    if (phoneConnected) return setState('phone-connected');
+    if (fallback === true || BASE_STATE[state]) setState(micOn ? 'listening' : 'idle');
+  }
   // F29: only output levels can enter speaking. A reply/state flag is not playback evidence.
   function setState(s, fromLevels = false) {
+    if (!LABEL[s]) throw new Error('unknown orb state "' + s + '" — no silent default');
     if ((s === 'speaking' && !fromLevels) || s === state) return;
-    state = s; if (V) V.setState(s); paintState(s);
+    state = s; if (V) V.setState(ENGINE_SAFE(s)); paintState(s);
   }
   const setLevels = (role, level) => {
     if (!['input', 'output'].includes(role) || !Number.isFinite(level) || level < 0 || level > 1) return;
     if (V) V.setLevels(role, { level });
     if (role === 'output' && !forcedOffline) {
       if (level > 0) setState('speaking', true);
-      else if (state === 'speaking') setState(busy ? 'thinking' : micOn ? 'listening' : 'idle');
+      else if (state === 'speaking') { setState(busy ? 'thinking' : micOn ? 'listening' : 'idle'); applyPhone(false); }
     }
   };
-  function settle() { if (busy || voiceTimer) return; setState(forcedOffline ? 'offline' : micOn ? 'listening' : 'idle'); }
+  function settle() {
+    if (busy || voiceTimer) return;
+    setState(forcedOffline ? 'offline' : micOn ? 'listening' : 'idle');
+    if (!forcedOffline) applyPhone(false);
+  }
   function lamps() {
     const on = { console: 'ok', daemon: daemon ? 'ok' : 'wait', voice: (micOn) ? 'ok' : 'wait', wire: daemon ? 'ok' : 'gone' };
     const titles = {
@@ -200,7 +240,7 @@
     if (s !== lastSrc) { el.rsrc.textContent = s; el.rsrc.classList.toggle('sim', sim); lastSrc = s; }
   }, 150);
 
-  /* ------------------------------------------------------------------ miniature orb (2D, shares the palette) */
+  /* miniature orb (2D, shares the palette) */
   const STOPS = [[.23,.07,.66],[.12,.30,1],[.61,.17,1],[1,.17,.72],[1,.42,.02],[1,.70,.10],[1,.42,.02],[1,.17,.72],[.61,.17,1]];
   function pal(x) {
     x -= Math.floor(x);
@@ -256,11 +296,19 @@
   }
   const startOrbs = () => { if (reduced) orbs.forEach((o) => o.draw(0)); else if (!orbRaf) orbRaf = requestAnimationFrame(orbLoop); };
 
-  /* ------------------------------------------------------------------ notifications: the mini orb */
+  /* notifications: the mini orb */
   function notify(o) {
     const text = o.text || '';
     const ms = o.ms || Math.min(9000, 4500 + text.length * 40);
-    while (el.toasts.children.length >= 3) closeToast(el.toasts.firstChild);
+    /* Full slots used to mean an endless loop: closeToast only STARTS the fade and removes the
+       node 450 ms later, so `while (children >= 3) closeToast(first)` could never make the
+       condition false and the shell froze on the fourth notification inside one tick. Dismiss
+       oldest non-fading toasts; if all three are already fading, drop one outright and move on. */
+    while (el.toasts.children.length >= 3) {
+      const old = Array.prototype.find.call(el.toasts.children, (t) => !t._closing);
+      if (old) closeToast(old);
+      else { el.toasts.firstChild.remove(); break; }
+    }
     const t = h('div', 'toast'); t.setAttribute('role', 'status');
     const cv = h('canvas', 'orb-cv'); cv.setAttribute('aria-hidden', 'true');
     const col = h('div', 'tcol'), nm = h('div', 'tname');
@@ -284,7 +332,7 @@
     if (!t || t._closing) return;
     t._closing = true; t.classList.add('out');
     const done = () => { orbs.delete(t._orb); t.remove(); };
-    t.addEventListener('animationend', done, { once: true }); setTimeout(done, 450);
+    if (!t._orbDone) { t._orbDone = done; t.addEventListener('animationend', done, { once: true }); setTimeout(done, 450); }
   }
   function pulseVoice(ms) {
     if (busy || forcedOffline) return;
@@ -298,7 +346,7 @@
   }
   const calmWants = () => { el.wants.hidden = true; };
 
-  /* ------------------------------------------------------------------ log rendering */
+  /* log rendering */
   const ROLE = { me: 'you', ai: 'elaria', sys: '', note: '', warn: '', err: '' };
   function receiptRows(value) {
     return Array.isArray(value) ? value.filter(x => typeof x === 'string' && x.length <= 1000).slice(0, 24) : [];
@@ -348,7 +396,7 @@
   });
   el.jump.addEventListener('click', () => { pinned = true; el.log.scrollTop = el.log.scrollHeight; });
 
-  /* ------------------------------------------------------------------ sessions */
+  /* sessions */
   function newSession(name) {
     const s = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
       name: name || 'session-' + (data.sessions.length + 1), created: Date.now(), msgs: [] };
@@ -399,7 +447,7 @@
     el.ta.focus();
   }
 
-  /* ------------------------------------------------------------------ sidebar sections + full-screen panes */
+  /* sidebar sections + full-screen panes */
   function setSec(name) {
     openSec = openSec === name ? null : name;
     PANES.forEach((p) => {
@@ -639,13 +687,193 @@
   document.querySelectorAll('.sec-h').forEach((b) => b.addEventListener('click', () => {
     const p = b.dataset.pane;
     if (p === 'transcript') openFull('transcript');
+    else if (p === 'drafts') { setSec('drafts'); renderDrafts(); }   // its own surface; never a full-screen pane
     else { setSec(p); if (fullPane) { fullPane = p; el.tbWhich.textContent = p; renderFull(); } }
   }));
+  /* phone draft review (IF-2 / IF-1)
+     One card per draft, states EXACTLY pending | approved | sent | failed, and a failed card
+     names its cause (rejected / expired / send-error) underneath — IF-1 owner amendment. The
+     recipient renders as the FULL number, never truncated or masked: textContent, so nothing
+     in a number is elided.
+
+     Two hard rules live here:
+       1. INERT. The snippet and the body are untrusted input (IF-6) — they are written with
+          textContent, never parsed, never executed. Nothing typed inside a message can run.
+       2. NO LOCAL VERDICT. approve/reject POST the command and await the daemon's own
+          draft-resolve frame. If the transport is missing or fails, the card says so and
+          STAYS PENDING. The console never becomes a sender (same doctrine as F29/no second
+          player), and deny-beats-consent: there is no optimistic path. */
+  const draftStore = new Map();  // draft_id -> {id, state, cause, recipient, body, snippet, created_at, outcome, busy, error}
+  let draftOrder = [];           // insertion order — a Map re-set never reorders, so keep the list
+  const draftView = new Map();   // draft_id -> {node, head, to, body, meta, cause, err, approve, reject}
+  const DRAFT_DISPLAY = new Set(DRAFT_STATES);
+
+  function normDraft(raw, base) {
+    if (!raw || typeof raw !== 'object') return null;
+    const id = String(raw.draft_id || '').trim();
+    if (!id) return null;                                   // a draft without its idempotent key is dropped
+    const prev = base || {};
+    let state = String(raw.state || prev.state || 'pending');
+    let cause = raw.cause != null ? String(raw.cause) : (prev.cause || '');
+    if (state === 'rejected' || state === 'expired' || state === 'send-error' || state === 'send_error') {
+      cause = DRAFT_CAUSES[state]; state = 'failed';        // causes are not top states
+    }
+    if (!DRAFT_DISPLAY.has(state)) state = 'failed';        // unknown states fail closed, loudly on the card
+    if (typeof raw.outcome === 'string' && raw.outcome && !cause) {
+      const o = raw.outcome.toLowerCase();
+      if (o === 'rejected' || o === 'expired') { state = 'failed'; cause = DRAFT_CAUSES[o]; }
+    }
+    const pick = (k) => raw[k] != null ? String(raw[k]) : (prev[k] != null ? String(prev[k]) : '');
+    return {
+      id, state, cause,
+      recipient: pick('recipient'), body: pick('body') || pick('snippet'),
+      created_at: raw.created_at != null ? raw.created_at : (prev.created_at != null ? prev.created_at : null),
+      outcome: raw.outcome != null ? String(raw.outcome) : (prev.outcome || ''),
+      busy: false, error: ''
+    };
+  }
+  function upsertDraft(raw, base) {
+    const d = normDraft(raw, base);
+    if (!d) return null;
+    const had = draftStore.has(d.id);
+    draftStore.set(d.id, d);
+    if (!had) draftOrder.push(d.id);
+    return d;
+  }
+  function pendingDrafts() {
+    return draftOrder.map((id) => draftStore.get(id)).filter((d) => d && d.state === 'pending');
+  }
+
+  function draftEl(tag, cls, txt) {
+    const node = h(tag, cls || '', txt == null ? '' : String(txt));   // h() sets textContent — inert
+    return node;
+  }
+  function draftCard(d) {
+    if (draftView.has(d.id)) return draftView.get(d.id);
+    const node = draftEl('article', 'draft-card');
+    node.dataset.draftId = d.id; node.dataset.state = d.state;
+    const head = draftEl('header', 'draft-head');
+    const st = draftEl('span', 'st'); const tag = draftEl('small', '', 'draft #' + d.id);
+    head.append(st, tag);
+    const to = draftEl('p', 'draft-to');
+    const body = draftEl('p', 'draft-body');
+    const meta = draftEl('p', 'draft-meta');
+    const cause = draftEl('p', 'draft-cause');
+    const err = draftEl('p', 'draft-err');
+    const acts = draftEl('div', 'draft-actions');
+    const approve = draftEl('button', 'draft-approve', 'approve'); approve.type = 'button';
+    const reject = draftEl('button', 'draft-reject', 'reject'); reject.type = 'button';
+    approve.dataset.draftAct = 'approve'; reject.dataset.draftAct = 'reject';
+    approve.setAttribute('aria-label', 'approve draft ' + d.id);
+    reject.setAttribute('aria-label', 'reject draft ' + d.id);
+    approve.addEventListener('click', () => draftDecide(d.id, 'approve', approve));
+    reject.addEventListener('click', () => draftDecide(d.id, 'reject', reject));
+    acts.append(approve, reject);
+    node.append(head, to, body, meta, cause, err, acts);
+    const view = { node, st, to, body, meta, cause, err, approve, reject };
+    draftView.set(d.id, view);
+    return view;
+  }
+  function paintCard(d) {
+    const v = draftCard(d);
+    v.node.dataset.state = d.state;
+    v.st.textContent = d.state;                                  // the four words, and only the four
+    v.to.textContent = d.recipient ? 'to ' + d.recipient : 'to — (no recipient in payload)';
+    v.body.textContent = d.body || '(no body in payload)';
+    const when = DRAFT_TIME(d.created_at);
+    v.meta.textContent = when
+      ? 'created ' + when + (d.outcome ? ' · outcome ' + d.outcome : '')
+      : (d.outcome ? 'outcome ' + d.outcome : '');
+    v.cause.textContent = d.state === 'failed' && d.cause ? 'cause: ' + d.cause : '';
+    v.cause.hidden = !v.cause.textContent;
+    v.err.textContent = d.error || '';
+    v.err.hidden = !v.err.textContent;
+    const live = d.state === 'pending' && !d.busy;
+    v.approve.disabled = !live; v.reject.disabled = !live;
+    return v;
+  }
+  function renderDrafts() {
+    const b = $('body-drafts');
+    if (!b) return;
+    b.replaceChildren();
+    const stat = pendingDrafts();
+    const live = daemon && typeof daemon.sendDraftCommand === 'function';
+    if (!draftOrder.length) {
+      b.append(draftEl('p', 'mini',
+        'No draft feed received. Cards appear when the daemon reports a phone draft; '
+        + 'approve / reject then POST draft.approve / draft.reject and only the daemon can send.'));
+    } else {
+      if (!stat.length) b.append(draftEl('p', 'mini', 'No pending drafts.'));
+      stat.forEach((d) => b.append(paintCard(d).node));
+      const resolved = draftOrder.filter((id) => draftStore.get(id).state !== 'pending').reverse();
+      if (resolved.length) {
+        b.append(draftEl('p', 'mini', resolved.length + ' resolved · newest first · history below the pending cards'));
+        resolved.slice(0, 6).forEach((id) => b.append(paintCard(draftStore.get(id)).node));
+      }
+    }
+    if (!live) {
+      b.append(draftEl('p', 'mini', draftOrder.some((id) => draftStore.get(id).state === 'pending')
+        ? '[WARN] no command transport — approve and reject fail closed; nothing is sent from this window.'
+        : 'Command transport: not connected. With no daemon there is no approve path.'));
+    }
+    const badge = $('badge-drafts');
+    if (badge) {
+      badge.textContent = stat.length + ' pending';
+      badge.className = 'badge ' + (stat.length ? 'warn' : 'st');
+    }
+    applyPhone(true);        // a removed signal recalculates; a live one upgrades
+  }
+  async function draftDecide(id, verb, button) {
+    const d = draftStore.get(id);
+    if (!d || d.state !== 'pending' || d.busy) return;
+    const live = daemon && typeof daemon.sendDraftCommand === 'function';
+    if (!live) { d.error = 'No command transport; nothing was sent.'; paintCard(d); return; }
+    d.busy = true; d.error = ''; paintCard(d);
+    try {
+      const res = await daemon.sendDraftCommand({ command: 'draft.' + verb, draft_id: id });
+      /* Accept ANY state word the daemon reports and let normDraft map it: 'rejected', 'expired'
+         and 'send-error' are CAUSES under failed, never top states (IF-1 owner amendment). */
+      const answered = res && typeof res === 'object'
+        ? (res.state != null ? res : (res.draft && res.draft.state != null ? res.draft : null))
+        : null;
+      if (answered) upsertDraft(Object.assign({}, answered, { draft_id: id }), draftStore.get(id));
+      /* and if the daemon reported nothing, the card stays pending on purpose: no local verdict. */
+    } catch (e) {
+      d.error = 'Daemon refused or unreachable: ' + ((e && e.message) || 'unknown') + ' Nothing was sent from this window.';
+    } finally { d.busy = false; renderDrafts(); }
+    if (button) button.blur();
+  }
+  function draftFrame(frame) {
+    if (!frame || typeof frame !== 'object') return;
+    let changed = 0;
+    if (Array.isArray(frame.drafts)) {
+      frame.drafts.forEach((raw) => { const d = upsertDraft(raw, draftStore.get(String((raw && raw.draft_id) || ''))); if (d) changed++; });
+    } else if (frame.draft && typeof frame.draft === 'object') {
+      const raw = frame.draft;
+      if (upsertDraft(raw, draftStore.get(String(raw.draft_id || '')))) changed++;
+    }
+    if ('phone_connected' in frame) phoneConnected = frame.phone_connected === true;
+    renderDrafts();
+    return changed;
+  }
+  function draftResolveFrame(frame) {
+    if (!frame || typeof frame !== 'object') return null;
+    const raw = (frame.draft && typeof frame.draft === 'object') ? frame.draft : frame;
+    if (!raw || raw.draft_id == null) return null;
+    /* A resolution arriving without a state word is a SENT one (IF-2: a resolved event supersedes
+       pending; the only send outcome is sent). An explicit word — including a cause — is honoured. */
+    const d = upsertDraft(Object.assign({}, raw, { state: raw.state != null ? raw.state : 'sent' }), draftStore.get(String(raw.draft_id)));
+    if (d) d.busy = false;
+    renderDrafts();
+    return d;
+  }
+  function draftTick() { renderDrafts(); }   // never touched by a timer; kept explicit for tests
+
   el.bNew.addEventListener('click', createSession);
   el.orb.addEventListener('click', calmWants);
   document.addEventListener('click', (e) => { if (!e.target.closest('.sb, .tools, #full')) calmWants(); });
 
-  /* ------------------------------------------------------------------ commands */
+  /* commands */
   const CMDS = [
     { n: 'help', u: '/help', d: 'this list', f: () => { const g = h('div', 'cmds'); CMDS.forEach((c) => g.append(h('code', '', c.u), h('span', '', c.d))); out(g); } },
     { n: 'status', u: '/status', d: 'lamps, and what each one means', f: () => out(statusText()) },
@@ -657,6 +885,11 @@
     { n: 'transcript', u: '/transcript', d: 'open the transcript full screen   (alt+1)', f: () => openFull('transcript', true) },
     { n: 'memory', u: '/memory', d: 'open her memory cards   (alt+2)', f: () => openPane('memory') },
     { n: 'audio', u: '/audio', d: 'open the audio manifest   (alt+3)', f: () => openPane('audio') },
+    { n: 'drafts', u: '/drafts', d: 'phone draft review — pending, and what each draft became', f: () => {
+      setSec('drafts'); renderDrafts();
+      const n = pendingDrafts().length;
+      out(n ? n + ' pending draft' + (n === 1 ? '' : 's') + ' in the sidebar. Approve or reject sends the command and waits for the daemon; nothing is sent from this window.'
+            : 'no pending drafts. ' + (draftOrder.length ? draftOrder.length + ' resolved, listed under the feed.' : 'no draft feed received yet.')); } },
     { n: 'panel', u: '/panel NAME|off', d: 'transcript | memory | audio | off', f: (a) => {
       const s = (a || '').toLowerCase();
       if (!PANES.concat('off').includes(s)) return out('panes: transcript, memory, audio, off');
@@ -702,7 +935,7 @@
     el.term.classList.toggle('crt', !!data.prefs.crt);
   }
 
-  /* ------------------------------------------------------------------ conversation */
+  /* conversation */
   // SYNTHESISED TEXT CADENCE, never measured audio. F29: no client playback/attachElement.
   const levelFor = (ch) => (/[\s.,;:!?]/.test(ch) ? .06 : .38 + Math.random() * .5);
   let abortType = null;
@@ -990,7 +1223,7 @@
     renderSess();
   }
 
-  /* ------------------------------------------------------------------ input */
+  /* input */
   const autosize = () => { el.ta.style.height = 'auto'; el.ta.style.height = Math.min(el.ta.scrollHeight, 180) + 'px'; };
   let typingT = 0, tab = { base: null, i: -1 };
   el.ta.addEventListener('input', () => {
@@ -1025,10 +1258,11 @@
       return;
     }
     if (!(e.altKey || e.ctrlKey)) return;
-    if (e.ctrlKey && !e.altKey && !['Digit0', 'Digit1', 'Digit2', 'Digit3', 'KeyK', 'KeyB'].includes(e.code)) return;
+    if (e.ctrlKey && !e.altKey && !['Digit0', 'Digit1', 'Digit2', 'Digit3', 'Digit4', 'KeyK', 'KeyB'].includes(e.code)) return;
     const act = {
       KeyN: createSession, KeyK: () => toggleSb(), KeyB: () => toggleOrb(), Digit0: () => setSize(0),
-      Digit1: () => openFull('transcript'), Digit2: () => openPane('memory'), Digit3: () => openPane('audio')
+      Digit1: () => openFull('transcript'), Digit2: () => openPane('memory'), Digit3: () => openPane('audio'),
+      Digit4: () => { setSec('drafts'); renderDrafts(); }
     }[e.code];
     if (act) { e.preventDefault(); act(); }
   });
@@ -1037,7 +1271,7 @@
     if (away) { notify({ text: away.length > 120 ? away.slice(0, 117) + '\u2026' : away, log: false }); away = null; }
   });
 
-  /* ------------------------------------------------------------------ the wire, prepared
+  /* the wire, prepared
      Nothing here opens a socket by itself. attachSocket(url) is the ONE call the mainline builder
      makes once the daemon side exists; until then it fails closed and every lamp keeps telling the
      truth. The protocol is written down in INTEGRATION.md — this is its client half.
@@ -1078,12 +1312,14 @@
       }
       if (m.t === 'undo-privacy') { undoPrivate = m.allowed === true; if (undoCard) { undoCard.allowed = m.allowed === true; if (!undoCard.allowed) hideUndo(); } return; }
       if (m.t === 'reply') { const p = pend.get(m.id); pend.delete(m.id); if (p) { if (m.undo_review) undoPrivate = true; p(m); } return; }
-      if (m.t === 'state') return window.ElariaShell.setState(m.name);
+      if (m.t === 'state') return window.ElariaShell.setState(m.name);   // unknown names THROW inside
       if (m.t === 'levels') return window.ElariaShell.levels(m.role, m.level);
       if (m.t === 'notify') return window.ElariaShell.notify({ text: m.text || '', speak: !!m.speak });
       if (m.t === 'transcript') return window.ElariaShell.transcript(m.rows || []);
       if (m.t === 'audio') return window.ElariaShell.audio(m.rows || []);
       if (m.t === 'memory') return window.ElariaShell.memory(m.cards || []);
+      if (m.t === 'drafts') return window.ElariaShell.drafts(m);
+      if (m.t === 'draft-resolve') return window.ElariaShell.draftResolved(m);
       if (m.t === 'bye') { dead = true; try { if (ws) ws.close(); } catch (e) { /* gone */ } window.ElariaShell.disconnect(); }
     }
     function sendOver(text, ctx) {
@@ -1134,7 +1370,7 @@
     };
   }
 
-  /* ------------------------------------------------------------------ public integration surface */
+  /* public integration surface */
   window.ElariaShell = {
     connect(adapter) {
       if (!adapter || typeof adapter.send !== 'function') throw new Error('ElariaShell.connect needs { send(text, ctx) }.');
@@ -1154,7 +1390,22 @@
     notify(o) { notify(o || {}); },
     attachSocket(url) { return attachSocket(url); },
     say(text) { if (!busy) { const s = cur(); busy = true; deliver(text, s).finally(() => { busy = false; settle(); }); } },
-    setState(s) { if (LABEL[s]) { forcedOffline = s === 'offline'; setState(s); } },
+    // unknown names THROW (IF-4: no silent default). Derived phone states are refused here —
+    // they exist only while their signals do, so nothing can paint one by hand.
+    setState(s) {
+      if (!LABEL[s]) throw new Error('unknown orb state "' + s + '" — no silent default');
+      if (BASE_STATE[s]) throw new Error('"' + s + '" is derived from the draft feed, not settable');
+      forcedOffline = s === 'offline'; setState(s);
+    },
+    /* IF-2 consumer surface. drafts(frame) is transport-driven (draft.pending/draft.resolved ride
+       the wire as 'drafts' and 'draft-resolve' frames); draftResolved(frame) upserts one resolution;
+       draftsForTest()/draftId() are read/act helpers for the stub-daemon harness only. */
+    drafts(frame) { return draftFrame(frame); },
+    draftResolved(frame) { return !!draftResolveFrame(frame); },
+    get pendingDraftCount() { return pendingDrafts().length; },
+    draftIds() { return draftOrder.slice(); },   // test helper: every known draft, in order
+    draftState(id) { const d = draftStore.get(String(id)); return d ? d.state : null; },  // test helper
+    get phoneConnected() { return phoneConnected; },
     levels(role, level) { setLevels(role, level); },
     transcript(rows) { liveTR = nonempty(rows); demoOn = false; syncBadges(); if (openSec === 'transcript') renderSec('transcript'); if (fullPane === 'transcript') renderFull(); },
     audio(rows) { liveAU = nonempty(rows); demoOn = false; syncBadges(); if (openSec === 'audio') renderSec('audio'); if (fullPane === 'audio') renderFull(); },
@@ -1162,7 +1413,7 @@
     get state() { return { daemon: !!daemon, mic: micOn, state, pane: fullPane, section: openSec }; }
   };
 
-  /* ------------------------------------------------------------------ boot */
+  /* boot */
   function seed() {
     const s = newSession('boot');
     const now = Date.now();
@@ -1170,7 +1421,7 @@
       ['sys',  'elaria console shell v6 — ' + new Date().toLocaleString() + ' — type /help for commands'],
       ['sys',  'lamps   console [ON]   daemon [NOT CONNECTED]   voice [NOT CONNECTED]   wire [ABSENT]'],
       ['note', 'colour key — green her · white you · orange names and numbers · blue system · violet aside · amber not-yet · red broken · ice paths · acid commands'],
-      ['note', 'layout — sessions, transcript, memory and audio in the left sidebar. her orb in a proportional panel on the right, yielding on narrow screens. the centre is the chat, always. transcript opens full screen across the chat and the orb; the sidebar stays exactly where it is.'],
+      ['note', 'layout — sessions, transcript, memory, audio and draft review in the left sidebar. her orb in a proportional panel on the right, yielding on narrow screens. the centre is the chat, always. transcript opens full screen across the chat and the orb; the sidebar stays exactly where it is.'],
       ['note', 'notification — when she wants you, a mini orb pops top right with her name and the message. /notify fires one so you can see it.'],
       ['note', 'Local shell preview — not a model answer.\n\nThe wide orb panel is proportional; narrow screens prioritise chat. /demo displays marked sample rows; /notify demonstrates the local notification surface. These do not prove daemon feed or messaging capabilities.'],
       ['me',   '/help'],
@@ -1190,7 +1441,7 @@
     document.body.classList.toggle('orb-off', !data.prefs.orb);
     sidebarAria();
     el.tgOrb.setAttribute('aria-expanded', String(data.prefs.orb));
-    renderLog(); renderSess(); lamps(); paintState('idle'); syncBadges(); syncOrb();
+    renderLog(); renderSess(); lamps(); paintState(state); syncBadges(); syncOrb(); renderDrafts();
     renderSec('transcript'); renderSec('memory'); renderSec('audio');
     el.ta.focus();
   }

@@ -49,6 +49,18 @@
       </button>
       <div class="sec-b" id="body-audio" role="region" aria-label="Audio preview"></div>
     </div>
+
+    <!-- Draft review. One card per pending phone draft; approve/reject POST through the command
+         gate and have no local effect. Snippet text is untrusted input: textContent only, never
+         parsed and never executed. IF-2 transport, IF-1/owner-amendment states. -->
+    <div class="sec" id="sec-drafts">
+      <button class="sec-h" type="button" data-pane="drafts" aria-expanded="false" aria-controls="body-drafts">
+        <span class="car" aria-hidden="true">&#9656;</span>
+        <span class="nm">drafts</span>
+        <span class="badge st" id="badge-drafts">0 pending</span>
+      </button>
+      <div class="sec-b" id="body-drafts" role="region" aria-label="Phone draft review"></div>
+    </div>
   </aside>
 
   <!-- ============ CENTRE: the chat. the flexible priority column. ============ -->

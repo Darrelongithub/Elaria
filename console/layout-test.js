@@ -3,8 +3,52 @@
    No model calls; no downloads. This is containment evidence, not owner visual approval. */
 'use strict';
 const assert = require('node:assert/strict');
-const { chromium } = require('playwright-core');
+const fs = require('node:fs');
+const path = require('node:path');
+
+/* STATIC SIZING DOCTRINE GATE (K) — runs with or without a browser.
+   The live geometry gate below needs Chromium; this half does not, so the owner's sizing
+   doctrine is still asserted, by number, on a box with no browser: panel ~36% wide,
+   orb ~80% of the panel's height, lamp strip at the bottom, narrow => chat priority and the
+   orb/rail yields instead of being cropped or scrolled. Proven against the BUILT index.html
+   when it exists (built css), else against src/shell.css. Nothing here claims pixels. */
+(function staticDoctrine() {
+  const cssPath = fs.existsSync(path.join(__dirname, 'index.html'))
+    ? path.join(__dirname, 'index.html') : path.join(__dirname, 'src', 'shell.css');
+  let css = fs.readFileSync(cssPath, 'utf8');
+  if (cssPath.endsWith('index.html')) {
+    const m = css.match(/<style>([\s\S]*?)<\/style>/);
+    assert(m, 'built index.html carries no <style> block');
+    css = m[1];
+  }
+  const need = (re, what) => { assert(re.test(css), 'missing css rule: ' + what); };
+  const grab = (re, what) => { const m = css.match(re); assert(m, 'missing css rule: ' + what); return m[1].trim(); };
+  const frames = grab(/--orbw:\s*([0-9.]+)vw/, '--orbw');
+  assert.equal(frames, '36', 'panel must be 36vw wide, got ' + frames + 'vw');
+  assert(/\.stage-box\s*\{[^}]*max-height:\s*80%/.test(css), 'stage-box must cap at 80% of the panel height');
+  assert(/\.stage-box\s*\{[^}]*flex:\s*1 1 auto/.test(css), 'stage-box must flex-fill the panel it is capped against');
+  need(/grid-template-columns:\s*var\(--sbw\)\s*minmax\(0,\s*1fr\)\s*var\(--orbw\)/,
+    'app grid columns = sidebar | flexible chat | panel');
+  assert(/\.console-footer\s*\{[^}]*grid-row:\s*2/.test(css), 'lamp footer must occupy the bottom grid row');
+  assert(/--orbw:\s*0px/.test(css.split('@media (max-width: 1040px)')[1] || ''), 'panel must yield below 1040px');
+  const narrow = css.split('@media (max-width: 680px)')[1] || '';
+  assert(/--orbw:\s*0px/.test(narrow), 'below 680px the orb column must be 0px (chat priority)');
+  assert(/\.orb\s*,[^}]*display:\s*none/.test(narrow) || /\.orb[^{]*\{[^}]*display:\s*none/.test(narrow),
+    'below 680px the orb is hidden, never cropped or floated over the chat');
+  assert(/\.orb\s*\{[^}]*overflow:\s*hidden/.test(css), 'the panel itself must clip its own overflow');
+  console.log('PASS: static sizing doctrine — 36vw panel, 80% orb cap, flexible chat column, footer lamps, 0px orb <=680px');
+})();
+
+let browserReady = true;
+let chromium = null;
+try { ({ chromium } = require('playwright-core')); } catch (e) { browserReady = false; }
 (async () => {
+  if (!browserReady || !process.env.ELARIA_TEST_URL) {
+    console.log('PASS: live geometry gate [SKIP] — ' +
+      (browserReady ? 'ELARIA_TEST_URL is not set (needs a synthetic test bridge, never the owner\'s daemon)'
+                    : 'playwright-core is not installed in this environment'));
+    return;   // no browser claim, and no fake pass: the static doctrine above is what ran
+  }
   const browser = await chromium.launch({
     executablePath: process.env.ELARIA_CHROMIUM_PATH,
     headless: true,
