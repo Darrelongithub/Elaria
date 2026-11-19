@@ -130,6 +130,14 @@ hoist `HomeButton` and `NoteField` into
 
 ## Deferred debt — unchanged by this fix
 
+> **WP0 paid this list down (2026-10-25)** — `assist ladder` / `elaria-ladder`
+> ship in `src/assistant/ladder.py` (chains console/wake/voice/event, rung E =
+> journal "Configuration Loaded" proxy + `elaria-console` layer namespace);
+> `assist doctor` gained the quickshell-binary check; the daemon writes the
+> §4.8 schema lines to stdout (`ts level event session_id peak verdict
+> detail`); a 5-minute PTT session watchdog auto-closes with a visible
+> marker. The items below are kept as written for that PR's record.
+
 - `assist ladder` productisation; upstream `%%` fix plus scripts `--help`
   smoke tests; `assist doctor` Quickshell-binary check.
 - Structured plain-language daemon lifecycle lines to stdout (session
