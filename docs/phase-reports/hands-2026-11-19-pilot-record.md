@@ -23,3 +23,13 @@ runs. Zero production-code lines.
 <!-- END ORIGINAL RECORD -->
 RECORD-BODY-SHA256: f17f4647f22c0fd3d0c85252daa6c4041c8ae11625456ae3db3158927b04144e
 
+
+<!-- BEGIN ANNOTATION 2026-11-19T14:36:27Z -->
+Dated annotation, 2026-11-19T14:36:27Z (Agent R): the working hypothesis above is superseded
+on the record, not rewritten. “spec e7316b9” is the single-op undo review pilot
+commit with 18 regression pins; the five scene criteria are carried by the R
+letter plus owner ruling 4 in `SEND-NOW-CONSOLE-HANDS.md` §2.4, with attribution
+added by the R letter. The original body and its SHA-256 are unchanged. This
+append-only annotation is the correction: five spec-only scenes, six armed
+traps, two benign controls, zero hardware runs, zero production-code lines.
+<!-- END ANNOTATION -->
