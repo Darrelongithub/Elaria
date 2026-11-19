@@ -150,3 +150,36 @@ branch, the full suite ran **2563 passed / 17 skipped / 0 failed / 0 errors**, a
 > import the package. `INVENTORY_SHA = policy.INVENTORY_SHA256` would have broken the worker. The patch
 > updates the literal and adds
 > `test_headless_inventory_pin_matches_the_kitty_catalogue`, so the two pins can never drift silently again.
+
+---
+
+## 9 · Round 3 (same day) — hand-off delivered, one cross-lane defect found
+
+Per the owner ruling, Q did **not** apply HR-Q-2 and did **not** touch any P file. The hand-off went into
+P's PR #46 as a COMMENTED review carrying both artefacts, the exact apply commands and the measured
+prerequisite.
+
+**Measured before posting (this is why the instruction changed shape):** PR #46 (`arena/792b6b73-elaria`,
+based on `main`) implements the headless lane differently from the console branch — 172/171 changed lines
+in `instance.py`, 89/146 in `contract.py`, no kitty package, no `tests/test_hands_dedicated_start.py`.
+`git apply --check` of the console-branch patch against PR #46's tip therefore fails on all three counts.
+A PR-46-specific artefact was produced instead:
+`reports/HR-Q-2-for-PR46.patch` (74 lines, 4 files), `git apply --check` clean at `1e8252b`, and P's suite
+runs **1824 passed, 6 skipped, 0 failed** with it applied in a scratch worktree (reverted afterwards).
+
+**What PR #46 already gets right:** `DEFAULT_VERSION_PIN = "kitty 0.49.2 "` is byte-identical to
+`pin.CLI_VERSION_PREFIX`, and the gate uses the same exact-prefix trailing-space `startswith` test. No
+version change was needed in P's branch at all.
+
+**The one real defect found:** `DEFAULT_EXTENT_SUBSET = frozenset({"viewport", "all"})`. `viewport` is not a
+kitty extent — measured in v0.49.2 `kitty/rc/get_text.py`, the choices are `screen, all, selection,
+first_cmd_output_on_screen, last_cmd_output, last_visited_cmd_output, last_non_empty_output, alternate,
+alternate_scrollback` with `default=screen`, and `viewport` has **0 occurrences** in `kitty/rc/*.py`. The
+contract would refuse kitty's own default and accept a value kitty rejects. The patch changes the value to
+`{"screen", "all"}` and updates P's five `"viewport"` test occurrences (including the "narrowing is
+allowed" test, whose subset would otherwise read as a widening).
+
+Inventory-hash binding is deliberately absent from that patch: PR #46 has no catalogue and defers the
+binding to HR-P-1. When it lands, the hash is `be06b3d2…` and it must stay a **literal** in
+`headless/contract.py` — that file is copied into the per-instance directory and imported standalone by
+the worker.
