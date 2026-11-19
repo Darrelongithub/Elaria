@@ -125,3 +125,28 @@ independently on catalogue version + commit + the four reviewed source hashes, a
 - History: 10 kitty documents carry an appended **DATED SUPERSESSION — 2026-11-19** block and the
   regenerated reference carries its own dated line (11 total); no historical text was rewritten. Two
   R-owned documents that also say 0.47.1 were deliberately left untouched (HR-Q-3).
+
+---
+
+## 8 · Round 2 (same day) — hardening, reproducibility proof, verified hand-off patch
+
+**Extra refusals (Q-owned files only).** `surface.resolve()` now refuses `pin.NEVER_GRANT_VERBS` *before*
+any target binding, and `checker.coverage()` labels the two new verbs `never-grant-rc` instead of the
+misleading `native-state`. The opaque-family accounting assertion (10) is unchanged and still asserted, so
+the legibility fix does not move any existing count. Two new tests cover both.
+
+**Reproducibility (measured, not asserted).** Two independent rebuilds of the v0.49.2 tarball produced
+byte-identical catalogues — sha256 `be06b3d206acca5ea906a471b174d594cfccf7118936ba27212a15af947b15f0`
+in both runs and in the committed file (`cmp` clean) — and the renderer run twice reproduces
+`docs/kitty-inventory.md` exactly. The committed artefact is therefore provably the output of the builder,
+not a hand-edited file.
+
+**HR-Q-2 is a patch, not a request.** `reports/HR-Q-2-hands-headless-repin.patch` (4 files, 70 diff lines)
+is included **unapplied** because `hands/headless/**` is P's. It was applied to a scratch checkout of this
+branch, the full suite ran **2563 passed / 17 skipped / 0 failed / 0 errors**, and it was reverted.
+
+> **Correction to the round-1 wording:** `headless/contract.py` must keep a *literal* hash — the module is
+> copied into the per-instance directory and imported standalone by the fixed Kitty worker, which cannot
+> import the package. `INVENTORY_SHA = policy.INVENTORY_SHA256` would have broken the worker. The patch
+> updates the literal and adds
+> `test_headless_inventory_pin_matches_the_kitty_catalogue`, so the two pins can never drift silently again.
