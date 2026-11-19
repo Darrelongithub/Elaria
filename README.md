@@ -27,6 +27,60 @@ the owner agrees with.
 
 ---
 
+## Wave 1: ownership and shared hook requests
+
+[`OWNERS.yaml`](OWNERS.yaml) assigns each repository path to one cluster. It uses
+JSON syntax within YAML 1.2 so the guard runs with only Python 3.11+ and Git.
+Globs are case-sensitive and relative to the repo root. `*`, `?`, and character
+classes match within one path segment; a trailing `/**` matches descendants.
+Every indexed path must match exactly one rule, even if two matching rules name
+the same cluster. A new path not covered by an existing rule needs a reviewed
+map-only change by Z before the feature edit can pass the guard. An ownership
+entry is not permission to start a held lane.
+
+```sh
+python scripts/check_ownership.py lint
+python scripts/check_ownership.py self-test
+python scripts/check_ownership.py check --cluster A --base <reviewed-base-sha> --staged
+python scripts/check_ownership.py check --cluster Z --base <reviewed-base-sha> --head <candidate-sha>
+```
+
+`lint` checks the worktree map against the index. `check` uses the reviewed
+base's map to authorize adds, deletions, and both endpoints of moves, then
+lints the candidate map against the candidate tree. Exit `0` means pass, `1`
+means a policy violation, and `2` means invalid input or a Git error. For a PR,
+the reviewer runs a trusted copy of the guard with a reviewed base SHA and the
+verified authoring cluster. `--cluster` does not authenticate authors or
+approve requests. There is no bypass for a feature agent editing Z-owned files.
+The initial bootstrap itself needs manual review because its parent has no map.
+
+### Intake and integration log
+
+File one [GitHub issue](https://github.com/Darrelongithub/Elaria/issues/new) per
+request. Use `HR-<cluster>-<n>: <short summary>` as the title; pick a unique,
+increasing number within your cluster. Include this payload in the issue body:
+
+```text
+HR-<cluster>-<n>: {files_needed:[...], contract_ref:"IF-x", rationale:"...", acceptance_delta:"..."}
+```
+
+Include repo-relative paths in `files_needed` and a measurable test outcome in
+`acceptance_delta`. Link the feature branch or PR if one exists. The feature
+cluster stubs against the frozen interface until the request lands; it does not
+edit Z's shared files.
+
+The [HR issue queue](https://github.com/Darrelongithub/Elaria/issues?q=is%3Aissue+in%3Atitle+HR-)
+is also the durable log. Z acknowledges requests in the issue, processes them
+one at a time in issue-number order (oldest first), and records any blocker in
+the issue instead of guessing or silently skipping it. Before changing runtime
+wiring, Z verifies the referenced contract against `CONTRACT-MANIFEST.sha256`.
+Each approved request gets one Z-authored commit (`[Z] Apply HR-<cluster>-<n>`),
+with no feature logic added to the daemon. Z posts the commit SHA, PR link, and
+test counts to the issue. Only the owner approves the PR; close the issue as
+landed after merge. Unmerged or blocked requests stay open.
+
+---
+
 ## ⚠️ Before anything live: two verifications only you can do
 
 This code was built and tested in a headless container (no Hyprland, no
