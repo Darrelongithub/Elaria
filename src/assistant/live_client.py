@@ -806,13 +806,23 @@ class GenaiLiveTransport:
         frames, so the type of a message is the set of populated fields —
         `message` counts every message, `server_content.*` and the top-level
         names count each field within it. Unparsed shapes are sampled.
+
+        H.2 (2026-10-27): EVERY counted type now appears in samples —
+        including `message`, the per-response total that read as an
+        unidentified payload type in scene 5/6 dumps. Each message's
+        sample names its populated fields/subtypes (text-only, ≤200
+        chars, never audio bytes), and a response with no populated
+        fields — a model notice/error shape the parser cannot name —
+        gets its own counted type so it can never hide in the total.
         """
         self._wire_counts["message"] += 1
         dumped = self._as_dict(response)
         if not dumped:
             self._wire_counts["unparsed.(unreadable)"] += 1
             self._sample_wire("unparsed.(unreadable)", response)
+            self._sample_wire("message", {"shape": ["(unreadable)"]})
             return
+        shape: list[str] = []
         for key, value in dumped.items():
             if value is None:
                 continue
@@ -821,12 +831,14 @@ class GenaiLiveTransport:
                     if sub_value is None:
                         continue
                     tag = f"server_content.{sub}"
+                    shape.append(tag)
                     self._wire_counts[tag] += 1
                     self._sample_wire(tag, {sub: sub_value})
                     if sub in ("input_transcription",
                                "interim_input_transcription"):
                         self._transcript_family += 1
             else:
+                shape.append(key)
                 self._wire_counts[key] += 1
                 self._sample_wire(key, {key: value})
                 if key == "voice_activity":
@@ -834,6 +846,16 @@ class GenaiLiveTransport:
                     kind = str(activity.get("voice_activity_type") or "")
                     if kind.upper().endswith("ACTIVITY_END"):
                         self._voice_end_seen = True
+        if shape:
+            self._sample_wire("message", {"shape": shape})
+        else:
+            # server_content present but nothing populated inside — the
+            # genuinely unidentified shape (model error/notice?). Names
+            # logged so the scene dump names it instead of guessing.
+            self._wire_counts["message.(no-populated-fields)"] += 1
+            self._sample_wire("message.(no-populated-fields)",
+                              {"keys": list(dumped)})
+            self._sample_wire("message", {"shape": ["(no-populated-fields)"]})
 
     def wire_stats(self) -> dict:
         """The F.1/F.3 sensors, flat and JSON-safe, for the close lines."""
