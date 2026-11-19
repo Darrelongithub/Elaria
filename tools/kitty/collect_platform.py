@@ -2,7 +2,8 @@
 """Fedora/OpenSSH metadata collector. BUILT FOR REVIEW; NOT AUTHORISED FOR OWNER RUN.
 
 No RC acts/connections, owner kitty/SSH config reads, shell, installs or executable overrides.
-Python stdlib only; fixed system query/decompression binaries must already exist.
+Python stdlib plus the in-repo pin module only; fixed system query/decompression binaries must
+already exist.
 Exit 0 = collection complete, NOT compatible, reconciled, semantic or hardware proof.
 """
 from __future__ import annotations
@@ -19,6 +20,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
+from assistant.hands.kitty import pin
 
 PACKAGES = ('kitty', 'kitty-kitten', 'kitty-shell-integration', 'kitty-terminfo',
             'openssh', 'openssh-clients')
@@ -304,7 +308,8 @@ def collect(output, *, runner=run_command, reader=read_document):
                   'python_version': sys.version.split()[0], 'child_home_changed': child_home_changed,
                   'collection_complete': not findings, 'compatibility_verified': False,
                   'hardware_proven': False, 'requires_manual_reconciliation': True,
-                  'source_pin': 'upstream kitty 0.47.1', 'owner_design_package_pin': '0.47.1-1.fc44',
+                  'source_pin': 'upstream kitty ' + pin.UPSTREAM_VERSION,
+                  'owner_design_package_pin': pin.OWNER_RPM_RULING,
                   'commands': commands, 'manuals': manuals, 'findings': findings,
                   'not_inspected': ['owner-kitty-config', 'effective-settings', 'rc-sockets',
                                     'owner-ssh-config', 'keys', 'agents', 'terminal-content',
