@@ -226,7 +226,7 @@ def test_a_silent_session_closes_without_ladder_and_marks_the_journal(
     # rule 5: a silent close costs zero Flash-Lite / TTS calls — the only
     # ledger row is the honest housekeeping row for the Live session itself.
     day = day_start_iso()
-    assert store.calls_since(day, model="gemini-flash-lite-latest") == 0
+    assert store.calls_since(day, model="gemini-3.5-flash-lite") == 0
     assert store.user_turn_calls_since(day) == 0
 
 
@@ -265,7 +265,7 @@ def test_b_below_floor_noise_with_garbage_transcript_is_silence(
     # the frames DID pass the old RMS gate — the floor is what decided this
     assert stats["peak_rms"] >= 0.01
     day = day_start_iso()
-    assert store.calls_since(day, model="gemini-flash-lite-latest") == 0
+    assert store.calls_since(day, model="gemini-3.5-flash-lite") == 0
 
 
 def test_b2_floor_is_configurable_and_decides_the_verdict(tmp_path, monkeypatch):
@@ -511,7 +511,7 @@ def test_a2_daemon_silent_session_no_voice_no_popup_and_a_console_line(
     # rule 5: quota counters did not move
     day = day_start_iso()
     assert status["quota_today_live_calls"] == 0
-    assert daemon.store.calls_since(day, model="gemini-flash-lite-latest") == 0
+    assert daemon.store.calls_since(day, model="gemini-3.5-flash-lite") == 0
     assert daemon.store.user_turn_calls_since(day) == 0
 
 
@@ -546,7 +546,7 @@ def test_b3_daemon_garbage_from_room_noise_never_reaches_a_reply(
     assert "session.silent_close" in kinds
     day = day_start_iso()
     assert daemon.store.user_turn_calls_since(day) == 0
-    assert daemon.store.calls_since(day, model="gemini-flash-lite-latest") == 0
+    assert daemon.store.calls_since(day, model="gemini-3.5-flash-lite") == 0
 
 
 def test_c2_daemon_one_real_word_still_gets_its_reply_path(

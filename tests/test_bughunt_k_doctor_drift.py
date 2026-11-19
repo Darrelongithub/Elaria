@@ -115,8 +115,11 @@ def test_present_hyprland_binds_are_ok(tmp_path):
     hypr = home / ".config" / "hypr"
     hypr.mkdir(parents=True)
     (hypr / "hyprland.conf").write_text(
+        # The escape/cancel bind is part of the canonical set since Task K/F30
+        # (owner ruling 2026-11-15), so a deployment without it is NOT complete.
         "bind = SUPER, grave, exec, assist ptt start\n"
-        "bindr = SUPER, grave, exec, assist ptt stop\n"
+        "bindri = SUPER, grave, exec, assist ptt stop\n"
+        "bind = , Escape, exec, assist ptt cancel\n"
         "bind = SUPER SHIFT, F12, exec, assist halt\n")
     checks = _deployment_drift_checks(repo, home, {}, sound=SOUND)
     assert _by_name(checks, "hyprland binds")["status"] == "ok"
