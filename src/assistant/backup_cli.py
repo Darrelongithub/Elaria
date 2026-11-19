@@ -29,18 +29,21 @@ Evidence tags: `[TESTED-ONLY]`. Nothing here contacts a network in the sandbox.
 from __future__ import annotations
 
 import random
+import subprocess
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
 from . import preflight, sensors
-from .backup import plan_reconcile, reconcile_all
+from .backup import reconcile_all
 from .remote import LocalPathBackend, Verification, make_verifier
+from .safety import try_sha256_file
 from .storage import StorageManifest
 from .tiering import (
     DEFAULT_WINDOW_DAYS,
     DEFAULT_WINDOW_GB,
+    TrashMover,
     scan,
 )
 
@@ -63,6 +66,56 @@ class Restorer(Protocol):
 
     def restore(self, artifact: Path, dest: Path) -> Path:
         ...
+
+
+class ResticRestorer:
+    """Read a single absolute snapshot path, not a matching basename or a tree."""
+
+    def __init__(self, backend, timeout: str):
+        self.name = f"restic:{backend.name}"
+        self.repo = f"rclone:{backend.remote}:{backend.path}"
+        self.timeout = timeout
+
+    def restore(self, artifact: Path, dest: Path) -> Path:
+        if not artifact.is_absolute() or ".." in artifact.parts:
+            raise OSError("expected an absolute manifest path")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as sink:
+            staged = Path(sink.name)
+        try:
+            with staged.open("wb") as output:
+                subprocess.run(["restic", "-r", self.repo, "-o", f"rclone.timeout={self.timeout}",
+                                "dump", "latest", str(artifact)], stdout=output,
+                               stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                               check=True, timeout=600)
+            staged.replace(dest)
+        except subprocess.SubprocessError as exc:
+            raise OSError("restic dump failed") from exc
+        finally:
+            staged.unlink(missing_ok=True)
+        return dest
+
+
+class AudioMovers:
+    """Constrain the generic TrashMover to files in the dedicated backup trees."""
+
+    def __init__(self, data_dir: Path):
+        self.root = data_dir.resolve()
+        self.audio = self.root / "audio"
+        self.trash = self.root / "backup" / "trash"
+        self.mover = TrashMover(self.trash)
+
+    def trim(self, path: Path) -> Path:
+        if (path.resolve() != path or not path.is_relative_to(self.audio)
+                or not path.is_file() or path.suffix.lower() != ".wav"
+                or self.trash.resolve() != self.trash):
+            raise OSError("not a regular capture in the audio tree")
+        return self.mover.move(path)
+
+    def purge(self, path: Path) -> bool:
+        if path.resolve() != path or path.parent != self.trash or not path.is_file():
+            raise OSError("not a regular file in backup trash")
+        return self.mover.purge(path)
 
 
 class LocalPathRestorer:
@@ -221,21 +274,44 @@ def build_context(config, *, now=None, read_quota: bool = True) -> BackupContext
     manifest = StorageManifest(config.data_dir / "backup" / "manifest.jsonl")
     remote = (section.get("rclone_remote") or "").strip()
     verifier = None
+    restorer = None
     backend = None
     remote_free_bytes = None
     if remote:
         from .remote import RcloneBackend
 
         backend = RcloneBackend(remote, path=section.get("rclone_path") or "")
-        verifier = make_verifier(backend)
+        restorer = ResticRestorer(backend, section.get("restic_timeout", "5m"))
+
+        def verifier(artifact):
+            # rclone lsjson sees restic pack objects, not files inside snapshots.
+            # Never authorize a trim from a coincidentally matching object name.
+            pin = backend.pin_status()
+            if not pin.confirmed:
+                return pin
+            record = manifest.current().get(str(artifact))
+            if record is None or not record.sha256:
+                return Verification(restorer.name, False, "hash", "missing manifest hash")
+            try:
+                with tempfile.TemporaryDirectory(prefix="elaria-verify-") as scratch:
+                    restored = restorer.restore(Path(artifact), Path(scratch) / "artifact")
+                    matches = try_sha256_file(restored) == record.sha256
+            except OSError:
+                return Verification(restorer.name, False, "hash", "snapshot read failed")
+            return Verification(restorer.name, matches, "hash", "match" if matches else "mismatch")
+
         # F24: the headroom gate needs a READING, not an assumption. Without this the
         # gate would refuse every real run forever, because nothing produced its input —
         # and a gate that can never open is a gate that has been silently switched off.
         # `read_quota=False` lets a caller build a context without touching the remote.
         if read_quota:
             remote_free_bytes = backend.remote_free()
+    movers = AudioMovers(config.data_dir) if remote else None
     return BackupContext(
         manifest,
+        restorer=restorer,
+        trim_mover=movers.trim if movers else None,
+        purge_mover=movers.purge if movers and int(section.get("trim_grace_days", 14)) > 0 else None,
         data_dir=config.data_dir,
         verifier=verifier,
         backend=backend,
@@ -262,8 +338,10 @@ def _status(ctx: BackupContext, out) -> int:
     print(ctx.manifest.summary(), file=out)
     print(f"hot={gauge.hot_bytes}B cold={gauge.cold_bytes}B "
           f"artifacts={gauge.hot_count + gauge.cold_count}", file=out)
+    if gauge.hot_count + gauge.cold_count == 0:
+        print("0 manifest records; not a count of discovered files", file=out)
     if not gauge.remote_free_known:
-        print("remote_free=unknown (no remote configured)", file=out)
+        print("remote_free=unknown (no quota reading)", file=out)
     elif gauge.below_floor():
         print("CAPACITY FLOOR BREACHED — the designed pressure gauge has fired",
               file=out)
@@ -271,39 +349,33 @@ def _status(ctx: BackupContext, out) -> int:
 
 
 def _resolve_artifact(ctx: BackupContext, artifact: str) -> tuple[Path | None, str]:
-    """Find the manifest key for a user-supplied artifact name.
-
-    The manifest keys are absolute paths, and asking an owner to retype an absolute path
-    to get their own audio back is a poor trade. So the lookup tries, in order:
-
-    1. the string exactly as given, expanded;
-    2. that path resolved against the filesystem (symlinks, `..`, a relative path);
-    3. the same name relative to the audio root this context scans.
-
-    Each step is deterministic — it never searches for a *similar* name, because a
-    basename match across several captures would be a silent substitution, and this lane's
-    rule is no substitution. If none of the three hit, the caller refuses.
-    """
-
+    """Prefer exact manifest keys and stems; accept only a unique bare WAV prefix."""
     current = ctx.manifest.current()
+    if not artifact.strip():
+        return None, "no manifest record"
     given = Path(artifact).expanduser()
-    tried = [str(given)]
+    audio = ctx.data_dir / "audio"
     candidates = [given]
     try:
-        resolved = given.resolve()
-        if str(resolved) not in tried:
-            tried.append(str(resolved))
-            candidates.append(resolved)
-    except OSError:
+        candidates.append(given.resolve())
+    except (OSError, RuntimeError):
         pass
-    audio_relative = ctx.data_dir / "audio" / given.name
-    if str(audio_relative) not in tried:
-        tried.append(str(audio_relative))
-        candidates.append(audio_relative)
-    for candidate in candidates:
-        record = current.get(str(candidate))
-        if record is not None:
-            return candidate, str(candidate)
+    if not given.is_absolute() and ".." not in given.parts:
+        candidates.append(ctx.data_dir / given if given.parts[:1] == ("audio",) else audio / given)
+    for path in candidates:
+        names = [path]
+        if path.name and not path.suffix:
+            names.append(path.with_name(path.name + ".wav"))
+        for candidate in names:
+            if str(candidate) in current:
+                return candidate, str(candidate)
+    if given.name == artifact and not given.suffix and given.name:
+        matches = [p for key in current if (p := Path(key)).parent == audio
+                   and p.suffix == ".wav" and p.stem.startswith(artifact)]
+        if len(matches) == 1:
+            return matches[0], str(matches[0])
+        if len(matches) > 1:
+            return None, "ambiguous artifact prefix"
     return None, "no manifest record"
 
 
@@ -313,7 +385,7 @@ def _fetch(ctx: BackupContext, artifact: str, *, dest: str | None, out) -> int:
     path, _key = _resolve_artifact(ctx, artifact)
     record = ctx.manifest.current().get(str(path)) if path is not None else None
     if record is None:
-        print("backup fetch: no manifest record for that artifact", file=out)
+        print(f"backup fetch: {_key} for that artifact", file=out)
         return 2
     if record.state not in _COLD_STATES:
         print(f"backup fetch: that artifact is {record.state}, not cold; "
@@ -327,27 +399,24 @@ def _fetch(ctx: BackupContext, artifact: str, *, dest: str | None, out) -> int:
     target = Path(dest).expanduser() if dest else Path(
         tempfile.mkdtemp(prefix="elaria-restore-")) / path.name
     try:
-        restored = ctx.restorer.restore(path, target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=target.parent) as scratch:
+            restored = ctx.restorer.restore(path, Path(scratch) / "artifact")
+            if not record.sha256 or try_sha256_file(restored) != record.sha256:
+                sensors.backup_verify(backend=ctx.restorer.name, method="hash",
+                                      confirmed=False, stream=out)
+                print("backup fetch: restored copy does not match the manifest hash", file=out)
+                return 1
+            restored.replace(target)
     except (OSError, FileNotFoundError) as exc:
         sensors.backup_failed(reason=f"restore failed ({type(exc).__name__})",
                               stream=out)
         print(f"backup fetch: restore failed ({type(exc).__name__})", file=out)
         return 1
 
-    from .safety import try_sha256_file
-
-    actual = try_sha256_file(restored)
-    expected = record.sha256
-    if expected and actual != expected:
-        sensors.backup_verify(backend=ctx.restorer.name, method="hash",
-                              confirmed=False, stream=out)
-        print("backup fetch: restored copy does not match the manifest hash; "
-              "refusing to call this a restore", file=out)
-        return 1
-
     sensors.backup_verify(backend=ctx.restorer.name, method="hash",
                           confirmed=True, stream=out)
-    print(f"restored: {restored}", file=out)
+    print(f"restored: {target}", file=out)
     print(f"backend: {ctx.restorer.name}  hash: verified", file=out)
     return 0
 
@@ -361,7 +430,7 @@ def _run(ctx: BackupContext, *, out, dry_run: bool = False) -> int:
         # scan() walks the tree AND classifies — it is the belt, and the directory poll
         # is truth. Classifying its result again would be classifying a decision.
         decision = scan(ctx.data_dir, now=ctx.now or _fallback_now(),
-                        data_dir=ctx.data_dir, window_days=ctx.window_days,
+                        data_dir=ctx.data_dir, extra=("backup",), window_days=ctx.window_days,
                         window_gb=ctx.window_gb)
     except OSError as exc:
         sensors.backup_failed(reason=f"scan failed ({type(exc).__name__})", stream=out)
@@ -379,7 +448,7 @@ def _run(ctx: BackupContext, *, out, dry_run: bool = False) -> int:
         sensors.backup_done(sent_cold=len(decision.send_cold),
                             kept_hot=len(decision.keep_hot), stream=out)
         print(decision.summary(), file=out)
-        print("dry run: no manifest change, no remote traffic", file=out)
+        print("dry run: no manifest change, no remote traffic; sent_cold is classification only", file=out)
         return 0
 
     # F24 remote pre-flight, before any planning. The capacity-floor knock must
@@ -390,6 +459,7 @@ def _run(ctx: BackupContext, *, out, dry_run: bool = False) -> int:
         sensors.backup_failed(reason=f"headroom refused ({gate.reason})", stream=out)
         print(f"backup run: REFUSED - {gate.detail()}", file=out)
         return 2
+    print(f"backup run: {gate.detail()}", file=out)
 
     if ctx.verifier is None:
         sensors.backup_failed(reason="no remote verifier configured", stream=out)
@@ -397,24 +467,20 @@ def _run(ctx: BackupContext, *, out, dry_run: bool = False) -> int:
               "that cannot be confirmed", file=out)
         return 2
 
-    plan = plan_reconcile(ctx.manifest, now=ctx.now or _fallback_now(),
-                          verify_remote=ctx.verifier,
-                          grace_days=ctx.grace_days)
-    if dry_run:
-        pass
-    else:
-        reconcile_all(ctx.manifest, now=ctx.now or _fallback_now(),
-                      verify_remote=ctx.verifier, trim_mover=ctx.trim_mover,
-                      purge_mover=ctx.purge_mover, grace_days=ctx.grace_days)
-
+    before = len(ctx.manifest.records())
+    plan = reconcile_all(ctx.manifest, now=ctx.now or _fallback_now(),
+                         verify_remote=ctx.verifier, trim_mover=ctx.trim_mover,
+                         purge_mover=ctx.purge_mover, grace_days=ctx.grace_days)
+    recorded = ctx.manifest.records()[before:]
     sensors.backup_done(
         sent_cold=len(decision.send_cold), kept_hot=len(decision.keep_hot),
-        trimmed=sum(1 for a in plan.actions if a.to_state == "trashed"),
-        purged=sum(1 for a in plan.actions if a.to_state == "purged"),
+        trimmed=sum(1 for r in recorded if r.state == "trashed"),
+        purged=sum(1 for r in recorded if r.state == "purged"),
         problems=len(plan.problems), passes=1, stream=out)
     print(decision.summary(), file=out)
     print(plan.summary(), file=out)
-    return 0
+    print(f"new_manifest_records={len(recorded)}; sent_cold is classification only", file=out)
+    return 1 if plan.problems else 0
 
 
 def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
@@ -484,7 +550,7 @@ def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
         chosen.size if chosen.size is not None else 0, margin_bytes=margin)
     local_gate = ctx.local_preflight(required_bytes=required,
                                       artifact_bytes=chosen.size or 0,
-                                      margin_bytes=margin)
+                                      margin_bytes=margin, directory=tempfile.gettempdir())
     if not local_gate.ok:
         sensors.backup_check(kind=kind, ok=False,
                              detail=f"reason=local headroom ({local_gate.reason}); "
@@ -497,10 +563,12 @@ def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
                       now=now)
         return 2
 
-    target = Path(tempfile.mkdtemp(prefix="elaria-drill-")) / Path(
-        chosen.artifact).name
+    print(f"backup check: {local_gate.detail()}", file=out)
     try:
-        restored = ctx.restorer.restore(Path(chosen.artifact), target)
+        with tempfile.TemporaryDirectory(prefix="elaria-drill-") as scratch:
+            target = Path(scratch) / Path(chosen.artifact).name
+            restored = ctx.restorer.restore(Path(chosen.artifact), target)
+            actual = try_sha256_file(restored)
     except (OSError, FileNotFoundError) as exc:
         sensors.backup_check(kind=kind, ok=False,
                              detail=f"reason=restore failed ({type(exc).__name__})",
@@ -510,20 +578,22 @@ def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
                       detail=f"restore=failed ({type(exc).__name__})", now=now)
         return 1
 
-    from .safety import try_sha256_file
-
-    actual = try_sha256_file(restored)
     ok = bool(chosen.sha256) and actual == chosen.sha256
+    hash_result = "verified" if ok else "MISMATCH"
+    check_result = "not run"
+    if ok and restic is not None:
+        ok, _ = restic.run()
+        check_result = "passed" if ok else "FAILED"
     sensors.backup_check(
         kind=kind, ok=ok,
         detail=f"backend={ctx.restorer.name}; method=hash; "
-               f"hash_ok={'yes' if ok else 'no'}",
+               f"hash={hash_result}; restic={check_result}",
         stream=out)
     print(f"backup check: {'passed' if ok else 'FAILED'} "
-          f"(restored 1 artifact, hash {'verified' if ok else 'MISMATCH'})",
+          f"(restored 1 artifact, hash {hash_result}; restic check: {check_result})",
           file=out)
     _record_drill(journal, kind=kind, ok=ok, ctx=ctx, restic=restic,
-                  detail=f"restore=ok; hash={'ok' if ok else 'MISMATCH'}",
+                  detail=f"restore=ok; hash={hash_result}; restic={check_result}",
                   now=now)
     return 0 if ok else 1
 
@@ -631,8 +701,10 @@ def backup_command(args, config, *, out=None, ctx: BackupContext | None = None) 
     import sys
 
     out = out if out is not None else sys.stdout
-    ctx = ctx if ctx is not None else build_context(config)
     action = getattr(args, "backup_action", "status")
+    if ctx is None:
+        read_quota = action == "status" or (action == "run" and not getattr(args, "dry_run", False))
+        ctx = build_context(config, read_quota=read_quota)
 
     if action == "status":
         return _status(ctx, out)
@@ -644,7 +716,13 @@ def backup_command(args, config, *, out=None, ctx: BackupContext | None = None) 
         if getattr(args, "last", False):
             _last_drill(ctx, kind=getattr(args, "kind", "monthly"), out=out)
             return 0
-        return _check(ctx, artifact=getattr(args, "artifact", None),
+        restic = None
+        if getattr(args, "kind", "monthly") == "monthly" and isinstance(ctx.restorer, ResticRestorer):
+            from .drill import ResticCheck
+
+            restic = ResticCheck(ctx.restorer.repo, remote=ctx.backend.remote,
+                                 path=ctx.backend.path, timeout=ctx.restorer.timeout)
+        return _check(ctx, artifact=getattr(args, "artifact", None), restic=restic,
                       kind=getattr(args, "kind", "monthly"), out=out,
                       journal=_drill_journal(ctx) if getattr(args, "record", False)
                       else None,

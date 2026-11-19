@@ -120,21 +120,29 @@ need restic
 need rclone
 need python3
 
-REPO_DEFAULT="${RESTIC_REPOSITORY_BASE}-default"
-REPO_ALT="${RESTIC_REPOSITORY_BASE}-pack${BENCH_PACK_ALT}"
+# Accept the historical remote:path input or its explicit restic form.
+rclone_base=${RESTIC_REPOSITORY_BASE#rclone:}
+[[ $rclone_base =~ ^[[:alnum:]_][[:alnum:]_.-]*:[^:]+$ ]] || die "expected remote:path scratch base"
+REPO_DEFAULT="${rclone_base}-default"
+REPO_ALT="${rclone_base}-pack${BENCH_PACK_ALT}"
 
-# Refuse to run over an existing scratch repo: a re-run must never silently
-# overwrite a measurement the design chat has not seen yet. (One listing per
-# repo — MEGA listings are slow, and this guard runs four times.)
-scratch_present() {
-  local listing
-  listing="$(rclone lsf "$1" 2>/dev/null || true)"
-  [ -n "$listing" ]
+check_scratch() {
+  local listing status
+  if listing="$(rclone lsf "$1")"; then
+    [ -z "$listing" ] || die "scratch repo already contains objects"
+    say "scratch listing: exit=0 entries=0 (empty listing, not a quota check)"
+  else
+    status=$?
+    [ "$status" -eq 3 ] || die "scratch listing failed exit=$status; not proof of absence"
+    say "scratch listing: exit=3 (directory not found)"
+  fi
 }
-scratch_present "$REPO_DEFAULT" && die "scratch repo $REPO_DEFAULT already exists — remove it deliberately first (see scene sheet cleanup)"
-scratch_present "$REPO_ALT" && die "scratch repo $REPO_ALT already exists — remove it deliberately first (see scene sheet cleanup)"
+check_scratch "$REPO_DEFAULT"
+check_scratch "$REPO_ALT"
 
+umask 077
 mkdir -p "$BENCH_LOCAL"
+BENCH_LOCAL="$(mktemp -d -- "$(cd "$BENCH_LOCAL" && pwd)/run-XXXXXXXX")"
 export TMPDIR="$BENCH_LOCAL/tmp"
 mkdir -p "$TMPDIR"
 
@@ -169,7 +177,7 @@ hr
 
 # bench_repo <repo> <pack-size-or-empty> <label>
 bench_repo() {
-  local repo="$1" pack="$2" label="$3"
+  local rclone_repo="$1" repo="rclone:$1" pack="$2" label="$3"
   local init_args=() backup_args=()
 
   init_args=(-r "$repo" --password-file "$RESTIC_PASSWORD_FILE"
@@ -200,37 +208,14 @@ bench_repo() {
 
   # total_bytes_processed / data_added come from restic's JSON "summary" message.
   local bytes_proc bytes_added
-  bytes_proc="$(printf '%s\n' "$backup_json" | python3 -c '
+  local totals
+  totals="$(printf '%s\n' "$backup_json" | python3 -c '
 import sys, json
-best = {}
-for line in sys.stdin:
-    line = line.strip()
-    if not line.startswith("{"):
-        continue
-    try:
-        msg = json.loads(line)
-    except ValueError:
-        continue
-    if msg.get("message_type") == "summary":
-        best = msg
-print(best.get("total_bytes_processed", 0))
-' 2>/dev/null || echo 0)"
-  bytes_added="$(printf '%s\n' "$backup_json" | python3 -c '
-import sys, json
-best = {}
-for line in sys.stdin:
-    line = line.strip()
-    if not line.startswith("{"):
-        continue
-    try:
-        msg = json.loads(line)
-    except ValueError:
-        continue
-    if msg.get("message_type") == "summary":
-        best = msg
-print(best.get("data_added", 0))
-' 2>/dev/null || echo 0)"
-
+rows = [json.loads(line) for line in sys.stdin if line.strip()]
+summary, = [row for row in rows if row.get("message_type") == "summary"]
+print(int(summary["total_bytes_processed"]), int(summary["data_added"]))
+')" || die "missing or invalid backup summary; bytes unknown"
+  read -r bytes_proc bytes_added <<< "$totals"
   say "backup wall_s     : $t_backup"
   say "bytes processed   : $bytes_proc ($(mib "$bytes_proc") MiB)"
   say "bytes added to repo: $bytes_added ($(mib "$bytes_added") MiB)"
@@ -244,8 +229,8 @@ print(best.get("data_added", 0))
   [ -n "$snap" ] || die "could not read back the snapshot id for $label"
 
   local pack_files index_files
-  pack_files="$(rclone lsf "$repo/data" 2>/dev/null | wc -l | tr -d ' ')"
-  index_files="$(rclone lsf "$repo/index" 2>/dev/null | wc -l | tr -d ' ')"
+  pack_files="$(rclone lsf --recursive --files-only "$rclone_repo/data" 2>/dev/null | wc -l | tr -d ' ')"
+  index_files="$(rclone lsf --files-only "$rclone_repo/index" 2>/dev/null | wc -l | tr -d ' ')"
   say "remote data objects: $pack_files"
   say "remote index objects: $index_files"
   say "remote objects total: $(( pack_files + index_files ))"
@@ -255,7 +240,7 @@ print(best.get("data_added", 0))
   #    artifact. --no-lock is used so the number measures the fetch, not lock
   #    contention on the MEGA backend.
   local fetch_dir="$BENCH_LOCAL/fetch-$label"
-  rm -rf "$fetch_dir"; mkdir -p "$fetch_dir"
+  mkdir "$fetch_dir"
   local n=0 sample times="" t_all=0 t_min=999999 t_max=0
   while [ "$n" -lt "$BENCH_FETCH_SAMPLES" ]; do
     local target
@@ -278,7 +263,6 @@ print(best.get("data_added", 0))
 
   # 5. one full ~500 MB restore ---------------------------------------------
   local restore_dir="$BENCH_LOCAL/restore-$label"
-  rm -rf "$restore_dir"
   run_timed "restore $label" restic \
     -r "$repo" --password-file "$RESTIC_PASSWORD_FILE" \
     -o "rclone.timeout=$RCLONE_TIMEOUT" \

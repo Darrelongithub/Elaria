@@ -289,10 +289,8 @@ def _trashed_as(detail: str) -> str:
     is recovered from, and it is why `reconcile()` records it in the first place.
     """
 
-    for part in (detail or "").split("; "):
-        if part.startswith("trashed_as="):
-            return part[len("trashed_as="):]
-    return ""
+    # The recorded path itself may contain a semicolon and a space.
+    return ("; " + (detail or "")).partition("; trashed_as=")[2]
 
 
 def _parse_ts(value: str):
