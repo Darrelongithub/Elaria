@@ -64,9 +64,10 @@ DEFERRED_MARKER = ("[seg {index:03d} transcription failed/deferred — "
                    "audio kept: {wav}]")
 NO_SIGNAL_MARKER = "[seg {index:03d}: no signal detected]"
 
-# Event-transport contract interface stub (HR-G-1 pending Z daemon/config wiring;
-# IF-4 frozen contract file pending verification). Fail closed on unknown states
-# and reject simulate=True unless explicitly opted in for non-transport callers.
+# Event-transport contract interface (IF-4-console-general.md verified on Drive:
+# sha256 387fa0847798cda08a92d344c08b5eecb9b1a937aaa255cdfec62bf651914f5e;
+# HR-G-1 pending Z daemon/config wiring). Fail closed on unknown states and
+# reject simulate=True unless explicitly opted in for non-transport callers.
 EVENT_STATES = frozenset({
     "not-running", "running", "stopping", "stopped",
     "recovered", "already-event", "needs-battery-ok", "refused",
@@ -1586,7 +1587,15 @@ class EventService:
                 disk_free_bytes=free_disk_bytes(events_root(self.config)),
                 calls_used=self._quota_ledger.used_today(), budget=self._budget)
 
-        level = self._level_check()
+        if self._level_checker is not None:
+            level = self._level_checker()
+        elif source == "simulated" or (source is not None and not isinstance(source, str)):
+            level = {"available": False, "signal": False,
+                     "target": getattr(source, "target", None) or "simulated",
+                     "reason": "simulated source" if source == "simulated"
+                     else "explicit source"}
+        else:
+            level = self._level_check()
         if power.get("on_battery") and not battery_ok:
             report = build_report({"held": False, "reason": "not acquired"})
             return {"state": "needs-battery-ok", "preflight": report}

@@ -242,7 +242,8 @@ async def test_event_service_emits_documented_lifecycle_shapes_to_async_transpor
 
     # 3 frames rotate segment 1 -> opens segment 2, closes & transcribes segment 1
     await source.push(3)
-    await asyncio.sleep(0.02)
+    assert service._queue is not None
+    await asyncio.wait_for(service._queue.drain(), timeout=2.0)
     switch_out = service.speaker_switch("John")
     assert switch_out["active_speaker"] == "John"
 
@@ -314,3 +315,31 @@ async def test_event_service_emits_deferred_error_and_recovered_shapes(config):
     assert len(recovered_frames) == 1
     assert recovered_frames[0]["event"] == "event.recovered"
     _assert_valid_frame(recovered_frames[0])
+
+
+async def test_simulated_source_never_invokes_pipewire_even_when_pw_record_present(
+    config, monkeypatch,
+):
+    """Regression guard for owner Fedora hosts with pw-record installed:
+    `source='simulated'` must bypass both PipeWireCapture and live_level_check."""
+    import assistant.capture as capture_mod
+    from assistant.event import EventService
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("PipeWire / live_level_check must not run under source='simulated'")
+
+    monkeypatch.setattr(capture_mod, "PipeWireCapture", fail_if_called)
+    monkeypatch.setattr(capture_mod, "live_level_check", fail_if_called)
+
+    service = EventService(
+        config, None,
+        transcribe_fn=lambda _p: asyncio.sleep(0, result="ok"),
+        power_probe=lambda: {"on_battery": False},
+    )
+    out = await service.start(
+        source="simulated", title="SimulatedSafe", battery_ok=True, no_transcribe=True,
+    )
+    assert out["state"] == "event"
+    assert out["preflight"]["mic"]["reason"] == "simulated source"
+    await service.stop()
+    await asyncio.gather(*service._background_queues, return_exceptions=True)

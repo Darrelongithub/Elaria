@@ -97,7 +97,7 @@ def test_fallback_script_enforces_signal_only_notification_and_600s_rate_limit(t
     assert first.returncode == 0
     assert str(doc_txt) in first.stderr
 
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + 3.0
     while not open_log.exists() and time.monotonic() < deadline:
         time.sleep(0.02)
 

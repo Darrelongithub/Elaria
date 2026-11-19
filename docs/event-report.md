@@ -80,29 +80,41 @@ Gate 2 checklist: [`EVENT-MODE-HARDWARE-CHECKLIST.md`](EVENT-MODE-HARDWARE-CHECK
 
 ## Wave-1 Cluster G addendum (2026-11-19)
 
-- **Event transport contract (`IF-4` stub in `src/assistant/event.py`):**
-  added `EVENT_STATES`, `EVENT_ROUTES`, `EVENT_TRANSPORT_MODES`,
-  `EVENT_TRANSPORT_SCHEMAS`, `validate_event_state`, `validate_event_route`,
-  `build_event_transport_frame`, `on_event` dispatch (`sync` + `async`),
-  `simulate: bool = False` fail-closed enforcement, and `recent_events()`
-  inspection across all 10 lifecycle/error/recovery frames (`event.started`,
-  `event.segment.opened`, `event.segment.closed`, `event.segment.transcribed`,
-  `event.segment.deferred`, `event.speaker.changed`, `event.stopping`,
-  `event.stopped`, `event.recovered`, `event.error`). Unknown states, unknown
-  routes, `simulate=True`, missing required fields, and non-finite floats throw
+- **Event transport contract (`IF-4-console-general.md` verified in `src/assistant/event.py`):**
+  verified `IF-4-console-general.md` on Drive (raw SHA256
+  `387fa0847798cda08a92d344c08b5eecb9b1a937aaa255cdfec62bf651914f5e` matches
+  `MANIFEST.sha256`). Implemented `EVENT_STATES`, `EVENT_ROUTES`,
+  `EVENT_TRANSPORT_MODES`, `EVENT_TRANSPORT_SCHEMAS`, `validate_event_state`,
+  `validate_event_route`, `build_event_transport_frame`, `on_event` dispatch
+  (`sync` + `async`), `simulate: bool = False` fail-closed enforcement, and
+  `recent_events()` inspection across all 10 lifecycle/error/recovery frames
+  (`event.started`, `event.segment.opened`, `event.segment.closed`,
+  `event.segment.transcribed`, `event.segment.deferred`,
+  `event.speaker.changed`, `event.stopping`, `event.stopped`,
+  `event.recovered`, `event.error`). Unknown states, unknown routes,
+  `simulate=True`, missing required fields, and non-finite floats throw
   `ValueError`. Wiring `on_event=self.broadcast` inside `src/assistant/daemon.py`
   and any `[quota]` config keys in `src/assistant/config.py` remain queued to
   Z under `HR-G-1`.
 - **Quota & preflight consistency:** fixed `EventService.start()` preflight to
-  read `self._quota_ledger.used_today()` instead of hardcoding `0`, and aligned
-  `status_from_disk()` `calls.reserve` with `EventService.status()`. Numerically
-  verified `batch` `rpd=25` (LA calendar-day ledger, cross-route isolated),
-  `reserve=2` blocking at 23 used and opening calls 24–25 strictly for the
-  closing segment before stopping at 25, retry cap=2 (`max_attempts=3`,
-  exponential `2 s` / `4 s` + `0–30%` jitter, `deferred_retries=0`), `live`
+  read `self._quota_ledger.used_today()` instead of hardcoding `0`, aligned
+  `status_from_disk()` `calls.reserve` with `EventService.status()`, and ensured
+  `source="simulated"` / explicit non-string test sources bypass host
+  `PipeWireCapture` and `live_level_check` (`pw-record`). Numerically verified
+  `batch` `rpd=25` (LA calendar-day ledger, cross-route isolated), `reserve=2`
+  blocking at 23 used and opening calls 24–25 strictly for the closing segment
+  before stopping at 25, retry cap=2 (`max_attempts=3`, exponential `2 s` /
+  `4 s` + `0–30%` jitter, `deferred_retries=0`), `live`
   `20,000 TPM * 0.7 = 14,000` estimated tok/min chunk splitting and 60 s window
   wait, `NO_SIGNAL_PEAK=0.005`, and disk checks (`< 115,200,000` B refuse /
   `< 10 h` warn).
+- **Deterministic CLI smoke & queue/fallback tests:** eliminated the host
+  PipeWire/wall-clock race behind the owner-reported `_wait_segments` timeout
+  (`tests/test_event_cli_smoke.py`) by passing `--source simulated`, isolating
+  tests from host `pw-record`, and driving rotation via a deterministic clock +
+  `event.segment.opened` signal; also replaced wall-clock sleeps in
+  `tests/test_event_pre_event_fixes.py` and
+  `tests/test_event_transport_contract.py` with event/queue-drain waits.
 - **Fallback script & historical spike records preserved:** synced
   `scripts/event-console-fallback.sh` (`25be847`: 600 s rate limit + static
   signal-only notification body) and `docs/event-spike.json` (`7133801`:
@@ -110,8 +122,9 @@ Gate 2 checklist: [`EVENT-MODE-HARDWARE-CHECKLIST.md`](EVENT-MODE-HARDWARE-CHECK
   `arena/c2a7085d-elaria@77143d9`. Preserved `event_spike._restate_batch_math`
   figures (10 h event at 30 min = `20` calls vs `25` RPD, `headroom=5`; at
   15 min = `40` calls vs `25` RPD, does not fit).
-- **Test status (2026-11-19):** `82` event tests (`tests/test_event_*.py`),
-  **1,791 passed, 6 skipped** full suite, `ruff check .` clean,
+- **Test status (2026-11-19):** `83` event tests (`tests/test_event_*.py`,
+  zero host `pw-record` invocations), **`1,792 passed, 6 skipped`** full suite
+  (`BASELINE=1780 DELTA=+12` vs `origin/main@a2eec68`), `ruff check .` clean,
   `bash -n scripts/event-console-fallback.sh` and `git diff --check` clean.
   Real hardware gates (`Gate 2` 1–8, `Gate 3` 1 h soak, `Gate 4` far-field) and
   the real-key 30-min batch provider spike remain unexecuted in sandbox.
