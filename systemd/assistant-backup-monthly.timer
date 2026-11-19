@@ -1,0 +1,26 @@
+[Unit]
+Description=Elaria — WP7 monthly integrity drill trigger (WP5 monthly shape)
+Documentation=file:%h/Elaria/docs/storage-handoff.md
+
+[Timer]
+# The WP5 monthly trigger shape. Frequency is MONTHLY and stays MONTHLY: Q24 ruled
+# (c)-then-(a) — monthly until Sheet 1 measures the end-to-end restic-over-MEGA ratio.
+# Fortnightly is a measured, owner-available option (17.2–21.1 months to the knock) that
+# ONLY the owner may pick, by number, on their own initiative. Weekly is ruled out
+# (8.6–10.5). This lane does not re-propose frequency absent an owner word.
+#
+# First day of the month, 04:11 — an hour after the nightly pass, so the drill sees a
+# repository that tonight's run already reconciled rather than racing it.
+OnCalendar=*-*-01 04:11:00
+# Persistent=true here too, and it matters MORE than on the nightly timer: a drill that
+# silently does not happen is the failure mode this whole lane exists to prevent. A
+# machine that was off on the 1st runs its drill on the next boot. Per systemd.timer(5),
+# multiple elapses in one continuous sleep still collapse to a single activation — a
+# laptop closed for a whole month runs ONE drill, not thirty, which is the desired
+# behaviour: the drill is a check, not a queue.
+Persistent=true
+AccuracySec=1min
+Unit=assistant-backup-monthly.service
+
+[Install]
+WantedBy=timers.target

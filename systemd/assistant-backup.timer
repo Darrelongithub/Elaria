@@ -1,0 +1,29 @@
+[Unit]
+Description=Elaria — WP7 cold-storage backup, nightly timer
+Documentation=file:%h/Elaria/docs/storage-handoff.md
+
+[Timer]
+# Nightly. `03:17` is a deliberately boring local hour: late enough that a day's
+# sessions have closed, early enough that a laptop is usually still on charge.
+OnCalendar=*-*-* 03:17:00
+# Persistent=true is the whole point of this unit. A calendar elapse that happens while
+# the machine is asleep, suspended or powered off is caught up on the next boot —
+# systemd.timer(5): "the timer will be activated immediately when the machine boots,
+# if it would have been triggered while the machine was off".
+#
+# T0 citation, recorded because it is counter-intuitive and load-bearing: **multiple
+# elapses during ONE continuous sleep collapse to a SINGLE activation.** A laptop
+# closed from Monday to Saturday runs ONE backup on Saturday, not five. That is correct
+# here — the manifest is a state machine, so one catch-up pass reaches the same
+# quiescence five passes would, and `reconcile_all()` runs to quiescence by design.
+Persistent=true
+# Accuracy: without this, systemd may delay an activation by up to a minute to batch
+# wakeups. A backup is not latency-critical, so the default is fine, but it is pinned
+# here rather than left implicit so a future edit does not make it accidentally tight.
+AccuracySec=1min
+# A missed run is not retried inside the same day: tomorrow's elapse plus
+# Persistent=true covers it, and a retry loop would fight the deferral policy.
+Unit=assistant-backup.service
+
+[Install]
+WantedBy=timers.target

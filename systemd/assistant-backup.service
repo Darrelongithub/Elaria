@@ -1,0 +1,43 @@
+[Unit]
+Description=Elaria — WP7 cold-storage backup run (nightly)
+Documentation=file:%h/Elaria/docs/storage-handoff.md
+# Runs after the daemon so a session that closed during the day has already been
+# recorded in the journal before the nightly pass reads it. NOT a dependency: a backup
+# must still run on a day the daemon never started, so this is ordering only.
+After=assistant.service
+# The nightly pass touches the network only when a remote is configured. On a laptop
+# that is offline at 03:17 the run is a correct no-op, which is why network-online is
+# NOT wanted here — wanting it would skip the night entirely on a machine that was
+# simply asleep with no wifi, and the next Persistent=true catch-up would carry two
+# days of work.
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The `[backup]` section is read from the same config the daemon reads. No credentials
+# live in this file: the restic passphrase is a 0600 file outside the repo with a paper
+# escrow off-machine, and rclone.conf OBFUSCATES (does not encrypt) the MEGA password at
+# 0600 outside the repo. Neither is referenced by path here on purpose — a unit file is
+# world-readable by design and must never name a secret.
+ExecStart=%h/.local/bin/assist backup run
+# §4.4/§4.8: every sensor line goes to the journal, never to a file in the repo.
+StandardOutput=journal
+StandardError=journal
+# A backup that fails is a real event, but it must not crash-loop: the nightly timer
+# will fire again tomorrow and Persistent=true will catch up anything missed.
+Restart=no
+# Light hardening that does not fight a personal desktop tool. filesystem access to
+# $HOME is the product (§3.7), so no ProtectHome.
+NoNewPrivileges=true
+PrivateTmp=true
+# Deferral policy: an upload above `defer_above_mb` (default 100 MB) waits for AC and
+# unmetered power. This unit does not itself decide that — `assist backup run` does,
+# from `[backup] defer_above_mb` — and reports the deferral as a sensor line rather
+# than silently skipping. Recorded here so the policy is visible at the unit.
+Environment=ELARIA_BACKUP_DEFER_ABOVE_MB=100
+
+[Install]
+# Not installed directly: the .timer is what gets enabled. This stanza exists so
+# `systemctl --user enable assistant-backup.service` still works for an operator who
+# prefers to drive the service by hand.
+WantedBy=default.target
