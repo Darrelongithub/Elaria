@@ -82,3 +82,29 @@ with an explanatory marker. `event rename` and `event export --format md|txt`
 write copies; the live document is never their target. The console systemd
 failure helper logs/notifies and opens the `.txt` without stopping capture. It
 assumes the existing unit checkout path `~/Elaria`.
+
+## Gate-by-gate verification status (Cluster G readback, 2026-11-19)
+
+Code-level and contract verification ran offline (`GEMINI_MODE=mock`, no live API
+key, no PipeWire audio device, no Hyprland session). Sandbox checks verify module
+contracts and math only; hardware gates remain exclusively the owner's to run.
+
+| Gate | Status | Verified in code / sandbox (`tests/test_event_*.py`) | Pending owner hardware / Z wiring |
+|---|---|---|---|
+| Pre-Gate 2 spike & quota math | PARTIAL (code verified; real spike pending owner) | `[quota.models.transcribe-batch]` `rpd=25` LA day, `reserve=2`, `max_attempts=3` (cap 2 retries), `deferred_retries=0`, `EventService.start` preflight reads `used_today()`. Batch spike math (`event_spike._restate_batch_math`): 30 min -> 20 calls/10 h (`headroom=5`, fits 25 RPD); 15 min -> 40 calls/10 h (exceeds 25 RPD). Historical `docs/event-spike.json` (2026-10-23 live `bidiGenerateContent` 400 failure) preserved intact. | Owner: `uv sync`, `assist doctor`, real-key 30-min batch spike on ~57 MB real WAV (`--wav`) to prove provider size/latency/token acceptance. |
+| Gate 2 preflight `--no-transcribe` soak | PARTIAL (code verified; hardware soak pending owner) | `no_transcribe=True` keeps `calls_used=0` (`transport: fake — no calls will be made`), rotates WAVs, writes `audio kept:` markers, emits battery warning, and acquires/releases `SleepInhibitor` interface. | Owner: real laptop soak verifying PipeWire `pw-record`, real battery sysfs probe, and `systemd-inhibit` lock behavior. |
+| Gate 2 item 1 — start, title, roster, path | PARTIAL (code verified; UI pending owner) | `EventService.start` + CLI/daemon handlers + `IF-4` verified (`387fa084...`) `event.started` / `event.segment.opened` transport shapes + deterministic `--source simulated` CLI smoke verified (`0` `pw-record` calls). | Owner: launch from Quickshell console in Hyprland; Z owes `HR-G-1` (`daemon.py` passing `on_event=self.broadcast`). |
+| Gate 2 item 2 — speak, WAV + transcript | PARTIAL (code verified; mic/API pending owner) | Next-segment-opens-first rotation, `WavSink` atomic write, `capture.stats`, `NO_SIGNAL_PEAK=0.005`, ordered `.md`/`.txt` mirror appends verified. | Owner: real mic speech segment + live batch API transcript landing. |
+| Gate 2 item 3 — speaker switch & label | PARTIAL (code verified; UI pending owner) | `SpeakerBook` inline marker on `batch` vs flush (`FLUSH_MIN_S=20.0`) on `transcribe-live`, `labels.json` persistence, and `event.speaker.changed` frame verified. | Owner: console `Next speaker` button + speaker label timing check. |
+| Gate 2 item 4 — edit in console + tail append | PARTIAL (code verified; UI pending owner) | `EventDocument.edit_segment` CAS check (conflict tail-append), independent `.md`/`.txt` check, and Quickshell 650 ms autosave wiring verified statically. | Owner: real cursor stability & 650 ms debounced save while typing during live append in Quickshell. |
+| Gate 2 item 5 — stop + intact doc/edits/markers | PARTIAL (code verified; UI pending owner) | `EventService.stop` forces pending markers before `stopped`, releases inhibitor, emits `event.stopping` -> `event.stopped`, preserves edits. | Owner: stop button from Quickshell console + visual check of `.md`/`.txt`. |
+| Gate 2 item 6 — stalled transcription stop | PARTIAL (code verified; live stall pending owner) | `stop()` returns promptly with durable `audio kept:` markers while background queue resolves/defers without overwriting edited suffix; `recover_event` emits `event.recovered`. | Owner: real network-drop / stalled-API stop rehearsal on laptop. |
+| Gate 2 item 7 — Quickshell crash fallback | PARTIAL (script tested; systemd unit pending owner) | `scripts/event-console-fallback.sh` passes `bash -n`, 600 s rate limit, static signal-only `notify-send` body (no path leak), stderr journal path, and `xdg-open` on `.txt` with stubbed binaries. | Owner: real `systemctl` failure drill confirming capture continues and `.txt` opens on Hyprland. |
+| Gate 2 item 8 — Console home (4 looks) | HARDWARE-ONLY (owner eyeball gate) | Static QML text checks (`shell.qml` status strings) pass in `tests/test_console_home.py` / `tests/test_event_console_surface.py`. | Owner: eyeball gate in `docs/console-home/hardware-gate.md` + `systemctl --user stop assistant` mid-event. |
+| Gate 3 — 1-hour capture soak (~30 boundaries) | PARTIAL (fast synthetic soak verified; 1 h laptop run pending owner) | Preflight `needs-battery-ok` -> `--battery-ok` warning, disk `<115.2 MB/h` refusal / `<10 h` warning, rotation gap <1 s, `capture.stats`, `NO_SIGNAL_PEAK=0.005` verified on synthetic clock. | Owner: real 1-hour unplugged->plugged soak with lid closed (~30 segments at 2 min) and `assist events --recent 50 --kind capture.stats`. |
+| Gate 4 — far-field mic test (`docs/event-hardware-checklist.md`) | HARDWARE-ONLY | None (acoustics cannot be tested in sandbox). | Owner: real room far-field readback at panel distance. |
+
+**Non-discrimination note:** Synthetic clock/source/mock runs cannot prove real
+Gemini batch 30-min WAV payload acceptance (~57 MB), PipeWire hardware stability,
+kernel `systemd-inhibit` lid-switch enforcement, Hyprland QML focus/layout, or
+live daemon broadcast until `HR-G-1` lands in `src/assistant/daemon.py`.
