@@ -121,7 +121,7 @@ def test_bug6_ptt_stop_returns_under_two_seconds_while_live_turn_in_flight(
 
         async def dictate(self, source, *, mode="narration", sink=None,
                           stop_event=None, is_playback_active=None,
-                          session_id=None):
+                          session_id=None, on_final_text=None):
             self.released = False
             if sink is not None:
                 await sink({"event": "session.started", "session_id": session_id})
@@ -497,7 +497,7 @@ def test_bug6_a_finished_previous_session_cannot_clobber_the_next_dictation(conf
     class SlowDictation:
         async def dictate(self, source, *, mode="narration", sink=None,
                           stop_event=None, is_playback_active=None,
-                          session_id=None):
+                          session_id=None, on_final_text=None):
             await stop_event.wait()
             await asyncio.sleep(0.3)
             return SessionResult(

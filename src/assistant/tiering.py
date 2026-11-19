@@ -200,7 +200,8 @@ def classify(candidates, *, now: datetime, window_days: int = DEFAULT_WINDOW_DAY
       is back under the cap. This is the urgent one: an over-cap HOT set is a problem now.
     * **age** — an artifact is older than `window_days`. Everything past the window goes.
 
-    If neither fires, `binding` is "none" and nothing moves. `binding` reports which limit
+    Both limits apply in one pass. If both fire, `binding` reports "size".
+    A cold classification is not evidence of a transfer. If neither fires, nothing moves. `binding` reports which limit
     actually bound, so the operator can see the 2 GB backstop is not the live constraint
     without having to trust a comment.
     """
@@ -218,21 +219,17 @@ def classify(candidates, *, now: datetime, window_days: int = DEFAULT_WINDOW_DAY
     window_bytes = window_gb * 1000 ** 3
 
     over_cap = decision.hot_bytes > window_bytes
-    aged = [c for c in tierable if (now - c.mtime) >= timedelta(days=window_days)]
-
-    if over_cap:
-        decision.binding = "size"
-        # oldest first, until back under the cap
-        remaining = sorted(tierable, key=lambda c: c.mtime)
+    cutoff = now - timedelta(days=window_days)
+    if over_cap or any(c.mtime <= cutoff for c in tierable):
+        decision.binding = "size" if over_cap else "age"
         budget = decision.hot_bytes
-        for candidate in remaining:
-            if budget <= window_bytes:
+        for candidate in sorted(tierable, key=lambda c: c.mtime):
+            # Everything after this candidate is at least as recent. Stop only
+            # when *both* the byte budget and the age window are satisfied.
+            if budget <= window_bytes and candidate.mtime > cutoff:
                 break
             decision.send_cold.append(candidate)
             budget -= candidate.size
-    elif aged:
-        decision.binding = "age"
-        decision.send_cold.extend(sorted(aged, key=lambda c: c.mtime))
 
     sent = {id(c) for c in decision.send_cold}
     decision.keep_hot = [c for c in tierable if id(c) not in sent]

@@ -16,6 +16,18 @@ dependencies = [
     "google-genai>=2.0.0",
     "httpx>=0.27",
     "faster-whisper>=1.1",
+    # F1 (voice-chain resilience 2026-11-02): PyAV 19.0.0 removed BOTH
+    # `metadata_errors` and `metadata_encoding` from av.open() — verified
+    # against the sdists (18.1.0 core.py carries metadata_errors="strict",
+    # 19.0.2's signature has neither kwarg). faster-whisper 1.2.1 (the
+    # LATEST release — checked on PyPI 2026-11-02; no av-19-compatible
+    # bump exists to move to) passes metadata_errors="ignore", so av 19
+    # makes every local decode raise TypeError — the W3 guard then names
+    # the degradation and the local leg dies (owner hardware, twice).
+    # Range bound: >=15.1 ships cp314 wheels (owner CPython 3.14) and
+    # 18.1.x ships cp311-abi3 manylinux wheels (sandbox 3.11) — both
+    # targets install wheels, no source builds; <19 is the kwarg wall.
+    "av>=15.1,<19",
     "piper-tts",
 ]
 

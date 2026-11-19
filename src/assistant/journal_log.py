@@ -32,6 +32,8 @@ interleave with a CLI's JSON on stdout.
 
 from __future__ import annotations
 
+import hashlib
+import re
 import sys
 import threading
 from datetime import datetime
@@ -99,3 +101,111 @@ def log_event(event: str, *, level: str = "info", session_id: str = "",
     except Exception:  # noqa: S110 - a broken log stream must not take a session down
         pass
     return line
+
+
+# -- M-5 stump sensor (mini order M, 2026-10-31) ---------------------------
+#
+# A landed transcript that is a STUMP (W1: both kept wavs returned the
+# literal token `<noise>` — 7 chars of a 29-char sentence) must be visible
+# in the journal WITHOUT copying the text into it. The sensor carries the
+# class, the char count and a sha256 prefix — never the transcript itself.
+
+#: class -> meaning. `noise_token` = a model-emitted bracketed audio-event
+#: token in place of a transcript; `short_stump` = landed text under
+#: STUMP_MAX_CHARS with no real sentence in it (the order's threshold).
+STUMP_MAX_CHARS = 12
+
+_NOISE_TOKEN_RE = re.compile(
+    r"^\s*[\[({<]?\s*<?\s*"
+    r"(noise|silence|silent|music|inaudible|unintelligible|applause|"
+    r"laughter|background[ _-]?noise|noise[ _-]?only|no[ _-]?speech)"
+    r"\s*>?\s*[\])}>.,!]*\s*$",
+    re.IGNORECASE)
+
+
+def stump_verdict(text) -> tuple[str, int, str] | None:
+    """(class, char_count, sha16) when `text` is a stump, else None.
+
+    Empty/whitespace text is NOT a stump here: no-text sessions already
+    carry their own verdicts (silence / no_final / deferred / empty).
+    Normalised-whitespace length is what counts; the hash is of the
+    stripped text so the same stump hashes the same across sessions.
+    """
+    stripped = " ".join(str(text or "").split())
+    if not stripped:
+        return None
+    digest = hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:16]
+    if _NOISE_TOKEN_RE.match(stripped):
+        return ("noise_token", len(stripped), digest)
+    if len(stripped) < STUMP_MAX_CHARS:
+        return ("short_stump", len(stripped), digest)
+    return None
+
+
+def log_transcription_stump(session_id: str, text: str, *, source: str) -> bool:
+    """Schema line `transcription.stump` when the landed transcript is a
+    stump. Carries the class, the char count and sha16 — NEVER the text.
+    Returns True when the line was emitted. Never raises."""
+    verdict = stump_verdict(text)
+    if verdict is None:
+        return False
+    kind, chars, digest = verdict
+    log_event("transcription.stump", level="warn", session_id=str(session_id),
+              verdict=kind,
+              detail=(f"chars={chars}; sha16={digest}; source={source}; "
+                      f"max_chars={STUMP_MAX_CHARS} — landed transcript is a "
+                      f"{kind.replace('_', ' ')}; the text itself is kept in "
+                      f"the transcript row, never this line"))
+    return True
+
+
+# -- voice-chain resilience (window findings order v1, 2026-11-02) --------
+#
+# The 2026-11-02 starved turn journaled `saved_wav_fallback_failed
+# (error "")` — an empty error string on a failure event (a message-less
+# TimeoutError from asyncio.wait_for). Empty error strings are forbidden
+# on failure events from here on: `error_text` names the class even when
+# the message is empty.
+
+def error_text(exc: BaseException) -> str:
+    """The failure text of `exc` — NEVER empty (F3a). A message-less
+    exception (asyncio.wait_for's TimeoutError) still names its class."""
+    message = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {message}" if message else name
+
+
+def backend_mark_detail(text: str | None = None, *, error: str = "") -> str:
+    """Per-backend class-mark detail (F3c): chars + sha16 where text
+    exists, the failure reason when there is one, NEVER the raw text."""
+    raw = text or ""
+    base = (f"chars={len(raw)}; "
+            f"sha16={hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+            if raw else "chars=0")
+    if error:
+        base += f"; reason={error}"
+    return base
+
+
+def log_backend_mark(session_id: str, backend: str, klass: str, *,
+                     text: str | None = None, error: str = "") -> str:
+    """Schema line `transcription.backend` — one per-backend empty/failure
+    class-mark (F3c), journaled AS the chain walks so a leg abandoned at
+    its budget still leaves the per-backend picture behind. Never raises.
+    """
+    return log_event(
+        "transcription.backend", level="warn", session_id=str(session_id),
+        verdict=str(klass),
+        detail=f"backend={backend}; {backend_mark_detail(text, error=error)}")
+
+
+def log_starvation(session_id: str, klass: str, *, detail: str = "") -> str:
+    """Schema line `transcription.starvation` — the whole-chain event
+    (F3c): nothing landed for audio that needed recovery. The per-backend
+    marks sit above it in the journal; the wav is kept (deferred contract).
+    """
+    return log_event(
+        "transcription.starvation", level="warn", session_id=str(session_id),
+        verdict="starved",
+        detail=(f"outcome={klass}"
+                + (f"; {detail}" if detail else "")))

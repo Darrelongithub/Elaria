@@ -34,6 +34,9 @@ from .cost import iso_now
 from .safety import expand, is_protected
 
 TEMP_SUFFIXES = (".part", ".crdownload", ".tmp", ".swp", ".download")
+#: F33: rendered speech is regenerable output, never a document. If a data dir
+#: ever sits inside a whitelisted root, this name is still never tiered.
+EXCLUDED_DIRNAMES = ("voice-cache",)
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".rst", ".log", ".csv", ".tsv", ".json", ".toml", ".yaml",
     ".yml", ".ini", ".cfg", ".py", ".js", ".ts", ".rs", ".go", ".c", ".h",
@@ -149,6 +152,9 @@ class Indexer:
                     yield sub, "symlink"
                     continue
                 if d.startswith(".") or d in ("_Conflicts",):
+                    continue
+                if d in EXCLUDED_DIRNAMES:
+                    yield sub, d        # counted, never descended
                     continue
                 if is_protected(sub, self.protected):
                     continue

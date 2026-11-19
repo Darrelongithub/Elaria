@@ -45,6 +45,26 @@ PINNED_ROLES: dict[str, str] = {
 #: every id that may legitimately appear in config or on the wire
 ALLOWED_IDS: frozenset[str] = frozenset(PINNED_ROLES.values())
 
+#: Free-tier request-rate knowledge of record (F2, window findings order
+#: v1, 2026-11-02). Source: the owner's verbatim 429 — quotaId
+#: `GenerateRequestsPerMinutePerProjectPerModel-FreeTier`, quotaDimensions
+#: {location: global, model: gemini-3.5-transcribe}, quotaValue 3,
+#: retryDelay 36s (4th call within ~19 s). The AI Studio rate-limit page
+#: (doctor's VERIFIED 2026-10-20 shape) showed "RPM n/a" for
+#: transcribe-batch — the page and the ENFORCEMENT disagree; the 429 is
+#: the enforcement speaking, so the 3 RPM figure lives here and paces the
+#: file leg. Owner-side `[quota.models.transcribe-batch] rpm = 3` makes
+#: doctor's shape line show it too (config is the owner's to edit).
+VERIFIED_FREE_TIER_RPM: dict[str, int] = {
+    "gemini-3.5-transcribe": 3,
+}
+
+
+def verified_free_tier_rpm(model: str) -> int | None:
+    """The verified free-tier RPM for `model`, or None when unknown."""
+    return VERIFIED_FREE_TIER_RPM.get(
+        str(model or "").rsplit("/", 1)[-1].strip())
+
 # -- the forbidden list (§4.1): retired / rejected models ------------------
 # Named here so the scan can reject them; these constants are the ONLY place
 # they are allowed to live as data (plus negative-test fixtures).
@@ -134,6 +154,34 @@ def scan_config_values(config) -> list[dict]:
     return findings
 
 
+def role_drift_rows(config) -> list[dict]:
+    """Role-fit drift: a configured `model_<role>` naming a REGISTERED id
+    that is pinned to a DIFFERENT role (mini order M-3, 2026-10-31).
+
+    The W1 root cause ran through this gap: `gemini-3.5-flash-lite` is a
+    registered id (chat), so a config pointing the files route at it passed
+    the membership scan while the leg transcribed with a chat model. A
+    missing/empty key is NOT drift — `model_for_role` resolves those to the
+    registry pin; only an explicitly configured wrong-for-role value rows
+    here. Voice is excluded: it resolves through `voice_model()` legacy
+    precedence and doctor's voice checks own it.
+    """
+    gemini = config.section("gemini")
+    rows: list[dict] = []
+    for role, pinned in sorted(PINNED_ROLES.items()):
+        if role == "voice":
+            continue
+        key = f"model_{role}"
+        raw = gemini.get(key)
+        if raw is None or not str(raw).strip():
+            continue
+        configured = str(raw).strip()
+        if normalise_model_id(configured) != normalise_model_id(pinned):
+            rows.append({"role": role, "key": key,
+                         "configured": configured, "pinned": pinned})
+    return rows
+
+
 def registry_report(config) -> dict:
     """Doctor-facing summary of the registry state of the configuration."""
     findings = scan_config_values(config)
@@ -143,10 +191,13 @@ def registry_report(config) -> dict:
     ladder_unregistered = [
         str(m) for m in ladder
         if not is_registered(str(m))]
+    role_drift = role_drift_rows(config)
     return {
         "forbidden": forbidden,
         "unregistered": unregistered,
         "ladder_unregistered": ladder_unregistered,
+        "role_drift": role_drift,
         "registered": [f for f in findings if f["verdict"] == "registered"],
-        "ok": not forbidden and not unregistered and not ladder_unregistered,
+        "ok": (not forbidden and not unregistered
+               and not ladder_unregistered and not role_drift),
     }

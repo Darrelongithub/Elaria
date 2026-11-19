@@ -85,7 +85,7 @@ class SlowDictation:
 
     async def dictate(self, source, *, mode="narration", sink=None,
                       stop_event=None, is_playback_active=None,
-                      session_id=None):
+                      session_id=None, on_final_text=None):
         await stop_event.wait()
         await asyncio.sleep(self.delay_s)
         return _result(session_id or "slow", self.text)
@@ -96,7 +96,7 @@ class SelfFinishingDictation:
 
     async def dictate(self, source, *, mode="narration", sink=None,
                       stop_event=None, is_playback_active=None,
-                      session_id=None):
+                      session_id=None, on_final_text=None):
         return _result(session_id or "done", "lost transcript")
 
 
@@ -199,10 +199,15 @@ def test_session_state_reset_answers_explicitly_and_promptly(
     # task/finisher/result for it are all gone — exactly the status snapshot
     # from the hardware box after Ctrl-C.
     daemon._ptt_session_id = "reset01"
+    daemon._ptt_last_session_id = "reset01"
     daemon._dictation_task = None
 
     status = call(config.socket_path, "status", timeout=5.0)
-    assert status["ptt_session_id"] == "reset01"
+    # W7a (2026-10-31): with no holder the live key is CLEAR — the old
+    # stale advertisement (closed session kept showing as ptt_session_id)
+    # is the defect the scene-7 evidence named. History is last_session_id.
+    assert status["ptt_session_id"] is None
+    assert status["last_session_id"] == "reset01"
     assert status["dictation_active"] is False
     assert status["dictation_processing"] is False
 
