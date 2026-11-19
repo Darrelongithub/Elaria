@@ -38,6 +38,10 @@ the same cluster. A new path not covered by an existing rule needs a reviewed
 map-only change by Z before the feature edit can pass the guard. An ownership
 entry is not permission to start a held lane.
 
+A test file belongs to the cluster owning the feature it verifies, regardless
+of the fixtures, helpers, or transport it uses. Tests that verify a contract
+across feature clusters belong to L.
+
 ```sh
 python scripts/check_ownership.py lint
 python scripts/check_ownership.py self-test
