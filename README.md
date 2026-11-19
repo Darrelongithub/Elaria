@@ -38,6 +38,10 @@ the same cluster. A new path not covered by an existing rule needs a reviewed
 map-only change by Z before the feature edit can pass the guard. An ownership
 entry is not permission to start a held lane.
 
+A test file belongs to the cluster owning the feature it verifies, regardless
+of the fixtures, helpers, or transport it uses. Tests that verify a contract
+across feature clusters belong to L.
+
 ```sh
 python scripts/check_ownership.py lint
 python scripts/check_ownership.py self-test
@@ -53,6 +57,12 @@ the reviewer runs a trusted copy of the guard with a reviewed base SHA and the
 verified authoring cluster. `--cluster` does not authenticate authors or
 approve requests. There is no bypass for a feature agent editing Z-owned files.
 The initial bootstrap itself needs manual review because its parent has no map.
+For Wave 1 branches that predate the guard or a new ownership rule, update the
+branch onto a reviewed base containing the current `OWNERS.yaml` before running
+`check`. A missing map or rule is not a pass. Each `reports/RPT-<cluster>-*`
+pattern belongs only to its named cluster. Use
+`RPT-<cluster>-r<round>-<timestamp>.md` for protocol reports; the directory
+itself has no blanket owner.
 
 ### Intake and integration log
 
