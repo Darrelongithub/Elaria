@@ -19,7 +19,10 @@ DATA = Path(__file__).with_name("data")
 # F31 / Task I owner ruling: pin the verified committed bytes, not the foundation
 # report's a8d9… value. A future revision requires explicit re-pin AND re-approval;
 # standing consent must bind this hash, never silently inherit a catalogue update.
-INVENTORY_SHA256 = "7e0f01ff2396c292f05528261d349142f1c6e08eed948847ee1300633a1aafcd"
+# RE-PINNED 2026-11-19 (lane Q) for upstream kitty v0.49.2; owner re-approval of this
+# new catalogue hash is OWED before any live hands run (the old consent bindings must
+# fail closed, and they do: see headless/consent.py inventory-consent-drift).
+INVENTORY_SHA256 = "be06b3d206acca5ea906a471b174d594cfccf7118936ba27212a15af947b15f0"
 
 
 def canonical(value):
