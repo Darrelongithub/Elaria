@@ -16,7 +16,14 @@ Phase 0 audit: docs/phase-reports/2026-10-25-phase0-model-id-audit.md
 
 from __future__ import annotations
 
+import json
+import os
 import re
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from types import MappingProxyType
+
+from .model_pins import PinMismatch, validate_pin
 
 # -- the §4.1 registry (pinned IDs by role) --------------------------------
 VOICE_CONVERSATION = "gemini-3.8-live"
@@ -201,3 +208,82 @@ def registry_report(config) -> dict:
         "ok": (not forbidden and not unregistered
                and not ladder_unregistered and not role_drift),
     }
+
+
+_NOTE_KEY = "__pinning_note__"
+_PINNING_NOTE = (
+    "An exact -latest string pin does not guarantee an immutable provider model. "
+    "Pinning the string is not pinning the model."
+)
+
+
+def _unique_pairs(pairs):
+    values = {}
+    for key, value in pairs:
+        if key in values:
+            raise ValueError(f"Duplicate registry key {key!r}")
+        values[key] = value
+    return values
+
+
+def _identifier(value):
+    return isinstance(value, str) and bool(value) and not any(c.isspace() for c in value)
+
+
+class ModelRegistry:
+    """One writer at a time; readers see either the old or new complete snapshot."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def _read(self) -> dict[str, str]:
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        try:
+            entries = json.loads(raw, object_pairs_hook=_unique_pairs)
+            if not isinstance(entries, dict):
+                raise TypeError("expected a slot-to-ID mapping")
+            if _NOTE_KEY in entries and entries.pop(_NOTE_KEY) != _PINNING_NOTE:
+                raise ValueError("invalid pinning note")
+            if not all(
+                _identifier(slot) and _identifier(model_id) for slot, model_id in entries.items()
+            ):
+                raise ValueError("expected a slot-to-ID mapping")
+        except (TypeError, ValueError) as exc:
+            raise PinMismatch(f"Invalid model registry at {self.path}: {exc}") from exc
+        return entries
+
+    @property
+    def pins(self):
+        return MappingProxyType(self._read())
+
+    def load_model(self, slot: str, model_id: str, loader):
+        """Check the exact pin before invoking any backend loader."""
+        return loader(validate_pin(self.pins, slot, model_id))
+
+    def register(self, slot: str, model_id: str) -> None:
+        """Add a pin; repeat registrations are idempotent, replacements refused."""
+        if slot == _NOTE_KEY or not _identifier(slot) or not _identifier(model_id):
+            raise ValueError("Registration requires nonempty IDs without whitespace")
+        entries = self._read()
+        if slot in entries:
+            validate_pin(entries, slot, model_id)
+            return
+        entries[slot] = model_id
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = None
+        try:
+            with NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.path.parent, delete=False
+            ) as stream:
+                tmp = Path(stream.name)
+                json.dump({**entries, _NOTE_KEY: _PINNING_NOTE}, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            tmp.replace(self.path)
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)

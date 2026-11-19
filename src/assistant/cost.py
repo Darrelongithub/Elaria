@@ -146,12 +146,15 @@ def format_cost_report(month: dict, today: dict, quota: dict, tier: str = "free"
     purpose_rows = month.get("by_purpose") or today.get("by_purpose")
     if purpose_rows:
         lines.append("By purpose:")
-        for row in purpose_rows:
-            lines.append(f"  {row['purpose']}: {row['calls']} call(s), {row['tokens']:,} tokens, shadow ${row['cost_usd']:.4f}")
-    elif today.get("by_purpose"):
-        lines.append("By purpose:")
-        for k, v in today["by_purpose"].items():
-            lines.append(f"  {k}: {v} call(s)")
+        if isinstance(purpose_rows, dict):
+            for purpose, count in purpose_rows.items():
+                lines.append(f"  {purpose}: {count} call(s)")
+        else:
+            for row in purpose_rows:
+                lines.append(
+                    f"  {row['purpose']}: {row['calls']} call(s), "
+                    f"{row['tokens']:,} tokens, shadow ${row['cost_usd']:.4f}"
+                )
     # BUG6 cost audit: failures must be attributable, not just counted.
     failure_rows = month.get("failures_detail") or []
     if month.get("failures") or failure_rows:
@@ -184,9 +187,6 @@ def format_cost_report(month: dict, today: dict, quota: dict, tier: str = "free"
     # Explicit user vs housekeeping split
     if "user_turn_calls" in today:
         lines.append(f"Today breakdown: {today.get('user_turn_calls',0)} user turn(s) · {today.get('housekeeping_calls',0)} housekeeping call(s) (housekeeping does not count toward quota)")
-    if today.get("by_purpose") and isinstance(today["by_purpose"], dict):
-        # dict case from _cost
-        pass
     # Bug 8: generated replies that never reached the user must be VISIBLE —
     # silent replacement hid the canned-fallback bug behind a working ledger.
     substitutions = today.get("reply_substitutions") or []
