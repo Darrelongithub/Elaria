@@ -122,5 +122,6 @@ independently on catalogue version + commit + the four reviewed source hashes, a
   cluster boundary.
 - `ruff check .` — 0 findings (the one pre-existing `SIM102` in `kitty/bridge.py`, a Q-owned file, was fixed).
 - `jsonschema` validation of the regenerated inventory: passes.
-- History: 12 pin-bearing documents carry an appended **DATED SUPERSESSION — 2026-11-19** block; no
-  historical text was rewritten.
+- History: 10 kitty documents carry an appended **DATED SUPERSESSION — 2026-11-19** block and the
+  regenerated reference carries its own dated line (11 total); no historical text was rewritten. Two
+  R-owned documents that also say 0.47.1 were deliberately left untouched (HR-Q-3).
