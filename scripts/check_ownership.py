@@ -256,6 +256,44 @@ class GuardTests(unittest.TestCase):
         self.assertIn("2 changed paths; 1 denied for A", output)
         self.assertIn("denied for A: 'src/daemon.py'", output)
 
+    def commit_report_rules(self):
+        # Use the shipped map so these tests catch a policy regression as well
+        # as a matcher regression. Keep all report rules, even broad ones.
+        repo_rules = read_map((self.SCRIPT.parents[1] / OWNERS).read_bytes())
+        mapping = {owner: globs.copy() for owner, globs in self.MAP.items()}
+        for owner, glob, _ in repo_rules:
+            if glob.startswith("reports/"):
+                mapping.setdefault(owner, []).append(glob)
+        self.write(OWNERS, json.dumps(mapping))
+        git("add", OWNERS, cwd=self.root)
+        self.make_commit()
+        self.base = commit("HEAD", self.root)
+        return repo_rules
+
+    def test_own_report_accepted(self):
+        rules = self.commit_report_rules()
+        for cluster in sorted(CLUSTERS):
+            with self.subTest(cluster=cluster):
+                path = f"reports/RPT-{cluster}-r1-x.md"
+                self.assertEqual(owners_for(path, rules), [(cluster, f"reports/RPT-{cluster}-*")])
+        self.assertEqual(owners_for("reports/unassigned.md", rules), [])
+        self.write("reports/RPT-E-r1-x.md")
+        git("add", "--", "reports/RPT-E-r1-x.md", cwd=self.root)
+        self.assertIn("1 changed paths; 0 denied for E", self.staged("E"))
+
+    def test_foreign_report_rewrite_denied(self):
+        self.commit_report_rules()
+        path = "reports/RPT-E-r1-x.md"
+        self.write(path, "E's original report\n")
+        git("add", "--", path, cwd=self.root)
+        self.make_commit()
+        self.base = commit("HEAD", self.root)
+        self.write(path, "another cluster's rewrite\n")
+        git("add", "--", path, cwd=self.root)
+        for cluster in ("F", "Z"):
+            with self.subTest(cluster=cluster):
+                self.assertIn(f"denied for {cluster}: {path!r}", self.staged(cluster, code=1))
+
     def test_invalid_map_fails_closed(self):
         self.write(OWNERS, '{"Z":["OWNERS.yaml"],"Z":["src/daemon.py"]}')
         self.assertIn("duplicate cluster", self.run_guard("lint", code=2))
