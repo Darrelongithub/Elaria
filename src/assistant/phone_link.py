@@ -26,8 +26,10 @@ Safety rules this module enforces, each covered by tests/test_phone_link.py:
    every write;
 2. reads are free but ALLOWLISTED: anything not on the read allowlist is
    refused, and the refusal happens BEFORE any packet leaves;
-3. the never-allowlist list — runcommand, remotecommands, remotecontrol,
-   mousepad, remotekeyboard, sftp(.browse/.unmount), lockdevice and the
+3. the never-allowlist list — share.*, clipboard.send_clipboard, send-text,
+   runcommand, remotecommands, remotecontrol, mousepad, remotekeyboard,
+   sftp(.browse/.unmount), lockdevice, the plugins IF-3 never enables
+   (scrcpy, webcam, virtualmonitor, shareinputdevices, digitizer) and the
    GENERIC ``call PLUGIN ACTION`` interpreter — is refused even if somebody
    edits the allowlist (the allowlist is validated at import);
 4. inbound texts and notifications are UNTRUSTED INPUT (contract IF-6):
