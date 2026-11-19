@@ -15,8 +15,8 @@ never a script, and never an instruction to the agent or to the runtime.
   state, SHA-256, and expected refusal.
 - `pilot-scenes.md` maps the five owner-ruling criteria 1:1 to five spec-only
   scenes. Execution is owner-only in Wave 2; this cluster runs no hardware.
-- `undo-review-test.js` is the local, deterministic acceptance test. Run it
-  with `node undo-review-test.js` from the repository root.
+- `console/undo-review-test.js` is the local, deterministic acceptance test. Run it
+  with `node console/undo-review-test.js` from the repository root.
 
 Records are annotated with dated append-only notes; historical bodies are never
 silently rewritten. R owns no production code. O owns the injection rail, P the

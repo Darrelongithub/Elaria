@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 
-const ROOT = __dirname;
+const ROOT = path.resolve(__dirname, '..');
 const IF6_SHA = '6961c7f8b72d223d053bd20a45d8401e0466d358565ecf19952aaf5ee0ca351f';
 
 function read(rel) {
@@ -115,13 +115,24 @@ test('historical record is append-only annotated, never rewritten', () => {
   assert.equal(sha256(body[1]), digest[1]);
   assert.equal(inventory.record_body_sha256, digest[1]);
   assert.equal((record.match(/<!-- BEGIN ORIGINAL RECORD -->/g) || []).length, 1);
-  const annotation = record.match(
-    /<!-- BEGIN ANNOTATION (\d{4}-\d{2}-\d{2}T[^ ]+) -->[\s\S]*<!-- END ANNOTATION -->/
-  );
-  assert.ok(annotation, 'dated annotation missing');
+  const annotations = [...record.matchAll(
+    /<!-- BEGIN ANNOTATION (\d{4}-\d{2}-\d{2}T[^ ]+) -->[\s\S]*?<!-- END ANNOTATION -->/g
+  )];
+  assert.equal(annotations.length, 2);
   assert.ok(record.indexOf('<!-- END ORIGINAL RECORD -->') < record.indexOf('<!-- BEGIN ANNOTATION'));
-  assert.match(annotation[0], /hypothesis/i);
-  assert.match(annotation[0], /annotat/i);
+  assert.match(annotations[0][0], /hypothesis/i);
+  assert.match(annotations[0][0], /annotat/i);
+  assert.match(annotations[1][0], /OWNERS\.yaml|ownership guard/i);
+  assert.match(annotations[1][0], /append-only/i);
+});
+
+test('live ownership guard maps the R acceptance test to console/', () => {
+  const owners = json('OWNERS.yaml');
+  assert.ok(owners.R.includes('console/undo-review-test.js'));
+  assert.ok(!owners.R.includes('undo-review-test.js'));
+  assert.ok(fs.existsSync(path.join(ROOT, 'console/undo-review-test.js')));
+  assert.ok(!fs.existsSync(path.join(ROOT, 'undo-review-test.js')));
+  assert.ok(fs.existsSync(path.join(ROOT, 'scripts/check_ownership.py')));
 });
 
 test('declared R paths stay inside R ownership roots', () => {
