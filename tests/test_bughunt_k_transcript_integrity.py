@@ -133,7 +133,10 @@ def test_dictated_email_with_filler_signoff_is_kept(
         result = asyncio.run(svc.dictate(
             SimulatedCapture(speech_frames=60, silent_frames=0),
             transport_factory=lambda: sdk_transport(session)))
-        assert calls == []
+        # W6 (2026-10-31): at most the one discarded speculative voice-end
+        # call may occur (the final arrives after voice-end here) — BH-K1
+        # is proven by raw_text below surviving untouched.
+        assert len(calls) <= 1
         assert result.raw_text == FILLER_EMAIL, (
             "the user's own words must survive a substring that resembles "
             "her filler — she never said them, he dictated them")

@@ -21,6 +21,7 @@ import shutil
 import struct
 import subprocess
 import wave
+from array import array
 from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -141,8 +142,105 @@ def pcm_peak(pcm: bytes) -> float:
     return max((abs(s) for s in samples), default=0) / 32768
 
 
+#: How long after stream open a sample can still be called a START transient
+#: (owner measurement 2026-11-15). The mute test proved the full-scale sample
+#: survives node mute — rms 0.007 with peak 0.9981 — so it is injected at or
+#: after stream open, not carried by room sound. 100 ms is the synthetic
+#: worst case (a one-frame pop at 50 ms) plus one frame of margin; the owner's
+#: three kept takes re-derive it with `scripts/frame_probe.py`, whose
+#: `recommended_start_pop_ms` is the number to set here. Changing it moves no
+#: audio: it only decides which frames may be called "the first speech frame"
+#: and which full-scale frames are transport rather than the owner.
+START_POP_MS = 100
+
+
+def split_peak(pcm: bytes, sample_rate: int = SAMPLE_RATE,
+               skip_ms: int = START_POP_MS, *,
+               full_scale: float = 0.99, frame_ms: int = 50) -> dict:
+    """Peak of EVERYTHING vs peak with the start transient removed.
+
+    A single `peak` cannot tell a start pop from a hot voice, and the mute test
+    showed exactly that: rms said the node was silent, peak said full scale.
+    Both readings are reported — the full one is never hidden, the steady one
+    is the one a diagnosis may anchor on.
+
+    "Steady" is deliberately not "everything after N ms": that would throw away
+    a real first syllable and it would report a silent steady span for a take
+    shorter than the window. It is **every frame that is not a start
+    transient** — a full-scale frame inside the first `skip_ms`. Speech inside
+    the window is kept, so the steady peak always describes the person, and a
+    pop never describes anything.
+    """
+    frame_bytes = max(2, int(sample_rate * frame_ms / 1000) * BYTES_PER_SAMPLE)
+    frame_bytes -= frame_bytes % BYTES_PER_SAMPLE
+    steady_peak = 0.0
+    steady_bytes = 0
+    for start in range(0, len(pcm), frame_bytes):
+        frame = pcm[start:start + frame_bytes]
+        if len(frame) < 2:
+            continue
+        start_ms = start / BYTES_PER_SAMPLE / sample_rate * 1000
+        is_transient = start_ms < skip_ms and pcm_peak(frame) >= full_scale
+        if is_transient:
+            continue
+        steady_peak = max(steady_peak, pcm_peak(frame))
+        steady_bytes += len(frame)
+    return {
+        "peak_full": round(pcm_peak(pcm), 4),
+        "peak_steady": round(steady_peak, 4),
+        "start_pop_ms": int(skip_ms),
+        "steady_bytes": steady_bytes,
+    }
+
+
+class StartTransientGate:
+    """Separates a stream-open transient from the person speaking.
+
+    The gate exists because one full-scale sample at stream open persuaded the
+    whole capture path that speech had begun: `first_speech_frame_s` read 0.0
+    on real takes and the energy gate opened on a click. It answers both
+    without touching the audio — every frame is still recorded (audio is never
+    lost), and a SPEECH-LEVEL frame inside the hold-off is kept for the uplink,
+    because a hold-off that costs a syllable is a worse bug than the pop:
+
+    * no frame inside the hold-off can be the FIRST SPEECH FRAME;
+    * a FULL-SCALE frame inside the hold-off is transport, not the owner, and
+      is recorded but not uploaded;
+    * nothing here changes `peak`/`rms` accounting: the limiter and the peaks
+      still see the true signal, transient included.
+    """
+
+    FULL_SCALE = 0.99
+
+    def __init__(self, *, sample_rate: int = SAMPLE_RATE,
+                 holdoff_ms: int = START_POP_MS,
+                 full_scale: float = FULL_SCALE) -> None:
+        self.sample_rate = sample_rate
+        self.holdoff_ms = max(0, int(holdoff_ms))
+        self.full_scale = float(full_scale)
+        self.holdoff_frames = 0
+        self.transients = 0
+
+    def classify(self, frame: bytes, start_ms: float) -> dict:
+        """What this frame is, and whether the hold-off covers it."""
+        in_holdoff = start_ms < self.holdoff_ms
+        peak = pcm_peak(frame)
+        transient = bool(in_holdoff and peak >= self.full_scale)
+        if in_holdoff:
+            self.holdoff_frames += 1
+        if transient:
+            self.transients += 1
+        return {"in_holdoff": in_holdoff, "transient": transient, "peak": peak}
+
+    def stats(self) -> dict:
+        return {"holdoff_ms": self.holdoff_ms, "full_scale": self.full_scale,
+                "holdoff_frames": self.holdoff_frames,
+                "transients": self.transients}
+
+
 def live_level_check(target: str | None = None, seconds: float = 1.2,
-                     runner=subprocess.run) -> dict:
+                     runner=subprocess.run, *,
+                     skip_ms: int = START_POP_MS) -> dict:
     """Brief real-microphone level probe for `assist doctor` (BUG 6).
 
     Records ~`seconds` of raw PCM from the configured (or default) source and
@@ -172,12 +270,17 @@ def live_level_check(target: str | None = None, seconds: float = 1.2,
         return {"available": False, "target": target or "(default source)",
                 "reason": f"{type(exc).__name__}: {exc}"}
     peak = pcm_peak(data)
+    split = split_peak(data, SAMPLE_RATE, skip_ms)
     return {
         "available": True,
         "target": target or "(default source)",
         "seconds": round(len(data) / BYTES_PER_SAMPLE / SAMPLE_RATE, 2),
         "bytes": len(data),
+        # `peak` stays for every existing reader; the split is the honest pair.
         "peak": round(peak, 4),
+        "peak_full": split["peak_full"],
+        "peak_steady": split["peak_steady"],
+        "start_pop_ms": split["start_pop_ms"],
         "rms": round(frame_rms(data), 4),
         # Anything under the frame gate is digital silence / a dead node.
         "signal": bool(data) and peak >= 0.01,
@@ -217,6 +320,23 @@ class RollingAudioBuffer:
     def clear(self) -> None:
         self._chunks.clear()
         self._size = 0
+
+    def zeroize(self) -> int:
+        """Overwrite the held audio with zeros, then drop it (F30 cancel).
+
+        `clear()` releases the reference and leaves the bytes in memory until
+        the allocator reuses them. A cancelled dictation must not be able to
+        leave recoverable speech behind, so the chunks are overwritten first.
+        Returns the number of bytes zeroed (journal evidence, never content).
+        """
+        zeroed = 0
+        for chunk in self._chunks:
+            zeroed += len(chunk)
+        for index, chunk in enumerate(self._chunks):
+            self._chunks[index] = b"\x00" * len(chunk)
+        self._chunks.clear()
+        self._size = 0
+        return zeroed
 
     @property
     def seconds(self) -> float:
@@ -285,6 +405,120 @@ class FrameGate:
         return False
 
 
+class SoftLimiter:
+    """Capture-side soft limiter (E5/F18/F27/F32/F35): a static curve.
+
+    Deliberately simple: no lookahead, no state carried between chunks, no
+    latency, one pass per frame. Samples below the knee pass untouched; above
+    it the curve compresses toward a ceiling under full scale, so a loud room
+    stops clipping the ADC and the ASR stops hearing distortion as phonemes.
+
+    It MITIGATES, IT NEVER CONCEALS: raw peak and processed peak are both
+    tracked forever and both are journalled, so a session that needed 12 dB of
+    limiting is visible as exactly that, not as a mysteriously quiet take.
+
+    `apply()` works in place on an `array('h')` built once per chunk and reuses
+    a single buffer, so a 30 ms frame costs no per-sample allocation.
+    """
+
+    #: Full-scale-safe ceiling: below 1.0 so inter-sample peaks cannot clip.
+    CEILING = 0.89
+    #: Below the knee the curve is the identity — normal speech is untouched.
+    KNEE = 0.60
+
+    def __init__(self, ceiling: float = CEILING, knee: float = KNEE):
+        if not 0.0 < knee < ceiling <= 1.0:
+            raise ValueError("limiter needs 0 < knee < ceiling <= 1")
+        self.ceiling = float(ceiling)
+        self.knee = float(knee)
+        self.raw_peak = 0.0
+        self.processed_peak = 0.0
+        self.frames = 0
+        self.limited_samples = 0
+        self._buf = array("h")
+
+    def _curve(self, value: float) -> float:
+        magnitude = abs(value)
+        if magnitude <= self.knee:
+            return value
+        span = self.ceiling - self.knee
+        compressed = self.knee + span * math.tanh((magnitude - self.knee) / span)
+        return math.copysign(min(compressed, self.ceiling), value)
+
+    def apply(self, pcm: bytes) -> bytes:
+        """One chunk in, one chunk out — same length, never longer."""
+        usable = len(pcm) - len(pcm) % 2
+        if usable <= 0:
+            return pcm
+        self._buf = array("h")
+        self._buf.frombytes(pcm[:usable])
+        raw = 0
+        processed = 0
+        limited = 0
+        for index in range(len(self._buf)):
+            sample = self._buf[index]
+            magnitude = sample if sample >= 0 else -sample
+            raw = max(raw, magnitude)
+            value = sample / 32768
+            if abs(value) > self.knee:
+                limited += 1
+                mapped = round(self._curve(value) * 32767)
+                self._buf[index] = max(-32768, min(32767, mapped))
+                magnitude = abs(self._buf[index])
+            processed = max(processed, magnitude)
+        self.frames += 1
+        self.limited_samples += limited
+        self.raw_peak = max(self.raw_peak, raw / 32768)
+        self.processed_peak = max(self.processed_peak, processed / 32768)
+        return self._buf.tobytes()
+
+    def stats(self) -> dict:
+        """Both peaks, always — the doctor and the journal both read this."""
+        return {
+            "raw_peak": round(self.raw_peak, 4),
+            "processed_peak": round(self.processed_peak, 4),
+            "frames": self.frames,
+            "limited_samples": self.limited_samples,
+            "limited_ratio": (round(self.limited_samples /
+                                    max(1, self.frames * (SAMPLE_RATE * 30 // 1000)), 4)),
+            "curve": {"knee": self.knee, "ceiling": self.ceiling,
+                      "lookahead": False},
+        }
+
+
+def strip_silence(pcm: bytes, *, rms_threshold: float = 0.01,
+                  hangover_frames: int = 2, frame_ms: int = 30) -> tuple[bytes, dict]:
+    """Trim leading and trailing silence BEFORE transcription (J2/E2).
+
+    Reuses the capture path's existing energy gate (`FrameGate`) rather than
+    introducing a second VAD. Interior silence is kept: pauses are speech
+    rhythm, and cutting them changes what Whisper hears. Only the dead head
+    and tail go — the part that hallucinates text on empty audio (§8).
+    """
+    frame_bytes = max(2, SAMPLE_RATE * frame_ms // 1000 * BYTES_PER_SAMPLE)
+    frames = [pcm[offset:offset + frame_bytes]
+              for offset in range(0, len(pcm) - len(pcm) % frame_bytes, frame_bytes)]
+    stats = {"frames_in": len(frames), "dropped_head": 0, "dropped_tail": 0,
+             "seconds_in": round(pcm_duration_s(pcm), 3),
+             "seconds_out": 0.0, "gate": "energy-vad"}
+    if not frames:
+        return b"", stats
+    gate = FrameGate(rms_threshold=rms_threshold, hangover_frames=hangover_frames)
+    allowed = [gate.allows(frame) for frame in frames]
+    if not any(allowed):
+        stats["seconds_out"] = 0.0
+        stats["empty"] = True
+        return b"", stats
+    first = allowed.index(True)
+    last = len(allowed) - 1 - allowed[::-1].index(True)
+    stats["dropped_head"] = first
+    stats["dropped_tail"] = len(frames) - 1 - last
+    kept = b"".join(frames[first:last + 1])
+    stats["seconds_out"] = round(pcm_duration_s(kept), 3)
+    stats["empty"] = False
+    return kept, stats
+
+
 class AsyncFrameSource(Protocol):
     def frames(self) -> AsyncIterator[bytes]: ...
     async def aclose(self) -> None: ...
@@ -311,6 +545,10 @@ class PipeWireCapture:
         self.target = target            # node.name/object.serial, or None = default
         self.stall_timeout_s = float(stall_timeout_s)
         self.stalled = False
+        # J5: xrun/underrun sensor. A stalled stream or a short read is audio
+        # the server did not deliver; counting it keeps "the take sounded
+        # choppy" a measured fact instead of an impression.
+        self.xruns = 0
         self._command = pw_record_pcm_stream_command(target, sample_rate=sample_rate)
         self._frame_bytes = sample_rate * frame_ms // 1000 * BYTES_PER_SAMPLE
         self._proc: asyncio.subprocess.Process | None = None
@@ -336,9 +574,11 @@ class PipeWireCapture:
                 # Dead capture: report it, end the stream, let the session
                 # fail fast with "no speech captured" instead of hanging.
                 self.stalled = True
+                self.xruns += 1
                 return
             except asyncio.IncompleteReadError as partial:
                 if partial.partial:
+                    self.xruns += 1      # short read: a dropped tail, counted
                     yield partial.partial
                 return
             yield chunk
@@ -378,6 +618,7 @@ class SimulatedCapture:
         self.realtime = realtime
         self.target = "simulated"        # diagnostics: never a mystery node
         self.stalled = False
+        self.xruns = 0                   # a simulated device cannot underrun
         self._stopped = asyncio.Event()
 
     def stop(self) -> None:

@@ -89,6 +89,25 @@ def test_cli_doctor_json_is_machine_readable():
     assert {"api key", "quota shape", "hyprland", "daemon"} <= names
 
 
+def test_cli_doctor_names_registry_role_drift(tmp_path):
+    """M-3 (mini order M): a registered id in the wrong role is its own
+    doctor defect — named by key with the pinned value. This is the check
+    that would have named the W1 files-route drift before the stump."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[gemini]\nmodel_transcribe_batch = "gemini-3.5-flash-lite"\n')
+    out = _cli(["doctor", "--json"], {"ASSIST_CONFIG": str(cfg)})
+    report = json.loads(out.stdout)
+    by_name = {c["check"]: c for c in report["checks"]}
+    pin_check = by_name["registry role pins"]
+    assert pin_check["status"] == "fail"
+    assert "model_transcribe_batch" in pin_check["detail"]
+    assert "gemini-3.5-transcribe" in pin_check["detail"]
+    # the clean config passes the same check
+    out2 = _cli(["doctor", "--json"])
+    by_name2 = {c["check"]: c for c in json.loads(out2.stdout)["checks"]}
+    assert by_name2["registry role pins"]["status"] == "ok"
+
+
 def test_cli_cost_works_with_daemon_down():
     out = _cli(["cost"])
     assert out.returncode == 0
