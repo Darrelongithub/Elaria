@@ -434,3 +434,191 @@ def test_assist_knock_commands_work_without_the_daemon(tmp_path):
         capture_output=True, text=True, env=env, timeout=30, check=False)
     assert listed.returncode == 0, listed.stderr
     assert "tax office" in listed.stdout
+
+
+# -- Wave-1 C round 1: the intent ladder, the trust rail, the autonomy gate ----
+#
+# Build order 2 and 3 live here, plus the capability/confirm rungs that make
+# build order 1 answerable without a model. Nothing below changes an existing
+# gate: everything new can only REFUSE, and the confidence floor is read.
+
+from assistant import intents
+from assistant.intents import Intent
+
+MUTATING = sorted(intents.MUTATING_KINDS)
+READ_ONLY = sorted(intents.READ_ONLY_KINDS - {intents.OBSERVATION_KIND})
+
+
+@pytest.mark.parametrize("phrase, kind", [
+    ("what can you do", "capability"),
+    ("what can you do?", "capability"),
+    ("what are your capabilities", "capability"),
+    ("what are you able to do?", "capability"),
+    ("unaweza kufanya nini", "capability"),
+    ("confirm rn", "confirm"),
+    ("confirm right now?", "confirm"),
+    ("can you confirm", "confirm"),
+    ("double-check rn", "confirm"),
+    ("thibitisha sasa", "confirm"),
+])
+def test_capability_and_confirm_are_local_read_only_rungs(phrase, kind):
+    intent = intents.route(phrase)
+    assert intent is not None and intent.kind == kind
+    assert intent.trusted is True and intent.dispatchable is True
+    assert intent.mutating is False
+
+
+@pytest.mark.parametrize("phrase", [
+    "don't confirm rn", "he said: what can you do",
+    "\"what can you do\" is what the speaker said",
+])
+def test_a_quoted_or_negated_question_never_routes(phrase):
+    assert intents.route(phrase) is None
+
+
+@pytest.mark.parametrize("source", list(intents.UNTRUSTED_SOURCES) + ["", "unknown-ish"])
+def test_untrusted_input_never_yields_a_dispatchable_intent(source):
+    """IF-6: a message/page/guest sentence is DATA. Same words, no action."""
+    hostile = "organise downloads"
+    trusted = intents.route(hostile)
+    observed = intents.route(hostile, source=source)
+    assert trusted is not None and trusted.dispatchable is True
+    assert observed is not None
+    assert observed.kind == intents.OBSERVATION_KIND
+    assert observed.dispatchable is False
+    assert observed.mutating is False
+    assert observed.observed_kind == "organise", "the shape is kept as data"
+    row = observed.as_journal()
+    assert row["event"] == "intent.observation"
+    assert row["dispatchable"] is False and row["trusted"] is False
+    assert hostile not in json.dumps(row), "the payload is not echoed into the journal"
+
+
+@pytest.mark.parametrize("source", list(intents.TRUSTED_SOURCES))
+def test_owner_sources_still_route_normally(source):
+    intent = intents.route("status", source=source)
+    assert intent is not None and intent.kind == "status"
+    assert intent.dispatchable is True and intent.trusted is True
+
+
+@pytest.mark.parametrize("kind", MUTATING)
+def test_every_mutating_intent_is_gated_with_all_three_legs_named(kind):
+    """Build order 2: consent · attribution · journal, fail-closed."""
+    gate = intents.authorise(Intent(kind), principal="", consent=None, journal=None)
+    assert gate["allowed"] is False
+    text = gate["reason"]
+    assert "attribution" in text and "consent" in text and "journal" in text
+    assert gate["journaled"] is False
+
+
+@pytest.mark.parametrize("kind", MUTATING)
+def test_mutating_intent_is_allowed_only_with_consent_attribution_and_journal(kind):
+    rows = []
+    gate = intents.authorise(
+        Intent(kind), principal="owner-voice-verified",
+        consent={"granted": True, "scope": "one reviewed plan"},
+        journal=rows.append)
+    assert gate["allowed"] is True, gate["reason"]
+    assert gate["journaled"] is True and len(rows) == 1
+    row = rows[0]
+    assert row["event"] == "mutation.authorised"
+    assert row["intent"] == kind and row["mutating"] is True
+    assert row["principal"] == "owner-voice-verified"
+    assert row["consent"] == "one reviewed plan"
+
+
+@pytest.mark.parametrize("kind", READ_ONLY)
+def test_read_only_intents_need_no_consent_or_journal(kind):
+    gate = intents.authorise(Intent(kind), principal="owner-typed")
+    assert gate["allowed"] is True
+    assert gate["mutating"] is False
+
+
+def test_an_untracked_kind_fails_closed_as_mutating():
+    assert intents.is_mutating("a-kind-nobody-registered") is True
+    gate = intents.authorise(Intent("a-kind-nobody-registered"),
+                             principal="owner-typed")
+    assert gate["allowed"] is False
+
+
+def test_unknown_or_guest_principal_can_never_be_the_author_of_a_mutation():
+    for principal in ("guest", "inbound", "web", "", "someone-else"):
+        gate = intents.authorise(Intent("organise"), principal=principal,
+                                 consent=True, journal=lambda row: None)
+        assert gate["allowed"] is False
+        assert "attribution" in gate["reason"] or "IF-6" in gate["reason"]
+
+
+def test_untrusted_content_cannot_be_authorised_even_with_every_leg():
+    observed = Intent(intents.OBSERVATION_KIND, raw="organise downloads",
+                      source="inbound", trusted=False, observed_kind="organise")
+    gate = intents.authorise(observed, principal="owner-typed", consent=True,
+                             journal=lambda row: None)
+    assert gate["allowed"] is False
+    assert "IF-6" in gate["reason"]
+
+
+def test_deny_beats_consent_and_the_refusal_is_journaled():
+    rows = []
+    gate = intents.authorise(Intent("organise"), principal="owner-hotkey",
+                             consent=True, journal=rows.append, deny=True)
+    assert gate["allowed"] is False
+    assert "deny beats consent" in gate["reason"]
+    assert rows and rows[0]["event"] == "mutation.refused"
+    assert rows[0]["consent_granted"] is True, "the denial is recorded beside the grant"
+
+
+def test_a_raising_consent_check_is_a_no_not_a_crash():
+    def broken():
+        raise RuntimeError("consent store offline")
+
+    gate = intents.authorise(Intent("forget"), principal="owner-typed",
+                             consent=broken, journal=lambda row: None)
+    assert gate["allowed"] is False
+    assert "consent" in gate["reason"]
+
+
+def test_a_journal_that_refuses_the_row_refuses_the_mutation():
+    def sink(row):
+        raise OSError("journal disk full")
+
+    gate = intents.authorise(Intent("undo"), principal="owner-typed",
+                             consent=True, journal=sink)
+    assert gate["allowed"] is False
+    assert "journal" in gate["reason"]
+
+
+def test_command_floor_report_states_the_asymmetry_and_moves_nothing(config):
+    before = config.section("transcribe")["command_min_confidence"]
+    report = intents.command_floor_report(config)
+    after = config.section("transcribe")["command_min_confidence"]
+    assert before == after == 0.85, "the gate is reported, never changed"
+    assert report["changed"] is False
+    assert report["observed"]["local_whisper_perfect_transcript"] == 0.6953
+    assert report["observed"]["gemini_batch_confidence"] is None
+    assert report["configured_floor"] == 0.85
+    options = {option["id"] for option in report["options"]}
+    assert options == {"A", "B", "C", "D"}
+    assert len(report["options"]) == 4
+    assert report["owner_decision"].startswith("the floor is the owner's call")
+
+
+def test_floor_report_survives_a_config_that_cannot_answer():
+    class Broken:
+        def section(self, name):
+            raise RuntimeError("no config")
+
+    report = intents.command_floor_report(Broken())
+    assert report["configured_floor"] == 0.85 and report["changed"] is False
+
+
+def test_the_daemons_mutation_list_is_a_subset_of_the_canonical_set():
+    """The daemon keeps its own tuple today (Z's file); it may never name a
+    kind the canonical classification calls read-only. The GAP — kinds the
+    canonical set calls mutating that the daemon tuple does not yet carry —
+    is what HR-C-1 asks Z to close; it is recorded, not asserted here."""
+    from assistant.daemon import Daemon
+
+    assert set(Daemon.MUTATING_INTENTS) <= intents.MUTATING_KINDS
+    gap = sorted(intents.MUTATING_KINDS - set(Daemon.MUTATING_INTENTS))
+    assert "organise" in gap and "remember" in gap
