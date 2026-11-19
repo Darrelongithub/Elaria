@@ -77,3 +77,41 @@ hardware-only until Gate 2 succeeds on that machine. A measured provider spike
 also requires the owner's real account; no sandbox measurement is claimed.
 
 Gate 2 checklist: [`EVENT-MODE-HARDWARE-CHECKLIST.md`](EVENT-MODE-HARDWARE-CHECKLIST.md).
+
+## Wave-1 Cluster G addendum (2026-11-19)
+
+- **Event transport contract (`IF-4` stub in `src/assistant/event.py`):**
+  added `EVENT_STATES`, `EVENT_ROUTES`, `EVENT_TRANSPORT_MODES`,
+  `EVENT_TRANSPORT_SCHEMAS`, `validate_event_state`, `validate_event_route`,
+  `build_event_transport_frame`, `on_event` dispatch (`sync` + `async`),
+  `simulate: bool = False` fail-closed enforcement, and `recent_events()`
+  inspection across all 10 lifecycle/error/recovery frames (`event.started`,
+  `event.segment.opened`, `event.segment.closed`, `event.segment.transcribed`,
+  `event.segment.deferred`, `event.speaker.changed`, `event.stopping`,
+  `event.stopped`, `event.recovered`, `event.error`). Unknown states, unknown
+  routes, `simulate=True`, missing required fields, and non-finite floats throw
+  `ValueError`. Wiring `on_event=self.broadcast` inside `src/assistant/daemon.py`
+  and any `[quota]` config keys in `src/assistant/config.py` remain queued to
+  Z under `HR-G-1`.
+- **Quota & preflight consistency:** fixed `EventService.start()` preflight to
+  read `self._quota_ledger.used_today()` instead of hardcoding `0`, and aligned
+  `status_from_disk()` `calls.reserve` with `EventService.status()`. Numerically
+  verified `batch` `rpd=25` (LA calendar-day ledger, cross-route isolated),
+  `reserve=2` blocking at 23 used and opening calls 24–25 strictly for the
+  closing segment before stopping at 25, retry cap=2 (`max_attempts=3`,
+  exponential `2 s` / `4 s` + `0–30%` jitter, `deferred_retries=0`), `live`
+  `20,000 TPM * 0.7 = 14,000` estimated tok/min chunk splitting and 60 s window
+  wait, `NO_SIGNAL_PEAK=0.005`, and disk checks (`< 115,200,000` B refuse /
+  `< 10 h` warn).
+- **Fallback script & historical spike records preserved:** synced
+  `scripts/event-console-fallback.sh` (`25be847`: 600 s rate limit + static
+  signal-only notification body) and `docs/event-spike.json` (`7133801`:
+  2026-10-23 `transcribe-live` 400 `bidiGenerateContent` failure) verbatim to
+  `arena/c2a7085d-elaria@77143d9`. Preserved `event_spike._restate_batch_math`
+  figures (10 h event at 30 min = `20` calls vs `25` RPD, `headroom=5`; at
+  15 min = `40` calls vs `25` RPD, does not fit).
+- **Test status (2026-11-19):** `82` event tests (`tests/test_event_*.py`),
+  **1,791 passed, 6 skipped** full suite, `ruff check .` clean,
+  `bash -n scripts/event-console-fallback.sh` and `git diff --check` clean.
+  Real hardware gates (`Gate 2` 1–8, `Gate 3` 1 h soak, `Gate 4` far-field) and
+  the real-key 30-min batch provider spike remain unexecuted in sandbox.
