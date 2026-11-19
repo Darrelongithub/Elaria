@@ -24,6 +24,7 @@ import pytest
 
 from assistant.drafts import APPROVED, FAILED, DraftStore, MemoryDraftBackend
 from assistant.phone_link import (
+    _ALLOWED_UPSTREAM_ACTIONS,
     FORBIDDEN_PLUGINS,
     FORBIDDEN_VERBS,
     READ_VERBS,
@@ -656,24 +657,53 @@ def test_every_upstream_action_outside_the_allowlist_is_forbidden() -> None:
     assert len(refused) == 35
 
 
+#: The upstream actions that EMIT A PACKET TO THE PHONE. Determined
+#: empirically against the real upstream v1.2.0 sidecar (see G1 in the
+#: round-3 report): each was invoked through upstream's own dispatch with a
+#: device that had a live notification and a live MPRIS player, and the
+#: resulting KDE Connect packet was observed. 17 of the 19 actions that
+#: E's round-2 code refused only by the outer allowlist are in this set.
+#: The two that are not are pure reads of local sidecar state
+#: (contacts.list_contacts, findthisdevice.stop).
+WRITES_TO_PHONE = (
+    "contacts.sync",
+    "mprisremote.media_action",
+    "mprisremote.refresh",
+    "mprisremote.select_player",
+    "mprisremote.set_position",
+    "mprisremote.set_volume",
+    "notifications.dismiss",
+    "notifications.dismiss_all",
+    "notifications.invoke_action",
+    "notifications.refresh",
+    "notifications.reply",
+    "remotesystemvolume.set_muted",
+    "remotesystemvolume.set_volume",
+    "sendnotifications.test",
+    "sms.get_attachment",
+    "sms.request_conversations",
+    "telephony.mute",
+)
+
+
 def test_the_write_capable_upstream_actions_are_all_forbidden() -> None:
     """Every upstream action that writes to the phone is on the never-list."""
-    writes_to_phone = (
-        "contacts.sync",
-        "mprisremote.refresh",
-        "notifications.dismiss",
-        "notifications.invoke_action",
-        "notifications.reply",
-        "remotesystemvolume.set_muted",
-        "remotesystemvolume.set_volume",
-        "sendnotifications.test",
-        "sms.get_attachment",
-        "sms.request_conversations",
-        "telephony.mute",
-    )
-    for verb in writes_to_phone:
+    for verb in WRITES_TO_PHONE:
         assert verb in UPSTREAM_ACTIONS, verb
         assert _is_forbidden(verb), verb
+
+
+def test_no_write_capable_upstream_action_is_allowlisted() -> None:
+    """The allowlist can never contain an action that writes to the phone."""
+    for verb in WRITES_TO_PHONE:
+        assert verb not in _ALLOWED_UPSTREAM_ACTIONS, verb
+
+
+def test_the_only_upstream_write_e_allows_is_sms_send_sms() -> None:
+    """IF-3: sms.send_sms is the sole write; it is the one exception."""
+    assert "sms.send_sms" in _ALLOWED_UPSTREAM_ACTIONS
+    assert "sms.send_sms" not in WRITES_TO_PHONE
+    assert WRITE_VERBS == {"sms.send_sms"}
 
 
 @pytest.mark.parametrize("verb", sorted(UPSTREAM_ACTIONS - ALLOWED_UPSTREAM_ACTIONS))
