@@ -1,10 +1,13 @@
-# Kitty inventory — build research 2026-11-02
+# Kitty inventory — build research 2026-11-19
 
-**Status: source-researched / TESTED-ONLY; not owner-version or Fedora-membership verified.**
+**Status: source-researched; owner package/version MEASURED 2026-11-17; Fedora file membership open.**
 
-Upstream v0.47.1, commit `fb5255b1ae4f0249ba832d6a773348fd103449ce`.
-Owner ruling: `0.47.1-1.fc44`; actual `kitten --version`: **NOT RECEIVED**.
+Upstream v0.49.2, commit `b2cb871254fbdac19a085188813c8dfb258b95cd`.
+Owner ruling: `0.49.2-1.fc44`; measured `kitten --version`: **kitten 0.49.2 created by Kovid Goyal**.
+Re-pinned 2026-11-19 by lane Q (code only; no release, deploy, install or live run).
 Do not substitute this version claim for verbatim owner output. No live kitty was run.
+
+DATED SUPERSESSION 2026-11-19: the previous revision of this page recorded upstream v0.47.1 and owner ruling `0.47.1-1.fc44`. That remains true of the historical build; this page now records v0.49.2. History is annotated, never rewritten.
 
 Authority: owner 2026-11-02 sequencing-only addendum > builder v1.1 > KITTY-CLAUSE v2.
 Clause SHA256: `8be8a4a94e958e1fd0323d8e687418f73e6cfd407a5a08bb6720b75769ffb6bc` (unchanged).
@@ -13,7 +16,7 @@ Lane placement is accepted in place by the 2026-11-02 design checkpoint ruling, 
 
 ## Scope and trust
 
-- Ring 1 contains all 39 upstream `kitty/rc` commands, including deprecated `new-window`.
+- Ring 1 contains all 41 upstream `kitty/rc` commands, including deprecated `new-window` and the two v0.49.2 additions `screenshot` and `set-os-window-title`.
 - Ring 2 enumerates upstream bundled kittens and companion tools; Fedora package membership still needs `rpm -ql` evidence.
 - Ring 3 includes the five requested configuration entries, packaging limits and Hyprland version findings.
 - Every tier below is a **minimum**, not a task whitelist. Unknown verbs default K3.
@@ -21,14 +24,16 @@ Lane placement is accepted in place by the 2026-11-02 design checkpoint ruling, 
 - Any irreversible/credential/unknown effect escalates K3. Existing T3 holds still refuse: a K3 Yes never overrides them.
 - SSH options depend on the installed OpenSSH binary. The pinned fallback flags and complete kitty-specific ssh.conf/copy surface are included; installed SSH help/man reconciliation is still open.
 - Defaults are the command-line defaults; an absent Python string default is None but generated Go CLI uses an empty string. `declared_default` retains explicit source metadata.
-- `send-key` on 0.47.1 carries `K3-send-key-exclude-active-unenforced-0.47.1` at verb and option level. Broadcast exclusion is untrustworthy even when `exclude_active=true`; a snapshot cannot make it atomic.
+- `send-key` on 0.49.2 carries `K3-send-key-exclude-active-unenforced-0.49.2` at verb and option level (RE-DERIVED against the new source, never inherited). Broadcast exclusion is untrustworthy even when `exclude_active=true`; a snapshot cannot make it atomic.
+- `get-text` on 0.49.2 carries `get-text-extent-unassessed-0.49.2`: `--extent` gained `alternate`/`alternate_scrollback`, which read the not-currently-visible screen and scrollback. Only the assessed subset is executable (`checker.validate_payload`); widening needs an owner ruling (ASK 50 / Approval 2c).
+- `screenshot` and `set-os-window-title` are classified `never-grant-rc`: an arbitrary-path PNG write plus screen-content return, and OS window-identity rewriting respectively.
 - CLI fields are not wire fields. Protocol specs and options are separately recorded. Raw source expressions are retained rather than guessed.
 
 ## Primary sources and appendix cross-check
 
-- [kitty pinned source](https://github.com/kovidgoyal/kitty/tree/v0.47.1): `kitty/rc/*.py`, `kitty/launch.py`, `kitty/simple_cli_definitions.py`, `gen/go_code.py`, `tools/cli/help.go`, `kittens/*`.
-- [Protocol](https://github.com/kovidgoyal/kitty/blob/v0.47.1/docs/rc_protocol.rst): DCS JSON, X25519/SHA256/AES-256-GCM, base85, async and streaming.
-- [Password enforcement](https://github.com/kovidgoyal/kitty/blob/v0.47.1/kitty/boss.py): password mode works over sockets; socket/socket-only bypass socket password checks.
+- [kitty pinned source](https://github.com/kovidgoyal/kitty/tree/v0.49.2): `kitty/rc/*.py`, `kitty/launch.py`, `kitty/simple_cli_definitions.py`, `gen/go_code.py`, `tools/cli/help.go`, `kittens/*`.
+- [Protocol](https://github.com/kovidgoyal/kitty/blob/v0.49.2/docs/rc_protocol.rst): DCS JSON, X25519/SHA256/AES-256-GCM, base85, async and streaming.
+- [Password enforcement](https://github.com/kovidgoyal/kitty/blob/v0.49.2/kitty/boss.py): password mode works over sockets; socket/socket-only bypass socket password checks.
 - [Hyprland v0.57.0](https://github.com/hyprwm/Hyprland/tree/v0.57.0), commit `0aa6745f705f2c4b0a5004eb019ef76e5bbdb426`: Lua ConfigManager, example/hyprland.lua, Rule.cpp, WindowRuleEffectContainer.cpp and LuaBindingsConfigRules.cpp confirm the replacement rule in setup.
 - [RA-15](https://github.com/jantman/robot-army/issues/125), [mcp-radar 107](https://github.com/Danyw24/mcp-radar/issues/107), [compass 88](https://github.com/tuna-os/compass/issues/88): read at build time; corroborate predictable /tmp paths, symlink and cross-UID hazards. These are reports, not owner-machine measurements.
 - [dotfiles PR6](https://github.com/snaraj/dotfiles/pull/6): reviewed as third-party application/paste evidence, not transferable proof for this owner or pinned kitty.
@@ -37,11 +42,13 @@ Lane placement is accepted in place by the 2026-11-02 design checkpoint ruling, 
 
 ### Build-time errata (the Drive clause is NOT rewritten)
 
-- set-os-window-title is not a v0.47.1 RC verb; launch has --os-window-title for initial titles.
+- ANNOTATED 2026-11-19 (re-pin v0.49.2): "set-os-window-title is not a v0.47.1 RC verb; launch has --os-window-title for initial titles" was TRUE at v0.47.1 and is FALSE at v0.49.2, where set_os_window_title IS an RC verb. Corrected, never silently carried forward; it is classified never-grant-rc in this inventory.
 - listen_on prose omits password from allowed modes, but boss.py explicitly permits password.
 - Hyprland v0.57.0 uses Lua, not the clause windowrulev2 spelling.
 - Bracketed paste is application-controlled, not proof of non-execution.
 - send-key declares exclude_active but its handler does not enforce it; bridge must exclude IDs itself.
+- ANNOTATED 2026-11-19 (re-pin v0.49.2): get-text --extent gained alternate and alternate_scrollback, which read the not-currently-visible screen and its scrollback. The grant is verb-granular, so the widening is invisible in the verb list; checker.validate_payload constrains the value to the assessed subset (narrowing). Widening needs an explicit owner ruling (ASK 50 / 2c).
+- ANNOTATED 2026-11-19 (re-pin v0.49.2): screenshot is NEW at v0.49.2 — an arbitrary-path PNG write AND a screen-content return-to-caller. Classified never-grant-rc; refused at the payload boundary.
 
 ## Ring 1 — every remote-control verb
 
@@ -70,6 +77,7 @@ Lane placement is accepted in place by the 2026-11-02 design checkpoint ruling, 
 | `resize-os-window` | K2 | Resize/show/hide/etc. the specified OS Windows |
 | `resize-window` | K2 | Resize the specified windows |
 | `run` | K2 | Run a program on the computer in which kitty is running and get the output |
+| `screenshot` | K3 | Take a screenshot of a kitty OS window, tab or window |
 | `scroll-window` | K1 | Scroll the specified windows |
 | `select-window` | K2 | Visually select a window in the specified tab |
 | `send-key` | K3 | Send arbitrary key presses to the specified windows |
@@ -79,6 +87,7 @@ Lane placement is accepted in place by the 2026-11-02 design checkpoint ruling, 
 | `set-colors` | K2 | Set terminal colors |
 | `set-enabled-layouts` | K2 | Set the enabled layouts in tabs |
 | `set-font-size` | K2 | Set the font size in the active top-level OS window |
+| `set-os-window-title` | K3 | Set the OS window title |
 | `set-spacing` | K2 | Set window paddings and margins |
 | `set-tab-color` | K2 | Change the color of the specified tabs in the tab bar |
 | `set-tab-title` | K2 | Set the tab title |
@@ -161,7 +170,7 @@ Run the specified mappable action. For a list of all available mappable actions,
 Hazards: target-default-may-be-active, effects-require-verification, arbitrary-effects, credential-access-K3.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='ACTION [ARGS FOR ACTION...]', json_field='action', minimum_count=1, completion=RemoteCommand.CompletionSpec.from_string('type:special group:complete_actions'))`.
-Source: `kitty/rc/action.py`, SHA256 `d954cc954702ae7be734194f21374a5555bfa6dceb4fb5a3a074be0dd6275fcf`.
+Source: `kitty/rc/action.py`, SHA256 `858294e4c90fc03f726f34a92b6a4bbde9507862d7d1316c94fba97099d8bc93`.
 
 #### Wire payload (upstream declaration)
 
@@ -259,7 +268,7 @@ tabs in the currently focused OS window, use::
 Hazards: target-default-may-be-active, effects-require-verification, target-blind, his-window-K3, destructive-K3.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/close_tab.py`, SHA256 `c85a4a0362e2e45c6aa045dce90adf01da0e8e2426c00da13b8e77bc951389c4`.
+Source: `kitty/rc/close_tab.py`, SHA256 `97465058e3840108ec83749c2e1cc297b65e88b3a65997ac2f4143967a20195c`.
 
 #### Wire payload (upstream declaration)
 
@@ -353,7 +362,7 @@ Close the specified windows
 Hazards: target-default-may-be-active, effects-require-verification, target-blind, his-window-K3, destructive-K3.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/close_window.py`, SHA256 `1f730fc9947990d7cb5b90f219d0de732c242f855ea94d9154179095f235e499`.
+Source: `kitty/rc/close_window.py`, SHA256 `ef197dfb60fc1243274efc0f6a8440149aadd6d102bffca85f178ce63faa81ce`.
 
 #### Wire payload (upstream declaration)
 
@@ -455,7 +464,7 @@ Create a marker which can highlight text in the specified window. For example: :
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='MARKER SPECIFICATION', json_field='marker_spec', minimum_count=2)`.
-Source: `kitty/rc/create_marker.py`, SHA256 `ac844de07cd150c10ab76ca43685ef6bbe0ee7c6ea7baab67773205dd7989e90`.
+Source: `kitty/rc/create_marker.py`, SHA256 `695cc7730a48a4ffc9a0ff4158643ab8d4f54c28d4fa7225bc94d785ae2ab6d4`.
 
 #### Wire payload (upstream declaration)
 
@@ -538,7 +547,7 @@ Detach the specified tabs and either move them into a new OS window or add them 
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/detach_tab.py`, SHA256 `d651c2f3e2fbf193aa101aa3c7651f42d19ac65f54a187880148906a9a49ed9a`.
+Source: `kitty/rc/detach_tab.py`, SHA256 `be24fffbe4b31bdb1363441c801216d979460ed2cba30b8c35f4e9cb20393b32`.
 
 #### Wire payload (upstream declaration)
 
@@ -660,7 +669,7 @@ Detach the specified windows and either move them into a new tab, a new OS windo
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/detach_window.py`, SHA256 `369bbe971ef4c6fc8c75d8b849707779f56480659b2d3d22769ad9c6738f3ed3`.
+Source: `kitty/rc/detach_window.py`, SHA256 `0dc99b2faa3900453856e045884db966a8a1dc78d67f42efb0f33cea3e4c1b6f`.
 
 #### Wire payload (upstream declaration)
 
@@ -801,7 +810,7 @@ Control ligature rendering for the specified windows/tabs (defaults to active wi
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='STRATEGY', count=1, json_field='strategy')`.
-Source: `kitty/rc/disable_ligatures.py`, SHA256 `bc3b0629be6d69ad2b29fc8638e34aa6856f97eb27758b1340b3b163d1d29f7e`.
+Source: `kitty/rc/disable_ligatures.py`, SHA256 `b67ebc9e567925f9cb5ac531cd461fae9e81e68debf51e31b39392477d643237`.
 
 #### Wire payload (upstream declaration)
 
@@ -933,7 +942,7 @@ Change the environment variables that will be seen in newly launched windows. Si
 Hazards: target-default-may-be-active, effects-require-verification, arbitrary-effects, credential-access-K3.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='env_var1=val env_var2=val ...', minimum_count=1, json_field='env')`.
-Source: `kitty/rc/env.py`, SHA256 `96b5cf7d970d4410f9de45f0853c8e67576cb72b061e0a528f9e209e6ac142ed`.
+Source: `kitty/rc/env.py`, SHA256 `ead897c8cae81af09306fd81f46112645396f0f6ba39083721d54797150b9826`.
 
 #### Wire payload (upstream declaration)
 
@@ -951,7 +960,7 @@ The active window in the specified tab will be focused.
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/focus_tab.py`, SHA256 `8e97da1379070b45165251ecc58dfeac5e90dc37ef18762870a87bc9d9f91540`.
+Source: `kitty/rc/focus_tab.py`, SHA256 `6da9f29cc91e76f15ba63c14e18ecf9ea2a7e346471ae20751aa200e8d34e775`.
 
 #### Wire payload (upstream declaration)
 
@@ -1025,7 +1034,7 @@ Focus the specified window, if no window is specified, focus the window this com
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/focus_window.py`, SHA256 `5cc42825c7629cdac44c8ad67a3c41bcead8832f341208acfaf021ef40a8ed23`.
+Source: `kitty/rc/focus_window.py`, SHA256 `a2079f46ce60a9143482a09f54320766e4e43e67ced8b7d1ba7557f86d68683f`.
 
 #### Wire payload (upstream declaration)
 
@@ -1112,7 +1121,7 @@ Change background above to whatever color you are interested in.
 Hazards: target-default-may-be-active, effects-require-verification, screen-or-environment-may-contain-secrets.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/get_colors.py`, SHA256 `f7d31ba8b72c5f4e900dd9372c6f3df814d7d6535cb46940e01b32fbc54375ca`.
+Source: `kitty/rc/get_colors.py`, SHA256 `a375f0f5b71c110ba7b3b56b917dccaa54f91243784b52b90f79ea92b4652a12`.
 
 #### Wire payload (upstream declaration)
 
@@ -1192,16 +1201,16 @@ Note that you can use the :ref:`kitten @ ls <at-ls>` command to get a list of wi
 
 Get text from the specified window
 
-Hazards: target-default-may-be-active, effects-require-verification, screen-or-environment-may-contain-secrets.
+Hazards: target-default-may-be-active, effects-require-verification, screen-or-environment-may-contain-secrets, get-text-extent-unassessed-0.49.2.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/get_text.py`, SHA256 `53049f84a8d48bc8845bf0e57501766b9caa89a21de5a5ff966d9ae8f0291833`.
+Source: `kitty/rc/get_text.py`, SHA256 `ae8116cbf50d0b102b239cceec1df895341707aa36d44991789492ac0f120e02`.
 
 #### Wire payload (upstream declaration)
 
 ```text
 match/str: The window to get text from
-    extent/choices.screen.first_cmd_output_on_screen.last_cmd_output.last_visited_cmd_output.all.selection:         One of :code:`screen`, :code:`first_cmd_output_on_screen`, :code:`last_cmd_output`,         :code:`last_visited_cmd_output`, :code:`all`, or :code:`selection`
+    extent/choices.screen.first_cmd_output_on_screen.last_cmd_output.last_visited_cmd_output.last_non_empty_output.all.selection.alternate.alternate_scrollback:         One of :code:`screen`, :code:`first_cmd_output_on_screen`, :code:`last_cmd_output`,         :code:`last_visited_cmd_output`, :code:`last_non_empty_output`, :code:`all`,         :code:`selection`, :code:`alternate`, or :code:`alternate_scrollback`
     ansi/bool: Boolean, if True send ANSI formatting codes
     cursor/bool: Boolean, if True send cursor position/style as ANSI codes
     wrap_markers/bool: Boolean, if True add wrap markers to output
@@ -1269,8 +1278,8 @@ Note that you can use the :ref:`kitten @ ls <at-ls>` command to get a list of wi
 ##### `--extent`
 
 Type: `choices`; CLI default: `"screen"`; explicit source default: `"screen"`.
-Choices: screen,  all,  selection,  first_cmd_output_on_screen,  last_cmd_output,  last_visited_cmd_output,  last_non_empty_output.
-Option hazards: inherits act hazards.
+Choices: screen,  all,  selection,  first_cmd_output_on_screen,  last_cmd_output,  last_visited_cmd_output,  last_non_empty_output,  alternate,  alternate_scrollback.
+Option hazards: get-text-extent-unassessed-0.49.2.
 
 What text to get. The default of :code:`screen` means all text currently on the screen.
 :code:`all` means all the screen+scrollback and :code:`selection` means the
@@ -1280,6 +1289,9 @@ the output of the last command that was run in the window. :code:`last_visited_c
 the first command output below the last scrolled position via scroll_to_prompt.
 :code:`last_non_empty_output` is the output from the last command run in the window that had
 some non empty output. The last four require :ref:`shell_integration` to be enabled.
+:code:`alternate` means the text in the screen that is not currently visible (if the terminal
+is in the main screen this is the secondary/alternate screen and vice versa).
+:code:`alternate_scrollback` is the same but also includes the scrollback buffer (if any).
 
 
 ##### `--ansi`
@@ -1336,7 +1348,7 @@ Set the window layout in the specified tabs (or the active tab if not specified)
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='LAYOUT_NAME', count=1, json_field='layout', completion=RemoteCommand.CompletionSpec.from_string('type:keyword group:"Layout" kwds:' + ','.join(layout_names())))`.
-Source: `kitty/rc/goto_layout.py`, SHA256 `f27f69b9dcb6b0530fe65762543eb196480005ac54b01ac95808818e8c5347c0`.
+Source: `kitty/rc/goto_layout.py`, SHA256 `4c77935ed2c7fe4ec4b0db2a22274e8b1dca38e3b038165de8dc6f1ad97416d3`.
 
 #### Wire payload (upstream declaration)
 
@@ -1401,7 +1413,7 @@ Run a kitten over the specified windows (active window by default). The :italic:
 Hazards: target-default-may-be-active, effects-require-verification, arbitrary-effects, credential-access-K3.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='kitten_name', json_field='kitten', minimum_count=1, first_rest=('kitten', 'args'))`.
-Source: `kitty/rc/kitten.py`, SHA256 `f8954ae9ce9646edd6b96dcc81ad5425e2561c80b57383295fcf107ca2e4ba10`.
+Source: `kitty/rc/kitten.py`, SHA256 `e54ebc787b69f434e86ce92bbc07b4a8f26bffde3cd5d8aaf31f09a9457db531`.
 
 #### Wire payload (upstream declaration)
 
@@ -1475,7 +1487,7 @@ Switch to the last used window layout in the specified tabs (or the active tab i
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/last_used_layout.py`, SHA256 `102ec028c5778b86e7a911ae8b0b21a0ba87d78c259443cff155302c3c8df89c`.
+Source: `kitty/rc/last_used_layout.py`, SHA256 `f7b8ae6b187cc309dac6a9a42d817a3804a701229e5972e4d2ca8d348c8b966d`.
 
 #### Wire payload (upstream declaration)
 
@@ -1561,7 +1573,7 @@ Prints out the id of the newly opened window. Any command line arguments are ass
 Hazards: target-default-may-be-active, effects-require-verification, arbitrary-process, focus-steal, never-grant-rc, stamp-required.
 Async: True; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='[CMD ...]', json_field='args', completion=RemoteCommand.CompletionSpec.from_string('type:special group:cli.CompleteExecutableFirstArg'))`.
-Source: `kitty/rc/launch.py`, SHA256 `5c5485031fdbaf3403ff50935a236564bdf5db0553fb044246b70070ffdc522e`.
+Source: `kitty/rc/launch.py`, SHA256 `3cd119fab444994a84d0f8e7b32b4a4c41d2877184fb7c3f74613814939b8db7`.
 
 #### Wire payload (upstream declaration)
 
@@ -1773,7 +1785,7 @@ Where to launch the child process:
 
 :code:`os-panel`
     Similar to :code:`os-window`, except that it creates the new OS Window as a desktop panel.
-    Only works on platforms that support this, such as Wayand compositors that support the layer
+    Only works on platforms that support this, such as Wayland compositors that support the layer
     shell protocol. Use the :option:`kitten @ launch --os-panel` option to configure the panel.
 
 #placeholder_for_formatting#
@@ -1819,7 +1831,7 @@ Add the newly created window/tab to the specified session. Use :code:`.` to add
 to the session of the :option:`source window <launch --source-window>`, if any. See :ref:`sessions`
 for what a session is and how to use one. By default, the window is added to the
 session of the :option:`source window <launch --source-window>` when :option:`kitten @ launch --cwd`
-is set to use the the working directory from that window, otherwise the newly created window
+is set to use the working directory from that window, otherwise the newly created window
 does not belong to any session. To force adding to no session, use the value :code:`!`.
 Adding a newly created window to a session is purely temporary, it does not change the actual
 session file, for that you have to resave the session. Note that using this flag in a launch
@@ -2233,7 +2245,7 @@ is specified.
 Hazards: target-default-may-be-active, effects-require-verification, arbitrary-effects, credential-access-K3.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='CONF_FILE ...', json_field='paths', completion=RemoteCommand.CompletionSpec.from_string('type:file group:"CONF files", ext:conf'))`.
-Source: `kitty/rc/load_config.py`, SHA256 `045ac005a1c0665b015df60d1aa9f03f0183c716582482317a0d3e1981b1fbc5`.
+Source: `kitty/rc/load_config.py`, SHA256 `89ccc155ef6eadcc72cc81aebf22496b31dfe7ece107cb1fbbd49e66f119dc04`.
 
 #### Wire payload (upstream declaration)
 
@@ -2286,7 +2298,7 @@ You can limit the windows/tabs in the output by using the :option:`--match` and 
 Hazards: target-default-may-be-active, effects-require-verification, screen-or-environment-may-contain-secrets.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/ls.py`, SHA256 `2d1e74a116fa7caf3ceaa534846ceecc92fadf915798e8772d97c4aeb0695f58`.
+Source: `kitty/rc/ls.py`, SHA256 `f54cd133e937e27e059815c2b41df11c0c8054d4baf4d5dca295a05883951927`.
 
 #### Wire payload (upstream declaration)
 
@@ -2440,7 +2452,7 @@ Open a new window in the specified tab. If you use the :option:`kitten @ new-win
 Hazards: target-default-may-be-active, effects-require-verification, arbitrary-process, focus-steal, never-grant-rc, stamp-required.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='[CMD ...]', json_field='args')`.
-Source: `kitty/rc/new_window.py`, SHA256 `1cd4411d6021a0475bd19d959864533e4513459cfdd35c0c2ebe20674f6f5725`.
+Source: `kitty/rc/new_window.py`, SHA256 `ce5c0d8bc0b65d2699d71451a50eec86a2d90ea5fe0deab3abd99d36a28b2578`.
 
 #### Wire payload (upstream declaration)
 
@@ -2578,7 +2590,7 @@ Remove the currently set marker, if any.
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/remove_marker.py`, SHA256 `58a1d6bd50e0b8cb81c9c1a2b0ff7722df603cc258ec116c438e52561f645c97`.
+Source: `kitty/rc/remove_marker.py`, SHA256 `b35646d1c17b523b49a3e079556507980f532ea5e4dbaad06227398a72e237d3`.
 
 #### Wire payload (upstream declaration)
 
@@ -2662,7 +2674,7 @@ To modify OS Panels created with the panel kitten, use :option:`--action`=:code:
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='[OS Panel settings ...]', json_field='os_panel', special_parse='escape_list_of_strings(args), nil')`.
-Source: `kitty/rc/resize_os_window.py`, SHA256 `f2790bdc62043fcbc5f82ddd9cf54ef3ff3d7cdadabc6a6f8f382f25af611e82`.
+Source: `kitty/rc/resize_os_window.py`, SHA256 `9841c6d81e3bd69f00e31b180ee7f60483fb80131f0f312c413983b772e60dc1`.
 
 #### Wire payload (upstream declaration)
 
@@ -2808,7 +2820,7 @@ Resize the specified windows in the current layout. Note that not all layouts ca
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/resize_window.py`, SHA256 `8ab51e30ed16bc8bcb1208b4f58a6be38b4f6fd9fb2ba9b07e473a643eaf185f`.
+Source: `kitty/rc/resize_window.py`, SHA256 `0a5ec354d77ec7f0ee94254176b91861a8011f53311f79588bc80cbde5586998`.
 
 #### Wire payload (upstream declaration)
 
@@ -2913,7 +2925,7 @@ Run the specified program on the computer in which kitty is running. When STDIN 
 Hazards: target-default-may-be-active, effects-require-verification, silent, arbitrary-process, irreversible-effects-K3.
 Async: True; streaming: True; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='CMD ...', json_field='data', special_parse='+cmdline:!read_run_data(io_data, args, &payload)', minimum_count=1, completion=RemoteCommand.CompletionSpec.from_string('type:special group:cli.CompleteExecutableFirstArg'))`.
-Source: `kitty/rc/run.py`, SHA256 `ea3373d05799167637b8fca4b87a4da768ac0105d6d800e0269835c952bdac3f`.
+Source: `kitty/rc/run.py`, SHA256 `e29a8c06eb43facd8c58821fd2611302a21c1fc2d7e459fab0cdfb6a6ac7cbad`.
 
 #### Wire payload (upstream declaration)
 
@@ -2972,6 +2984,129 @@ is also specified. Can be specified multiple times to create multiple passwords.
 This option was added to kitty in version 0.26.0
 
 
+### `screenshot` — K3
+
+Take a screenshot, as a PNG image, of an entire kitty OS window. Restrict the screenshot to a single kitty window or tab with :option:`--match`/:option:`--match-tab`. The specified window/tab must be currently visible, i.e. it must be in the active tab of its OS window and, in the case of a window, not hidden behind another window by the layout, otherwise this command will fail.
+
+By default, the PNG image data is written to STDOUT. If instead a file path is specified, kitty itself (rather than this :program:`kitten` process) saves the screenshot to that path. Since kitty and the kitten are typically running on the same computer, this avoids copying the (potentially large) image data over the possibly slow remote control transport.
+
+Hazards: target-default-may-be-active, effects-require-verification, never-grant-rc, arbitrary-path-write, screen-content-return, os-window-reach.
+Async: True; streaming: False; no-response declaration: False.
+Argument declaration: `RemoteCommand.Args(spec='[OUTPUT_FILE]', json_field='output_path', special_parse='!read_screenshot_args(io_data, args)', completion=RemoteCommand.CompletionSpec.from_string('type:file ext:png'))`.
+Source: `kitty/rc/screenshot.py`, SHA256 `89140d63992e9fa0ef00149dffc9d3c9b54906fca21cc58f8992337f25464c84`.
+
+#### Wire payload (upstream declaration)
+
+```text
+match/str: The window to screenshot
+    match_tab/str: The tab to screenshot
+    output_path/str: Path to save the PNG image to, on the computer kitty is running on. Empty to return the image data instead.
+```
+
+#### Complete declared CLI options
+
+##### `--match`, `-m`
+
+Type: `str`; CLI default: `""`; explicit source default: `null`.
+Choices: not enumerated.
+Option hazards: target-expansion.
+
+The window to match. Match specifications are of the form: :italic:`field:query`.
+Where :italic:`field` can be one of: :code:`id`, :code:`title`, :code:`pid`, :code:`cwd`, :code:`cmdline`, :code:`num`,
+:code:`env`, :code:`var`, :code:`state`, :code:`neighbor`, :code:`session` and :code:`recent`.
+:italic:`query` is the expression to match. Expressions can be either a number or a regular expression, and can be
+:ref:`combined using Boolean operators <search_syntax>`.
+
+The special value :code:`all` matches all windows.
+
+For numeric fields: :code:`id`, :code:`pid`, :code:`num` and :code:`recent`, the expression is interpreted as
+a number, not a regular expression. Negative values for :code:`id` match from the highest id number down, in particular,
+-1 is the most recently created window.
+
+The field :code:`num` refers to the window position in the current tab, starting from zero and counting clockwise (this
+is the same as the order in which the windows are reported by the :ref:`kitten @ ls <at-ls>` command).
+
+The window id of the current window is available as the :envvar:`KITTY_WINDOW_ID` environment variable.
+
+The field :code:`recent` refers to recently active windows in the currently active tab, with zero being the currently
+active window, one being the previously active window and so on.
+
+The field :code:`neighbor` refers to a neighbor of the active window in the specified direction, which can be:
+:code:`left`, :code:`right`, :code:`top` or :code:`bottom`.
+
+The field :code:`session` matches windows that were created in the specified session.
+Use the expression :code:`^$` to match windows that were not created in a session and
+:code:`.` to match the currently active session and :code:`~` to match either the currently
+active session or the last active session when no session is active.
+
+When using the :code:`env` field to match on environment variables, you can specify only the environment variable name
+or a name and value, for example, :code:`env:MY_ENV_VAR=2`.
+
+Similarly, the :code:`var` field matches on user variables set on the window. You can specify name or name and value
+as with the :code:`env` field.
+
+The field :code:`state` matches on the state of the window. Supported states
+are: :code:`active`, :code:`focused`, :code:`needs_attention`,
+:code:`parent_active`, :code:`parent_focused`, :code:`focused_os_window`,
+:code:`self`, :code:`overlay_parent`.  Active windows are the windows that are
+active in their parent tab. There is only one focused window and it is the
+window to which keyboard events are delivered. If no window is focused, the
+last focused window is matched. The value :code:`focused_os_window` matches
+all windows in the currently focused OS window. The value :code:`self` matches
+the window in which the remote control command is run. The value
+:code:`overlay_parent` matches the window that is under the :code:`self`
+window, when the self window is an overlay.
+
+Note that you can use the :ref:`kitten @ ls <at-ls>` command to get a list of windows.
+
+
+##### `--match-tab`, `-t`
+
+Type: `str`; CLI default: `""`; explicit source default: `null`.
+Choices: not enumerated.
+Option hazards: target-expansion.
+
+The tab to match. Match specifications are of the form: :italic:`field:query`.
+Where :italic:`field` can be one of: :code:`id`, :code:`index`, :code:`title`, :code:`window_id`, :code:`window_title`,
+:code:`pid`, :code:`cwd`, :code:`cmdline` :code:`env`, :code:`var`, :code:`state`, :code:`session` and :code:`recent`.
+:italic:`query` is the expression to match. Expressions can be either a number or a regular expression, and can be
+:ref:`combined using Boolean operators <search_syntax>`.
+
+The special value :code:`all` matches all tabs.
+
+For numeric fields: :code:`id`, :code:`index`, :code:`window_id`, :code:`pid` and :code:`recent`, the
+expression is interpreted as a number, not a regular expression. Negative values for :code:`id`/:code:`window_id` match
+from the highest id number down, in particular, -1 is the most recently created tab/window.
+
+When using :code:`title` or :code:`id`, first a matching tab is looked for, and if not found a matching window is looked
+for, and the tab for that window is used.
+
+You can also use :code:`window_id` and :code:`window_title` to match the tab that contains the window with the specified
+id or title.
+
+The :code:`index` number is used to match the nth tab in the currently active OS window.
+The :code:`recent` number matches recently active tabs in the currently active OS window, with zero being the currently
+active tab, one the previously active tab and so on.
+
+The field :code:`session` matches tabs that were created in the specified session.
+Use the expression :code:`^$` to match windows that were not created in a session and
+:code:`.` to match the currently active session and :code:`~` to match either the currently
+active session or the last active session when no session is active.
+
+When using the :code:`env` field to match on environment variables, you can specify only the environment variable name
+or a name and value, for example, :code:`env:MY_ENV_VAR=2`. Tabs containing any window with the specified environment
+variables are matched. Similarly, :code:`var` matches tabs containing any window with the specified user variable.
+
+The field :code:`state` matches on the state of the tab. Supported states are:
+:code:`active`, :code:`focused`, :code:`needs_attention`, :code:`parent_active`, :code:`parent_focused`
+and :code:`focused_os_window`.
+Active tabs are the tabs that are active in their parent OS window. There is only one focused tab
+and it is the tab to which keyboard events are delivered. If no tab is focused, the last focused tab is matched.
+The value :code:`focused_os_window` matches all tabs in the currently focused OS window.
+
+Note that you can use the :ref:`kitten @ ls <at-ls>` command to get a list of tabs.
+
+
 ### `scroll-window` — K1
 
 Scroll the specified windows, if no window is specified, scroll the window this command is run inside. :italic:`SCROLL_AMOUNT` can be either the keywords :code:`start` or :code:`end` or an argument of the form :italic:`<number>[unit][+-]`. :code:`unit` can be :code:`l` for lines, :code:`p` for pages, :code:`u` for unscroll and :code:`r` for scroll to prompt. If unspecified, :code:`l` is the default. For example, :code:`30.5` will scroll down 30 and a half lines, :code:`2p-` will scroll up 2 pages and :code:`0.5p` will scroll down half page. :code:`3u` will *unscroll* by 3 lines, which means that 3 lines will move from the scrollback buffer onto the top of the screen. :code:`1r-` will scroll to the previous prompt and :code:`1r` to the next prompt. See :ac:`scroll_to_prompt` for details on how scrolling to prompt works.
@@ -2979,7 +3114,7 @@ Scroll the specified windows, if no window is specified, scroll the window this 
 Hazards: target-default-may-be-active, effects-require-verification, screen-or-environment-may-contain-secrets.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='SCROLL_AMOUNT', count=1, special_parse='parse_scroll_amount(args[0])', json_field='amount')`.
-Source: `kitty/rc/scroll_window.py`, SHA256 `ebd6010c3ef6b7bee87d9703df35a91c0943afcd6d3d1b21422bd424d5bd1f6d`.
+Source: `kitty/rc/scroll_window.py`, SHA256 `8a984d8ac301c0e9125fe3cf75cacbae02258726ab7cb6840b366d187133c9cf`.
 
 #### Wire payload (upstream declaration)
 
@@ -3063,7 +3198,7 @@ Prints out the id of the selected window. Other commands can then be chained to 
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: True; streaming: False; no-response declaration: False.
 Argument declaration: ``.
-Source: `kitty/rc/select_window.py`, SHA256 `d32a5a12daa8a540d4dc65a619084946f07e1e581734cfdf98cf9d5dce57d1fb`.
+Source: `kitty/rc/select_window.py`, SHA256 `7687eeb1cf2761af7c82737f5d2318f9e3e810e22e8046da0c94e0d0d9c628de`.
 
 #### Wire payload (upstream declaration)
 
@@ -3176,10 +3311,10 @@ be refocused.
 
 Send arbitrary key presses to specified windows. All specified keys are sent first as press events then as release events in reverse order. Keys are sent to the programs running in the windows. They are sent only if the current keyboard mode for the program supports the particular key. For example: send-key ctrl+a ctrl+b. Note that errors are not reported, for technical reasons, so send-key always succeeds, even if no key was sent to any window.
 
-Hazards: target-default-may-be-active, effects-require-verification, silent-success, arbitrary-input, broadcast, his-window-K3, K3-send-key-exclude-active-unenforced-0.47.1.
+Hazards: target-default-may-be-active, effects-require-verification, silent-success, arbitrary-input, broadcast, his-window-K3, K3-send-key-exclude-active-unenforced-0.49.2.
 Async: False; streaming: False; no-response declaration: True.
 Argument declaration: `RemoteCommand.Args(spec='[KEYS TO SEND ...]', json_field='keys')`.
-Source: `kitty/rc/send_key.py`, SHA256 `a66921c25f138aac9ff87aebd603881aa08cfee3b83f822d1796599418c66e0b`.
+Source: `kitty/rc/send_key.py`, SHA256 `7eb7197b07462af2d96bebe2f27f26e146f76ba59ac5c01cd54caef16540b83e`.
 
 #### Wire payload (upstream declaration)
 
@@ -3308,7 +3443,7 @@ Match all windows.
 
 Type: `bool-set`; CLI default: `false`; explicit source default: `null`.
 Choices: not enumerated.
-Option hazards: K3-send-key-exclude-active-unenforced-0.47.1.
+Option hazards: K3-send-key-exclude-active-unenforced-0.49.2.
 
 Do not send text to the active window, even if it is one of the matched windows.
 
@@ -3320,7 +3455,7 @@ Send arbitrary text to specified windows. The text follows Python escaping rules
 Hazards: target-default-may-be-active, effects-require-verification, silent-success, arbitrary-input, broadcast, his-window-K3, python-escape-cli, newline-execution, bracketed-paste-not-a-guarantee.
 Async: False; streaming: False; no-response declaration: True.
 Argument declaration: `RemoteCommand.Args(spec='[TEXT TO SEND]', json_field='data', special_parse='+session_id:parse_send_text(io_data, args)')`.
-Source: `kitty/rc/send_text.py`, SHA256 `598d90e13628126d764250408436d2f0fce8ee5828182f41568ee6834d573f0b`.
+Source: `kitty/rc/send_text.py`, SHA256 `3cedf2ad79818de50f196984d0f8750d5b445c354d10cff3639fe385110f5b2f`.
 
 #### Wire payload (upstream declaration)
 
@@ -3496,14 +3631,14 @@ You can also specify an index to change the background image to one of the pre-c
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: True; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='PATH_TO_IMAGE_OR_INDEX', count=1, json_field='data', special_parse='!read_background_image(io_data, args[0])', completion=ImageCompletion)`.
-Source: `kitty/rc/set_background_image.py`, SHA256 `f9b4932494c9128f0686f9d881dfed78e683f91133bf7ad773665d59375b9ddb`.
+Source: `kitty/rc/set_background_image.py`, SHA256 `64a13561f150913b6dc3655ee51c6fd65190f98b4bc755822fe437c213cbd658`.
 
 #### Wire payload (upstream declaration)
 
 ```text
 data+/str: Chunk of at most 512 bytes of PNG data, base64 encoded. Must send an empty chunk to indicate end of image.     Or the special value - to indicate image must be removed. Or the value index:idx to change image.
     match/str: Window to change opacity in
-    layout/choices.{layout_choices.replace(",", ".")}: The image layout
+    layout/choices.tiled.scaled.mirror-tiled.clamped.centered.cscaled.configured: The image layout
     all/bool: Boolean indicating operate on all windows
     configured/bool: Boolean indicating if the configured value should be changed
 ```
@@ -3613,7 +3748,7 @@ Set the background opacity for the specified windows. This will only work if you
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='OPACITY', count=1, json_field='opacity', special_parse='parse_opacity(args[0])')`.
-Source: `kitty/rc/set_background_opacity.py`, SHA256 `7f642c61e19c60b7ca6e5fa321d068ced900e6cf0f9c8ce1dd80df697aaa8855`.
+Source: `kitty/rc/set_background_opacity.py`, SHA256 `f011c1b6a7e7242e5e37ea4e92cc92bd137f6af12b7388ec06bfb7ad1d3522d6`.
 
 #### Wire payload (upstream declaration)
 
@@ -3758,7 +3893,7 @@ Set the terminal colors for the specified windows/tabs (defaults to active windo
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='COLOR_OR_FILE ...', json_field='colors', special_parse='parse_colors_and_files(args)', completion=RemoteCommand.CompletionSpec.from_string('type:file group:"CONF files", ext:conf'))`.
-Source: `kitty/rc/set_colors.py`, SHA256 `d21eaa5d12a54b779dfcc56e0c1d48a3ade2807b381f4334b0ea2c068d2a2f22`.
+Source: `kitty/rc/set_colors.py`, SHA256 `357e762acaf357f55c4803fb070a3545b2bc004f2888785ca25845ae050e1afb`.
 
 #### Wire payload (upstream declaration)
 
@@ -3912,7 +4047,7 @@ Set the enabled layouts in the specified tabs (or the active tab if not specifie
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='LAYOUT ...', minimum_count=1, json_field='layouts', completion=RemoteCommand.CompletionSpec.from_string('type:keyword group:"Layout" kwds:' + ','.join(layout_names())), args_choices=layout_names)`.
-Source: `kitty/rc/set_enabled_layouts.py`, SHA256 `f7ee68148d3458ff27132036e9f509ecca44f57ddc01c7fab07b7513d8758eb5`.
+Source: `kitty/rc/set_enabled_layouts.py`, SHA256 `b442d5629b55aa2da62fc48a3d2c165171dbdb420229e560af3bc128238d2574`.
 
 #### Wire payload (upstream declaration)
 
@@ -3988,7 +4123,7 @@ Sets the font size to the specified size, in pts. Note that in kitty all sub-win
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='FONT_SIZE', count=1, special_parse='+increment_op:parse_set_font_size(args[0], &payload)', json_field='size')`.
-Source: `kitty/rc/set_font_size.py`, SHA256 `b6ce983b69413be06ed93c7c0a294442fca781d920486374a311bf5ac865a536`.
+Source: `kitty/rc/set_font_size.py`, SHA256 `ef0008c8520e5c3ff1dfa8cad82a6c419615b8fc4ac1d886bdd3d846a5c98dbe`.
 
 #### Wire payload (upstream declaration)
 
@@ -4011,6 +4146,79 @@ this option will cause it to be changed in all OS windows. It also changes
 the font size for any newly created OS Windows in the future.
 
 
+### `set-os-window-title` — K3
+
+Set the title for the OS windows containing the specified windows. If you use the :option:`kitten @ set-os-window-title --match` option the title will be set for all matched OS windows. By default, only the OS window in which the command is run is affected. If you do not specify a title, the title of the currently active window in each OS window is used.
+
+Hazards: target-default-may-be-active, effects-require-verification, never-grant-rc, window-identity-spoofing, os-window-reach.
+Async: False; streaming: False; no-response declaration: False.
+Argument declaration: `RemoteCommand.Args(spec='[TITLE ...]', json_field='title', special_parse='expand_ansi_c_escapes_in_args(args...)')`.
+Source: `kitty/rc/set_os_window_title.py`, SHA256 `31c2adf72a00bfbfabbb645f1682af6aa650996d31e46350d6f648523cf6e011`.
+
+#### Wire payload (upstream declaration)
+
+```text
+title/str: The new title
+    match/str: Which OS windows to change, matched via their contained windows
+```
+
+#### Complete declared CLI options
+
+##### `--match`, `-m`
+
+Type: `str`; CLI default: `""`; explicit source default: `null`.
+Choices: not enumerated.
+Option hazards: target-expansion.
+
+The window to match. Match specifications are of the form: :italic:`field:query`.
+Where :italic:`field` can be one of: :code:`id`, :code:`title`, :code:`pid`, :code:`cwd`, :code:`cmdline`, :code:`num`,
+:code:`env`, :code:`var`, :code:`state`, :code:`neighbor`, :code:`session` and :code:`recent`.
+:italic:`query` is the expression to match. Expressions can be either a number or a regular expression, and can be
+:ref:`combined using Boolean operators <search_syntax>`.
+
+The special value :code:`all` matches all windows.
+
+For numeric fields: :code:`id`, :code:`pid`, :code:`num` and :code:`recent`, the expression is interpreted as
+a number, not a regular expression. Negative values for :code:`id` match from the highest id number down, in particular,
+-1 is the most recently created window.
+
+The field :code:`num` refers to the window position in the current tab, starting from zero and counting clockwise (this
+is the same as the order in which the windows are reported by the :ref:`kitten @ ls <at-ls>` command).
+
+The window id of the current window is available as the :envvar:`KITTY_WINDOW_ID` environment variable.
+
+The field :code:`recent` refers to recently active windows in the currently active tab, with zero being the currently
+active window, one being the previously active window and so on.
+
+The field :code:`neighbor` refers to a neighbor of the active window in the specified direction, which can be:
+:code:`left`, :code:`right`, :code:`top` or :code:`bottom`.
+
+The field :code:`session` matches windows that were created in the specified session.
+Use the expression :code:`^$` to match windows that were not created in a session and
+:code:`.` to match the currently active session and :code:`~` to match either the currently
+active session or the last active session when no session is active.
+
+When using the :code:`env` field to match on environment variables, you can specify only the environment variable name
+or a name and value, for example, :code:`env:MY_ENV_VAR=2`.
+
+Similarly, the :code:`var` field matches on user variables set on the window. You can specify name or name and value
+as with the :code:`env` field.
+
+The field :code:`state` matches on the state of the window. Supported states
+are: :code:`active`, :code:`focused`, :code:`needs_attention`,
+:code:`parent_active`, :code:`parent_focused`, :code:`focused_os_window`,
+:code:`self`, :code:`overlay_parent`.  Active windows are the windows that are
+active in their parent tab. There is only one focused window and it is the
+window to which keyboard events are delivered. If no window is focused, the
+last focused window is matched. The value :code:`focused_os_window` matches
+all windows in the currently focused OS window. The value :code:`self` matches
+the window in which the remote control command is run. The value
+:code:`overlay_parent` matches the window that is under the :code:`self`
+window, when the self window is an overlay.
+
+Note that you can use the :ref:`kitten @ ls <at-ls>` command to get a list of windows.
+
+
 ### `set-spacing` — K2
 
 Set the paddings and margins for the specified windows (defaults to active window). For example: :code:`margin=20` or :code:`padding-left=10` or :code:`margin-h=30`. The shorthand form sets all values, the :code:`*-h` and :code:`*-v` variants set horizontal and vertical values. The special value :code:`default` resets to using the default value. If you specify a tab rather than a window, all windows in that tab are affected.
@@ -4018,7 +4226,7 @@ Set the paddings and margins for the specified windows (defaults to active windo
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='MARGIN_OR_PADDING ...', minimum_count=1, json_field='settings', special_parse='parse_set_spacing(args)')`.
-Source: `kitty/rc/set_spacing.py`, SHA256 `5007540b061aafbafe34726ec39bbe6839142975aa9b9f7a6fa561718cdaa18c`.
+Source: `kitty/rc/set_spacing.py`, SHA256 `a308db423d8224049651491d541eb1161bccdfbdf5ad23d9581d4ce20ed3f753`.
 
 #### Wire payload (upstream declaration)
 
@@ -4165,7 +4373,7 @@ The foreground and background colors when active and inactive can be overridden 
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='COLORS', json_field='colors', minimum_count=1, special_parse='parse_tab_colors(args)')`.
-Source: `kitty/rc/set_tab_color.py`, SHA256 `920449b0f33478ba5a62b29b1666ceea3f466a35c5e692c1db55ab10fff05cbb`.
+Source: `kitty/rc/set_tab_color.py`, SHA256 `0800497cf145364ff5ed5737e20258d377dd0c7d473c7c4580095cc9da772828`.
 
 #### Wire payload (upstream declaration)
 
@@ -4240,7 +4448,7 @@ Set the title for the specified tabs. If you use the :option:`kitten @ set-tab-t
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='TITLE ...', json_field='title', special_parse='expand_ansi_c_escapes_in_args(args...)')`.
-Source: `kitty/rc/set_tab_title.py`, SHA256 `482850d51e60de11bfc6d5b05643ee4a08fe76bc0243c224c2f2af1913c80601`.
+Source: `kitty/rc/set_tab_title.py`, SHA256 `19f831ea2f35327c07beadedbf12cb973e3877e175d1c7ec52b8ab1a8735f444`.
 
 #### Wire payload (upstream declaration)
 
@@ -4305,7 +4513,7 @@ Set user variables for the specified windows. If you use the :option:`kitten @ s
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(json_field='var', spec='[NAME=VALUE ...]')`.
-Source: `kitty/rc/set_user_vars.py`, SHA256 `85c2ed11abc995483a924875848ba275875350bd4cf7919842e33647ef938293`.
+Source: `kitty/rc/set_user_vars.py`, SHA256 `6c42950b58f5e5c1cccff9bb60458dc99ffd835a0cfd5c6fc69c3fcb99221aa9`.
 
 #### Wire payload (upstream declaration)
 
@@ -4378,7 +4586,7 @@ Set the logo image for the specified windows. You must specify the path to an im
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: True; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(spec='PATH_TO_PNG_IMAGE', count=1, json_field='data', special_parse='!read_window_logo(io_data, args[0])', completion=ImageCompletion)`.
-Source: `kitty/rc/set_window_logo.py`, SHA256 `4e30d35625f1054b126fe44af6cda2c62e20718784d2f300007353d0ff4287f0`.
+Source: `kitty/rc/set_window_logo.py`, SHA256 `a2ce0969451ffe0334c764c9fd3035d3cf02dcb6823c049de20ec4d29d769d61`.
 
 #### Wire payload (upstream declaration)
 
@@ -4492,7 +4700,7 @@ Set the title for the specified windows. If you use the :option:`kitten @ set-wi
 Hazards: target-default-may-be-active, effects-require-verification.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(json_field='title', spec='[TITLE ...]', special_parse='expand_ansi_c_escapes_in_args(args...)')`.
-Source: `kitty/rc/set_window_title.py`, SHA256 `83fc98224d66d1b4a2a223b8822d8c01850c89e36efabcc1211370b7479e7ba6`.
+Source: `kitty/rc/set_window_title.py`, SHA256 `118bf47a120f01b3c7e3c7c46e7bfe14b3100f9822129f929ba7846a3c82f39e`.
 
 #### Wire payload (upstream declaration)
 
@@ -4578,7 +4786,7 @@ Send one or more signals to the foreground process in the specified windows. If 
 Hazards: target-default-may-be-active, effects-require-verification, target-blind, his-window-K3, destructive-K3.
 Async: False; streaming: False; no-response declaration: False.
 Argument declaration: `RemoteCommand.Args(json_field='signals', spec='[SIGNAL_NAME ...]', value_if_unspecified=('SIGINT',))`.
-Source: `kitty/rc/signal_child.py`, SHA256 `86971025e2d1501962cb1ea260c8682e024580dc39777c80c34d140ddfd9ce82`.
+Source: `kitty/rc/signal_child.py`, SHA256 `3b3dfb51e316787c7e26fce59d7baa61fffb362e689f8dbce7876df92cd8edba`.
 
 #### Wire payload (upstream declaration)
 
@@ -5160,7 +5368,7 @@ Option hazards: inherits act hazards.
 Path to the remote file.
 
 
-##### `--hostname`, `-h`
+##### `--hostname`
 
 Type: `str`; CLI default: `""`; explicit source default: `null`.
 Choices: not enumerated.
@@ -5312,7 +5520,7 @@ Changing this option by reloading the config is not supported.
 
 ### Packaging and upgrade gate
 
-The owner design record identifies Fedora 44 updates `0.47.1-1.fc44`, base `0.43.1`, and packages `kitty`, `kitty-kitten`, `kitty-shell-integration`, `kitty-terminfo`. These are **ruling-supplied facts**, not installed-package measurements here.
+Fedora 44 packages MEASURED on owner hardware 2026-11-17: `kitty-0.49.2-1.fc44.x86_64`, `kitty-kitten-0.49.2-1.fc44.x86_64`, `kitty-shell-integration-0.49.2-1.fc44.noarch`, `kitty-terminfo-0.49.2-1.fc44.noarch`; `kitten --version` printed `kitten 0.49.2 created by Kovid Goyal`. Package FILE MEMBERSHIP (`rpm -ql`) remains owner evidence, not lane proof.
 Owner collects `rpm -q kitty kitty-kitten kitty-shell-integration kitty-terminfo`, package file lists, `kitten --version`, and `ssh -V`. Never use `kitten update-self` to bypass RPM-managed upgrades.
 Run `tools/kitty/drift.py` after **every dnf kitty upgrade**, then manually reconcile command/options/defaults, semantic changes, Fedora membership and OpenSSH delegation before calling this lane done.
 
@@ -5323,4 +5531,4 @@ See `docs/kitty-setup.md`: v0.57.0 uses `hl.window_rule`, `initial_title`, `no_i
 ### License and reproduction
 
 Upstream option/protocol/config prose is GPL-3.0, copyright Kovid Goyal and contributors. `src/assistant/hands/kitty/data/COPYING.kitty` accompanies the extracted text.
-Build scripts parse Python AST and literal option declarations only; they do not import or execute upstream kitty. Download v0.47.1 source, run `tools/kitty/build_inventory.py SOURCE src/assistant/hands/kitty/data/inventory.json`, then `tools/kitty/render_inventory.py`.
+Build scripts parse Python AST (including f-string specs, ASK 52) and literal option declarations only; they never import or execute upstream kitty. Download v0.49.2 source, run `tools/kitty/build_inventory.py SOURCE src/assistant/hands/kitty/data/inventory.json`, then `tools/kitty/render_inventory.py`. The version pin lives in ONE place: `src/assistant/hands/kitty/pin.py` (ASK 49).
