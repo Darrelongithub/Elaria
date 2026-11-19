@@ -118,18 +118,21 @@ test('historical record is append-only annotated, never rewritten', () => {
   const annotations = [...record.matchAll(
     /<!-- BEGIN ANNOTATION (\d{4}-\d{2}-\d{2}T[^ ]+) -->[\s\S]*?<!-- END ANNOTATION -->/g
   )];
-  assert.equal(annotations.length, 2);
+  assert.equal(annotations.length, 3);
   assert.ok(record.indexOf('<!-- END ORIGINAL RECORD -->') < record.indexOf('<!-- BEGIN ANNOTATION'));
   assert.match(annotations[0][0], /hypothesis/i);
   assert.match(annotations[0][0], /annotat/i);
   assert.match(annotations[1][0], /OWNERS\.yaml|ownership guard/i);
   assert.match(annotations[1][0], /append-only/i);
+  assert.match(annotations[2][0], /a2eec68|5cf7c77|reports\/RPT-R/);
+  assert.match(annotations[2][0], /append-only/i);
 });
 
-test('live ownership guard maps the R acceptance test to console/', () => {
+test('live ownership guard maps R test to console/ and R reports to R', () => {
   const owners = json('OWNERS.yaml');
   assert.ok(owners.R.includes('console/undo-review-test.js'));
-  assert.ok(!owners.R.includes('undo-review-test.js'));
+  assert.ok(owners.R.includes('reports/RPT-R-*'));
+  assert.ok(owners.R.includes('undo-review-test.js'), 'legacy root alias remains mapped');
   assert.ok(fs.existsSync(path.join(ROOT, 'console/undo-review-test.js')));
   assert.ok(!fs.existsSync(path.join(ROOT, 'undo-review-test.js')));
   assert.ok(fs.existsSync(path.join(ROOT, 'scripts/check_ownership.py')));
