@@ -90,7 +90,7 @@ def fake_device(
 
 CONVERSATIONS = [
     {
-        "threadId": "thread-7",
+        "threadId": "4242",
         "addresses": [RECIPIENT],
         "names": ["Wanjiku"],
         "title": "Wanjiku",
@@ -248,6 +248,11 @@ class FakeAndroidPeer:
         if plugin == "sms" and action == "messages":
             return MESSAGES, None
         if plugin == "sms" and action == "request_conversation":
+            # Upstream's sms plugin does int(thread_id): the KDE Connect
+            # thread id is NUMERIC. The fake peer holds the same line, so a
+            # non-numeric id fails here exactly as it would upstream.
+            if not isinstance(args.get("thread_id"), int):
+                return None, f"invalid literal for int(): {args.get('thread_id')!r}"
             return True, None
         if plugin == "sms" and action == "send_sms":
             if self.fail_sends:
@@ -446,8 +451,8 @@ def test_the_allowlist_holds_no_forbidden_verb() -> None:
 
 def test_allowlisted_reads_work(harness: Harness) -> None:
     assert harness.link.request("sms.conversations") == CONVERSATIONS
-    assert harness.link.request("sms.messages", thread_id="thread-7") == MESSAGES
-    assert harness.link.request("sms.request_conversation", thread_id="thread-7") is True
+    assert harness.link.request("sms.messages", thread_id="4242") == MESSAGES
+    assert harness.link.request("sms.request_conversation", thread_id="4242") is True
     assert harness.link.request("ping.ping", message="hello") is True
     assert harness.link.request("battery.read") == {"charge": 77, "charging": False}
     assert harness.link.request("connectivity.read")["networkType"] == "wifi"
@@ -702,3 +707,27 @@ def test_the_adapter_imports_no_third_party_code() -> None:
     text = source.read_text(encoding="utf-8")
     for forbidden in ("import caelestia", "from caelestia", "import evdev", "from evdev"):
         assert forbidden not in text, f"{forbidden} must never appear"
+
+
+# -- the thread id is numeric (upstream does int(thread_id)) -------------------
+
+
+def test_the_thread_id_goes_out_as_a_number(harness: Harness) -> None:
+    harness.link.request("sms.request_conversation", thread_id="4242")
+    plugin, action, args = harness.peer.calls[-1]
+    assert (plugin, action) == ("sms", "request_conversation")
+    assert args["thread_id"] == 4242
+    assert isinstance(args["thread_id"], int)
+
+
+def test_a_non_numeric_thread_id_is_refused_locally(harness: Harness) -> None:
+    with pytest.raises(PhoneLinkError):
+        harness.link.request("sms.request_conversation", thread_id="thread-7")
+    assert harness.peer.packets == []
+    assert harness.peer.calls == []
+
+
+def test_a_non_numeric_thread_id_is_refused_for_messages_too(harness: Harness) -> None:
+    with pytest.raises(PhoneLinkError):
+        harness.link.request("sms.messages", thread_id="thread-7")
+    assert harness.peer.packets == []

@@ -537,9 +537,9 @@ class PhoneLink:
         if verb == "sms.conversations":
             return self._call_plugin("sms", "conversations", {})
         if verb == "sms.messages":
-            return self._call_plugin("sms", "messages", {"thread_id": _need(params, "thread_id")})
+            return self._call_plugin("sms", "messages", {"thread_id": _thread_id(params)})
         if verb == "sms.request_conversation":
-            args: dict[str, Any] = {"thread_id": _need(params, "thread_id")}
+            args: dict[str, Any] = {"thread_id": _thread_id(params)}
             if "start" in params:
                 args["start"] = int(params["start"])
             if "count" in params:
@@ -828,3 +828,21 @@ def _need(params: Mapping[str, Any], key: str) -> Any:
     if key not in params or params[key] in (None, ""):
         raise PhoneLinkError(f"the {key} parameter is required")
     return params[key]
+
+
+def _thread_id(params: Mapping[str, Any]) -> int:
+    """The KDE Connect thread id is NUMERIC.
+
+    Upstream's sms plugin does ``int(thread_id)`` on the value it is handed,
+    so a non-numeric id fails inside the sidecar. The adapter converts it
+    here instead: the number goes out, and a bad id is refused LOCALLY with
+    a message that names the fault.
+    """
+    raw = _need(params, "thread_id")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise PhoneLinkError(
+            "the thread id must be the numeric KDE Connect thread id"
+            f" (the value sms.conversations reports), not {raw!r}"
+        ) from None
