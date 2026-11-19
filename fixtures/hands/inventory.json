@@ -43,7 +43,7 @@
   "fixture_count": 8,
   "never_execute_fixtures": true,
   "no_hardware_execution": true,
-  "owned_path_count": 21,
+  "owned_path_count": 22,
   "owned_paths": [
     "fixtures/hands/README.md",
     "fixtures/hands/inventory.json",
@@ -65,7 +65,8 @@
     "console/undo-review-test.js",
     "reports/RPT-R-r1-20261119T144059Z.md",
     "reports/RPT-R-r2-20261119T150117Z.md",
-    "reports/RPT-R-r3-20261119T161119Z.md"
+    "reports/RPT-R-r3-20261119T161119Z.md",
+    "reports/RPT-R-r4-20261119T170419Z.md"
   ],
   "pilot_scene_count": 5,
   "record_body_sha256": "f17f4647f22c0fd3d0c85252daa6c4041c8ae11625456ae3db3158927b04144e",
