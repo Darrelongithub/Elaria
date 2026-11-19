@@ -170,3 +170,15 @@ owner fact. The voice-chain fixture finding reinforces this distinction; no cros
 work is authorised or performed here. This turn authorises the collector only, not
 additional adapter work. Scene NOT READY, no PR, no extra protected hunks, stub-only
 tests and unchanged shared fixtures remain binding.
+
+---
+
+## DATED SUPERSESSION — 2026-11-19 (appended by lane Q; the text above is untouched)
+
+The `0.47.1` / `0.47.1-1.fc44` statements in this document were true of the build they record.
+The pin has moved to upstream **v0.49.2** (commit `b2cb871254fbdac19a085188813c8dfb258b95cd`),
+owner ruling `0.49.2-1.fc44`, measured `kitten 0.49.2 created by Kovid Goyal`. The live pin now
+lives in ONE place — `src/assistant/hands/kitty/pin.py` (ASK 49) — and the regenerated inventory
+is `src/assistant/hands/kitty/data/inventory.json`. Re-pin evidence: `KITTY-REPIN-DECISION.md` and
+`KITTY-SEMANTIC-DIFF.md` (2026-11-17), re-verified against the v0.49.2 source. Nothing above is
+rewritten; this is an annotation, not a correction of the historical record.
