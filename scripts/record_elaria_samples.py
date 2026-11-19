@@ -522,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
     record.add_argument("--device", default="",
                         help="override [capture] mic_target (node.name)")
     freeze = sub.add_parser("freeze-eval",
-                            help="THE split: 20%/bucket into eval/, once")
+                            help="THE split: 20%%/bucket into eval/, once")
     freeze.add_argument("--fraction", type=float, default=0.2)
     freeze.add_argument("--seed", type=int, default=1234)
     sub.add_parser("status", help="per-bucket counts + manifest + freeze state")
