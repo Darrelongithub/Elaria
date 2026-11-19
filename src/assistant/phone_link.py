@@ -102,6 +102,72 @@ FORBIDDEN_PLUGINS: frozenset[str] = frozenset(
     }
 )
 
+#: Every plugin.action the pinned upstream release exposes.
+#:
+#: Enumerated from the upstream v1.2.0 sources at commit
+#: CAELESTIA_COMMIT (the release the tarball pin above names). These are
+#: NAMES only -- no upstream code is copied, imported or vendored. The list
+#: exists so the refusal layer is derived from the real upstream surface
+#: instead of from a hand-written guess that can fall behind it.
+#:
+#: E's own allowlist names five of them; the other 35 are refused.
+UPSTREAM_ACTIONS: frozenset[str] = frozenset(
+    {
+        "clipboard.send_clipboard",
+        "contacts.list_contacts",
+        "contacts.sync",
+        "findmyphone.ring",
+        "findthisdevice.stop",
+        "lockdevice.set_locked",
+        "mprisremote.media_action",
+        "mprisremote.refresh",
+        "mprisremote.select_player",
+        "mprisremote.set_position",
+        "mprisremote.set_volume",
+        "notifications.dismiss",
+        "notifications.dismiss_all",
+        "notifications.invoke_action",
+        "notifications.refresh",
+        "notifications.reply",
+        "ping.ping",
+        "remotecommands.edit_commands",
+        "remotecommands.trigger",
+        "remotecontrol.command",
+        "remotecontrol.move",
+        "remotekeyboard.send_key",
+        "remotekeyboard.send_text",
+        "remotesystemvolume.set_muted",
+        "remotesystemvolume.set_volume",
+        "runcommand.add_command",
+        "runcommand.edit_command",
+        "runcommand.remove_command",
+        "sendnotifications.test",
+        "share.open_folder",
+        "share.share_files",
+        "share.share_text",
+        "share.share_url",
+        "sms.conversations",
+        "sms.get_attachment",
+        "sms.messages",
+        "sms.request_conversation",
+        "sms.request_conversations",
+        "sms.send_sms",
+        "telephony.mute",
+    }
+)
+
+#: The upstream actions E is allowed to reach, mapped from E's own verbs.
+#: Everything else upstream exposes is refused.
+_ALLOWED_UPSTREAM_ACTIONS: frozenset[str] = frozenset(
+    {
+        "sms.conversations",
+        "sms.messages",
+        "sms.request_conversation",
+        "ping.ping",
+        "sms.send_sms",
+    }
+)
+
 #: The generic plugin/action interpreter. Never allowlistable.
 FORBIDDEN_VERBS: frozenset[str] = frozenset(
     {
@@ -178,7 +244,14 @@ def _is_forbidden(verb: str) -> bool:
     if any(verb.startswith(prefix) for prefix in FORBIDDEN_PREFIXES):
         return True
     plugin = verb.split(".", 1)[0]
-    return plugin in FORBIDDEN_PLUGINS
+    if plugin in FORBIDDEN_PLUGINS:
+        return True
+    # Any upstream plugin.action that E did not explicitly allow is refused.
+    # This is the fail-closed default: a verb that names a real upstream
+    # action cannot be allowlisted by accident, and a future upstream
+    # release that adds an action fails closed until E re-pins and
+    # re-assesses it (IF-3 change control).
+    return verb in UPSTREAM_ACTIONS and verb not in _ALLOWED_UPSTREAM_ACTIONS
 
 
 def _validate_allowlist() -> None:

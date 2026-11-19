@@ -27,6 +27,7 @@ from assistant.phone_link import (
     FORBIDDEN_PLUGINS,
     FORBIDDEN_VERBS,
     READ_VERBS,
+    UPSTREAM_ACTIONS,
     WRITE_VERBS,
     NotApproved,
     PairingRegistry,
@@ -34,6 +35,7 @@ from assistant.phone_link import (
     PhoneLinkError,
     Refused,
     TransportError,
+    _is_forbidden,
 )
 
 RECIPIENT = "+254712345678"
@@ -56,6 +58,18 @@ FORBIDDEN_CASES = (
     "share.share_files",
     "clipboard.send_clipboard",
     "findmyphone.ring",
+)
+
+#: The upstream plugin.actions E's own allowlist reaches. Everything else
+#: the pinned upstream release exposes is refused.
+ALLOWED_UPSTREAM_ACTIONS = frozenset(
+    {
+        "sms.conversations",
+        "sms.messages",
+        "sms.request_conversation",
+        "ping.ping",
+        "sms.send_sms",
+    }
 )
 
 
@@ -620,6 +634,76 @@ def test_the_read_allowlist_is_exactly_the_if3_list() -> None:
 
 def test_the_write_allowlist_is_sms_send_sms_only() -> None:
     assert WRITE_VERBS == {"sms.send_sms"}
+
+
+# -- the upstream-derived refusal layer -----------------------------------------
+
+
+def test_the_upstream_action_table_covers_the_pinned_release() -> None:
+    """The table names the 40 plugin.actions upstream v1.2.0 exposes."""
+    assert len(UPSTREAM_ACTIONS) == 40
+    assert "sms.send_sms" in UPSTREAM_ACTIONS
+    assert "share.share_text" in UPSTREAM_ACTIONS
+    assert "telephony.mute" in UPSTREAM_ACTIONS
+    assert "notifications.reply" in UPSTREAM_ACTIONS
+
+
+def test_every_upstream_action_outside_the_allowlist_is_forbidden() -> None:
+    """Fail closed: 35 of the 40 upstream actions can never be allowlisted."""
+    refused = sorted(a for a in UPSTREAM_ACTIONS if _is_forbidden(a))
+    allowed = sorted(a for a in UPSTREAM_ACTIONS if not _is_forbidden(a))
+    assert allowed == sorted(ALLOWED_UPSTREAM_ACTIONS)
+    assert len(refused) == 35
+
+
+def test_the_write_capable_upstream_actions_are_all_forbidden() -> None:
+    """Every upstream action that writes to the phone is on the never-list."""
+    writes_to_phone = (
+        "contacts.sync",
+        "mprisremote.refresh",
+        "notifications.dismiss",
+        "notifications.invoke_action",
+        "notifications.reply",
+        "remotesystemvolume.set_muted",
+        "remotesystemvolume.set_volume",
+        "sendnotifications.test",
+        "sms.get_attachment",
+        "sms.request_conversations",
+        "telephony.mute",
+    )
+    for verb in writes_to_phone:
+        assert verb in UPSTREAM_ACTIONS, verb
+        assert _is_forbidden(verb), verb
+
+
+@pytest.mark.parametrize("verb", sorted(UPSTREAM_ACTIONS - ALLOWED_UPSTREAM_ACTIONS))
+def test_no_refused_upstream_action_reaches_the_peer(
+    harness: Harness, verb: str
+) -> None:
+    with pytest.raises(Refused):
+        harness.link.request(verb)
+    assert harness.peer.packets == []
+    assert harness.peer.calls == []
+    assert harness.peer.sends == []
+
+
+def test_the_allowed_upstream_actions_are_not_forbidden() -> None:
+    """The refusal layer must not swallow the five actions E does use."""
+    for verb in ALLOWED_UPSTREAM_ACTIONS:
+        assert not _is_forbidden(verb), verb
+
+
+def test_an_upstream_verb_cannot_be_allowlisted_by_a_future_edit() -> None:
+    """Adding a real upstream action to the allowlist fails closed at import."""
+    import assistant.phone_link as module
+
+    original = module.READ_VERBS
+    try:
+        module.READ_VERBS = frozenset(original | {"telephony.mute"})
+        with pytest.raises(RuntimeError, match="never-allowlist"):
+            module._validate_allowlist()
+    finally:
+        module.READ_VERBS = original
 
 
 def test_every_if3_refusal_is_on_the_never_allowlist_list() -> None:
