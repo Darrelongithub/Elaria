@@ -59,8 +59,10 @@ approve requests. There is no bypass for a feature agent editing Z-owned files.
 The initial bootstrap itself needs manual review because its parent has no map.
 For Wave 1 branches that predate the guard or a new ownership rule, update the
 branch onto a reviewed base containing the current `OWNERS.yaml` before running
-`check`. A missing map or rule is not a pass. Protocol reports under `reports/`
-resolve by the cluster ID in `RPT-<cluster>-r<round>-<timestamp>.md`.
+`check`. A missing map or rule is not a pass. Each `reports/RPT-<cluster>-*`
+pattern belongs only to its named cluster. Use
+`RPT-<cluster>-r<round>-<timestamp>.md` for protocol reports; the directory
+itself has no blanket owner.
 
 ### Intake and integration log
 

@@ -3,7 +3,7 @@
     "OWNERS.yaml",
     "README.md",
     "pyproject.toml",
-    "reports/RPT-Z-r[0-9]*-*.md",
+    "reports/RPT-Z-*",
     "scripts/check_ownership.py",
     "src/assistant/__init__.py",
     "src/assistant/cli.py",
@@ -31,7 +31,7 @@
     "PROCESS-AUDIO-PROMPT.md",
     "VOICE-BUGTEST.md",
     "docs/voice-audition*.md",
-    "reports/RPT-A-r[0-9]*-*.md",
+    "reports/RPT-A-*",
     "scripts/record_elaria_samples.py",
     "src/assistant/asr.py",
     "src/assistant/audio_gateway.py",
@@ -70,7 +70,7 @@
     "tests/test_voicetest.py"
   ],
   "B": [
-    "reports/RPT-B-r[0-9]*-*.md",
+    "reports/RPT-B-*",
     "src/assistant/embeddings.py",
     "src/assistant/indexer.py",
     "src/assistant/memory.py",
@@ -83,7 +83,7 @@
   ],
   "C": [
     "humour.toml",
-    "reports/RPT-C-r[0-9]*-*.md",
+    "reports/RPT-C-*",
     "src/assistant/executor.py",
     "src/assistant/inbox.py",
     "src/assistant/initiative.py",
@@ -116,7 +116,7 @@
     "INVARIANTS.md",
     "fixtures/*.json",
     "fixtures/README.md",
-    "reports/RPT-D-r[0-9]*-*.md",
+    "reports/RPT-D-*",
     "src/assistant/cleanup.py",
     "src/assistant/disclosure.py",
     "src/assistant/fixtures.py",
@@ -130,7 +130,7 @@
     "tests/test_persona_safety_latency.py"
   ],
   "E": [
-    "reports/RPT-E-r[0-9]*-*.md",
+    "reports/RPT-E-*",
     "src/assistant/drafts.py",
     "src/assistant/phone_link.py",
     "tests/test_drafts.py",
@@ -138,7 +138,7 @@
   ],
   "F": [
     "docs/observability-readers.md",
-    "reports/RPT-F-r[0-9]*-*.md",
+    "reports/RPT-F-*",
     "scripts/capture_source_check.py",
     "scripts/capture_source_check.py.sha256",
     "scripts/capture_source_check.sha256",
@@ -165,14 +165,14 @@
     "docs/event-report*",
     "docs/event-spike.json",
     "docs/event-venue-card*",
-    "reports/RPT-G-r[0-9]*-*.md",
+    "reports/RPT-G-*",
     "scripts/event-console-fallback.sh",
     "src/assistant/event.py",
     "src/assistant/event_spike.py",
     "tests/test_event_*.py"
   ],
   "H": [
-    "reports/RPT-H-r[0-9]*-*.md",
+    "reports/RPT-H-*",
     "src/assistant/clipboard.py",
     "src/assistant/hypr_binds.py",
     "src/assistant/overlay.py",
@@ -186,7 +186,7 @@
     "ui/waybar/**"
   ],
   "I": [
-    "reports/RPT-I-r[0-9]*-*.md",
+    "reports/RPT-I-*",
     "src/assistant/cost.py",
     "src/assistant/model_pins.py",
     "src/assistant/model_registry.py",
@@ -195,7 +195,7 @@
   "J": [
     "HOTWORD-REVIEW.md",
     "docs/hotword-training-plan.md",
-    "reports/RPT-J-r[0-9]*-*.md",
+    "reports/RPT-J-*",
     "src/assistant/hotword.py",
     "src/assistant/wake_buffers.py",
     "src/assistant/wake_guard.py",
@@ -219,7 +219,7 @@
     "console/src/shell.js",
     "console/vendor/three.min.js",
     "docs/console-home/**",
-    "reports/RPT-K-r[0-9]*-*.md",
+    "reports/RPT-K-*",
     "systemd/elaria-console.service",
     "tests/test_console_home.py",
     "ui/quickshell/console/**"
@@ -247,7 +247,7 @@
     "console/smoke.js",
     "console/wire-client-test.js",
     "console/wire-test.js",
-    "reports/RPT-L-r[0-9]*-*.md",
+    "reports/RPT-L-*",
     "systemd/assistant.service",
     "tests/conftest.py",
     "tests/test_bug_i5_private_storage_modes.py",
@@ -278,10 +278,10 @@
     "console/native_window.py",
     "console/observe_native_bind.py",
     "console/verify-native-installer.sh",
-    "reports/RPT-M-r[0-9]*-*.md"
+    "reports/RPT-M-*"
   ],
   "O": [
-    "reports/RPT-O-r[0-9]*-*.md",
+    "reports/RPT-O-*",
     "src/assistant/hands/README.md",
     "src/assistant/hands/__init__.py",
     "src/assistant/hands/bridge.py",
@@ -301,7 +301,7 @@
     "tests/test_hands_partial_sink.py"
   ],
   "P": [
-    "reports/RPT-P-r[0-9]*-*.md",
+    "reports/RPT-P-*",
     "src/assistant/hands/headless/__init__.py",
     "src/assistant/hands/headless/consent.py",
     "src/assistant/hands/headless/contract.py",
@@ -310,7 +310,7 @@
     "src/assistant/hands/headless/worker.py"
   ],
   "Q": [
-    "reports/RPT-Q-r[0-9]*-*.md",
+    "reports/RPT-Q-*",
     "src/assistant/hands/kitty/**"
   ],
   "R": [
@@ -323,11 +323,11 @@
     "docs/live-scene/pilot-*.md",
     "docs/phase-reports/hands-*.md",
     "fixtures/hands/**",
-    "reports/RPT-R-r[0-9]*-*.md",
+    "reports/RPT-R-*",
     "undo-review-test.js"
   ],
   "S": [
-    "reports/RPT-S-r[0-9]*-*.md",
+    "reports/RPT-S-*",
     "scripts/warm-cold-transition.py",
     "src/assistant/sensors.py",
     "src/assistant/storage.py",
@@ -337,7 +337,7 @@
     "docs/live-scene/op3-*.md",
     "docs/live-scene/op4-*.md",
     "docs/live-scene/op5-*.md",
-    "reports/RPT-T-r[0-9]*-*.md",
+    "reports/RPT-T-*",
     "src/assistant/backup.py",
     "src/assistant/backup_cli.py",
     "src/assistant/backup_triggers.py",
@@ -345,7 +345,7 @@
   ],
   "U": [
     "docs/live-scene/sheet1-*.md",
-    "reports/RPT-U-r[0-9]*-*.md",
+    "reports/RPT-U-*",
     "scripts/storage-benchmark.sh",
     "scripts/storage-census-check.py",
     "src/assistant/drill.py",
@@ -355,15 +355,15 @@
     "docs/phase-reports/0[0-9][0-9]-*",
     "docs/storage-handoff.md",
     "docs/wp7-accd33a-readback-findings.md",
-    "reports/RPT-V-r[0-9]*-*.md"
+    "reports/RPT-V-*"
   ],
   "REL": [
     "docs/release/**",
-    "reports/RPT-REL-r[0-9]*-*.md",
+    "reports/RPT-REL-*",
     "scripts/release/**"
   ],
   "REACH": [
-    "reports/RPT-REACH-r[0-9]*-*.md",
+    "reports/RPT-REACH-*",
     "src/assistant/reach/**"
   ]
 }
