@@ -15,7 +15,7 @@
 
 - IF-6 SHA `6961c7f8…c351f` verified against the frozen Drive manifest before
   any file was written.
-- `node undo-review-test.js` is the deterministic local acceptance test.
+- `node console/undo-review-test.js` is the deterministic local acceptance test.
 - Historical records are append-only annotated; see
   `docs/phase-reports/hands-2026-11-19-pilot-record.md`.
 - Banner: **TESTED-ONLY / OWNER-HARDWARE-PENDING**. Nothing here is HW-proven.

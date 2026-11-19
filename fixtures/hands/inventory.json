@@ -7,7 +7,7 @@
     "docs/hands-handoff.md",
     "docs/hands-headless.md",
     "docs/phase-reports/hands-",
-    "undo-review-test.js"
+    "console/undo-review-test.js"
   ],
   "benign_control_count": 2,
   "benign_controls": [
@@ -61,7 +61,7 @@
     "docs/hands-handoff.md",
     "docs/hands-headless.md",
     "docs/phase-reports/hands-2026-11-19-pilot-record.md",
-    "undo-review-test.js"
+    "console/undo-review-test.js"
   ],
   "pilot_scene_count": 5,
   "record_body_sha256": "f17f4647f22c0fd3d0c85252daa6c4041c8ae11625456ae3db3158927b04144e",

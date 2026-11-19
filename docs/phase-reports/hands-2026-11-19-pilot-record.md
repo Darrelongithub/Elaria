@@ -33,3 +33,13 @@ added by the R letter. The original body and its SHA-256 are unchanged. This
 append-only annotation is the correction: five spec-only scenes, six armed
 traps, two benign controls, zero hardware runs, zero production-code lines.
 <!-- END ANNOTATION -->
+
+<!-- BEGIN ANNOTATION 2026-11-19T14:56:00Z -->
+Dated append-only annotation, 2026-11-19T14:56:00Z (Agent R): current main advanced to
+`ca4e13f` and its Z-owned OWNERS.yaml maps R's acceptance test to
+`console/undo-review-test.js`, while the root `undo-review-test.js` was
+zero-owner under the actual ownership guard. R moved only its own test file into
+`console/`, added a guard-alignment assertion, and merged current main into the
+PR branch without force-push or history rewrite. No Z-owned file was edited. The
+original body, its SHA-256, and the earlier dated annotation remain unchanged.
+<!-- END ANNOTATION -->
