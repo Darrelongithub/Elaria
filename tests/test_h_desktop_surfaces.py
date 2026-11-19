@@ -214,3 +214,14 @@ def test_waybar_class_vocabulary_is_unchanged():
     assert "phone: connected" in with_phone["tooltip"]
     assert "phone:" not in plain["tooltip"]
     assert json.dumps(with_phone)          # still one serialisable line for Waybar
+
+
+def test_owner_ruling_q_h_1_is_held_in_place():
+    """Q-H-1 was RULED (2026-11-19): tooltip-only, no pill colour, and the ownership
+    addition for ui/** is NOT filed this wave. Pinned so a later round cannot
+    "helpfully" add a class + a css rule and an ownership claim in one commit."""
+    waybar = (REPO / "src/assistant/waybar.py").read_text()
+    assert "Q-H-1" in waybar and "tooltip-only" in waybar
+    css = (REPO / "ui/waybar/style.css").read_text()
+    assert ".phone" not in css                       # ruling respected: no new colour
+    assert not (REPO / "OWNERS.yaml").exists()        # and no ownership file from H

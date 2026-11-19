@@ -18,9 +18,13 @@ tooltip carries the exact connectivity mode, queue and local voice.
 
 Device presence (IF-4, H) rides the tooltip only, via `presence.format_device_line`
 — one formatter shared with the console, so the two surfaces cannot disagree about
-whether the phone is here. It is deliberately NOT a new class token: this module's
-classes are a closed set mirrored in ui/waybar/style.css, and styling a new one is
-an owner call, not a dressing-lane fait accompli.
+whether the phone is here.
+
+OWNER RULING 2026-11-19 (Q-H-1): **tooltip-only, no new pill colour.** `ui/waybar/**`
+sits in nobody's ownership glob and IF-4 defines no phone-presence colour, so a
+cosmetic class is not worth an ownership change mid-wave. The orb's states stay
+IF-4's. Colour is deferred, and the ownership addition is NOT to be filed this wave —
+which is why the class list below is closed and stays closed.
 """
 
 from __future__ import annotations
