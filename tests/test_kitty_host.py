@@ -123,7 +123,7 @@ def test_cancel_intent_survives_crash_even_without_cancel_result(private):
 def test_native_classifier_accounts_for_every_pinned_verb_and_unknown_fails_closed():
     assessor = NativeChecker()
     assert set(assessor.coverage()) == set(inventory()['verbs'])
-    assert len(assessor.coverage()) == 39
+    assert len(assessor.coverage()) == 41
     result = assessor(Act('future-verb', '{}'), 'plan', ())
     assert result.denied and result.nature == 'unknown'
 

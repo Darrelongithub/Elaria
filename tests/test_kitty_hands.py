@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from assistant.hands.kitty import pin
 from assistant.hands.kitty.bridge import Bridge, make_act, windows_from_ls
 from assistant.hands.kitty.journal import EventJournal
 from assistant.hands.kitty.policy import (
@@ -103,10 +104,10 @@ def prepared_send(text='synthetic text', *, tier=1, bp=False):
     return bridge, fake, events, act, plan, targets
 
 
-def test_inventory_all_39_are_explicit_and_unknown_is_k3():
+def test_inventory_every_verb_is_explicit_and_unknown_is_k3():
     data = inventory()
-    assert len(data['verbs']) == 39
-    assert data['owner_version_verbatim'] is None
+    assert len(data['verbs']) == 41
+    assert data['owner_version_verbatim'] == pin.OWNER_VERSION_VERBATIM
     assert data['unknown_verb_tier'] == 'K3'
     for verb, entry in data['verbs'].items():
         assert entry['tier'] in {'K1', 'K2', 'K3'}
@@ -666,16 +667,19 @@ def test_runtime_must_be_current_environment(private, monkeypatch, runtime):
             pass
 
 
-def test_adopted_send_key_hazard_is_machine_readable_at_both_levels():
+def test_re_derived_send_key_hazard_is_machine_readable_at_both_levels():
     data = inventory()
     entry = data['verbs']['send-key']
-    flag = 'K3-send-key-exclude-active-unenforced-0.47.1'
-    assert data['upstream_version'] == '0.47.1'
+    flag = pin.SEND_KEY_EXCLUDE_ACTIVE_UNENFORCED
+    assert data['upstream_version'] == pin.UPSTREAM_VERSION
     assert entry['tier'] == 'K3'
     assert flag in entry['hazards']
+    assert '0.47.1' not in ''.join(entry['hazards'])
     option = next(o for o in entry['options'] if '--exclude-active' in o['flags'])
     assert flag in option['hazards']
-    assert 'set-os-window-title' not in data['verbs']
+    # v0.49.2 added this verb; it exists and is classified never-grant, never absent.
+    assert 'set-os-window-title' in data['verbs']
+    assert data['verbs']['set-os-window-title']['tier'] == 'K3'
 
 
 def prepared_key_broadcast():
