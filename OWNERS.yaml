@@ -3,6 +3,7 @@
     "OWNERS.yaml",
     "README.md",
     "pyproject.toml",
+    "reports/RPT-Z-*",
     "scripts/check_ownership.py",
     "src/assistant/__init__.py",
     "src/assistant/cli.py",
@@ -11,6 +12,18 @@
     "src/assistant/daemon.py",
     "src/assistant/ipc.py",
     "src/assistant/store.py",
+    "tests/test_bug7_cli_smoke.py",
+    "tests/test_bug_i5_authority_ipc.py",
+    "tests/test_bughunt_k_config.py",
+    "tests/test_bughunt_k_doctor_drift.py",
+    "tests/test_bughunt_k_error_surfacing.py",
+    "tests/test_bughunt_k_param_coercion.py",
+    "tests/test_bughunt_k_status_surface.py",
+    "tests/test_bughunt_k_store.py",
+    "tests/test_bughunt_k_subscribers.py",
+    "tests/test_daemon_cli.py",
+    "tests/test_default_sync.py",
+    "tests/test_ipc_handler_integrity.py",
     "uv.lock",
     "uv.toml"
   ],
@@ -18,6 +31,7 @@
     "PROCESS-AUDIO-PROMPT.md",
     "VOICE-BUGTEST.md",
     "docs/voice-audition*.md",
+    "reports/RPT-A-*",
     "scripts/record_elaria_samples.py",
     "src/assistant/asr.py",
     "src/assistant/audio_gateway.py",
@@ -56,13 +70,20 @@
     "tests/test_voicetest.py"
   ],
   "B": [
+    "reports/RPT-B-*",
     "src/assistant/embeddings.py",
     "src/assistant/indexer.py",
     "src/assistant/memory.py",
+    "tests/test_embeddings_local.py",
+    "tests/test_indexer_exclusions.py",
+    "tests/test_memory_journal.py",
+    "tests/test_memory_retrieval.py",
+    "tests/test_memory_schema.py",
     "tests/test_phase5_memory.py"
   ],
   "C": [
     "humour.toml",
+    "reports/RPT-C-*",
     "src/assistant/executor.py",
     "src/assistant/inbox.py",
     "src/assistant/initiative.py",
@@ -95,6 +116,7 @@
     "INVARIANTS.md",
     "fixtures/*.json",
     "fixtures/README.md",
+    "reports/RPT-D-*",
     "src/assistant/cleanup.py",
     "src/assistant/disclosure.py",
     "src/assistant/fixtures.py",
@@ -108,13 +130,20 @@
     "tests/test_persona_safety_latency.py"
   ],
   "E": [
+    "reports/RPT-E-*",
     "src/assistant/drafts.py",
-    "src/assistant/phone_link.py"
+    "src/assistant/phone_link.py",
+    "tests/test_drafts.py",
+    "tests/test_phone_link.py"
   ],
   "F": [
+    "docs/observability-readers.md",
+    "reports/RPT-F-*",
     "scripts/capture_source_check.py",
     "scripts/capture_source_check.py.sha256",
     "scripts/capture_source_check.sha256",
+    "scripts/daemon_identity.py",
+    "scripts/daemon_identity.py.sha256",
     "scripts/file_leg_probe.py",
     "scripts/file_leg_probe.py.sha256",
     "scripts/file_leg_probe.sha256",
@@ -122,7 +151,13 @@
     "scripts/limiter_readings.py.sha256",
     "scripts/limiter_readings.sha256",
     "scripts/player_probe.py",
-    "src/assistant/watcher.py"
+    "scripts/player_probe.py.sha256",
+    "src/assistant/watcher.py",
+    "tests/test_capture_source_check.py",
+    "tests/test_daemon_identity.py",
+    "tests/test_limiter_readings.py",
+    "tests/test_player_probe.py",
+    "tests/test_watcher.py"
   ],
   "G": [
     "docs/EVENT-MODE-*",
@@ -130,12 +165,14 @@
     "docs/event-report*",
     "docs/event-spike.json",
     "docs/event-venue-card*",
+    "reports/RPT-G-*",
     "scripts/event-console-fallback.sh",
     "src/assistant/event.py",
     "src/assistant/event_spike.py",
     "tests/test_event_*.py"
   ],
   "H": [
+    "reports/RPT-H-*",
     "src/assistant/clipboard.py",
     "src/assistant/hypr_binds.py",
     "src/assistant/overlay.py",
@@ -149,6 +186,7 @@
     "ui/waybar/**"
   ],
   "I": [
+    "reports/RPT-I-*",
     "src/assistant/cost.py",
     "src/assistant/model_pins.py",
     "src/assistant/model_registry.py",
@@ -157,6 +195,7 @@
   "J": [
     "HOTWORD-REVIEW.md",
     "docs/hotword-training-plan.md",
+    "reports/RPT-J-*",
     "src/assistant/hotword.py",
     "src/assistant/wake_buffers.py",
     "src/assistant/wake_guard.py",
@@ -180,6 +219,7 @@
     "console/src/shell.js",
     "console/vendor/three.min.js",
     "docs/console-home/**",
+    "reports/RPT-K-*",
     "systemd/elaria-console.service",
     "tests/test_console_home.py",
     "ui/quickshell/console/**"
@@ -207,30 +247,19 @@
     "console/smoke.js",
     "console/wire-client-test.js",
     "console/wire-test.js",
+    "reports/RPT-L-*",
     "systemd/assistant.service",
     "tests/conftest.py",
-    "tests/test_bug7_cli_smoke.py",
-    "tests/test_bug_i5_authority_ipc.py",
     "tests/test_bug_i5_private_storage_modes.py",
     "tests/test_bughunt_corpora.py",
     "tests/test_bughunt_k_authority.py",
-    "tests/test_bughunt_k_config.py",
-    "tests/test_bughunt_k_doctor_drift.py",
-    "tests/test_bughunt_k_error_surfacing.py",
-    "tests/test_bughunt_k_param_coercion.py",
-    "tests/test_bughunt_k_status_surface.py",
-    "tests/test_bughunt_k_store.py",
-    "tests/test_bughunt_k_subscribers.py",
     "tests/test_bughunt_systems.py",
     "tests/test_bugs_1_to_5_regressions.py",
     "tests/test_config_and_store.py",
-    "tests/test_daemon_cli.py",
-    "tests/test_default_sync.py",
     "tests/test_gate_fix_round.py",
     "tests/test_hardening_pass2.py",
     "tests/test_hardening_pass2b.py",
     "tests/test_hotword_and_reply_delivery.py",
-    "tests/test_ipc_handler_integrity.py",
     "tests/test_phase1_dictation.py",
     "tests/test_phase8_offline_voice.py",
     "tests/test_stage_abcd_bughunt.py",
@@ -248,9 +277,11 @@
     "console/native_launch.py",
     "console/native_window.py",
     "console/observe_native_bind.py",
-    "console/verify-native-installer.sh"
+    "console/verify-native-installer.sh",
+    "reports/RPT-M-*"
   ],
   "O": [
+    "reports/RPT-O-*",
     "src/assistant/hands/README.md",
     "src/assistant/hands/__init__.py",
     "src/assistant/hands/bridge.py",
@@ -265,9 +296,12 @@
     "src/assistant/hands/runner.py",
     "src/assistant/hands/sandbox.py",
     "src/assistant/hands/sink.py",
-    "src/assistant/hands/verify.py"
+    "src/assistant/hands/verify.py",
+    "tests/test_hands_core.py",
+    "tests/test_hands_partial_sink.py"
   ],
   "P": [
+    "reports/RPT-P-*",
     "src/assistant/hands/headless/__init__.py",
     "src/assistant/hands/headless/consent.py",
     "src/assistant/hands/headless/contract.py",
@@ -276,6 +310,7 @@
     "src/assistant/hands/headless/worker.py"
   ],
   "Q": [
+    "reports/RPT-Q-*",
     "src/assistant/hands/kitty/**"
   ],
   "R": [
@@ -287,9 +322,12 @@
     "docs/hands-headless.md",
     "docs/live-scene/pilot-*.md",
     "docs/phase-reports/hands-*.md",
-    "fixtures/hands/**"
+    "fixtures/hands/**",
+    "reports/RPT-R-*",
+    "undo-review-test.js"
   ],
   "S": [
+    "reports/RPT-S-*",
     "scripts/warm-cold-transition.py",
     "src/assistant/sensors.py",
     "src/assistant/storage.py",
@@ -299,6 +337,7 @@
     "docs/live-scene/op3-*.md",
     "docs/live-scene/op4-*.md",
     "docs/live-scene/op5-*.md",
+    "reports/RPT-T-*",
     "src/assistant/backup.py",
     "src/assistant/backup_cli.py",
     "src/assistant/backup_triggers.py",
@@ -306,6 +345,7 @@
   ],
   "U": [
     "docs/live-scene/sheet1-*.md",
+    "reports/RPT-U-*",
     "scripts/storage-benchmark.sh",
     "scripts/storage-census-check.py",
     "src/assistant/drill.py",
@@ -314,13 +354,16 @@
   "V": [
     "docs/phase-reports/0[0-9][0-9]-*",
     "docs/storage-handoff.md",
-    "docs/wp7-accd33a-readback-findings.md"
+    "docs/wp7-accd33a-readback-findings.md",
+    "reports/RPT-V-*"
   ],
   "REL": [
     "docs/release/**",
+    "reports/RPT-REL-*",
     "scripts/release/**"
   ],
   "REACH": [
+    "reports/RPT-REACH-*",
     "src/assistant/reach/**"
   ]
 }
