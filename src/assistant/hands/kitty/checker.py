@@ -68,7 +68,8 @@ class NativeChecker:
         self.marker = CreateMarkerAdapter()
 
     def coverage(self):
-        return {verb: ('partial-create-marker-adapter' if verb == 'create-marker' else
+        return {verb: ('never-grant-rc' if verb in pin.NEVER_GRANT_VERBS else
+                       'partial-create-marker-adapter' if verb == 'create-marker' else
                        'needs-trusted-effect-adapter' if verb in OPAQUE else 'native-state')
                 for verb in self.catalogue['verbs']}
 

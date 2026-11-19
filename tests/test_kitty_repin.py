@@ -195,6 +195,20 @@ def test_assessed_get_text_extents_still_pass_and_are_marked_in_the_inventory():
 def test_checker_marks_never_grant_coverage_for_the_new_verbs():
     coverage = NativeChecker().coverage()
     assert set(coverage) == set(inventory()['verbs'])
+    assert coverage['screenshot'] == coverage['set-os-window-title'] == 'never-grant-rc'
+    # The never-grant label must not quietly displace the opaque-family accounting.
+    assert sum(v == 'needs-trusted-effect-adapter' for v in coverage.values()) == 10
+
+
+@pytest.mark.parametrize('verb,payload', [
+    ('screenshot', {'match': 'id:1'}),
+    ('set-os-window-title', {'title': 'spoofed', 'match': 'id:1'}),
+])
+def test_surface_refuses_never_grant_verbs_before_any_target_binding(verb, payload):
+    from assistant.hands.kitty.surface import resolve
+    act = Act(verb, canonical(payload), (1,))
+    with pytest.raises(PermissionError, match='never-grant-rc'):
+        resolve(act, [])
 
 
 # ---------------------------------------------------------------- history discipline
