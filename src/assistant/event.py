@@ -31,6 +31,7 @@ lossless because labels.json is written DURING the event).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 import os
@@ -62,6 +63,144 @@ NO_SIGNAL_PEAK = 0.005              # near-zero peak → visible marker (§5)
 DEFERRED_MARKER = ("[seg {index:03d} transcription failed/deferred — "
                    "audio kept: {wav}]")
 NO_SIGNAL_MARKER = "[seg {index:03d}: no signal detected]"
+
+# Event-transport contract interface stub (HR-G-1 pending Z daemon/config wiring;
+# IF-4 frozen contract file pending verification). Fail closed on unknown states
+# and reject simulate=True unless explicitly opted in for non-transport callers.
+EVENT_STATES = frozenset({
+    "not-running", "running", "stopping", "stopped",
+    "recovered", "already-event", "needs-battery-ok", "refused",
+})
+EVENT_ROUTES = frozenset({"batch", "transcribe-live"})
+EVENT_TRANSPORT_MODES = frozenset({
+    "real transcription",
+    "fake — no calls will be made",
+})
+EVENT_TRANSPORT_SCHEMAS: dict[str, dict] = {
+    "event.started": {
+        "states": frozenset({"running"}),
+        "required": frozenset({
+            "title", "route", "segment_minutes", "active_speaker",
+            "document", "txt_document", "event_dir", "transport",
+        }),
+    },
+    "event.segment.opened": {
+        "states": frozenset({"running"}),
+        "required": frozenset({"segment", "speaker", "wav", "document"}),
+    },
+    "event.segment.closed": {
+        "states": frozenset({"running", "stopping"}),
+        "required": frozenset({
+            "segment", "duration_s", "bytes", "peak", "no_signal", "wav",
+        }),
+    },
+    "event.segment.transcribed": {
+        "states": frozenset({"running", "stopping", "stopped"}),
+        "required": frozenset({"segment", "late", "status", "txt"}),
+    },
+    "event.segment.deferred": {
+        "states": frozenset({"running", "stopping", "stopped"}),
+        "required": frozenset({"segment", "wav", "error", "status"}),
+    },
+    "event.speaker.changed": {
+        "states": frozenset({"running"}),
+        "required": frozenset({
+            "outgoing_speaker", "incoming_speaker", "marker",
+            "flushed", "active_speaker",
+        }),
+    },
+    "event.stopping": {
+        "states": frozenset({"stopping"}),
+        "required": frozenset({"event_dir", "document"}),
+    },
+    "event.stopped": {
+        "states": frozenset({"stopped"}),
+        "required": frozenset({
+            "title", "document", "txt_document", "event_dir",
+            "segments", "transcribed", "queued", "deferred",
+            "word_count", "transport",
+        }),
+    },
+    "event.recovered": {
+        "states": frozenset({"recovered"}),
+        "required": frozenset({
+            "title", "document", "txt_document", "event_dir",
+            "segments", "transcribed", "deferred", "word_count",
+        }),
+    },
+    "event.error": {
+        "states": EVENT_STATES,
+        "required": frozenset({"error"}),
+    },
+}
+
+
+def validate_event_state(state: str) -> str:
+    """Reject unknown event states fail-closed."""
+    if not isinstance(state, str) or state not in EVENT_STATES:
+        raise ValueError(f"unknown event state: {state!r}")
+    return state
+
+
+def validate_event_route(route: str) -> str:
+    """Reject unknown event routes fail-closed."""
+    if not isinstance(route, str) or route not in EVENT_ROUTES:
+        raise ValueError(f"unknown event route: {route!r}")
+    return route
+
+
+def _assert_finite_json(value, *, path: str = "payload") -> None:
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite float in event transport at {path}")
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            _assert_finite_json(v, path=f"{path}.{k}")
+    elif isinstance(value, (list, tuple)):
+        for idx, item in enumerate(value):
+            _assert_finite_json(item, path=f"{path}[{idx}]")
+
+
+def build_event_transport_frame(
+    event_name: str,
+    *,
+    state: str,
+    simulate: bool = False,
+    allow_simulate: bool = False,
+    **fields,
+) -> dict:
+    """Build and validate a console-transport event frame.
+
+    Enforces simulate OFF by default and throws ValueError on unknown event
+    types, unknown states, invalid state transitions, missing fields, or
+    non-finite numbers.
+    """
+    if bool(simulate) and not allow_simulate:
+        raise ValueError("event transport simulate is OFF")
+    if not isinstance(event_name, str) or event_name not in EVENT_TRANSPORT_SCHEMAS:
+        raise ValueError(f"unknown event transport type: {event_name!r}")
+    validated_state = validate_event_state(state)
+    schema = EVENT_TRANSPORT_SCHEMAS[event_name]
+    if validated_state not in schema["states"]:
+        raise ValueError(
+            f"invalid state {validated_state!r} for event {event_name!r}")
+    missing = sorted(schema["required"] - set(fields))
+    if missing:
+        raise ValueError(
+            f"event {event_name!r} missing required fields: {', '.join(missing)}")
+    if "transport" in fields and fields["transport"] not in EVENT_TRANSPORT_MODES:
+        raise ValueError(f"unknown event transport mode: {fields['transport']!r}")
+    if "route" in fields:
+        validate_event_route(fields["route"])
+    frame = {
+        "event": event_name,
+        "state": validated_state,
+        "simulate": bool(simulate),
+        **fields,
+    }
+    _assert_finite_json(frame)
+    json.dumps(frame)
+    return frame
 
 
 # --------------------------------------------------------------------------
@@ -991,8 +1130,10 @@ def latest_event_dir(root: Path, *, running_only: bool = False) -> Path | None:
     return candidates[0] if candidates else None
 
 
-def recover_event(config) -> dict:
+def recover_event(config, *, on_event=None, simulate: bool = False) -> dict:
     """Daemon-down `event stop` (§5): assemble the full document from disk."""
+    if bool(simulate):
+        raise ValueError("event transport simulate is OFF")
     root = config.data_dir / "events"
     event_dir = latest_event_dir(root, running_only=True)
     if event_dir is None:
@@ -1003,6 +1144,22 @@ def recover_event(config) -> dict:
     state["stopped_at"] = iso_now()
     _atomic_write(event_dir / "state.json", json.dumps(state, indent=2))
     summary["state"] = "recovered"
+    if on_event is not None:
+        frame = build_event_transport_frame(
+            "event.recovered",
+            state="recovered",
+            simulate=False,
+            allow_simulate=False,
+            title=summary["title"],
+            document=summary["document"],
+            txt_document=summary["txt_document"],
+            event_dir=summary["event_dir"],
+            segments=summary["segments"],
+            transcribed=summary["transcribed"],
+            deferred=summary["deferred"],
+            word_count=summary["word_count"],
+        )
+        on_event(frame)
     return summary
 
 
@@ -1024,7 +1181,8 @@ def status_from_disk(config) -> dict:
         root / "transcribe-calls.jsonl", route=route).status(budget)
     calls = {"used": quota_status["used_today"],
              "used_today": quota_status["used_today"], "budget": budget,
-             "remaining": quota_status["remaining"]}
+             "remaining": quota_status["remaining"],
+             "reserve": min(2, budget) if budget > 0 else 0}
     quota_summary = {"day": quota_status["day"],
                      "next_reset_eat": quota_status["next_reset_eat"]}
     if event_dir is None:
@@ -1064,7 +1222,9 @@ class EventService:
                  deferred_retries: int = 2, daily_call_budget=None,
                  tpm_ceiling=None, tokens_per_second=None,
                  power_probe=None, level_checker=None, stop_grace_s=None,
-                 quota_now_fn=None):
+                 quota_now_fn=None, on_event=None, simulate: bool = False):
+        if bool(simulate):
+            raise ValueError("event transport simulate is OFF")
         settings = config.section("event") or {}
         self.config = config
         self.store = store
@@ -1077,11 +1237,15 @@ class EventService:
         self._segment_minutes = float(
             segment_minutes if segment_minutes is not None
             else settings.get("segment_minutes", SEGMENT_MIN_DEFAULT))
-        self._route = str(route or settings.get("route", "batch"))
+        self._route = validate_event_route(str(route or settings.get("route", "batch")))
         self._quota_ledger = DailyQuotaLedger(
             config.data_dir / "events" / "transcribe-calls.jsonl",
             route=self._route, now_fn=quota_now_fn)
         self._fake_transport = False
+        self._simulate_transport = False
+        self._on_event = on_event
+        self._emitted_events: deque[dict] = deque(maxlen=200)
+        self._event_emit_tasks: set[asyncio.Task] = set()
         self._flush_min_s = float(flush_min_s)
         self._max_attempts = int(max_attempts)
         self._deferred_retries = int(deferred_retries)
@@ -1207,6 +1371,33 @@ class EventService:
         }
         _atomic_write(self._event_dir / "labels.json", json.dumps(labels, indent=2))
 
+    def _emit_event(self, event_name: str, *, state: str, **fields) -> dict:
+        frame = build_event_transport_frame(
+            event_name,
+            state=state,
+            simulate=self._simulate_transport,
+            allow_simulate=False,
+            **fields,
+        )
+        self._emitted_events.append(frame)
+        if self._on_event is None:
+            return frame
+        result = self._on_event(frame)
+        if inspect.isawaitable(result):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                if inspect.iscoroutine(result):
+                    result.close()
+                raise
+            task = loop.create_task(result)
+            self._event_emit_tasks.add(task)
+            task.add_done_callback(self._event_emit_tasks.discard)
+        return frame
+
+    def recent_events(self) -> list[dict]:
+        return list(self._emitted_events)
+
     # -- segments -----------------------------------------------------------
     def _open_segment(self) -> dict:
         when = self._now_fn()
@@ -1226,6 +1417,14 @@ class EventService:
         self._next_index = index + 1
         self._appender.expect(index)
         self._write_state()
+        self._emit_event(
+            "event.segment.opened",
+            state=(self._state or {}).get("status", "running"),
+            segment=index,
+            speaker=rec["speaker"],
+            wav=rec["wav"],
+            document=str(self._document.md_path) if self._document else "",
+        )
         return rec
 
     def _close_segment(self, rec: dict, sink) -> dict:
@@ -1247,6 +1446,17 @@ class EventService:
         self._write_labels()
         self._write_state()
         self._queue.submit(rec)
+        current_state = (self._state or {}).get("status", "running")
+        self._emit_event(
+            "event.segment.closed",
+            state=current_state,
+            segment=int(rec["index"]),
+            duration_s=rec["duration_s"],
+            bytes=int(rec["bytes"]),
+            peak=round(float(rec["peak"]), 4),
+            no_signal=bool(rec["no_signal"]),
+            wav=str(rec["wav"]),
+        )
         return rec
 
     def _rotate(self) -> None:
@@ -1277,6 +1487,13 @@ class EventService:
                     json.dumps({"segment": (self._current or {}).get("index"),
                                 "node": getattr(self._source, "target", "unknown"),
                                 "error": f"{type(exc).__name__}: {exc}"}))
+            state_name = (self._state or {}).get("status", "running")
+            self._emit_event(
+                "event.error",
+                state=state_name,
+                error=f"{type(exc).__name__}: {exc}",
+                segment=(self._current or {}).get("index"),
+            )
         finally:
             self._capture_ended = True
             if self._current is not None and (self._state or {}).get("status") == "running":
@@ -1311,6 +1528,15 @@ class EventService:
                 index, render_segment_block({**rec, "recovered": True}, text))
         else:
             self._appender.resolved(index, render_segment_block(rec, text))
+        state_name = (self._state or {}).get("status", "running")
+        self._emit_event(
+            "event.segment.transcribed",
+            state=state_name,
+            segment=index,
+            late=late,
+            status="done",
+            txt=str(txt_path),
+        )
 
     def _on_deferred(self, segment: dict, error) -> None:
         index = int(segment["index"])
@@ -1319,11 +1545,23 @@ class EventService:
         rec["error"] = str(error)
         self._write_state()
         self._appender.deferred(index, render_segment_block(rec, None))
+        state_name = (self._state or {}).get("status", "running")
+        self._emit_event(
+            "event.segment.deferred",
+            state=state_name,
+            segment=index,
+            wav=str(rec.get("wav", "")),
+            error=str(error),
+            status="deferred",
+        )
 
     # -- lifecycle ----------------------------------------------------------
     async def start(self, *, title=None, speakers=None, segment_minutes=None,
                     source=None, battery_ok: bool = False,
-                    no_transcribe: bool = False) -> dict:
+                    no_transcribe: bool = False,
+                    simulate: bool = False) -> dict:
+        if bool(simulate):
+            raise ValueError("event transport simulate is OFF")
         if self._state is not None and self._state.get("status") == "running":
             return {"state": "already-event", "title": self._state.get("title", ""),
                     "document": str(self._document.md_path) if self._document else "",
@@ -1346,7 +1584,7 @@ class EventService:
                 inhibit_reason=inhibit_detail.get("reason", ""),
                 power=power, level_check=level,
                 disk_free_bytes=free_disk_bytes(events_root(self.config)),
-                calls_used=0, budget=self._budget)
+                calls_used=self._quota_ledger.used_today(), budget=self._budget)
 
         level = self._level_check()
         if power.get("on_battery") and not battery_ok:
@@ -1448,6 +1686,14 @@ class EventService:
                 event_appender.resolved(index, block)
             rec["status"] = "done"
             save_event_state()
+            self._emit_event(
+                "event.segment.transcribed",
+                state=event_state.get("status", "running"),
+                segment=index,
+                late=late,
+                status="done",
+                txt=str(txt_path),
+            )
 
         def on_deferred(segment: dict, error) -> None:
             index = int(segment["index"])
@@ -1456,6 +1702,14 @@ class EventService:
             rec["error"] = str(error)
             save_event_state()
             event_appender.deferred(index, render_segment_block(rec, None))
+            self._emit_event(
+                "event.segment.deferred",
+                state=event_state.get("status", "running"),
+                segment=index,
+                wav=str(rec.get("wav", "")),
+                error=str(error),
+                status="deferred",
+            )
 
         event_queue = SegmentQueue(
             self._transcribe_fn, on_resolved=on_resolved,
@@ -1477,6 +1731,19 @@ class EventService:
         self._queue_task.add_done_callback(self._background_queues.discard)
 
         self._source = source if hasattr(source, "frames") else self._build_source(source)
+        self._emit_event(
+            "event.started",
+            state="running",
+            title=self._title,
+            route=self._route,
+            segment_minutes=self._segment_minutes,
+            active_speaker=self._speaker.active,
+            document=str(self._document.md_path),
+            txt_document=str(self._document.txt_path),
+            event_dir=str(self._event_dir),
+            transport=("fake — no calls will be made" if self._fake_transport
+                       else "real transcription"),
+        )
         self._open_segment()                              # segment 001 + timer (§3)
         self._write_labels()
         self._write_state()
@@ -1495,6 +1762,12 @@ class EventService:
             return {"state": "not-running"}
         self._state["status"] = "stopping"
         self._write_state()
+        self._emit_event(
+            "event.stopping",
+            state="stopping",
+            event_dir=str(self._event_dir or ""),
+            document=str(self._document.md_path) if self._document else "",
+        )
         if self._source is not None:
             try:
                 close_task = asyncio.create_task(self._source.aclose())
@@ -1548,6 +1821,24 @@ class EventService:
         self._state["stopped_at"] = iso_now()
         self._write_state()
         summary["state"] = "stopped"
+        self._emit_event(
+            "event.stopped",
+            state="stopped",
+            title=summary["title"],
+            document=summary["document"],
+            txt_document=summary["txt_document"],
+            event_dir=summary["event_dir"],
+            segments=summary["segments"],
+            transcribed=summary["transcribed"],
+            queued=summary["queued"],
+            deferred=summary["deferred"],
+            word_count=summary["word_count"],
+            transport=("fake — no calls will be made" if self._fake_transport
+                       else "real transcription"),
+        )
+        pending_emits = {task for task in self._event_emit_tasks if not task.done()}
+        if pending_emits:
+            await asyncio.wait(pending_emits, timeout=0.2)
         return summary
 
     async def close(self) -> None:
@@ -1558,6 +1849,7 @@ class EventService:
             self._inhibitor.release()
         finally:
             tasks = {task for task in self._background_queues if not task.done()}
+            tasks.update(task for task in self._event_emit_tasks if not task.done())
             for task in tasks:
                 task.cancel()
             if tasks:
@@ -1593,6 +1885,15 @@ class EventService:
             self._current["markers"].append(marker)
         self._write_labels()
         self._write_state()
+        self._emit_event(
+            "event.speaker.changed",
+            state="running",
+            outgoing_speaker=outgoing,
+            incoming_speaker=incoming,
+            marker=marker,
+            flushed=flushed,
+            active_speaker=self._speaker.active,
+        )
         return {"state": "speaker", "outgoing_speaker": outgoing,
                 "incoming_speaker": incoming, "marker": marker,
                 "flushed": flushed, "active_speaker": self._speaker.active,
