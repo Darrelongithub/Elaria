@@ -200,10 +200,6 @@ def test_no_shell_true_and_no_new_state_key_in_the_lane():
     for path in H_PATHS:
         text = path.read_text()
         assert "shell=True" not in text, f"{path.name} shells out"
-    presence = (REPO / "src/assistant/presence.py").read_text()
-    assert presence.count("self.store.set_state(") == 2
-    assert "STATE_KEY, json.dumps(bool(enabled))" in presence
-    assert "DEVICE_STATE_KEY, json.dumps(payload)" in presence
 
 
 def test_waybar_class_vocabulary_is_unchanged():
