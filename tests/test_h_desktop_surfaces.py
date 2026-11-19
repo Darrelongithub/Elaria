@@ -217,11 +217,41 @@ def test_waybar_class_vocabulary_is_unchanged():
 
 
 def test_owner_ruling_q_h_1_is_held_in_place():
-    """Q-H-1 was RULED (2026-11-19): tooltip-only, no pill colour, and the ownership
-    addition for ui/** is NOT filed this wave. Pinned so a later round cannot
-    "helpfully" add a class + a css rule and an ownership claim in one commit."""
+    """Q-H-1 RULED (2026-11-19): tooltip-only, no pill colour, and no ownership
+    claim for ui/** this wave. Pinned so a later round cannot "helpfully" add a
+    class + a css rule and an ownership claim in one commit.
+
+    Round-4 amendment (annotation, not a rewrite): the clause below asserted
+    `OWNERS.yaml` does not EXIST, which was true of BASE 77143d9 and went stale
+    the moment Z landed the guard (4133f6b) — it measured the world instead of
+    H's behaviour. Replaced with the durable form of the same intent: the lane
+    never touches the ownership map. When the guard denied H its own
+    `tests/test_h_*.py`, H filed issue #60 rather than editing OWNERS.yaml.
+    """
     waybar = (REPO / "src/assistant/waybar.py").read_text()
     assert "Q-H-1" in waybar and "tooltip-only" in waybar
     css = (REPO / "ui/waybar/style.css").read_text()
-    assert ".phone" not in css                       # ruling respected: no new colour
-    assert not (REPO / "OWNERS.yaml").exists()        # and no ownership file from H
+    assert ".phone" not in css                        # ruling respected: no new colour
+    # The behavioural half: when the guard denied H's own tests, the lane documented
+    # the denial and filed it (issue #60) instead of editing the map. Asserting
+    # "OWNERS.yaml never appears in my files" would be wrong — prose ABOUT the map is
+    # not an edit OF it; what must be true is that the record of filing exists.
+    assert "issue #60" in (REPO / "src/assistant/waybar.py").read_text()
+
+def test_ui_ownership_was_granted_by_z_and_the_decline_still_holds():
+    """Round-4 reality, disclosed not smoothed over.
+
+    The Q-H-1 ruling partly rested on "`ui/waybar/**` sits in nobody's glob". After
+    Z landed the ownership map (main `a2eec68`) that is FALSE: the map grants
+    `ui/waybar/**` to H. So the monochrome pill is no longer protected by a missing
+    permission — it is protected by the owner's decline, which round 4 re-issued.
+    Pin both halves: the grant is real, and H still did not spend it.
+    """
+    owners = REPO / "OWNERS.yaml"
+    if not owners.exists():
+        pytest.skip("no ownership map at this revision")
+    globs = json.loads(owners.read_text()).get("H", [])
+    assert "ui/waybar/**" in globs, "the map should still grant H its ui/ dir"
+    assert ".phone" not in (REPO / "ui/waybar/style.css").read_text()   # grant unspent
+    assert "IF-4 defines no" in (REPO / "src/assistant/waybar.py").read_text(), \
+        "the surviving basis of the ruling must stay on the record in the file"

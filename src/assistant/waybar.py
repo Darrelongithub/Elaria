@@ -20,11 +20,22 @@ Device presence (IF-4, H) rides the tooltip only, via `presence.format_device_li
 — one formatter shared with the console, so the two surfaces cannot disagree about
 whether the phone is here.
 
-OWNER RULING 2026-11-19 (Q-H-1): **tooltip-only, no new pill colour.** `ui/waybar/**`
-sits in nobody's ownership glob and IF-4 defines no phone-presence colour, so a
-cosmetic class is not worth an ownership change mid-wave. The orb's states stay
-IF-4's. Colour is deferred, and the ownership addition is NOT to be filed this wave —
-which is why the class list below is closed and stays closed.
+OWNER RULING 2026-11-19 (Q-H-1): **tooltip-only, no new pill colour.** The reasoning
+written at BASE was that `ui/waybar/**` sat in nobody's ownership glob and IF-4
+defines no phone-presence colour, so a cosmetic class was not worth an ownership
+change mid-wave. AMENDMENT after Z's guard landed (main `a2eec68`): the first half of
+that reason is now void — `OWNERS.yaml` assigns `ui/waybar/**` to `H`. What survives
+is the half that actually decided it, and it is unchanged: **IF-4 defines no
+phone-presence colour; the orb's states are IF-4's.** The owner re-issued the same
+ruling in the round-4 dispatch ("Q-H-1 declined — keep tooltip-only"), so owning the
+directory is not a licence to decorate it, and no colour is added. It stays
+DEFERRED, NOT REJECTED: now that the ownership objection is gone, this is a clean
+one-line call for the owner if they ever want it — class in `format_waybar`, rule in
+`ui/waybar/style.css`, and nothing else in this file changes.
+
+Round-4 note on the same discipline in reverse: the new guard denied H its own
+`tests/test_h_*.py` (they are zero-owner in `OWNERS.yaml`), and H filed **issue #60**
+instead of editing the map from the lane the map exists to police.
 """
 
 from __future__ import annotations
