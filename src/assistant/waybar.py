@@ -15,6 +15,12 @@ knock | knock-loud | knock-silent (combinable).
 
 The offline marker follows §13.9 rule 1: one small suffix, while the
 tooltip carries the exact connectivity mode, queue and local voice.
+
+Device presence (IF-4, H) rides the tooltip only, via `presence.format_device_line`
+— one formatter shared with the console, so the two surfaces cannot disagree about
+whether the phone is here. It is deliberately NOT a new class token: this module's
+classes are a closed set mirrored in ui/waybar/style.css, and styling a new one is
+an owner call, not a dressing-lane fait accompli.
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ from __future__ import annotations
 import socket
 
 from .ipc import DaemonUnavailable, call, parse_event_line
+from .presence import format_device_line
 
 
 def format_waybar(status: dict) -> dict:
@@ -90,6 +97,12 @@ def format_waybar(status: dict) -> dict:
                              "knocks silent · initiative urgent-only")
     elif class_mode.get("suggested"):
         tooltip_lines.append("class suggestion: " + str(class_mode.get("suggestion")))
+    # Device presence (IF-4, H): one tooltip line, no new class token. The pill's
+    # classes are a closed set shared with ui/waybar/style.css, and styling a new
+    # one is not H's call — so the phone state is *said*, never dressed up.
+    device_line = format_device_line(status.get("device_presence") or {})
+    if device_line:
+        tooltip_lines.append(device_line)
     if company.get("company"):
         tooltip_lines.append("company present · secrets and private plans "
                              "withheld · behaviour memory allowed")
