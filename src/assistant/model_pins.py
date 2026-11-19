@@ -23,8 +23,6 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
-from .config import ensure_private_dir
-
 PINS_FILE = "model-pins.json"
 
 
@@ -51,6 +49,8 @@ def load_pins(config) -> dict:
 
 
 def _write_pins(config, pins: dict) -> Path:
+    from .config import ensure_private_dir
+
     path = pins_path(config)
     ensure_private_dir(path.parent)
     tmp = path.with_suffix(".tmp")
