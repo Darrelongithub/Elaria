@@ -32,6 +32,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import load_config, load_humour_profile
+from .hypr_binds import detect as hypr_binds_detect
 from .ipc import DaemonError, DaemonOutcomeUnknown, DaemonUnavailable, call
 
 # BH-K8: total time `assist plan build` will poll a daemon build before
@@ -83,8 +84,13 @@ def _wait_for_dictation_endpoint(config, session_id: str | None,
         except (DaemonUnavailable, DaemonError, OSError, RuntimeError):
             return "unavailable"
         current = status.get("ptt_session_id")
+        last = status.get("last_session_id", current)
         if current not in (None, session_id):
             return "superseded"         # never release another process's PTT
+        if current is None and last == session_id:
+            return "closed"             # W7a: holder gone — our session ended
+        if current is None and last not in (None, session_id):
+            return "superseded"         # replaced, and that session closed too
         if (current == session_id
                 and not status.get("dictation_active", True)):
             return "closed"
@@ -209,36 +215,34 @@ def _deployment_drift_checks(repo_root: Path, home: Path, environ: dict, *,
             except OSError:
                 break
             missing = [m for m in ("assist ptt start", "assist ptt stop",
-                                   "assist halt") if m not in text]
+                                   "assist ptt cancel", "assist halt")
+                       if m not in text]
             checks.append(_check(
                 "hyprland binds", not missing,
                 (f"{hypr_cfg} carries the Elaria binds" if not missing else
                  f"{hypr_cfg} is missing bind(s) for: {', '.join(missing)} — "
-                 "append ui/hyprland/elaria-binds.conf (or .lua)")))
+                 "append the emitted snippet for your syntax "
+                 "(ui/hyprland/elaria-binds.lua is the Lua-first one; "
+                 "`assist doctor` prints which format this compositor reads)")))
             break
     return checks
 
 
 def hyprland_info(runner=subprocess.run) -> dict:
-    """Parse `hyprctl version` -> config-syntax verdict (§3.3, §11.4)."""
-    if not shutil.which("hyprctl"):
-        return {"present": False, "detail": "hyprctl not found — not a Hyprland "
-                "session (expected inside containers/SSH; run doctor on the "
-                "Fedora desktop for the real answer)"}
-    try:
-        out = runner(["hyprctl", "version"], capture_output=True, text=True, timeout=10)
-        match = re.search(r"v?(\d+)\.(\d+)", out.stdout)
-        if not match:
-            return {"present": True, "version": out.stdout.strip().splitlines()[0]
-                    if out.stdout else "unknown", "syntax": "unknown"}
-        major, minor = int(match.group(1)), int(match.group(2))
-        lua = (major, minor) >= (0, 55)
-        return {"present": True, "version": f"{major}.{minor}",
-                "syntax": "lua (hl.bind)" if lua else "legacy .conf (bind/bindr)",
-                "detail": "use the " + ("Lua" if lua else ".conf") +
-                          " bind snippet from README/GETTING-STARTED Step 6"}
-    except Exception as exc:
-        return {"present": True, "detail": f"hyprctl failed: {exc}"}
+    """`hyprctl version` -> config-syntax verdict + the emitted bind snippet.
+
+    Detection lives in `hypr_binds` (one parser, Lua-first — see the owner
+    ruling 2026-11-15 in that module). The `emit` field is the exact text an
+    installer should append: legacy `bind = ...` syntax silently does nothing on
+    Hyprland 0.57, which reads only `hl.bind`.
+    """
+    from .hypr_binds import emit_binds
+
+    info = hypr_binds_detect(runner=runner)
+    info["emit"] = emit_binds(info.get("syntax", "lua"))
+    info["syntax"] = ("lua (hl.bind)" if info.get("syntax") == "lua"
+                      else "legacy .conf (bind/bindr)")
+    return info
 
 
 def run_doctor(config) -> dict:
@@ -389,6 +393,28 @@ def run_doctor(config) -> dict:
             "model registry", True,
             "every configured id is in the §4.1 pinned registry "
             "(pinned ids live in src/assistant/model_registry.py)"))
+    # M-3 role-pin assert (mini order M, 2026-10-31): a registered id in a
+    # WRONG role is its own defect class — the W1 file-leg stump ran on this
+    # exact gap (files route configured at a chat model). Named by key, with
+    # the pinned value the key should carry.
+    role_drift = reg.get("role_drift") or []
+    if role_drift:
+        checks.append(_check(
+            "registry role pins", False,
+            "DEFECT — configured for the wrong role: "
+            + "; ".join(f"[gemini] {d['key']} = {d['configured']} "
+                        f"(pinned to {d['pinned']} for role {d['role']})"
+                        for d in role_drift)
+            + " — set the key to its pinned id or remove the line (an "
+              "unset key resolves to the registry pin). The files route "
+              "pointed at a chat model is the W1 <noise> stump's named "
+              "suspect.",
+            warn_only=False))
+    else:
+        checks.append(_check(
+            "registry role pins", True,
+            "every configured model_<role> key names its own role's pinned id "
+            "(unset keys resolve to the registry pin)"))
 
     hypr = hyprland_info()
     checks.append(_check(
@@ -423,11 +449,24 @@ def run_doctor(config) -> dict:
 
     mic_target = (config.section("capture").get("mic_target")
                   or config.section("meeting").get("mic_target") or None)
-    level = live_level_check(mic_target, seconds=1.2)
+    # F17 (owner ruling 2026-11-15): an unnamed node is refused on EVERY
+    # machine, so doctor must not measure one the daemon would never open —
+    # probing the default source would be the same wrong-mic habit wearing a
+    # diagnostic costume. With no node the answer is the refusal itself.
+    start_pop_ms = int(config.section("capture").get("start_pop_ms", 100))
+    level = (live_level_check(mic_target, seconds=1.2, skip_ms=start_pop_ms)
+             if mic_target else
+             {"available": False, "target": None,
+              "reason": "no capture node configured — capture is refused "
+                        "(F17); set [capture] mic_target to the node the "
+                        "doctor reports (wpctl status + wpctl inspect)"})
     if level.get("available"):
         level_detail = (
             f"node={level.get('target')} · {level.get('bytes', 0)} bytes "
-            f"({level.get('seconds', 0)}s) · peak {level.get('peak')} · "
+            f"({level.get('seconds', 0)}s) · "
+            f"peak full {level.get('peak_full', level.get('peak'))} · "
+            f"peak steady {level.get('peak_steady')} "
+            f"(first {level.get('start_pop_ms')} ms excluded) · "
             f"rms {level.get('rms')}"
             + (" — SIGNAL present (speak now: peak should move)"
                if level.get("signal") else
@@ -447,14 +486,15 @@ def run_doctor(config) -> dict:
     mic2_named = "mic2" in mic_pin.lower().replace(" ", "")
     checks.append(_check(
         "capture node (Mic1)",
-        not mic2_named and bool(mic_pin or level.get("available")),
+        bool(mic_pin) and not mic2_named,
         ("MIC2 CONFIGURED — Mic2 is silent; set [capture] mic_target to the "
          "Mic1 node.name (wpctl status + wpctl inspect)" if mic2_named else
          (f"mic_target={mic_pin!r} (matched by node.name)"
           if mic_pin else
-          "mic_target empty — the PipeWire default source is used; pin "
-          "node.name Mic1 explicitly ([capture] mic_target) so a silent node "
-          "can never become the default"))))
+          "mic_target empty — capture is REFUSED on every machine (F17, "
+          "owner ruling 2026-11-15); pin node.name Mic1 explicitly "
+          "([capture] mic_target) so a silent node can never become the "
+          "default"))))
 
     # §4.8: the quickshell binary (the console/overlay are quickshell panels).
     checks.append(_check(
@@ -674,6 +714,31 @@ def run_doctor(config) -> dict:
         status = call(config.socket_path, "status", timeout=2.0)
         daemon_detail = f"running, mode={status.get('mode')}, uptime={status.get('uptime_s')}s"
         daemon_ok = True
+        # J5: both peaks and the dropout count, from the last session that
+        # actually ran. "not measured yet" is a real answer; a fabricated 0.0
+        # would read as a silent room.
+        diag = status.get("capture_diag") or {}
+        if diag:
+            limiter = diag.get("limiter") or {}
+            # 2026-11-15: peak is SPLIT. A start transient at full scale
+            # survives node mute, so "peak 1.0" alone proved nothing about the
+            # voice — the steady reading is the one a diagnosis may use.
+            checks.append(_check(
+                "capture levels", True,
+                f"peak full {diag.get('peak_full', diag.get('raw_peak'))} · "
+                f"peak steady {diag.get('peak_steady')} "
+                f"(first {diag.get('start_pop_ms')} ms excluded) · "
+                f"start transients {diag.get('start_transient', {}).get('transients', 0)} · "
+                f"processed peak {diag.get('processed_peak', limiter.get('processed_peak'))} · "
+                f"limited samples {limiter.get('limited_samples', 0)} · "
+                f"xruns/dropouts {diag.get('xruns', 0)} · "
+                f"node {diag.get('node')} (the limiter mitigates, it never "
+                f"conceals: full and steady peaks are both kept)"))
+        else:
+            checks.append(_check(
+                "capture levels", True,
+                "no session measured yet — one `assist ptt start` fills this; "
+                "raw and processed peaks are journalled as capture.levels"))
     except DaemonUnavailable as exc:
         daemon_detail, daemon_ok = f"down ({exc})", False
     except DaemonError as exc:
@@ -2016,7 +2081,7 @@ def build_parser() -> argparse.ArgumentParser:
              "listening")
     hotword_sub.add_parser("stop", help="disarm and zero the RAM buffers")
     hotword_sub.add_parser("purge", help="delete saved wake clips now")
-    ptt_p.add_argument("action", choices=["start", "stop", "toggle"])
+    ptt_p.add_argument("action", choices=["start", "stop", "cancel", "toggle"])
     ptt_p.add_argument("--mode", choices=["narration", "conversation", "command"],
                        help="session mode for start; command routes via the local ladder")
     ptt_p.add_argument("--source", help="capture source override")
@@ -2551,9 +2616,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(result.get("text") or result.get("error") or "(no transcript)")
             capture = result.get("capture") or {}
             if capture and (result.get("no_speech") or result.get("no_final")):
+                # peak_rms is the peak of the per-frame rms, not a sample
+                # peak; the split is printed beside it so no reader has to
+                # guess which number it is looking at.
                 print(f"[capture: node={capture.get('node')} · "
                       f"bytes={capture.get('bytes')} · "
-                      f"peak={capture.get('peak_rms')} · "
+                      f"peak_rms={capture.get('peak_rms')} · "
+                      f"peak_full={capture.get('peak_full')} · "
+                      f"peak_steady={capture.get('peak_steady')} · "
                       f"audio={result.get('audio_path')}]", file=sys.stderr)
             print(f"[inbox: {result.get('inbox_path')} · clipboard: "
                   f"{(result.get('clipboard') or {}).get('copied')}]", file=sys.stderr)
@@ -2603,6 +2673,15 @@ def main(argv: list[str] | None = None) -> int:
             if action == "toggle":
                 action = "stop" if call(config.socket_path, "status", timeout=3.0).get("mode") == "listening" else "start"
             params = {}
+            if action == "cancel":
+                # F30/J4: Escape. A cancel is a stop with destruction, never a
+                # release — the wire call is the same method with a flag so the
+                # bind never needs a second daemon route.
+                params["cancel"] = True
+                params["stop_source"] = args.stop_source or "bind"
+                result = call(config.socket_path, "ptt.stop", params, timeout=5.0)
+                print(json.dumps(result))
+                return 0
             if action == "start":
                 if args.mode:
                     params["mode"] = args.mode

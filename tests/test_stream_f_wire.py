@@ -92,10 +92,14 @@ def test_unparsed_types_are_sampled_text_only_max_three():
     assert stats["types"]["server_content.interrupted"] == 5
     samples = stats["samples"]
     # G.2: up to 3 samples PER type (was 3 globally over unparsed only).
-    assert len(samples) == 6, samples
+    # H.2 (2026-10-27): "message" — the per-response total — is sampled
+    # too, naming each payload's fields, so no counted type is missing
+    # from samples. Same 3-per-type cap applies.
+    assert len(samples) == 9, samples
     assert sum(1 for s in samples if s.startswith("tool_call: ")) == 3
     assert sum(1 for s in samples
                if s.startswith("server_content.interrupted: ")) == 3
+    assert sum(1 for s in samples if s.startswith("message: ")) == 3
     assert all(len(s) <= 220 for s in samples)
     joined = " ".join(samples)
     assert "weather" in joined and "Nairobi" in joined   # text fields kept

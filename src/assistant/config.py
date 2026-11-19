@@ -17,6 +17,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .model_registry import PINNED_ROLES
+
 VALID_MODES = ("live", "record", "mock")
 
 
@@ -361,6 +363,9 @@ DEFAULTS: dict = {
         "speak_acks": True,
         "speak_replies": False,
         "cache_dir": "",
+        # F33 (Task L): rendered speech is LRU-capped and regenerable. The
+        # directory (`voice-cache/`) is permanently outside tiering.
+        "cache_max_files": 120,
         "audition_dir": "",
         "audition_candidates": [
             {
@@ -424,6 +429,13 @@ DEFAULTS: dict = {
         # PipeWire default source. Find the node name with `wpctl status` +
         # `wpctl inspect <id>` (node.name, NOT object.id).
         "mic_target": "",
+        # Owner measurement 2026-11-15: a full-scale start transient survives
+        # node mute, so the first N ms of a take are transport, not the owner.
+        # Frames inside this window are recorded but never uploaded full-scale
+        # and can never be the "first speech frame"; the steady peak (used by
+        # the silence verdict and doctor) starts after it. Re-derive N from
+        # `python3 scripts/frame_probe.py <wav>` (`recommended_start_pop_ms`).
+        "start_pop_ms": 100,
         "sample_rate": 16000,
         "chunk_ms": 30,
         # No bytes at all for this long = a dead capture process (pw-record
@@ -743,7 +755,16 @@ class Config:
         gemini = self.section("gemini")
         if role == "voice":
             return voice_model(self)
+        # M-3 re-pin (mini order M, 2026-10-31): a registry role whose
+        # config key is missing or empty resolves to the REGISTRY pin, not
+        # to `model_default`. The W1 root cause: the production file leg ran
+        # gemini-3.5-flash-lite (a chat model) on the files route while the
+        # registry pins that route to gemini-3.5-transcribe — an unset key
+        # silently fell through to the chat default. Explicit config still
+        # wins (owner experimentation is never blocked at runtime); doctor's
+        # role-pin assert names the drift by key.
         return str(gemini.get(f"model_{role}")
+                   or PINNED_ROLES.get(role)
                    or gemini.get("model_default") or "")
 
     def voice_model(self) -> str:
