@@ -12,7 +12,7 @@ import stat
 
 import pytest
 
-from assistant.journal_log import (
+from assistant.safety_journal import (
     OUTCOME_FAILED,
     OUTCOME_OK,
     OUTCOME_REFUSED,
