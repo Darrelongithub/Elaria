@@ -34,9 +34,16 @@ ShellRoot {
 
         // --- zwlr_layer_shell_v1 posture ---
         WlrLayershell.layer: WlrLayer.Overlay
-        WlrLayershell.namespace: "elaria-nus"
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
         exclusiveZone: -1
+
+        // Set the namespace AFTER construction: assigning it in the window
+        // definition can silently prevent sibling IpcHandlers from registering
+        // (Quickshell #1411). Separate hardening from the show-name fix below.
+        Component.onCompleted: {
+            if (nusSurface.WlrLayershell !== null)
+                nusSurface.WlrLayershell.namespace = "elaria-overlay";
+        }
 
         anchors {
             left: true
@@ -57,8 +64,10 @@ ShellRoot {
     IpcHandler {
         target: "nus"
 
-        function show(): void { root.surfaceVisible = true }
-        function hide(): void { root.surfaceVisible = false }
+        // `show` is consumed by `qs ipc show` (visibility/metadata), so it
+        // never dispatched to this handler on hardware. Non-reserved names.
+        function showSurface(): void { root.surfaceVisible = true }
+        function hideSurface(): void { root.surfaceVisible = false }
         function isVisible(): bool { return root.surfaceVisible }
 
         // Geometry only — the target shape is data, never a capture.
