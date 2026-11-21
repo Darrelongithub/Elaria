@@ -22,7 +22,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
-NUS_NAMESPACE = "elaria-nus"
+NUS_NAMESPACE = "elaria-overlay"
 NUS_LAYER = "overlay"
 NUS_KEYBOARD_FOCUS = "none"
 NUS_INPUT_MODE = "positive-allow"

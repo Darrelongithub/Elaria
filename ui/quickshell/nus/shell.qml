@@ -34,7 +34,7 @@ ShellRoot {
 
         // --- zwlr_layer_shell_v1 posture ---
         WlrLayershell.layer: WlrLayer.Overlay
-        WlrLayershell.namespace: "elaria-nus"
+        WlrLayershell.namespace: "elaria-overlay"
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
         exclusiveZone: -1
 
@@ -57,7 +57,7 @@ ShellRoot {
     IpcHandler {
         target: "nus"
 
-        function show(): void { root.surfaceVisible = true }
+        function reveal(): void { root.surfaceVisible = true }
         function hide(): void { root.surfaceVisible = false }
         function isVisible(): bool { return root.surfaceVisible }
 
