@@ -263,6 +263,8 @@ class StorageManifest:
     def summary(self) -> dict:
         """Counts and sizes by state and tier. No paths, ever.
 
+        This counts the latest durable record per artifact, not files on disk.
+        Zero cannot distinguish an empty directory from an unindexed one.
         Sensors, phase reports and PRs read this. It is deliberately blind to
         which artifact is which — that blindness IS the privacy fence, not a
         limitation of it.
@@ -271,12 +273,13 @@ class StorageManifest:
         by_state: dict[str, int] = {}
         by_tier: dict[str, int] = {}
         bytes_by_state: dict[str, int] = {}
-        for record in self.current().values():
+        current = self.current()
+        for record in current.values():
             by_state[record.state] = by_state.get(record.state, 0) + 1
             tier = record.tier or "unknown"
             by_tier[tier] = by_tier.get(tier, 0) + 1
             if record.size:
                 bytes_by_state[record.state] = (bytes_by_state.get(record.state, 0)
                                                 + int(record.size))
-        return {"artifacts": len(self.current()), "by_state": by_state,
+        return {"artifacts": len(current), "by_state": by_state,
                 "by_tier": by_tier, "bytes_by_state": bytes_by_state}
