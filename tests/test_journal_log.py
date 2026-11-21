@@ -12,7 +12,8 @@ import stat
 
 import pytest
 
-from assistant.journal_log import (
+from assistant.safety import PolicyDecision
+from assistant.safety_journal import (
     OUTCOME_FAILED,
     OUTCOME_OK,
     OUTCOME_REFUSED,
@@ -24,7 +25,6 @@ from assistant.journal_log import (
     JournalStateError,
     deny_beats_consent,
 )
-from assistant.safety import PolicyDecision
 
 
 @pytest.fixture
