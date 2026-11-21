@@ -435,7 +435,8 @@ def test_bh_h7_class_mode_toggle_racing_spoken_ack_speech_always_loses(tmp_path:
         def __init__(self) -> None:
             pass
 
-        def generate_audio(self, model: str, text: str, voice_name: str) -> dict:
+        def generate_audio(self, model: str, text: str, voice_name: str,
+                           on_chunk=None, **kwargs) -> dict:
             # During synthesis, class mode flips ON!
             presence.set_enabled(True)
             return {
