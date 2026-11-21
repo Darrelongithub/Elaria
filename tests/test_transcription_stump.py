@@ -131,6 +131,16 @@ def _dictate(config, tmp_path, monkeypatch, fallback_text):
     monkeypatch.setattr(
         asr, "transcribe_file",
         lambda *a, **k: Transcript(fallback_text, "en", "gemini_batch"))
+    # dictate() reaches the batch fallback through asr.transcribe_dictation
+    # (:286), NOT through transcribe_file (:353). Patching the wrong one let a
+    # real faster-whisper model load, hit the HF Hub, and take 52s — then the
+    # fallback text was discarded and raw_text came back empty.
+    monkeypatch.setattr(
+        asr, "transcribe_dictation",
+        lambda *a, **k: asr.DictationOutcome(
+            text=fallback_text, language="en", backend="gemini_batch",
+            confidence=None, path="local", labelled=None,
+            escalation="not_needed", provenance={}))
     stream = io.StringIO()
     bind_journal(stream)
     try:
