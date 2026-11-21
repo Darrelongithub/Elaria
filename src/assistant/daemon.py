@@ -422,7 +422,7 @@ class Daemon:
         `audible` mark rides it (sound starts at the first slice)."""
         try:
             result = task.result()
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             self._emit_latency_table(session_id, final=True)
             return
         synth = getattr(result, "synth_mark", None)
@@ -763,6 +763,8 @@ class Daemon:
                 text, play=True,
                 session_id=(route or {}).get("session_id") or None)
             result = await asyncio.shield(worker)
+            if getattr(result, "error", None):
+                result.muted = True
             if result.error and not route.get("muted"):
                 await self.broadcast({"event": "speech.error", "error": result.error,
                                       **route})

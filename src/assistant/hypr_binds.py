@@ -121,6 +121,6 @@ def detect(runner=subprocess.run) -> dict:
         "detected": version is not None,
         "detail": (f"Hyprland {version[0]}.{version[1]} reads "
                    f"{'Lua (hl.bind)' if syntax == LUA else 'legacy .conf'}"
-                   if version else "version unreadable — emitting Lua, the "
+                   if version else "hyprctl version unreadable — emitting Lua, the "
                                    "current format"),
     }

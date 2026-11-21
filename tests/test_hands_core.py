@@ -364,7 +364,7 @@ def test_preinjected_trap_full_four_part_oracle(lab, origin):
     if not (fixtures / "inventory.json").exists():
         pytest.skip("R-owned hands inventory not installed")
     inventory = json.loads((fixtures / "inventory.json").read_text())
-    entry = next(e for e in inventory["entries"] if e["trap"] and e["origin"] == origin)
+    entry = next(e for e in inventory["trap_arm_manifest"] if e["armed"] and e["origin"] == origin)
     fixture = fixtures / entry["path"]
     payload = fixture.name if origin == "filename" else fixture.read_text()
     assert core.run(plan, data=(DataInput(origin, payload),)) == "refused"
