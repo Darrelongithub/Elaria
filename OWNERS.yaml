@@ -199,6 +199,24 @@
     "ui/waybar/**"
   ],
   "I": [
+    "docs/phase-reports/2026-10-25-phase0-model-id-audit.md",
+    "docs/phase-reports/2026-10-25-wp0-eyes.md",
+    "docs/phase-reports/2026-10-26-scene2-order.md",
+    "docs/phase-reports/2026-10-26-scene3b-redo.md",
+    "docs/phase-reports/2026-10-26-scene3b-triage.md",
+    "docs/phase-reports/2026-10-26-stream-f-wire.md",
+    "docs/phase-reports/2026-10-27-stream-g-primary.md",
+    "docs/phase-reports/2026-10-27-stream-g7-pre-scene.md",
+    "docs/phase-reports/2026-10-27-stream-h-scene6-verdict.md",
+    "docs/phase-reports/2026-10-31-scene7-mini-order-m.md",
+    "docs/phase-reports/2026-10-31-scene7-work-order.md",
+    "docs/phase-reports/2026-11-02-voice-chain-resilience.md",
+    "docs/phase-reports/2026-11-03-extraction-fix.md",
+    "docs/phase-reports/2026-11-05-producer-seams-3-5-6.md",
+    "docs/phase-reports/2026-11-05-undo-review-pilot.md",
+    "docs/phase-reports/2026-11-14-tasks-j-k-l.md",
+    "docs/phase-reports/2026-11-15-clipping-pop-vs-voice.md",
+    "docs/phase-reports/2026-11-15-tasks-jkl-addendum.md",
     "reports/RPT-I-*",
     "src/assistant/cost.py",
     "src/assistant/model_pins.py",
@@ -223,6 +241,7 @@
   ],
   "K": [
     "console/attribution-test.js",
+    "console/draft-review-test.js",
     "console/elaria-visualizer.js",
     "console/hands-sidebar-test.js",
     "console/index.html",
@@ -327,6 +346,11 @@
     "src/assistant/hands/headless/host.py",
     "src/assistant/hands/headless/instance.py",
     "src/assistant/hands/headless/worker.py",
+    "tests/test_hands_headless_consent.py",
+    "tests/test_hands_headless_contract.py",
+    "tests/test_hands_headless_host.py",
+    "tests/test_hands_headless_instance.py",
+    "tests/test_hands_headless_worker.py",
     "tests/test_p_*.py"
   ],
   "Q": [
@@ -373,7 +397,6 @@
   "U": [
     "docs/live-scene/sheet1-*.md",
     "reports/RPT-U-*",
-    "scripts/storage-census-check.py",
     "src/assistant/drill.py",
     "src/assistant/preflight.py",
     "tests/test_u_*.py"
@@ -383,6 +406,7 @@
     "docs/storage-handoff.md",
     "docs/wp7-accd33a-readback-findings.md",
     "reports/RPT-V-*",
+    "scripts/storage-census-check.py",
     "tests/test_v_*.py"
   ],
   "REL": [
