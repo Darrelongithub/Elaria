@@ -354,7 +354,7 @@ def test_terminal_error_cleanup_and_no_blind_replay(lab, exception, status):
     assert len(runner.calls) == 1 and "private" not in output.getvalue()
 
 
-@pytest.mark.parametrize("origin", ["file", "filename", "stdout", "stderr", "retrieved", "tool_output"])
+@pytest.mark.parametrize("origin", ["file", "filename", "stdout", "stderr", "retrieved", "tool_output", "phone", "notification", "transcript", "web"])
 def test_preinjected_trap_full_four_part_oracle(lab, origin):
     space, _, runner, core, output = lab
     plan = Plan((step(space, ("note0.txt", "filed/note0.txt"), tier=1, tool="move"),))
