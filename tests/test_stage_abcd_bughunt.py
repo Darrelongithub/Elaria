@@ -191,8 +191,12 @@ def test_bh_h1_live_disconnect_during_conversation_emits_speech_error_and_text_f
                 on_first_token()
             return self.generate(model, contents, config)
 
-        def generate_audio(self, model: str, text: str, voice_name: str) -> dict:
-            raise RuntimeError("Live WebSocket closed unexpectedly (1006)")
+        def generate_audio(self, model: str, text: str, voice_name: str,
+                           on_chunk=None, **kwargs) -> dict:
+            # on_chunk is part of the live transport contract. A stub that
+            # omits it raises TypeError, which speak() swallows as a routine
+            # 'no speech for this turn' degradation instead of a dead socket.
+                    raise RuntimeError("Live WebSocket closed unexpectedly (1006)")
 
         def list_models(self) -> list[str]:
             return [DEFAULT_VOICE_MODEL]
