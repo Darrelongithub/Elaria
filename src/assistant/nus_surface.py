@@ -27,6 +27,13 @@ NUS_LAYER = "overlay"
 NUS_KEYBOARD_FOCUS = "none"
 NUS_INPUT_MODE = "positive-allow"
 
+# PanelWindow inherits show() from QQuickWindow, so an IpcHandler function
+# named `show` never registers as a callable verb. `reveal` is the verb that
+# actually dispatches (verified on Hyprland with `hyprctl layers`).
+SHOW_COMMAND = "reveal"
+HIDE_COMMAND = "hide"
+VISIBLE_COMMAND = "isVisible"
+
 Runner = Callable[[list[str]], str]
 
 

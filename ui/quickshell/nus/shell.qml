@@ -57,6 +57,8 @@ ShellRoot {
     IpcHandler {
         target: "nus"
 
+        // PanelWindow inherits show() from QQuickWindow: a handler verb named
+        // `show` is shadowed by that native method and never dispatches here.
         function reveal(): void { root.surfaceVisible = true }
         function hide(): void { root.surfaceVisible = false }
         function isVisible(): bool { return root.surfaceVisible }

@@ -11,12 +11,16 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import ClassVar
 
 from assistant.nus_surface import (
+    HIDE_COMMAND,
     NUS_INPUT_MODE,
     NUS_KEYBOARD_FOCUS,
     NUS_LAYER,
     NUS_NAMESPACE,
+    SHOW_COMMAND,
+    VISIBLE_COMMAND,
     NusSurfaceController,
     active_window,
 )
@@ -57,6 +61,71 @@ class FakeCompositor:
         # Deliberately no mutation of self.focus.
 
 
+class FakeRoot:
+    """QML root properties the parsed handler bodies are allowed to touch."""
+
+    def __init__(self) -> None:
+        self.surfaceVisible = False
+        self.targetX = 0
+        self.targetY = 0
+        self.targetWidth = 1
+        self.targetHeight = 1
+
+
+class FakeQuickshellIpc:
+    """Models `qs ipc call` against the REAL IpcHandler block in shell.qml.
+
+    It reads the typed function declarations from the shipped QML and runs
+    their bodies against a fake QML root. `show` is inherited from
+    QQuickWindow by PanelWindow, so the native method shadows the handler
+    verb: calling it prints the member list and changes nothing. That is the
+    exact hardware failure this fake must reproduce.
+    """
+
+    RESERVED: ClassVar[frozenset[str]] = frozenset({"show"})
+
+    def __init__(self, source: str) -> None:
+        match = re.search(r"IpcHandler\s*\{(.*?)^    \}", source, re.DOTALL | re.MULTILINE)
+        assert match, "no IpcHandler block in the shipped QML"
+        self.block = match.group(1)
+        self.target = re.search(r'target:\s*"([^"]+)"', self.block).group(1)
+        self.root = FakeRoot()
+        self.functions: dict[str, tuple[list[str], str]] = {}
+        for fn in re.finditer(
+            r"function\s+(\w+)\s*\(([^)]*)\)\s*:\s*(\w+)\s*\{(.*?)\}", self.block, re.DOTALL
+        ):
+            name, args, _return_type, body = fn.groups()
+            params = [part.split(":", 1)[0].strip() for part in args.split(",") if part.strip()]
+            self.functions[name] = (params, body)
+
+    def member_list(self) -> str:
+        lines = [f"target {self.target}"]
+        for name in sorted(self.functions):
+            if name not in self.RESERVED:
+                lines.append(f"  function {name}")
+        return "\n".join(lines)
+
+    def call(self, target: str, name: str, *args: str) -> str:
+        if target != self.target:
+            return "Target not found."
+        if name in self.RESERVED or name not in self.functions:
+            return self.member_list()  # the observed failure, not an invocation
+        params, body = self.functions[name]
+        bound = dict(zip(params, args))
+        for raw in body.splitlines():
+            stmt = raw.strip().rstrip(";")
+            if not stmt or stmt.startswith("//"):
+                continue
+            if match := re.fullmatch(r"return\s+root\.(\w+)", stmt):
+                value = getattr(self.root, match.group(1))
+                return "true" if value is True else "false"
+            if match := re.fullmatch(r"root\.(\w+)\s*=\s*(true|false)", stmt):
+                setattr(self.root, match.group(1), match.group(2) == "true")
+            elif match := re.fullmatch(r"root\.(\w+)\s*=\s*(\w+)", stmt):
+                setattr(self.root, match.group(1), bound[match.group(2)])
+        return ""
+
+
 def test_surface_is_wlr_layer_shell_not_a_normal_window():
     source = QML.read_text()
     assert "import Quickshell.Wayland" in source
@@ -81,7 +150,28 @@ def test_clickthrough_is_positive_allow_not_negative_hole():
     assert NusSurfaceController().show().interactive_rects == ()
 
 
-def test_show_and_hide_are_commands_that_toggle_visibility():
+def test_is_visible_turns_true_after_show_through_the_ipc_handler_path():
+    """This fails on the old `show` declaration: it returns the member list.
+
+    No fake surface dict: the fake dispatches the typed functions actually
+    declared in shell.qml and executes their bodies against a QML root.
+    """
+    ipc = FakeQuickshellIpc(QML.read_text())
+    assert ipc.target == "nus"
+    assert ipc.call("nus", VISIBLE_COMMAND) == "false"
+
+    # Reproduces the hardware failure: `show` resolves to QQuickWindow.show.
+    assert ipc.call("nus", "show") == ipc.member_list()
+    assert ipc.call("nus", VISIBLE_COMMAND) == "false"
+
+    assert ipc.call("nus", SHOW_COMMAND) == ""
+    assert ipc.call("nus", VISIBLE_COMMAND) == "true"
+
+    assert ipc.call("nus", HIDE_COMMAND) == ""
+    assert ipc.call("nus", VISIBLE_COMMAND) == "false"
+
+
+def test_controller_commands_match_the_handler_names():
     source = QML.read_text()
     assert 'target: "nus"' in source
     for line in (
@@ -90,13 +180,13 @@ def test_show_and_hide_are_commands_that_toggle_visibility():
         "function isVisible(): bool { return root.surfaceVisible }",
     ):
         assert line in source
+    assert (SHOW_COMMAND, HIDE_COMMAND, VISIBLE_COMMAND) == ("reveal", "hide", "isVisible")
 
     controller = NusSurfaceController()
     shown = controller.show(120, 40, 240, 80)
     assert shown.visible and (shown.x, shown.y, shown.width, shown.height) == (120, 40, 240, 80)
-    hidden = controller.hide()
-    assert not hidden.visible
     assert shown.as_dict()["keyboard_focus"] == "none"
+    assert not NusSurfaceController().hide().visible
 
 
 def test_focus_unchanged_after_overlay_appears():
@@ -107,14 +197,20 @@ def test_focus_unchanged_after_overlay_appears():
 
     compositor = FakeCompositor(focus=before)
     controller = NusSurfaceController()
+    ipc = FakeQuickshellIpc(QML.read_text())
+
+    assert ipc.call("nus", SHOW_COMMAND) == ""
     compositor.apply(controller.show(120, 40, 240, 80).as_dict())
     after_show = active_window(runner=hyprctl)
+    assert ipc.call("nus", VISIBLE_COMMAND) == "true"
     assert after_show == before                     # address, class, title identical
     assert compositor.focus == before
     assert NUS_NAMESPACE in compositor.surfaces     # the surface did appear
 
+    assert ipc.call("nus", HIDE_COMMAND) == ""
     compositor.apply(controller.hide().as_dict())
     after_hide = active_window(runner=hyprctl)
+    assert ipc.call("nus", VISIBLE_COMMAND) == "false"
     assert after_hide == before
     assert NUS_NAMESPACE not in compositor.surfaces  # and it disappeared
     assert len(hyprctl.calls) == 3                  # three reads, zero focus writes
