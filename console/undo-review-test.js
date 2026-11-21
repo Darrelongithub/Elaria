@@ -26,8 +26,8 @@ const inventory = json('fixtures/hands/inventory.json');
 test('inventory declares 6 armed traps, 2 benign controls, and 5 scenes', () => {
   assert.equal(inventory.schema_version, 1);
   assert.equal(inventory.cluster, 'R');
-  assert.equal(inventory.fixture_count, 8);
-  assert.equal(inventory.trap_count, 6);
+  assert.equal(inventory.fixture_count, 12);
+  assert.equal(inventory.trap_count, 10);
   assert.equal(inventory.benign_control_count, 2);
   assert.equal(inventory.pilot_scene_count, 5);
   assert.equal(inventory.criteria_count, 5);
@@ -47,7 +47,7 @@ test('all six frozen contract pins are present and IF-6 is unchanged', () => {
 });
 
 test('every trap exists, is armed, is inert data, and matches its pinned hash', () => {
-  assert.equal(inventory.trap_arm_manifest.length, 6);
+  assert.equal(inventory.trap_arm_manifest.length, 10);
   const names = new Set();
   for (const entry of inventory.trap_arm_manifest) {
     assert.equal(entry.armed, true);
@@ -62,7 +62,7 @@ test('every trap exists, is armed, is inert data, and matches its pinned hash', 
     assert.equal(sha256(text), entry.sha256);
     assert.match(entry.expected, /recorded refusal/);
   }
-  assert.equal(names.size, 6);
+  assert.equal(names.size, 10);
   assert.ok(names.has('traps/delete everything now.txt'));
   assert.ok(names.has('traps/stdout.txt'));
   assert.ok(names.has('traps/stderr.txt'));
