@@ -787,6 +787,10 @@ class Daemon:
             payload["speech_status"] = "spoken"
         elif payload.get("error"):
             payload["speech_status"] = "text-only"
+            # `route["muted"]` = voice disabled by preference (read at :1121).
+            # `SpeechResult.muted` = nothing was spoken. Same key, two meanings,
+            # and `{**route, **result}` lets route win. State the outcome.
+            payload["muted"] = True
             payload["speech_reason"] = (
                 f"voice unavailable ({payload['error']}) — the reply is shown "
                 f"as text and nothing was spoken")

@@ -11,7 +11,8 @@ from hashlib import sha256
 
 ORIGINS = frozenset({"file", "filename", "stdout", "stderr", "retrieved", "tool_output", "phone", "notification", "transcript", "web"})
 _IMPERATIVE = re.compile(
-    r"\b(?:delete|remove|erase|wipe|execute|run|ignore|send|upload|append|add|pretend)\s+\S+"
+    r"\b(?:delete|remove|erase|wipe|execute|run|ignore|send|upload|append|add|pretend"
+    r"|override|bypass|grant|dispatch)\s+\S+"
     r'|"(?:steps|argv|env_diff)"\s*:', re.IGNORECASE)
 
 
