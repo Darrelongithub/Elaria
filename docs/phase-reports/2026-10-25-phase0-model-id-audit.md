@@ -155,3 +155,28 @@ owner's hardware scene.
    decision routes all speech through `gemini-3.8-live` native audio (Flare).
    Confirm this is a WP1 change with the owner's ear (it is a voice-identity
    adjacent route change), not part of the pin fix.
+
+## 2026-11-19 — Wave 1, Agent I (base `346cef0`)
+
+The historical provider observations above are not a fresh catalog check. At
+this checkout, `config.py` declares these defaults:
+
+| Role | Configured ID |
+| --- | --- |
+| Default, organise, cleanup | `gemini-3.5-flash-lite` |
+| Chat | `gemini-3.5-flash-lite` |
+| Live transcription | `gemini-3.5-transcribe-live` |
+| Batch transcription | `gemini-3.5-transcribe` |
+| Native voice | `gemini-3.8-live` |
+
+An exact string pin is not an immutable provider revision: `-latest` aliases
+may change upstream. No provider availability, billing, quota or artifact
+identity was tested. No wake model was registered. The registry refuses unknown
+slots and mismatched IDs before calling a loader. Config and CLI wiring remain
+with Z; existing runtime paths are not yet routed through this registry.
+
+Cost checks cover paid-rate arithmetic (including 25 audio tokens per second),
+monthly purpose rows and the daily count fallback. Unknown IDs still fall back
+to estimated Flash pricing in the ledger; that is not load authorization.
+`voice`, `embeddings`, and `diarize` are declared; neither `openwakeword` nor
+`tflite-runtime` is declared or locked.
