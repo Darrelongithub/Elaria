@@ -189,6 +189,7 @@ def test_silent_capture_source_reports_no_speech_and_skips_fallback(
 # ===========================================================================
 # 1/4. Real-signal source: a transcript, in live mode
 # ===========================================================================
+@pytest.mark.slow
 def test_real_signal_capture_source_produces_a_live_transcript(tmp_path):
     config = _service_config(tmp_path)
     store = Store(tmp_path / "bug6.db")
