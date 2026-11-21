@@ -24,6 +24,7 @@
     "tests/test_daemon_cli.py",
     "tests/test_default_sync.py",
     "tests/test_ipc_handler_integrity.py",
+    "tests/test_z_*.py",
     "uv.lock",
     "uv.toml"
   ],
@@ -46,6 +47,7 @@
     "src/assistant/voiceprint.py",
     "src/assistant/voicetest.py",
     "tests/measure_voice_latency.py",
+    "tests/test_a_*.py",
     "tests/test_bug6_dictate_capture.py",
     "tests/test_bug6_live_duplex_and_stop.py",
     "tests/test_bug6d_ptt_result_orphans.py",
@@ -74,6 +76,7 @@
     "src/assistant/embeddings.py",
     "src/assistant/indexer.py",
     "src/assistant/memory.py",
+    "tests/test_b_*.py",
     "tests/test_embeddings_local.py",
     "tests/test_indexer_exclusions.py",
     "tests/test_memory_journal.py",
@@ -106,6 +109,7 @@
     "tests/test_bughunt_k_executor.py",
     "tests/test_bughunt_k_plan_tasks.py",
     "tests/test_bughunt_k_symlink_hash.py",
+    "tests/test_c_*.py",
     "tests/test_phase3_organiser.py",
     "tests/test_phase4_executor.py",
     "tests/test_phase6_meeting.py",
@@ -125,8 +129,12 @@
     "src/assistant/safety.py",
     "tests/bughunt_fixtures/**",
     "tests/test_bughunt_safety.py",
+    "tests/test_cleanup_hygiene.py",
+    "tests/test_d_*.py",
     "tests/test_disclosure.py",
+    "tests/test_disclosure_spec.py",
     "tests/test_fixtures_and_harness.py",
+    "tests/test_journal_log.py",
     "tests/test_persona_safety_latency.py"
   ],
   "E": [
@@ -134,6 +142,7 @@
     "src/assistant/drafts.py",
     "src/assistant/phone_link.py",
     "tests/test_drafts.py",
+    "tests/test_e_*.py",
     "tests/test_phone_link.py"
   ],
   "F": [
@@ -155,6 +164,7 @@
     "src/assistant/watcher.py",
     "tests/test_capture_source_check.py",
     "tests/test_daemon_identity.py",
+    "tests/test_f_*.py",
     "tests/test_limiter_readings.py",
     "tests/test_player_probe.py",
     "tests/test_watcher.py"
@@ -169,7 +179,8 @@
     "scripts/event-console-fallback.sh",
     "src/assistant/event.py",
     "src/assistant/event_spike.py",
-    "tests/test_event_*.py"
+    "tests/test_event_*.py",
+    "tests/test_g_*.py"
   ],
   "H": [
     "reports/RPT-H-*",
@@ -179,6 +190,7 @@
     "src/assistant/presence.py",
     "src/assistant/waybar.py",
     "systemd/elaria-overlay.service",
+    "tests/test_h_*.py",
     "tests/test_phase2_surfaces.py",
     "ui/README.md",
     "ui/hyprland/**",
@@ -190,7 +202,8 @@
     "src/assistant/cost.py",
     "src/assistant/model_pins.py",
     "src/assistant/model_registry.py",
-    "tests/test_bughunt_k_quota.py"
+    "tests/test_bughunt_k_quota.py",
+    "tests/test_i_*.py"
   ],
   "J": [
     "HOTWORD-REVIEW.md",
@@ -202,6 +215,7 @@
     "tests/test_bughunt_k_hotword_knock.py",
     "tests/test_bughunt_k_keyword_window.py",
     "tests/test_bughunt_k_knock_daemon_first.py",
+    "tests/test_j_*.py",
     "tests/test_wake_knock_package.py",
     "tests/test_wake_runtime.py",
     "ui/sounds/knock.wav"
@@ -222,6 +236,7 @@
     "reports/RPT-K-*",
     "systemd/elaria-console.service",
     "tests/test_console_home.py",
+    "tests/test_k_*.py",
     "ui/quickshell/console/**"
   ],
   "L": [
@@ -260,6 +275,7 @@
     "tests/test_hardening_pass2.py",
     "tests/test_hardening_pass2b.py",
     "tests/test_hotword_and_reply_delivery.py",
+    "tests/test_l_*.py",
     "tests/test_phase1_dictation.py",
     "tests/test_phase8_offline_voice.py",
     "tests/test_stage_abcd_bughunt.py",
@@ -278,7 +294,8 @@
     "console/native_window.py",
     "console/observe_native_bind.py",
     "console/verify-native-installer.sh",
-    "reports/RPT-M-*"
+    "reports/RPT-M-*",
+    "tests/test_m_*.py"
   ],
   "O": [
     "reports/RPT-O-*",
@@ -298,7 +315,8 @@
     "src/assistant/hands/sink.py",
     "src/assistant/hands/verify.py",
     "tests/test_hands_core.py",
-    "tests/test_hands_partial_sink.py"
+    "tests/test_hands_partial_sink.py",
+    "tests/test_o_*.py"
   ],
   "P": [
     "reports/RPT-P-*",
@@ -307,11 +325,13 @@
     "src/assistant/hands/headless/contract.py",
     "src/assistant/hands/headless/host.py",
     "src/assistant/hands/headless/instance.py",
-    "src/assistant/hands/headless/worker.py"
+    "src/assistant/hands/headless/worker.py",
+    "tests/test_p_*.py"
   ],
   "Q": [
     "reports/RPT-Q-*",
-    "src/assistant/hands/kitty/**"
+    "src/assistant/hands/kitty/**",
+    "tests/test_q_*.py"
   ],
   "R": [
     "console/undo-review-test.js",
@@ -324,38 +344,45 @@
     "docs/phase-reports/hands-*.md",
     "fixtures/hands/**",
     "reports/RPT-R-*",
+    "tests/test_r_*.py",
     "undo-review-test.js"
   ],
   "S": [
     "reports/RPT-S-*",
-    "scripts/warm-cold-transition.py",
     "src/assistant/sensors.py",
     "src/assistant/storage.py",
-    "src/assistant/tiering.py"
+    "src/assistant/tiering.py",
+    "tests/test_s_*.py",
+    "tests/test_storage_policy.py"
   ],
   "T": [
     "docs/live-scene/op3-*.md",
     "docs/live-scene/op4-*.md",
     "docs/live-scene/op5-*.md",
     "reports/RPT-T-*",
+    "scripts/storage-benchmark.sh",
+    "scripts/warm-cold-transition.py",
     "src/assistant/backup.py",
     "src/assistant/backup_cli.py",
     "src/assistant/backup_triggers.py",
-    "src/assistant/remote.py"
+    "src/assistant/remote.py",
+    "tests/test_storage_wiring_t.py",
+    "tests/test_t_*.py"
   ],
   "U": [
     "docs/live-scene/sheet1-*.md",
     "reports/RPT-U-*",
-    "scripts/storage-benchmark.sh",
     "scripts/storage-census-check.py",
     "src/assistant/drill.py",
-    "src/assistant/preflight.py"
+    "src/assistant/preflight.py",
+    "tests/test_u_*.py"
   ],
   "V": [
     "docs/phase-reports/0[0-9][0-9]-*",
     "docs/storage-handoff.md",
     "docs/wp7-accd33a-readback-findings.md",
-    "reports/RPT-V-*"
+    "reports/RPT-V-*",
+    "tests/test_v_*.py"
   ],
   "REL": [
     "docs/release/**",
