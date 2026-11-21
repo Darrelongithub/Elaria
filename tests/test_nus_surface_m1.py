@@ -85,7 +85,7 @@ def test_show_and_hide_are_commands_that_toggle_visibility():
     source = QML.read_text()
     assert 'target: "nus"' in source
     for line in (
-        "function show(): void { root.surfaceVisible = true }",
+        "function reveal(): void { root.surfaceVisible = true }",
         "function hide(): void { root.surfaceVisible = false }",
         "function isVisible(): bool { return root.surfaceVisible }",
     ):
