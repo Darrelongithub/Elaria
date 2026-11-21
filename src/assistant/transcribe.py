@@ -619,6 +619,7 @@ class DictationService:
         # VAD, the Live uplink and the archive. Raw peak is measured first, so
         # the limiter can never hide how hot the input was.
         limiter = SoftLimiter()
+        next_levels_at = 0.0
         cancelled = False
         zeroized_bytes = 0
         gate = FrameGate(rms_threshold=self.vad_threshold)
@@ -897,6 +898,13 @@ class DictationService:
                     await emit({"event": "live.uplink_gated", "state": "open",
                                 "dropped_frames": gated_frames,
                                 "session_id": session_id})
+                now = time.monotonic()
+                if limiter.last_frame_levels and now >= next_levels_at:
+                    next_levels_at = now + 0.1
+                    await emit_lifecycle_event("capture_levels", {
+                        "event": "capture.levels", "session_id": session_id,
+                        **limiter.last_frame_levels,
+                    })
                 duration_s += frame_s
                 if wav_sink:
                     wav_sink.write(frame)
