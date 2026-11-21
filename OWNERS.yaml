@@ -48,6 +48,7 @@
     "src/assistant/voicetest.py",
     "tests/measure_voice_latency.py",
     "tests/test_a_*.py",
+    "tests/test_capture_limiter.py",
     "tests/test_bug6_dictate_capture.py",
     "tests/test_bug6_live_duplex_and_stop.py",
     "tests/test_bug6d_ptt_result_orphans.py",

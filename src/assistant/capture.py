@@ -435,6 +435,7 @@ class SoftLimiter:
         self.processed_peak = 0.0
         self.frames = 0
         self.limited_samples = 0
+        self.last_frame_levels: dict[str, float | int] = {}
         self._buf = array("h")
 
     def _curve(self, value: float) -> float:
@@ -449,6 +450,7 @@ class SoftLimiter:
         """One chunk in, one chunk out — same length, never longer."""
         usable = len(pcm) - len(pcm) % 2
         if usable <= 0:
+            self.last_frame_levels = {}
             return pcm
         self._buf = array("h")
         self._buf.frombytes(pcm[:usable])
@@ -466,6 +468,10 @@ class SoftLimiter:
                 self._buf[index] = max(-32768, min(32767, mapped))
                 magnitude = abs(self._buf[index])
             processed = max(processed, magnitude)
+        self.last_frame_levels = {
+            "raw_peak": raw / 32768, "processed_peak": processed / 32768,
+            "limited_samples": limited,
+        }
         self.frames += 1
         self.limited_samples += limited
         self.raw_peak = max(self.raw_peak, raw / 32768)
