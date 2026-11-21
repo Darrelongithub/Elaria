@@ -70,7 +70,7 @@ packages = ["src/assistant"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
-    "slow: slow/high-memory tests (deselected by default; override with -m slow or -m '')",
+   "slow: long-running, memory-heavy live capture tests — 3:12 and 996MB peak; deselected by default, run with -m slow before any release",
 ]
 addopts = '-m "not slow"'
 
