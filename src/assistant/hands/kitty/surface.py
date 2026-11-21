@@ -5,6 +5,7 @@ ID expression does not imply that a known native command has been effect-verifie
 """
 from __future__ import annotations
 
+from . import pin
 from .policy import inventory
 
 TABS = frozenset({'close-tab', 'focus-tab', 'set-tab-title', 'set-tab-color', 'goto-layout',
@@ -19,6 +20,11 @@ def expression(ids):
 
 
 def resolve(act, snapshot):
+    # Never-grant verbs are refused here as well as in checker/policy: a target adapter
+    # must never be the only thing standing between the wire and a screenshot write or an
+    # OS window-title rewrite (v0.49.2 additions).
+    if act.verb in pin.NEVER_GRANT_VERBS:
+        raise PermissionError('never-grant-rc verb refused')
     entry = inventory()['verbs'].get(act.verb)
     if entry is None:
         raise PermissionError('new verb requires target adapter review')

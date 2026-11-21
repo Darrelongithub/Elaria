@@ -3,15 +3,19 @@ import hashlib
 
 import pytest
 
-from assistant.hands.kitty import policy
+from assistant.hands.kitty import pin, policy
 
-PIN = '7e0f01ff2396c292f05528261d349142f1c6e08eed948847ee1300633a1aafcd'
+# Re-pinned 2026-11-19 (lane Q) to upstream kitty v0.49.2 bytes. Owner re-approval of this
+# exact hash is OWED before any live run; the previous pin was
+# 7e0f01ff2396c292f05528261d349142f1c6e08eed948847ee1300633a1aafcd (v0.47.1, 514801 bytes).
+PIN = 'be06b3d206acca5ea906a471b174d594cfccf7118936ba27212a15af947b15f0'
 
 
 def test_inventory_bytes_match_owner_verified_pin_exactly():
     raw = (policy.DATA / 'inventory.json').read_bytes()
-    assert len(raw) == 514801
+    assert len(raw) == 539589
     assert hashlib.sha256(raw).hexdigest() == policy.INVENTORY_SHA256 == PIN
+    assert policy.inventory()['upstream_version'] == pin.UPSTREAM_VERSION
     assert policy.inventory()['schema_version'] == 1
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 
+from . import pin
 from .adapters.marker import CreateMarkerAdapter
 from .attribution import attribute
 from .policy import Assessment, digest, inventory
@@ -20,6 +21,11 @@ def validate_payload(act, catalogue):
     entry = catalogue['verbs'].get(act.verb)
     if entry is None:
         raise ValueError('unclassified wire protocol')
+    # Defence in depth for a mis-granted password: the two verbs that appeared at
+    # v0.49.2 are refused at the payload boundary as well as being absent from the
+    # per-instance `remote_control_password` verb list.
+    if act.verb in pin.NEVER_GRANT_VERBS:
+        raise PermissionError('never-grant-rc verb refused')
     fields = {f['name']: f for f in entry['payload']}
     p = act.payload
     if p.keys() - fields.keys() or any(f['required'] and k not in p for k, f in fields.items()):
@@ -45,6 +51,12 @@ def validate_payload(act, catalogue):
             valid = False
         if not valid:
             raise ValueError('wire field type or choice mismatch')
+    # ASK 50 / Approval 2c: v0.49.2 widened `--extent` to the not-currently-visible
+    # screen and its scrollback. The grant is verb-granular, so the verb name and the
+    # option name cannot carry this restriction — it is enforced here, on the value.
+    # Only the assessed subset is executable; the expansion needs an owner ruling.
+    if act.verb == 'get-text' and p.get('extent') in pin.UNASSESSED_GET_TEXT_EXTENTS:
+        raise PermissionError('get-text extent outside the assessed subset refused')
     if p.get('allow_remote_control') or p.get('remote_control_password'):
         raise PermissionError('child remote-control grant refused')
 
@@ -56,7 +68,8 @@ class NativeChecker:
         self.marker = CreateMarkerAdapter()
 
     def coverage(self):
-        return {verb: ('partial-create-marker-adapter' if verb == 'create-marker' else
+        return {verb: ('never-grant-rc' if verb in pin.NEVER_GRANT_VERBS else
+                       'partial-create-marker-adapter' if verb == 'create-marker' else
                        'needs-trusted-effect-adapter' if verb in OPAQUE else 'native-state')
                 for verb in self.catalogue['verbs']}
 

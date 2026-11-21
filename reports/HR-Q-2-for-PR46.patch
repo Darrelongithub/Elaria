@@ -1,0 +1,74 @@
+diff --git a/src/assistant/hands/headless/contract.py b/src/assistant/hands/headless/contract.py
+index e608b23..a7d3cd4 100644
+--- a/src/assistant/hands/headless/contract.py
++++ b/src/assistant/hands/headless/contract.py
+@@ -16,7 +16,12 @@ ALLOWED_VERBS = frozenset({"ls", "get-text", "send-text"})
+ 
+ # Assessed safe subset for ``get-text --extent``. The 0.49.2 additions
+ # (alternate / alternate_scrollback) are deliberately NOT in this set.
+-DEFAULT_EXTENT_SUBSET = frozenset({"viewport", "all"})
++# MEASURED against v0.49.2 (lane Q, 2026-11-19): the real choice list is screen, all,
++# selection, first_cmd_output_on_screen, last_cmd_output, last_visited_cmd_output,
++# last_non_empty_output, alternate, alternate_scrollback. `viewport` is NOT a kitty extent
++# (0 occurrences in kitty/rc/*.py), while `screen` -- kitty's own default -- was the value
++# being refused. Narrowing further is free; widening still needs the owner ruling.
++DEFAULT_EXTENT_SUBSET = frozenset({"screen", "all"})
+ 
+ # Options each verb accepts, and whether the option is extent-constrained.
+ _VERB_OPTIONS: dict[str, frozenset[str]] = {
+diff --git a/tests/test_hands_headless_contract.py b/tests/test_hands_headless_contract.py
+index 463806c..a246db1 100644
+--- a/tests/test_hands_headless_contract.py
++++ b/tests/test_hands_headless_contract.py
+@@ -23,7 +23,7 @@ def test_only_three_verbs_are_reachable():
+     assert set(contract.verbs) == set(ALLOWED_VERBS)
+ 
+ 
+-@pytest.mark.parametrize("extent", ["viewport", "all"])
++@pytest.mark.parametrize("extent", ["screen", "all"])
+ def test_get_text_accepts_assessed_extent(extent):
+     WorkerContract().check_request("get-text", {"extent": extent})
+ 
+@@ -72,8 +72,8 @@ def test_widening_extent_refused_at_construction():
+ 
+ 
+ def test_narrowing_extent_allowed_and_enforced():
+-    contract = WorkerContract(extent_subset=frozenset({"viewport"}))
+-    contract.check_request("get-text", {"extent": "viewport"})
++    contract = WorkerContract(extent_subset=frozenset({"screen"}))
++    contract.check_request("get-text", {"extent": "screen"})
+     with pytest.raises(ContractViolationError):
+         contract.check_request("get-text", {"extent": "all"})
+ 
+diff --git a/tests/test_hands_headless_host.py b/tests/test_hands_headless_host.py
+index 1305509..6d7c97d 100644
+--- a/tests/test_hands_headless_host.py
++++ b/tests/test_hands_headless_host.py
+@@ -63,7 +63,7 @@ def _spy_runner(calls: list) -> callable:
+         {"shell_integration": True},
+         {"allowed_verbs": ALLOWED_VERBS | {"screenshot"}},
+         {"allowed_verbs": frozenset({"ls"})},
+-        {"extent_subset": frozenset({"viewport", "alternate"})},
++        {"extent_subset": frozenset({"screen", "alternate"})},
+     ],
+ )
+ def test_config_fails_closed_on_bad_values(tmp_path, overrides):
+diff --git a/tests/test_hands_headless_worker.py b/tests/test_hands_headless_worker.py
+index 3eedfcc..e1cd45b 100644
+--- a/tests/test_hands_headless_worker.py
++++ b/tests/test_hands_headless_worker.py
+@@ -38,12 +38,12 @@ def _worker(journal=None, runner=None, policy=None):
+ def test_build_argv_shapes_for_the_three_verbs():
+     worker = _worker()
+     assert worker.build_argv(RemoteRequest(verb="ls")) == ["/usr/bin/kitty", "+rc", "ls"]
+-    assert worker.build_argv(RemoteRequest(verb="get-text", options={"extent": "viewport"})) == [
++    assert worker.build_argv(RemoteRequest(verb="get-text", options={"extent": "screen"})) == [
+         "/usr/bin/kitty",
+         "+rc",
+         "get-text",
+         "--extent",
+-        "viewport",
++        "screen",
+     ]
+     assert worker.build_argv(RemoteRequest(verb="send-text", payload="hello")) == [
+         "/usr/bin/kitty",

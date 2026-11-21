@@ -1,4 +1,4 @@
-"""create-marker assessment from reviewed 0.47.1 parser/dispatch/marker sources.
+"""create-marker assessment from reviewed v0.49.2 parser/dispatch/marker sources.
 
 Literal text is escaped by upstream before regex compilation. Function markers run
 Python files. Regex complexity is not proven by syntactic validity. Never execute,
@@ -8,18 +8,14 @@ from __future__ import annotations
 
 from types import MappingProxyType
 
+from .. import pin
 from ..attribution import PHASES, attribute
 from ..policy import Assessment, digest
 
 ASSESSOR = 'kitty.create-marker/v1'
-COMMIT = 'fb5255b1ae4f0249ba832d6a773348fd103449ce'
+COMMIT = pin.UPSTREAM_COMMIT
 # Reviewed dependency chain, not an assertion about the installed owner binary.
-SOURCES = MappingProxyType({
-    'kitty/rc/create_marker.py': 'ac844de07cd150c10ab76ca43685ef6bbe0ee7c6ea7baab67773205dd7989e90',
-    'kitty/options/utils.py': '8a5a7ec2dca9f4d18fa68c5d9bfc9591281c66ed378ce227161df98472f0afa2',
-    'kitty/window.py': '6e1b33931d3a3795bf082a886ed946b2f0a954a7e4171d4ba5e57bd1145ff846',
-    'kitty/marks.py': 'e4c5e9bbc0f4e4cc412c0dd97becb86d8ceeaf9d4c91d4c533f1946b4b99f6e2',
-})
+SOURCES = MappingProxyType(dict(pin.MARKER_SOURCES))
 
 
 class CreateMarkerAdapter:
@@ -33,7 +29,7 @@ class CreateMarkerAdapter:
             return attribute(Assessment(tier, nature, denied=denied), assessor=ASSESSOR,
                              reason=reason, act=act, phase=phase, targets=targets, basis=basis)
 
-        if (catalogue.get('upstream_version') != '0.47.1'
+        if (catalogue.get('upstream_version') != pin.UPSTREAM_VERSION
                 or catalogue.get('upstream_commit') != COMMIT
                 or entry.get('source') != 'kitty/rc/create_marker.py'
                 or entry.get('source_sha256') != SOURCES['kitty/rc/create_marker.py']):

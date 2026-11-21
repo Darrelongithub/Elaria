@@ -192,7 +192,7 @@ class Bridge:
                 if act.verb == "send-text":
                     for w in targets:
                         pre_text[w["id"]] = self.probe("get-text", {"match": exact_match([w["id"]])}, plan, [w])
-                # BOTH send verbs need a fresh identity/focus observation and gate. In 0.47.1
+                # BOTH send verbs need a fresh identity/focus observation and gate. In the pinned release
                 # send-key ignores exclude_active; this does NOT make broadcast exclusion atomic.
                 # Fresh identity immediately before the send, after any get-text round trips.
                 latest = self.targets(act, self.snapshot(plan))
@@ -249,9 +249,9 @@ class Bridge:
                     verification = "target-absence-observed"
             elif act.verb in {"ls", "get-text", "get-colors"}:
                 verification = "response-observed"
-            elif self.verifier is not None:
-                # Trusted effect adapter, not an RC exit status. False/None stays UNVERIFIED.
-                if self.verifier(act, tuple(before), tuple(after), response) is True:
+            elif (self.verifier is not None
+                  # Trusted effect adapter, not an RC exit status. False/None stays UNVERIFIED.
+                  and self.verifier(act, tuple(before), tuple(after), response) is True):
                     verification = "independent-effect-observed"
             self.event(**common(), verification=verification, phase="result", silent=silent)
             return {"verification": verification, "data": response}

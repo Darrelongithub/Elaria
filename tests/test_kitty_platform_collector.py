@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 from test_kitty_hands import private as private  # noqa: PLC0414 - pytest fixture registration
 
+from assistant.hands.kitty import pin
+
 SPEC = importlib.util.spec_from_file_location('kitty_platform', Path(__file__).resolve().parents[1] / 'tools/kitty/collect_platform.py')
 collector = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(collector)
@@ -73,8 +75,8 @@ def test_complete_synthetic_packet_never_claims_compatibility_or_hardware(home, 
     report, stub = collect(home, StubQueries(suffix))
     assert report['collection_complete'] and not report['compatibility_verified']
     assert not report['hardware_proven'] and report['requires_manual_reconciliation']
-    assert report['source_pin'] == 'upstream kitty 0.47.1'
-    assert report['owner_design_package_pin'] == '0.47.1-1.fc44'
+    assert report['source_pin'] == 'upstream kitty ' + pin.UPSTREAM_VERSION
+    assert report['owner_design_package_pin'] == pin.OWNER_RPM_RULING
     assert len(stub.calls) == 12 + (2 if suffix else 0)
     assert len(list((home / 'evidence').glob('*.json'))) == 15
     for name in collector.PAGES:
