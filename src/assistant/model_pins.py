@@ -20,9 +20,8 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Mapping
 from pathlib import Path
-
-from .config import ensure_private_dir
 
 PINS_FILE = "model-pins.json"
 
@@ -50,6 +49,8 @@ def load_pins(config) -> dict:
 
 
 def _write_pins(config, pins: dict) -> Path:
+    from .config import ensure_private_dir
+
     path = pins_path(config)
     ensure_private_dir(path.parent)
     tmp = path.with_suffix(".tmp")
@@ -130,3 +131,10 @@ def pinned_summary(config) -> dict:
                              "sha256": str(data.get("sha256"))[:16] + "…",
                              "first_fetch_ts": data.get("first_fetch_ts")}
                       for tier, data in pins.items()}}
+
+
+def validate_pin(pins: Mapping[str, str], slot: str, model_id: str) -> str:
+    """Return the approved ID unchanged; never normalize or fall back."""
+    if slot not in pins or not isinstance(model_id, str) or pins[slot] != model_id:
+        raise PinMismatch(f"Model {model_id!r} does not match the exact pin for {slot!r}")
+    return model_id

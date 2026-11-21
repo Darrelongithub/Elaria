@@ -140,25 +140,50 @@ class Executor:
     def apply_plan(self, plan_id: int, root_spec: dict, *,
                    include_review: bool = False,
                    allow_tripwire: bool = False,
-                   sandbox_root: Path | None = None) -> ApplyReport:
+                   sandbox_root: Path | None = None,
+                   attribution: str = "owner-cli-ipc",
+                   trusted: bool = True) -> ApplyReport:
         with self._operation_gate():
             return self._apply_plan_gated(
                 plan_id, root_spec, include_review=include_review,
-                allow_tripwire=allow_tripwire, sandbox_root=sandbox_root)
+                allow_tripwire=allow_tripwire, sandbox_root=sandbox_root,
+                attribution=attribution, trusted=trusted)
 
     def _apply_plan_gated(self, plan_id: int, root_spec: dict, *,
                           include_review: bool = False,
                           allow_tripwire: bool = False,
-                          sandbox_root: Path | None = None) -> ApplyReport:
+                          sandbox_root: Path | None = None,
+                          attribution: str = "owner-cli-ipc",
+                          trusted: bool = True) -> ApplyReport:
         """Apply a ready plan's auto items (+ approved review items).
 
         `allow_tripwire` is the owner's explicit 'yes, move >25% of my
-        tree' — the structural pause-and-ask (§4.4) made a parameter."""
+        tree' — the structural pause-and-ask (§4.4) made a parameter.
+
+        Wave-1 C (build order 2): before the first read of a plan item this
+        call passes the AUTONOMY GATE — consent (this live root, which the
+        owner flipped deliberately), attribution (who asked; never a guest, a
+        message or a page — IF-6), and a journal row. The gate can only ever
+        REFUSE more than this method already did; `attribution`/`trusted`
+        default to the owner-issued CLI/IPC path every existing caller uses.
+        """
         if root_spec.get("mode") != "live":
             raise PermissionError(
                 f"root {root_spec['path']} is mode={root_spec.get('mode')!r}, not "
                 "'live'. Shadow first (§4.3): read the shadow logs, then flip "
                 "the root to live in config.toml yourself — deliberately.")
+        from .intents import Intent, authorise
+
+        gate = authorise(
+            Intent(kind="apply", raw=f"apply plan {plan_id}",
+                   source=attribution, trusted=trusted),
+            principal=attribution,
+            consent={"granted": True, "scope": f"root {root_spec['path']} mode=live"},
+            journal=self._authorisation_journal())
+        if not gate["allowed"]:
+            raise PermissionError(
+                "refused by the autonomy gate — " + gate["reason"]
+                + ". Nothing moved; the refusal is in the journal.")
         plan = self.store.get_plan(plan_id)
         if plan is None or plan["status"] != "ready":
             raise ValueError(f"plan {plan_id} is not ready to apply")
@@ -221,6 +246,26 @@ class Executor:
         return report
 
     # -- one op, fully journaled --------------------------------------------------
+    def _authorisation_journal(self):
+        """The autonomy gate's journal sink: one §4.8 schema line.
+
+        Deliberately a schema line, not a persona event: the undo-review pilot
+        pins "exactly one persona line for a No", and an authorisation record
+        belongs in the journal (journald) where every other gate decision is.
+        """
+        def sink(row: dict) -> None:
+            from .journal_log import log_event
+
+            log_event("mutation.gate",
+                      level="info" if row.get("allowed") else "warn",
+                      verdict="authorised" if row.get("allowed") else "refused",
+                      detail=(f"intent={row.get('intent')}; "
+                              f"principal={row.get('attribution') or row.get('principal')}; "
+                              f"mutating={int(bool(row.get('mutating')))}; "
+                              f"consent={row.get('consent') or 'none'}; "
+                              f"reasons={'; '.join(row.get('reasons') or []) or 'none'}"))
+        return sink
+
     @staticmethod
     def _copy_file_no_overwrite(src: Path, dst: Path) -> None:
         """Exclusive-create copy for the cross-device path. `xb` makes a

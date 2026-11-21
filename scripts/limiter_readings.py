@@ -1,32 +1,44 @@
 #!/usr/bin/env python3
-"""The capture limiter's own numbers, from the daemon's durable record.
+"""The capture limiter's own numbers, read from the daemon's durable record.
 
 Ask 18 (2026-11-17): *"If a limiter were active, nothing in the file could read
 1.0000 at all — and 38 frames do. Is it wired? Is it enabled at this gain? What
 is its threshold?"*
 
-The code answers the first three (wired, unconditional, static curve knee 0.6 /
-ceiling 0.89, applied **before** the take is written) and a pinned test proves a
-full-scale source reads back from disk at <= 0.89. That means a
-dictate-produced take cannot contain a 1.0000 sample — so the owner's take that
-does needs its OWN numbers, not a fresh theory.
+A journal grep cannot answer that. `journalctl | grep capture.levels` coming back
+empty **discriminates nothing**: a stale daemon, a different unit, a rotated
+journal and "no session ran on this unit" all produce the same silence. The store
+cannot be stale that way — every dictation writes a `capture.stats` persona event
+on the way out.
 
-The journal grep came back empty, which discriminates nothing on its own: a
-stale daemon, another unit, or no session on that unit all look the same. The
-durable record is the store, and it cannot be stale — every `dictate` writes a
-`capture.stats` persona event carrying the limiter's raw and processed peaks and
-its limited-sample count.
+So this reads those rows, newest first, and prints numbers. It writes nothing:
+the connection is opened `mode=ro`, no DDL, no migration, no `CREATE TABLE`. The
+database file is byte-identical before and after a read (pinned by test).
 
-This prints those numbers, read-only, one `key value` line per session,
-newest first. `limiter_effective 1` means the raw input was hotter than what
-went out (processed < raw with samples actually limited); `0` means either
-nothing needed limiting or the limiter did not see that audio.
+`limiter_effective` is THREE-valued on purpose:
+
+  1   the limiter did something — processed_peak < raw_peak AND limited_samples > 0
+  0   the limiter was measured and had nothing to do (the input was already under
+      the knee) — this is a real, useful answer
+ -1   the limiter was NOT MEASURED: the row carries no raw_peak / processed_peak /
+      limited_samples, so nothing about its effectiveness may be claimed
+
+That third state is the whole point. A reader that folded "no fields" into `0`
+would report "the limiter did not fire" about audio it never saw, which is the
+silence-as-proof-of-absence mistake this cluster exists to prevent.
+
+Provenance note: on the current base tree the `SoftLimiter` counters
+(`raw_peak` / `processed_peak` / `limited_samples`) are **not** emitted by
+`transcribe.py` or `event.py`, so honest output today is `limiter_effective -1`
+with `limiter_fields_present 0`. On a tree that carries the limiter, the same
+reader returns 1/0. When those lines say `0`, the reader is telling you the
+instrument is missing — not that the limiter is innocent.
 
 Usage:
-  limiter_readings.py                 # the last 3 measured sessions
+  limiter_readings.py                     # the last 3 measured sessions
   limiter_readings.py --limit 10
   limiter_readings.py --db /path/to/assistant.db
-  limiter_readings.py --checksum
+  limiter_readings.py --checksum          # regenerate this file's .sha256
 
 Integrity: `scripts/limiter_readings.py.sha256` holds this file's digest under
 its repository-relative name; verify from the repository root with
@@ -44,6 +56,17 @@ from pathlib import Path
 
 UNKNOWN = "-1"
 
+# The counters the limiter would publish. Named once so "absent" and "zero"
+# can never be confused by a typo.
+LIMITER_FIELDS = ("raw_peak", "processed_peak", "limited_samples")
+
+EMPTY_FAILS_TO_DISCRIMINATE = (
+    "no capture.stats rows in this database cannot tell apart: (a) the daemon "
+    "never ran against this file, (b) the daemon ran against a different file, "
+    "(c) a session reached capture but exited before stats were written, or "
+    "(d) the store is intact and simply has no dictation yet"
+)
+
 
 def default_db_path() -> Path:
     """The daemon's database, resolved the way the daemon resolves it."""
@@ -59,6 +82,7 @@ def default_db_path() -> Path:
 
 def read_sessions(db: Path, limit: int = 3) -> tuple[list[dict], str]:
     """Newest `capture.stats` rows, parsed. Read-only; never creates the file."""
+    db = Path(db)
     if not db.exists():
         return [], f"no database at {db}"
     uri = f"file:{db}?mode=ro"
@@ -67,6 +91,7 @@ def read_sessions(db: Path, limit: int = 3) -> tuple[list[dict], str]:
     except sqlite3.Error as exc:
         return [], f"{type(exc).__name__}: {exc}"
     try:
+        connection.row_factory = sqlite3.Row
         rows = connection.execute(
             "SELECT ts, detail FROM persona_events "
             "WHERE kind = 'capture.stats' ORDER BY id DESC LIMIT ?",
@@ -75,59 +100,101 @@ def read_sessions(db: Path, limit: int = 3) -> tuple[list[dict], str]:
         return [], f"{type(exc).__name__}: {exc}"
     finally:
         connection.close()
-    sessions = []
-    for ts, detail in rows:
+    sessions: list[dict] = []
+    for row in rows:
         try:
-            data = json.loads(detail)
+            data = json.loads(row["detail"])
         except (TypeError, ValueError):
             continue
         if isinstance(data, dict):
-            sessions.append({"ts": ts, **data})
+            sessions.append({"ts": row["ts"], **data})
     return sessions, ""
 
 
-def _value(session: dict, key: str):
-    for source in (session, session.get("limiter") or {}):
+def _value(session: dict, key: str) -> tuple[object, str]:
+    """`(value, where)` — the flat key wins, the nested limiter block is the
+    fallback. Returns `(None, "")` when neither carries the field."""
+    for where, source in (("flat", session), ("nested", session.get("limiter"))):
         if isinstance(source, dict) and source.get(key) is not None:
-            return source[key]
-    return None
+            return source[key], where
+    return None, ""
+
+
+def _as_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def limiter_effective(session: dict) -> tuple[int, str]:
+    """`(1|0|-1, reason)`. -1 means NOT MEASURED, never "did not fire"."""
+    raw, _ = _value(session, "raw_peak")
+    processed, _ = _value(session, "processed_peak")
+    limited, _ = _value(session, "limited_samples")
+    if raw is None and processed is None and limited is None:
+        return -1, "fields_absent"
+    if raw is None or processed is None:
+        missing = "raw_peak" if raw is None else "processed_peak"
+        return -1, f"partial_fields_missing_{missing}"
+    raw_f, processed_f = _as_float(raw), _as_float(processed)
+    if raw_f is None or processed_f is None:
+        return -1, "unparseable_peaks"
+    if limited is None:
+        return -1, "limited_samples_absent"
+    try:
+        limited_i = int(limited)
+    except (TypeError, ValueError):
+        return -1, "unparseable_limited_samples"
+    if processed_f < raw_f and limited_i > 0:
+        return 1, "limited"
+    if limited_i == 0:
+        return 0, "nothing_to_limit"
+    return 0, "count_only"
 
 
 def describe(session: dict) -> dict:
     """The limiter's numbers for one session, and whether it did anything."""
-    raw = _value(session, "raw_peak")
-    processed = _value(session, "processed_peak")
-    limited = _value(session, "limited_samples")
-    effective = None
-    try:
-        if raw is not None and processed is not None:
-            effective = int(float(processed) < float(raw)
-                            and (limited or 0) > 0)
-    except (TypeError, ValueError):
-        effective = None
+    effective, reason = limiter_effective(session)
+    _, raw_where = _value(session, "raw_peak")
+    _, processed_where = _value(session, "processed_peak")
+    _, limited_where = _value(session, "limited_samples")
+    present = sum(1 for key in LIMITER_FIELDS if _value(session, key)[0] is not None)
     return {
         "ts": session.get("ts") or UNKNOWN,
         "node": session.get("node") or UNKNOWN,
-        "peak_full": _value(session, "peak_full"),
-        "peak_steady": _value(session, "peak_steady"),
-        "raw_peak": raw,
-        "processed_peak": processed,
-        "limited_samples": limited,
+        "peak_rms": session.get("peak_rms"),
+        "peak": session.get("peak"),
+        "raw_peak": _value(session, "raw_peak")[0],
+        "processed_peak": _value(session, "processed_peak")[0],
+        "limited_samples": _value(session, "limited_samples")[0],
         "frames": session.get("frames"),
         "no_speech": (1 if session.get("no_speech") else 0),
-        "limiter_effective": (UNKNOWN if effective is None else effective),
+        "limiter_fields_present": present,
+        "limiter_provenance": (f"{raw_where or '-'}/{processed_where or '-'}"
+                              f"/{limited_where or '-'}"),
+        "limiter_effective": effective,
+        "limiter_effective_reason": reason,
     }
+
+
+KEYS = ("ts", "node", "peak_rms", "peak", "raw_peak", "processed_peak",
+        "limited_samples", "frames", "no_speech", "limiter_fields_present",
+        "limiter_provenance", "limiter_effective", "limiter_effective_reason")
 
 
 def render(readings: list[dict]) -> str:
     lines = [f"available {1 if readings else 0}", f"sessions {len(readings)}"]
     for index, reading in enumerate(readings):
-        for key in ("ts", "node", "peak_full", "peak_steady", "raw_peak",
-                    "processed_peak", "limited_samples", "frames", "no_speech",
-                    "limiter_effective"):
-            value = reading[key]
+        for key in KEYS:
+            value = reading.get(key)
             lines.append(f"session_{index}.{key} {UNKNOWN if value is None else value}")
     if readings:
+        measured = sum(1 for r in readings if r["limiter_effective"] != -1)
+        lines.append(f"limiter_measured_sessions {measured}")
+        if measured == 0:
+            lines.append("note limiter_not_measured_in_any_row")
+            lines.append("note this_is_a_missing_instrument_not_a_clean_verdict")
         lines.append("note read_only")
     return "\n".join(lines)
 
@@ -165,7 +232,11 @@ def main(argv: list[str]) -> int:
                 print(f"error value_required {token}", file=sys.stderr)
                 return 2
             if token == "--limit":
-                limit = int(argv[index + 1])
+                try:
+                    limit = int(argv[index + 1])
+                except ValueError:
+                    print("error limit_must_be_an_integer", file=sys.stderr)
+                    return 2
             else:
                 db = Path(argv[index + 1]).expanduser()
             index += 2
@@ -175,6 +246,7 @@ def main(argv: list[str]) -> int:
     sessions, reason = read_sessions(db or default_db_path(), limit)
     if not sessions:
         print(f"available 0\nreason {reason or 'no capture.stats rows'}")
+        print(f"note empty_fails_to_discriminate {EMPTY_FAILS_TO_DISCRIMINATE}")
         return 2
     print(render([describe(session) for session in sessions]))
     return 0

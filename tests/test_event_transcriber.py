@@ -683,9 +683,13 @@ async def test_preflight_warns_on_battery_and_start_requires_battery_ok(config):
     assert any("battery" in w.lower() for w in report["warnings"])
     assert report["refusals"] == []
 
-    service = EventService(config, store=None,
-                           transcribe_fn=TranscribeScript(),
-                           power_probe=lambda: power)
+    service = EventService(
+        config, store=None,
+        transcribe_fn=TranscribeScript(),
+        power_probe=lambda: power,
+        level_checker=lambda: {"available": False, "signal": False,
+                               "target": "mic", "reason": "test"},
+    )
     result = await service.start(title="Panel", battery_ok=False)
     assert result["state"] == "needs-battery-ok"
     assert result["preflight"]["power"]["on_battery"] is True

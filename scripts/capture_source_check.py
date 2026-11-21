@@ -1,39 +1,49 @@
 #!/usr/bin/env python3
-"""Capture-path source check — what capture opened, and at what volume.
+"""Capture-path source check — which node capture would open, and at what volume.
 
 Owner-runnable, read-only, stdlib only, no network, no credentials. It answers
-the two questions the 2026-11-15 evidence left open and nothing else:
+two questions and nothing else:
 
-1. Which node capture would open right now and whether it would open one at
-   all. **F17 (owner ruling 2026-11-15) has no default-source fallback**: with
-   `[capture] mic_target` unset, capture is REFUSED, so this script prints
-   `node -1`, `capture_would_refuse 1`, `refusal f17_no_node` — it never
-   presents the PipeWire default as something capture would use. The default
-   source is still reported, under its own name, because it is a fact about the
-   machine; it is not a capture target while the node is unnamed. The node's
-   monitor state answers question (b) for the 20261102 flat envelope: a steady
-   loud source beside the voice (monitor/loopback of playback).
-2. What is that node's capture volume right now, as a percentage? The
-   gain-reduction packet must record the current value before changing it, so
-   the change is reversible. `default_volume_percent` is reported separately,
-   because the default source's level is still a number the owner may need to
-   record even when capture refuses to use that node.
+1. **Which node capture would open right now** — resolved by the SAME order the
+   daemon uses (`params` → `[capture] mic_target` → `[meeting] mic_target` →
+   PipeWire default; see `daemon._ptt_start`), plus whether that node is listed
+   by PipeWire at this moment.
+2. **What is that node's capture volume**, as a percentage? The gain-reduction
+   packet must record the current value BEFORE changing it so the change is
+   reversible. `default_volume_percent` is reported separately, because the
+   default source's level is a number the owner may still need to record.
 
-The config file is the daemon's own (`$ASSIST_CONFIG`, else
-`$XDG_CONFIG_HOME/assistant/config.toml`), and `config_path` / `config_found`
-say which file was read — a `-1` here means "not read", never "not set". It
-never writes, never sets anything, and never needs the daemon.
+THE REFUSAL POLICY IS A FLAG, NOT A CLAIM (`--policy`):
 
-Output is one `key value` line each. An unreadable string is `-1`, an
-unreadable number is `-1`; `available 0` means `pactl` is absent or failed and
-the `reason` line says which. `node_is_monitor 0` on a named Mic1 input is the
-answer to (b) being "not a loopback" — for THIS node, at THIS moment.
+  as-built   (default) report what this tree's daemon actually does. On the
+             current base tree an unset `mic_target` falls back to the PipeWire
+             default source, so `fallback_to_default 1` and
+             `capture_would_refuse 0`. That is a fact about this checkout.
+  f17        evaluate the owner's F17 ruling: with `mic_target` unset, capture
+             is REFUSED — `refusal f17_no_node`, `capture_would_refuse 1`, and
+             the default source is still reported (as a fact about the machine)
+             but is never presented as something capture would use.
+
+Why the flag instead of one hardcoded answer: a probe that asserts a ruling the
+checked-out code does not implement is a lie with a straight face. `as-built`
+says what happens IF you run the daemon from this tree; `f17` says what happens
+once the ruling is wired. `f17_refusal_implemented` reports which tree state the
+probe believes it is standing in — never inferred, always printed.
+
+The config read is the daemon's own (`$ASSIST_CONFIG`, else
+`$XDG_CONFIG_HOME/assistant/config.toml`); `config_path` / `config_found` say
+which file was read, so `-1` here means "not read", never "not set". It never
+writes, never sets anything, never needs the daemon.
+
+Output is one `key value` line each; an unreadable string or number is `-1`, and
+`available 0` means `pactl` is absent or failed and `reason` says which.
 
 Usage:
   capture_source_check.py
   capture_source_check.py --config config.toml --node alsa_input...Mic1__source
-  capture_source_check.py --pin-line                 # the exact mic_target line
-  capture_source_check.py --pactl-json sources.json --pactl-info info.txt  # replay
+  capture_source_check.py --policy f17
+  capture_source_check.py --pin-line          # the exact mic_target line
+  capture_source_check.py --pactl-json sources.json --pactl-info info.txt
   capture_source_check.py --checksum
 
 Integrity: `scripts/capture_source_check.py.sha256` holds this file's digest
@@ -52,6 +62,14 @@ import sys
 from pathlib import Path
 
 UNKNOWN = "-1"
+POLICIES = ("as-built", "f17")
+
+EMPTY_FAILS_TO_DISCRIMINATE = (
+    "`available 0` cannot tell apart: pactl missing, pactl present but the "
+    "PipeWire socket is down, or a permissions failure — the `reason` line "
+    "carries whichever this run saw, and nothing about it generalises to the "
+    "next run"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -128,22 +146,36 @@ def parse_info_default(text: str) -> str:
     return ""
 
 
-def resolve_node(override: str, configured: str) -> tuple[str, str]:
-    """The node capture would use, or a refusal — F17 has no default fallback.
+def resolve_node(override: str, configured: str, policy: str = "as-built"
+                 ) -> tuple[str, str, int]:
+    """`(node, refusal, fallback_to_default)` for the named policy.
 
-    Returns `(node, refusal)`. A configured node (or an explicit override) is
-    the node; nothing else is. The system default source is NOT a capture
-    target: `audio_gateway.resolve_target` refuses on every machine, so a
-    diagnostic that fell back to the default would measure a microphone the
-    daemon would never open.
+    as-built: the daemon's real order ends at `None`, which means "let
+    pw-record pick", i.e. the PipeWire default source. That is not a refusal and
+    must not be printed as one.
+
+    f17: no default-source fallback. An unnamed node is a refusal, full stop —
+    so capture is never described as measuring a mic the owner did not name.
     """
+    if policy not in POLICIES:
+        raise ValueError(f"unknown policy {policy!r}; expected one of {POLICIES}")
     node = override or configured
-    return (node, "") if node else ("", "f17_no_node")
+    if node:
+        return node, "", 0
+    if policy == "f17":
+        return "", "f17_no_node", 0
+    return "", "", 1
 
 
-def config_home() -> Path:
-    """Same rule as `assistant.config.config_home` — the daemon's own home."""
-    value = os.environ.get("XDG_CONFIG_HOME", "")
+def config_home(environ: dict | None = None) -> Path:
+    """Same rule as `assistant.config.config_home` — the daemon's own home.
+
+    `environ` is a testable seam: injecting it must change EVERY variable this
+    lookup reads, not just the first one, or a test that passes a fake home is
+    quietly reading the real one.
+    """
+    env = os.environ if environ is None else environ
+    value = env.get("XDG_CONFIG_HOME", "")
     return Path(value).expanduser() if value else Path.home() / ".config"
 
 
@@ -153,7 +185,7 @@ def default_config_path(environ: dict | None = None) -> Path:
     configured = env.get("ASSIST_CONFIG", "")
     if configured:
         return Path(configured).expanduser()
-    return config_home() / "assistant" / "config.toml"
+    return config_home(env) / "assistant" / "config.toml"
 
 
 def configured_node_from(path: Path | None) -> str:
@@ -224,7 +256,8 @@ def write_manifest(target: Path | None = None) -> Path:
 
 def report(pactl: str, config: Path | None, override: str,
            sources: list[dict] | None = None,
-           default: str | None = None) -> dict:
+           default: str | None = None,
+           policy: str = "as-built") -> dict:
     """The reading, as numbers and names. Tests pass `sources`/`default`."""
     if sources is None:
         sources, err = read_sources(pactl)
@@ -232,27 +265,35 @@ def report(pactl: str, config: Path | None, override: str,
             return {"available": False, "reason": err or "no sources"}
     if default is None:
         default = read_default(pactl)
-    return _report_from(sources, default, config, override)
+    return _report_from(sources, default, config, override, policy)
 
 
 def _report_from(sources: list[dict], default: str, config: Path | None,
-                 override: str) -> dict:
+                 override: str, policy: str = "as-built") -> dict:
+    if policy not in POLICIES:
+        raise ValueError(f"unknown policy {policy!r}; expected one of {POLICIES}")
     configured = configured_node_from(config)
-    node, refusal = resolve_node(override, configured)
+    node, refusal, fallback = resolve_node(override, configured, policy)
     match = next((src for src in sources if src["name"] == node), None) if node else None
     default_match = next((src for src in sources if src["name"] == default), None)
     monitors = [src for src in sources if src["monitor"]]
+    # What capture will really open: the named node, or the machine's default.
+    effective = node or (default if fallback else "")
     return {
         "available": True,
+        "policy": policy,
+        "f17_refusal_implemented": 0 if policy == "as-built" else 1,
         "config_path": str(config) if config else UNKNOWN,
         "config_found": 1 if (config is not None and config.exists()) else 0,
         "configured_node": configured or UNKNOWN,
         "node": node or UNKNOWN,
-        "capture_would_refuse": 0 if node else 1,
+        # The node capture will actually open, named — never left implicit.
+        "effective_node": effective or UNKNOWN,
+        "fallback_to_default": fallback,
+        "capture_would_refuse": 0 if (node or fallback) else 1,
         "refusal": refusal or UNKNOWN,
         "node_found": 1 if match else 0,
         "node_is_monitor": 1 if (match and match["monitor"]) else 0,
-        # Named after the OWNER's ruling, not a guess: F17 pins Mic1.
         "node_is_mic1": 1 if node and "mic1" in node.lower() else 0,
         "volume_percent": (f"{match['volume_percent']:.1f}"
                            if match and match["volume_percent"] >= 0 else UNKNOWN),
@@ -270,9 +311,9 @@ def _report_from(sources: list[dict], default: str, config: Path | None,
 def pin_line(node: str, sources: list[dict]) -> str:
     """The exact `mic_target` line for a real mic node, else -1.
 
-    A paste-exact line beats a transcription: the Ask-13 answer is only as good
-    as the string the owner types into `[capture]`. A `.monitor` is refused
-    here too — pinning a loopback would be (b) made permanent.
+    A paste-exact line beats a transcription: the answer is only as good as the
+    string the owner types into `[capture]`. A `.monitor` is refused here too —
+    pinning a loopback would be the flat-envelope bug made permanent.
     """
     if not node:
         return UNKNOWN
@@ -282,21 +323,29 @@ def pin_line(node: str, sources: list[dict]) -> str:
     return f'mic_target = "{node}"'
 
 
+RENDER_KEYS = ("policy", "f17_refusal_implemented", "config_path", "config_found",
+               "configured_node", "node", "effective_node", "fallback_to_default",
+               "capture_would_refuse", "refusal", "node_found", "node_is_monitor",
+               "node_is_mic1", "volume_percent", "default_source",
+               "default_volume_percent", "monitor_sources", "sources")
+
+
 def render(result: dict) -> str:
     lines = [f"available {1 if result.get('available') else 0}"]
     if not result.get("available"):
         lines.append(f"reason {result.get('reason') or UNKNOWN}")
+        lines.append(f"note empty_fails_to_discriminate {EMPTY_FAILS_TO_DISCRIMINATE}")
         return "\n".join(lines)
-    for key in ("config_path", "config_found", "configured_node", "node",
-                "capture_would_refuse", "refusal", "node_found",
-                "node_is_monitor", "node_is_mic1", "volume_percent",
-                "default_source", "default_volume_percent", "monitor_sources",
-                "sources"):
+    for key in RENDER_KEYS:
         lines.append(f"{key} {result[key]}")
     for index, name in enumerate(result["monitor_names"]):
         lines.append(f"monitor_source_{index} {name}")
-    if result["node_found"] == 0:
+    if result["node_found"] == 0 and result["node"] != UNKNOWN:
         lines.append("note node_not_listed_now")
+    if result["fallback_to_default"]:
+        lines.append("note unset_mic_target_falls_back_to_default_source")
+    if result["refusal"] != UNKNOWN:
+        lines.append("note refusal_means_do_not_guess_a_node")
     lines.append("note read_only")
     return "\n".join(lines)
 
@@ -304,13 +353,13 @@ def render(result: dict) -> str:
 def main(argv: list[str]) -> int:
     if argv and argv[0] in ("-h", "--help"):
         print("usage: capture_source_check.py [--config PATH] [--node NAME] "
-              "[--pactl BIN] [--pactl-json FILE] [--pactl-info FILE] "
-              "[--pin-line] | --checksum", file=sys.stderr)
+              "[--policy as-built|f17] [--pactl BIN] [--pactl-json FILE] "
+              "[--pactl-info FILE] [--pin-line] | --checksum", file=sys.stderr)
         return 2
     if argv and argv[0] == "--checksum":
         print(write_manifest())
         return 0
-    args = {}
+    args: dict[str, str] = {}
     flags = {"--pin-line"}
     index = 0
     while index < len(argv):
@@ -318,7 +367,7 @@ def main(argv: list[str]) -> int:
         if token in flags:
             index += 1
             continue
-        if token in ("--config", "--node", "--pactl", "--pactl-json",
+        if token in ("--config", "--node", "--policy", "--pactl", "--pactl-json",
                      "--pactl-info"):
             if index + 1 >= len(argv):
                 print(f"error value_required {token}", file=sys.stderr)
@@ -327,6 +376,10 @@ def main(argv: list[str]) -> int:
             index += 2
             continue
         print(f"error unknown_argument {token}", file=sys.stderr)
+        return 2
+    policy = args.get("--policy", "as-built")
+    if policy not in POLICIES:
+        print(f"error unknown_policy {policy}", file=sys.stderr)
         return 2
     config = (Path(args["--config"]).expanduser() if "--config" in args
               else default_config_path())
@@ -348,11 +401,10 @@ def main(argv: list[str]) -> int:
             print(f'mic_target = "{node}"', file=sys.stderr)
             print(UNKNOWN)
             return 0
-        line = pin_line(node, sources)
-        print(line)
+        print(pin_line(node, sources))
         return 0
     result = report(args.get("--pactl", "pactl"), config, args.get("--node", ""),
-                    sources=sources, default=default)
+                    sources=sources, default=default, policy=policy)
     print(render(result))
     return 0
 

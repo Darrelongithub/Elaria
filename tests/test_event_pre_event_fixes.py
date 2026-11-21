@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 EAT = ZoneInfo("Africa/Nairobi")
+SPEECH_FRAME = struct.pack("<480h", *([6000] * 480))
 
 
 def test_daily_quota_ledger_survives_restart_and_resets_at_la_midnight(tmp_path):
@@ -113,14 +115,54 @@ def test_fake_transport_is_explicit_and_never_calls_transcriber(config):
             def release(self):
                 self.held = False
 
+        class FakeClock:
+            def __init__(self):
+                self.t = 1000.0
+
+            def __call__(self):
+                return self.t
+
+            def advance(self, dt: float):
+                self.t += dt
+
+        class DeterministicSource:
+            target = "simulated"
+            stalled = False
+
+            def __init__(self, clock: FakeClock):
+                self.clock = clock
+                self._closed = asyncio.Event()
+
+            async def frames(self):
+                for _ in range(4):
+                    if self._closed.is_set():
+                        return
+                    self.clock.advance(1.0)
+                    yield SPEECH_FRAME
+                    await asyncio.sleep(0)
+                await self._closed.wait()
+
+            async def aclose(self):
+                self._closed.set()
+
+        clock = FakeClock()
+        seg2_opened = asyncio.Event()
+
+        def on_event(frame: dict):
+            if frame.get("event") == "event.segment.opened" and int(frame.get("segment", 0)) >= 2:
+                seg2_opened.set()
+
         inhibitor = Inhibitor()
         service = EventService(config, None, transcribe_fn=forbidden,
+                               clock=clock,
+                               capture_factory=lambda _s: DeterministicSource(clock),
                                inhibitor=inhibitor, max_attempts=3,
+                               on_event=on_event,
                                level_checker=lambda: {"signal": True})
         service._power_probe = lambda: {"on_battery": True, "detail": "Battery discharging"}
         result = await service.start(source="simulated", title="Soak", battery_ok=True,
-                                    no_transcribe=True, segment_minutes=0.001)
-        await asyncio.sleep(0.18)
+                                    no_transcribe=True, segment_minutes=0.05)
+        await asyncio.wait_for(seg2_opened.wait(), timeout=2.0)
         assert service.status()["segments"]["opened"] >= 2
         assert result["state"] == "event"
         assert any("ON BATTERY" in warning
@@ -147,7 +189,10 @@ def test_event_start_parser_exposes_no_transcribe_flag():
 def test_cli_no_transcribe_soak_shows_zero_call_transport(running_daemon, capsys):
     from assistant.cli import main
 
-    _daemon, _server = running_daemon
+    daemon, _server = running_daemon
+    daemon.event_service._power_probe = lambda: {
+        "available": False, "on_battery": False, "detail": "AC",
+    }
     rc = main(["event", "start", "--no-transcribe", "--battery-ok",
                "--source", "simulated", "--title", "Zero-cost soak"])
     output = capsys.readouterr().out

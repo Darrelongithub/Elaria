@@ -23,10 +23,15 @@ from .safety import check_blast_radius
 
 
 class OrganiserService:
-    def __init__(self, config, store, client=None):
+    def __init__(self, config, store, client=None, memory=None):
         self.config = config
         self.store = store
         self.client = client  # enables Tier 1/2 when asked (Phase 4)
+        # B's Memory (read-only consumer): Tier 1/2 hints come from the owner's
+        # own prior placements when a memory is wired (build order 4). The
+        # daemon passes it via HR-C-1; with memory=None the tiers run exactly
+        # as before, hint-free.
+        self.memory = memory
         self.indexer = Indexer(config, store)
         self.shadow_dir = config.data_dir / "shadow"
 
@@ -94,7 +99,8 @@ class OrganiserService:
                     raise ValueError("Tier 1/2 requested but no Gemini client wired")
                 from .planner_llm import LlmPlanner
 
-                LlmPlanner(self.config, self.store, self.client) \
+                LlmPlanner(self.config, self.store, self.client,
+                           recall=getattr(self.memory, "recall", None)) \
                     .classify_abstained(items, taxonomy)
                 if progress:
                     progress({"event": "plan.progress", "plan_id": plan_id,
