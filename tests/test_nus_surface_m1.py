@@ -76,10 +76,10 @@ class FakeQuickshellIpc:
     """Models `qs ipc call` against the REAL IpcHandler block in shell.qml.
 
     It reads the typed function declarations from the shipped QML and runs
-    their bodies against a fake QML root. The name `show` is registered by
-    Quickshell's `ipc show` metadata path, not dispatched as a handler
-    function: calling it returns the member list and changes nothing. That
-    is the exact hardware failure this fake must reproduce.
+    their bodies against a fake QML root. `show` is inherited from
+    QQuickWindow by PanelWindow, so the native method shadows the handler
+    verb: calling it prints the member list and changes nothing. That is the
+    exact hardware failure this fake must reproduce.
     """
 
     RESERVED: ClassVar[frozenset[str]] = frozenset({"show"})
@@ -131,9 +131,7 @@ def test_surface_is_wlr_layer_shell_not_a_normal_window():
     assert "import Quickshell.Wayland" in source
     assert "PanelWindow {" in source
     assert "WlrLayershell.layer: WlrLayer.Overlay" in source
-    assert f'WlrLayershell.namespace = "{NUS_NAMESPACE}"' in source
-    assert "Component.onCompleted" in source  # deferred: avoid Quickshell #1411
-    assert "WlrLayershell.namespace:" not in source
+    assert f'WlrLayershell.namespace: "{NUS_NAMESPACE}"' in source
     assert "WlrLayershell.keyboardFocus: WlrKeyboardFocus.None" in source
     assert "exclusiveZone: -1" in source
     assert not re.search(r"keyboardFocus:\s*WlrKeyboardFocus\.(Exclusive|OnDemand)", source)
@@ -162,7 +160,7 @@ def test_is_visible_turns_true_after_show_through_the_ipc_handler_path():
     assert ipc.target == "nus"
     assert ipc.call("nus", VISIBLE_COMMAND) == "false"
 
-    # Reproduces the hardware failure: `show` is metadata, not a call.
+    # Reproduces the hardware failure: `show` resolves to QQuickWindow.show.
     assert ipc.call("nus", "show") == ipc.member_list()
     assert ipc.call("nus", VISIBLE_COMMAND) == "false"
 
@@ -176,9 +174,16 @@ def test_is_visible_turns_true_after_show_through_the_ipc_handler_path():
 def test_controller_commands_match_the_handler_names():
     source = QML.read_text()
     assert 'target: "nus"' in source
-    for name in (SHOW_COMMAND, HIDE_COMMAND, VISIBLE_COMMAND):
-        assert re.search(rf"function\s+{name}\s*\(", source)
-    shown = NusSurfaceController().show(120, 40, 240, 80)
+    for line in (
+        "function reveal(): void { root.surfaceVisible = true }",
+        "function hide(): void { root.surfaceVisible = false }",
+        "function isVisible(): bool { return root.surfaceVisible }",
+    ):
+        assert line in source
+    assert (SHOW_COMMAND, HIDE_COMMAND, VISIBLE_COMMAND) == ("reveal", "hide", "isVisible")
+
+    controller = NusSurfaceController()
+    shown = controller.show(120, 40, 240, 80)
     assert shown.visible and (shown.x, shown.y, shown.width, shown.height) == (120, 40, 240, 80)
     assert shown.as_dict()["keyboard_focus"] == "none"
     assert not NusSurfaceController().hide().visible
