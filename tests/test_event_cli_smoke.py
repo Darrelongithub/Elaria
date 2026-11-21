@@ -1,20 +1,101 @@
 """Event transcriber — CLI smoke through the real daemon socket (§7).
 
 `assist event start|stop|status|speaker` exercised via cli.main() against the
-real Daemon on a real Unix socket. Capture falls back to the simulated source
-on a headless box (no PipeWire) — the same fallback `event start` uses in the
-container. The daemon-down recovery path is covered with hand-built disk
-state, exactly what a killed daemon leaves behind.
+real Daemon on a real Unix socket. Capture uses `--source simulated` with a
+deterministic test clock and capture source so the smoke test never depends
+on host PipeWire hardware or wall-clock sleep pacing. The daemon-down recovery
+path is covered with hand-built disk state, exactly what a killed daemon leaves
+behind.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import struct
+import threading
 import time
 from pathlib import Path
 
 SPEECH_FRAME = struct.pack("<480h", *([6000] * 480))
+
+
+class _DeterministicClock:
+    def __init__(self, start: float = 10_000.0):
+        self.t = float(start)
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += float(seconds)
+
+
+class _DeterministicCapture:
+    """Emit synthetic speech frames advancing the test clock deterministically,
+    then hold the stream open until `aclose()` so rotation is never wall-clock
+    racy and never spawns host PipeWire (`pw-record`)."""
+
+    def __init__(self, clock: _DeterministicClock, *, frame_s: float = 1.0,
+                 min_frames: int = 4, target: str = "simulated"):
+        self.clock = clock
+        self.frame_s = float(frame_s)
+        self.min_frames = int(min_frames)
+        self.target = target
+        self.stalled = False
+        self._closed = asyncio.Event()
+
+    async def frames(self):
+        emitted = 0
+        while not self._closed.is_set():
+            if emitted < self.min_frames:
+                emitted += 1
+                self.clock.advance(self.frame_s)
+                yield SPEECH_FRAME
+                await asyncio.sleep(0)
+            else:
+                await self._closed.wait()
+                return
+
+    async def aclose(self) -> None:
+        self._closed.set()
+
+
+class _NoopInhibitor:
+    def acquire(self) -> dict:
+        return {"held": True, "reason": "deterministic test lock"}
+
+    def release(self) -> None:
+        pass
+
+
+def _install_deterministic_capture(daemon, *, min_frames: int = 4) -> threading.Event:
+    clock = _DeterministicClock()
+    svc = daemon.event_service
+    svc._clock = clock
+    svc._capture_factory = lambda _source: _DeterministicCapture(
+        clock, frame_s=1.0, min_frames=min_frames,
+    )
+    svc._level_checker = lambda: {
+        "available": False, "signal": False,
+        "target": "simulated", "reason": "deterministic test",
+    }
+    svc._power_probe = lambda: {
+        "available": False, "on_battery": False, "detail": "AC",
+    }
+    svc._inhibitor = _NoopInhibitor()
+    seg2_opened = threading.Event()
+    prev_on_event = svc._on_event
+
+    def _watch(frame: dict):
+        if frame.get("event") == "event.segment.opened" and int(frame.get("segment", 0)) >= 2:
+            seg2_opened.set()
+        if prev_on_event is not None:
+            return prev_on_event(frame)
+        return None
+
+    svc._on_event = _watch
+    return seg2_opened
 
 
 def _run_cli(argv: list[str]) -> int:
@@ -23,21 +104,25 @@ def _run_cli(argv: list[str]) -> int:
     return cli.main(argv)
 
 
-def _wait_segments(service, minimum: int = 2, timeout: float = 10.0) -> int:
+def _wait_segments(service, minimum: int = 2, timeout: float = 10.0,
+                   *, ready_event: threading.Event | None = None) -> int:
+    if ready_event is not None:
+        ready_event.wait(timeout=timeout)
     deadline = time.monotonic() + timeout
     opened = 0
-    while time.monotonic() < deadline:
+    while True:
         opened = service.status()["segments"]["opened"]
-        if opened >= minimum:
+        if opened >= minimum or time.monotonic() >= deadline:
             return opened
-        time.sleep(0.05)
-    return opened
+        time.sleep(0.01)
 
 
 def test_event_cli_smoke_start_status_speaker_stop(running_daemon, config, capsys):
     daemon, _server = running_daemon
+    seg2_opened = _install_deterministic_capture(daemon, min_frames=4)
 
-    rc = _run_cli(["event", "start", "--title", "Panel Dry Run",
+    rc = _run_cli(["event", "start", "--source", "simulated",
+                   "--title", "Panel Dry Run",
                    "--speakers", "Amina,John", "--segment-minutes", "0.05",
                    "--battery-ok"])
     out = capsys.readouterr().out
@@ -70,8 +155,8 @@ def test_event_cli_smoke_start_status_speaker_stop(running_daemon, config, capsy
     assert "Amina" in out
     assert "elapsed" in out.lower()
 
-    # let a couple of segments rotate through the simulated capture
-    assert _wait_segments(daemon.event_service, minimum=2) >= 2
+    # deterministic clock-driven segment rotation (no host PipeWire or wall-clock race)
+    assert _wait_segments(daemon.event_service, minimum=2, ready_event=seg2_opened) >= 2
 
     rc = _run_cli(["event", "stop"])
     captured = capsys.readouterr().out
@@ -97,10 +182,13 @@ def test_event_cli_smoke_start_status_speaker_stop(running_daemon, config, capsy
 
 def test_event_cli_second_start_refused(running_daemon, config, capsys):
     daemon, _server = running_daemon
-    rc = _run_cli(["event", "start", "--title", "One", "--battery-ok"])
+    _install_deterministic_capture(daemon, min_frames=2)
+    rc = _run_cli(["event", "start", "--source", "simulated",
+                   "--title", "One", "--battery-ok"])
     assert rc == 0
     capsys.readouterr()
-    rc = _run_cli(["event", "start", "--title", "Two", "--battery-ok"])
+    rc = _run_cli(["event", "start", "--source", "simulated",
+                   "--title", "Two", "--battery-ok"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "already" in out.lower()
@@ -172,9 +260,11 @@ def test_event_cli_start_refuses_on_low_disk(running_daemon, config, capsys,
     import assistant.event as event_mod
 
     daemon, _server = running_daemon
+    _install_deterministic_capture(daemon, min_frames=2)
     monkeypatch.setattr(event_mod, "free_disk_bytes", lambda root: 10 * 1024 * 1024)
 
-    rc = _run_cli(["event", "start", "--title", "Tiny Disk", "--battery-ok"])
+    rc = _run_cli(["event", "start", "--source", "simulated",
+                   "--title", "Tiny Disk", "--battery-ok"])
     captured = capsys.readouterr()
     out = captured.out + captured.err
     assert rc != 0

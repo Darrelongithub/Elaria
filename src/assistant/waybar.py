@@ -15,6 +15,27 @@ knock | knock-loud | knock-silent (combinable).
 
 The offline marker follows §13.9 rule 1: one small suffix, while the
 tooltip carries the exact connectivity mode, queue and local voice.
+
+Device presence (IF-4, H) rides the tooltip only, via `presence.format_device_line`
+— one formatter shared with the console, so the two surfaces cannot disagree about
+whether the phone is here.
+
+OWNER RULING 2026-11-19 (Q-H-1): **tooltip-only, no new pill colour.** The reasoning
+written at BASE was that `ui/waybar/**` sat in nobody's ownership glob and IF-4
+defines no phone-presence colour, so a cosmetic class was not worth an ownership
+change mid-wave. AMENDMENT after Z's guard landed (main `a2eec68`): the first half of
+that reason is now void — `OWNERS.yaml` assigns `ui/waybar/**` to `H`. What survives
+is the half that actually decided it, and it is unchanged: **IF-4 defines no
+phone-presence colour; the orb's states are IF-4's.** The owner re-issued the same
+ruling in the round-4 dispatch ("Q-H-1 declined — keep tooltip-only"), so owning the
+directory is not a licence to decorate it, and no colour is added. It stays
+DEFERRED, NOT REJECTED: now that the ownership objection is gone, this is a clean
+one-line call for the owner if they ever want it — class in `format_waybar`, rule in
+`ui/waybar/style.css`, and nothing else in this file changes.
+
+Round-4 note on the same discipline in reverse: the new guard denied H its own
+`tests/test_h_*.py` (they are zero-owner in `OWNERS.yaml`), and H filed **issue #60**
+instead of editing the map from the lane the map exists to police.
 """
 
 from __future__ import annotations
@@ -22,6 +43,7 @@ from __future__ import annotations
 import socket
 
 from .ipc import DaemonUnavailable, call, parse_event_line
+from .presence import format_device_line
 
 
 def format_waybar(status: dict) -> dict:
@@ -90,6 +112,12 @@ def format_waybar(status: dict) -> dict:
                              "knocks silent · initiative urgent-only")
     elif class_mode.get("suggested"):
         tooltip_lines.append("class suggestion: " + str(class_mode.get("suggestion")))
+    # Device presence (IF-4, H): one tooltip line, no new class token. The pill's
+    # classes are a closed set shared with ui/waybar/style.css, and styling a new
+    # one is not H's call — so the phone state is *said*, never dressed up.
+    device_line = format_device_line(status.get("device_presence") or {})
+    if device_line:
+        tooltip_lines.append(device_line)
     if company.get("company"):
         tooltip_lines.append("company present · secrets and private plans "
                              "withheld · behaviour memory allowed")

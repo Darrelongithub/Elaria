@@ -86,8 +86,20 @@ class SentenceTransformerEmbedder:  # pragma: no cover - optional heavy dep
         return [list(map(float, v)) for v in vectors]
 
 
-def make_embedder(config) -> Embedder:
-    choice = config.section("memory").get("embedder", "hashing")
+class EgressRulingError(RuntimeError):
+    """Raised when an API/network embedding provider is requested without an owner egress ruling."""
+
+
+LOCAL_EMBEDDING_PROVIDERS = frozenset({"hashing", "sentence-transformers"})
+
+
+def make_embedder(config, *, egress_ruling_approved: bool = False) -> Embedder:
+    choice = str(config.section("memory").get("embedder", "hashing")).strip().lower()
+    if choice not in LOCAL_EMBEDDING_PROVIDERS:
+        raise EgressRulingError(
+            f"embedding provider {choice!r} requires an explicit owner egress ruling "
+            "(local-first only: 'hashing' or 'sentence-transformers')"
+        )
     if choice == "sentence-transformers":
         return SentenceTransformerEmbedder(
             config.section("memory").get("embedding_model", "all-MiniLM-L6-v2"))

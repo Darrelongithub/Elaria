@@ -1,0 +1,2 @@
+# Separate console-process dependency; no root pyproject change.
+websockets>=14,<18
