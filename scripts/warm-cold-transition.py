@@ -32,8 +32,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import shutil
 import sys
 import wave
 from datetime import UTC, datetime, timedelta
@@ -42,7 +40,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from assistant.backup import plan_reconcile, reconcile, reconcile_all
-from assistant.remote import LocalPathBackend, Verification
+from assistant.backup_cli import AudioMovers
+from assistant.remote import LocalPathBackend
 from assistant.safety import try_sha256_file
 from assistant.storage import (
     FLIPPED,
@@ -87,7 +86,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
-    root = Path(args.root)
+    root = Path(args.root).resolve()
+    if root.exists() and any(root.iterdir()):
+        ap.error("fixture requires an empty work directory")
+    if args.grace_days < 1:
+        ap.error("grace must be at least one day")
     (root / "audio").mkdir(parents=True, exist_ok=True)
     artifact = root / "audio" / "synthetic-capture.wav"
     size = _synthetic_recording(artifact)
@@ -95,25 +98,8 @@ def main(argv: list[str] | None = None) -> int:
 
     backend = LocalPathBackend(root / "fixture-remote")
     manifest = StorageManifest(root / "manifest.jsonl")
-    trash = root / "trash"
-
-    trash = root / "trash"
-    trash.mkdir(parents=True, exist_ok=True)
-
-    def trim_mover(path: str) -> str:
-        """Move the artifact into local trash under a stamped name, and say where."""
-        src = Path(path)
-        dest = trash / f"{src.stem}.trashed{src.suffix}"
-        shutil.move(str(src), str(dest))
-        return str(dest)
-
-    def purge_mover(trashed_path: str) -> bool:
-        """Remove the trashed copy. Only ever reached after the grace has elapsed."""
-        try:
-            os.unlink(trashed_path)
-            return True
-        except OSError:
-            return False
+    movers = AudioMovers(root)
+    trim_mover, purge_mover = movers.trim, movers.purge
 
     steps: list[dict] = []
 
@@ -144,12 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         confirmation. A bare bool reports `opaque-verifier` — correctly, because it
         genuinely cannot say who answered.
         """
-        target = backend.root / Path(path).name
-        if not target.exists():
-            return Verification(backend=backend.name, confirmed=False,
-                                method="absent", detail="remote copy absent")
-        return Verification(backend=backend.name, confirmed=True,
-                            method="hash", detail="hash-match")
+        return backend.verify(Path(path), expected_sha256=digest)
 
     now = datetime.now(UTC)
     plan = plan_reconcile(manifest, now=now, verify_remote=verify_remote,
