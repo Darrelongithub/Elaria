@@ -23,3 +23,5 @@ near-miss/
 elaria-wake-samples/
 wake-clips/
 *.pcm
+
+node_modules/
