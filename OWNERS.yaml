@@ -1,4 +1,17 @@
-{
+  P:   # PHONE
+    - src/assistant/phone_link.py
+    - tests/test_phone_link*.py
+    - tests/test_drafts.py
+    - docs/contracts/IF-3*
+  W:   # WAKE
+    - models/**
+    - src/assistant/model_registry.py
+    - src/assistant/model_pins.py
+    - src/assistant/voiceprint.py
+    - tests/test_w_*.py
+  C:   # CONSOLE
+    - console/**
+    - tests/test_capture_state_wire.py{
   "Z": [
     "OWNERS.yaml",
     "README.md",
