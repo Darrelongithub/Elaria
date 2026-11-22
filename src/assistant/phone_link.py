@@ -6,11 +6,11 @@ over its local IPC socket and import NONE of its Python: LICENSE-DECIDES-
 METHOD says a copyleft dependency may be spoken to, never copied into
 Elaria's permissive tree. Nothing here imports, vendors or edits upstream.
 
-Pinned upstream (contract IF-3 asks for tag + sha256):
+Pinned upstream (contract IF-3 asks for tag + commit + sha256):
   repo    https://github.com/maylton/caelestia-connect
-  tag     v1.2.0
-  commit  a423a05bbcb762b30c365bf0734478def80d2c5f
-  tarball sha256 af0e69c27b20c36966a4dcf2407a9ab89e6730ccb1fb83deeaaedc6716564326
+  tag     v1.1.1
+  commit  b49ca2c9f76dd6feccf40fb6b82fc98db344c613
+  tarball sha256 fa305344123b481d9ba09b5aee46b31a9cb46ad73fef6ef8dfa3d83ae4ee8bd6
 
 The wire dialect is the sidecar's own (line-delimited JSON over AF_UNIX,
 socket mode 0600):
@@ -28,17 +28,19 @@ Safety rules this module enforces, each covered by tests/test_phone_link.py:
    refused, and the refusal happens BEFORE any packet leaves;
 3. the never-allowlist list — share.*, clipboard.send_clipboard, send-text,
    runcommand, remotecommands, remotecontrol, mousepad, remotekeyboard,
-   sftp(.browse/.unmount), lockdevice, the plugins IF-3 never enables
-   (scrcpy, webcam, virtualmonitor, shareinputdevices, digitizer) and the
-   GENERIC ``call PLUGIN ACTION`` interpreter — is refused even if somebody
-   edits the allowlist (the allowlist is validated at import);
+   sftp(.browse/.unmount/.mount), lockdevice, phoneaudio.*, the plugins IF-3
+   never enables (scrcpy, webcam, android, virtualmonitor, shareinputdevices,
+   digitizer) and the GENERIC ``call PLUGIN ACTION`` interpreter — is refused
+   even if somebody edits the allowlist (the allowlist is validated at import);
 4. inbound texts and notifications are UNTRUSTED INPUT (contract IF-6):
    they are delivered as DATA, tagged untrusted, never dispatched as an
    action;
 5. pairing is the OWNER's act. We never accept, request or complete a
    verification code — we only read which devices are paired, and journal
    the pair/unpair transitions;
-6. revocation (unpair + key removal) blocks every later send.
+6. revocation (unpair + key removal) calls ``device.unpair`` on the sidecar
+   (or marks ``pending_unpair`` and retries on next link-up if unreachable)
+   and blocks every later send locally before any IPC call.
 
 The phone adapter never installs anything, never touches a real device and
 never performs a real send: the tests run against a fake peer only.
@@ -66,11 +68,12 @@ from assistant.drafts import APPROVED, DraftRecord
 log = logging.getLogger(__name__)
 
 CAELESTIA_UPSTREAM = "https://github.com/maylton/caelestia-connect"
-CAELESTIA_TAG = "v1.2.0"
-CAELESTIA_COMMIT = "a423a05bbcb762b30c365bf0734478def80d2c5f"
+CAELESTIA_TAG = "v1.1.1"
+CAELESTIA_COMMIT = "b49ca2c9f76dd6feccf40fb6b82fc98db344c613"
 CAELESTIA_TARBALL_SHA256 = (
-    "af0e69c27b20c36966a4dcf2407a9ab89e6730ccb1fb83deeaaedc6716564326"
+    "fa305344123b481d9ba09b5aee46b31a9cb46ad73fef6ef8dfa3d83ae4ee8bd6"
 )
+CAELESTIA_PINNED_ACTION_COUNT = 47
 
 #: Reads are free, but only these. Everything else is refused.
 READ_VERBS: frozenset[str] = frozenset(
@@ -99,18 +102,20 @@ FORBIDDEN_PLUGINS: frozenset[str] = frozenset(
         "remotekeyboard",
         "sftp",
         "lockdevice",
+        "phoneaudio",
+        "android",
     }
 )
 
 #: Every plugin.action the pinned upstream release exposes.
 #:
-#: Enumerated from the upstream v1.2.0 sources at commit
+#: Enumerated from the upstream v1.1.1 sources at commit
 #: CAELESTIA_COMMIT (the release the tarball pin above names). These are
 #: NAMES only -- no upstream code is copied, imported or vendored. The list
 #: exists so the refusal layer is derived from the real upstream surface
 #: instead of from a hand-written guess that can fall behind it.
 #:
-#: E's own allowlist names five of them; the other 35 are refused.
+#: E's own allowlist names five of them; the other 42 are refused.
 UPSTREAM_ACTIONS: frozenset[str] = frozenset(
     {
         "clipboard.send_clipboard",
@@ -129,6 +134,8 @@ UPSTREAM_ACTIONS: frozenset[str] = frozenset(
         "notifications.invoke_action",
         "notifications.refresh",
         "notifications.reply",
+        "phoneaudio.set_on_computer",
+        "phoneaudio.toggle",
         "ping.ping",
         "remotecommands.edit_commands",
         "remotecommands.trigger",
@@ -142,6 +149,9 @@ UPSTREAM_ACTIONS: frozenset[str] = frozenset(
         "runcommand.edit_command",
         "runcommand.remove_command",
         "sendnotifications.test",
+        "sftp.browse",
+        "sftp.mount",
+        "sftp.unmount",
         "share.open_folder",
         "share.share_files",
         "share.share_text",
@@ -153,6 +163,8 @@ UPSTREAM_ACTIONS: frozenset[str] = frozenset(
         "sms.request_conversations",
         "sms.send_sms",
         "telephony.mute",
+        "virtualmonitor.start",
+        "virtualmonitor.stop",
     }
 )
 
@@ -175,6 +187,8 @@ FORBIDDEN_VERBS: frozenset[str] = frozenset(
         "send-text",
         "scrcpy",
         "webcam",
+        "android",
+        "phoneaudio",
         "virtualmonitor",
         "shareinputdevices",
         "digitizer",
@@ -185,6 +199,7 @@ FORBIDDEN_VERBS: frozenset[str] = frozenset(
         "clipboard.send_clipboard",
         "findmyphone.ring",
         "sftp.browse",
+        "sftp.mount",
         "sftp.unmount",
     }
 )
@@ -195,6 +210,8 @@ FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "send-text.",
     "scrcpy.",
     "webcam.",
+    "android.",
+    "phoneaudio.",
     "virtualmonitor.",
     "shareinputdevices.",
     "digitizer.",
@@ -377,6 +394,7 @@ class SocketTransport:
                 sock.sendall(payload.encode() + b"\n")
         except OSError as exc:
             self._drop(mid)
+            self.close()
             raise TransportError(f"cannot write to the sidecar: {exc}") from exc
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -486,14 +504,19 @@ class PairingRegistry:
 
     The owner performs the pairing (and the verification code) — this
     registry only remembers what the sidecar reports, and it never stores a
-    verification key. Revocation removes the local key record and marks the
-    device revoked so that every later send is refused.
+    verification key. Revocation asks the sidecar to ``device.unpair`` and
+    removes the local record; if the sidecar is unreachable, local refusal
+    still stands immediately while ``pending_unpair`` keeps the sidecar
+    unpair queued until the next link-up.
     """
 
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else None
         self._paired: dict[str, dict[str, Any]] = {}
         self._revoked: set[str] = set()
+        self._pending_unpair: set[str] = set()
+        self._unpaired: set[str] = set()
+        self.has_synced: bool = False
         self._load()
 
     def _load(self) -> None:
@@ -510,12 +533,28 @@ class PairingRegistry:
             revoked = data.get("revoked")
             if isinstance(revoked, list):
                 self._revoked = {str(x) for x in revoked}
+            pending_unpair = data.get("pending_unpair")
+            if isinstance(pending_unpair, list):
+                self._pending_unpair = {str(x) for x in pending_unpair}
+                # Pending-unpair devices must always stay refused locally too.
+                self._revoked.update(self._pending_unpair)
+            unpaired = data.get("unpaired")
+            if isinstance(unpaired, list):
+                self._unpaired = {str(x) for x in unpaired}
+            if "has_synced" in data:
+                self.has_synced = bool(data["has_synced"])
 
     def _save(self) -> None:
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"paired": self._paired, "revoked": sorted(self._revoked)}
+        payload = {
+            "paired": self._paired,
+            "revoked": sorted(self._revoked),
+            "pending_unpair": sorted(self._pending_unpair),
+            "unpaired": sorted(self._unpaired),
+            "has_synced": self.has_synced,
+        }
         self.path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         try:
             os.chmod(self.path, 0o600)
@@ -523,25 +562,68 @@ class PairingRegistry:
             pass
 
     def paired_devices(self) -> dict[str, dict[str, Any]]:
-        return dict(self._paired)
+        return {
+            did: dict(info)
+            for did, info in self._paired.items()
+            if did not in self._revoked and did not in self._pending_unpair
+        }
+
+    def is_paired(self, device_id: str) -> bool:
+        did = str(device_id)
+        return (
+            did in self._paired
+            and did not in self._revoked
+            and did not in self._pending_unpair
+        )
 
     def is_revoked(self, device_id: str) -> bool:
         return str(device_id) in self._revoked
 
+    def is_pending_unpair(self, device_id: str) -> bool:
+        return str(device_id) in self._pending_unpair
+
+    def pending_unpairs(self) -> list[str]:
+        return sorted(self._pending_unpair)
+
+    def unpaired_devices(self) -> list[str]:
+        return sorted(self._unpaired)
+
+    def is_unpaired(self, device_id: str) -> bool:
+        return str(device_id) in self._unpaired
+
+    def mark_synced(self) -> None:
+        self.has_synced = True
+        self._save()
+
     def record_paired(self, device_id: str, name: str = "") -> None:
-        if self.is_revoked(device_id):
+        did = str(device_id)
+        if self.is_revoked(did) or self.is_pending_unpair(did):
             return
-        self._paired[str(device_id)] = {"name": str(name), "paired_at": time.time()}
+        self._unpaired.discard(did)
+        self._paired[did] = {"name": str(name), "paired_at": time.time()}
         self._save()
 
     def record_unpaired(self, device_id: str) -> None:
-        self._paired.pop(str(device_id), None)
+        did = str(device_id)
+        self._paired.pop(did, None)
+        self._unpaired.add(did)
+        self._save()
+
+    def mark_pending_unpair(self, device_id: str) -> None:
+        """Keep local refusal standing while waiting to flush device.unpair."""
+        did = str(device_id)
+        self._revoked.add(did)
+        self._pending_unpair.add(did)
+        if did in self._paired:
+            self._paired[did]["status"] = "pending-unpair"
         self._save()
 
     def revoke(self, device_id: str) -> None:
         """Unpair + key removal. Later sends to this device are refused."""
         device_id = str(device_id)
         self._paired.pop(device_id, None)
+        self._unpaired.discard(device_id)
+        self._pending_unpair.discard(device_id)
         self._revoked.add(device_id)
         self._save()
 
@@ -635,6 +717,10 @@ class PhoneLink:
         the caller — so the sent body is the stored body by construction.
         The draft must already be ``approved``; anything else is refused
         before a single packet leaves.
+
+        Local pairing state is checked BEFORE any IPC call: revoked,
+        pending-unpair, or unpaired devices are refused locally with zero
+        IPC packets sent.
         """
         resolved = self._resolve_draft(draft, store)
         if resolved.state != APPROVED:
@@ -642,14 +728,62 @@ class PhoneLink:
                 f"refused to send draft {resolved.draft_id}: it is {resolved.state!r},"
                 " not 'approved'"
             )
-        device_id = device or self._select_device(self._read_state()).get("id")
-        if self._registry.is_revoked(device_id):
-            self._refuse(
-                "sms.send_sms",
-                f"device {device_id} was unpaired and its key removed;"
-                " the owner must pair it again before sending",
-                device_id=device_id,
-            )
+        target_id = device or self.device_id
+        if target_id is not None:
+            target_id = str(target_id)
+            if self._registry.is_revoked(target_id) or self._registry.is_pending_unpair(
+                target_id
+            ):
+                self._refuse(
+                    "sms.send_sms",
+                    f"device {target_id} was unpaired and its key removed;"
+                    " the owner must pair it again before sending",
+                    device_id=target_id,
+                )
+            if not self._registry.is_paired(target_id):
+                self._refuse(
+                    "sms.send_sms",
+                    f"device {target_id} is not paired locally;"
+                    " the owner must pair it before sending",
+                    device_id=target_id,
+                )
+            state = self._read_state()
+            dev = self._find_device(state, target_id)
+            if dev is None or not dev.get("paired"):
+                self._registry.record_unpaired(target_id)
+                self._audit("phone.unpaired", device_id=target_id)
+                self._refuse(
+                    "sms.send_sms",
+                    f"device {target_id} is not paired on the sidecar;"
+                    " the owner must pair it before sending",
+                    device_id=target_id,
+                )
+            if not dev.get("reachable"):
+                raise PhoneLinkError(f"device {target_id} is not reachable")
+            device_id = target_id
+        else:
+            if not self._registry.paired_devices() and (
+                self._registry.has_synced
+                or self._registry.revoked_devices()
+                or self._registry.unpaired_devices()
+            ):
+                self._refuse(
+                    "sms.send_sms",
+                    "no paired device in local pairing registry;"
+                    " the owner must pair a phone before sending",
+                )
+            state = self._read_state()
+            selected = self._select_device(state, refuse_unpaired=True)
+            device_id = str(selected.get("id"))
+            if self._registry.is_revoked(device_id) or self._registry.is_pending_unpair(
+                device_id
+            ):
+                self._refuse(
+                    "sms.send_sms",
+                    f"device {device_id} was unpaired and its key removed;"
+                    " the owner must pair it again before sending",
+                    device_id=device_id,
+                )
         self._audit(
             "phone.send.attempt",
             draft_id=resolved.draft_id,
@@ -701,13 +835,24 @@ class PhoneLink:
 
     # -- pairing -------------------------------------------------------------
 
+    def flush_pending_unpairs(self) -> list[str]:
+        """Retry any queued ``device.unpair`` calls on the sidecar."""
+        if not self._registry.pending_unpairs():
+            return []
+        state = self._transport.call("state", {}, timeout=self.request_timeout)
+        return self._flush_pending_unpairs(state if isinstance(state, dict) else None)
+
     def sync_pairing(self) -> dict[str, list[str]]:
         """Read which devices are paired and journal pair/unpair transitions.
 
         The owner performs the pairing and the verification code. This only
-        observes what the sidecar reports.
+        observes what the sidecar reports, after flushing any pending
+        unpair requests queued while the sidecar was unreachable.
         """
+        if self._registry.pending_unpairs():
+            self.flush_pending_unpairs()
         state = self._read_state()
+        self._registry.mark_synced()
         devices = state.get("devices") or []
         paired_now = {
             str(device.get("id")): str(device.get("name") or device.get("id"))
@@ -719,7 +864,9 @@ class PhoneLink:
         for device_id, name in paired_now.items():
             if device_id in known:
                 continue
-            if self._registry.is_revoked(device_id):
+            if self._registry.is_revoked(device_id) or self._registry.is_pending_unpair(
+                device_id
+            ):
                 continue
             self._registry.record_paired(device_id, name)
             events["paired"].append(device_id)
@@ -730,12 +877,43 @@ class PhoneLink:
             self._registry.record_unpaired(device_id)
             events["unpaired"].append(device_id)
             self._audit("phone.unpaired", device_id=device_id)
+        for device in devices:
+            device_id = str(device.get("id") or "")
+            if (
+                device_id
+                and not device.get("paired")
+                and not self._registry.is_revoked(device_id)
+                and not self._registry.is_unpaired(device_id)
+            ):
+                self._registry.record_unpaired(device_id)
         return events
 
     def revoke(self, device_id: str) -> None:
-        """Unpair + key removal. Later sends to this device are refused."""
-        self._registry.revoke(device_id)
-        self._audit("phone.revoked", device_id=str(device_id))
+        """Unpair on the sidecar + remove local state.
+
+        If the sidecar is unreachable, the local refusal stands immediately
+        and the pairing is marked ``pending-unpair`` so ``device.unpair``
+        is retried on the next link-up.
+        """
+        did = str(device_id)
+        try:
+            self._transport.call(
+                "device.unpair",
+                {"device": did},
+                timeout=self.request_timeout,
+            )
+        except TransportError as exc:
+            self._registry.mark_pending_unpair(did)
+            self._audit(
+                "phone.revoked",
+                device_id=did,
+                sidecar_unpaired=False,
+                pending_unpair=True,
+                reason=str(exc),
+            )
+            return
+        self._registry.revoke(did)
+        self._audit("phone.revoked", device_id=did, sidecar_unpaired=True)
 
     def revoked_devices(self) -> list[str]:
         return self._registry.revoked_devices()
@@ -816,7 +994,63 @@ class PhoneLink:
 
     def _read_state(self) -> dict[str, Any]:
         result = self._transport.call("state", {}, timeout=self.request_timeout)
-        return result if isinstance(result, dict) else {}
+        state = result if isinstance(result, dict) else {}
+        if self._registry.pending_unpairs():
+            self._flush_pending_unpairs(state)
+        return state
+
+    def _flush_pending_unpairs(self, state: Mapping[str, Any] | None = None) -> list[str]:
+        pending = self._registry.pending_unpairs()
+        if not pending:
+            return []
+        devices = (
+            {
+                str(d.get("id")): d
+                for d in (state.get("devices") or [])
+                if d.get("id") is not None
+            }
+            if state is not None
+            else None
+        )
+        flushed: list[str] = []
+        for did in pending:
+            dev = devices.get(did) if devices is not None else None
+            if devices is not None and (dev is None or not dev.get("paired")):
+                if dev is not None:
+                    try:
+                        self._transport.call(
+                            "device.unpair",
+                            {"device": did},
+                            timeout=self.request_timeout,
+                        )
+                    except TransportError:
+                        pass
+                self._registry.revoke(did)
+                self._audit("phone.unpair.synced", device_id=did)
+                flushed.append(did)
+                continue
+            try:
+                self._transport.call(
+                    "device.unpair",
+                    {"device": did},
+                    timeout=self.request_timeout,
+                )
+            except TransportError as exc:
+                if devices is not None and did not in devices:
+                    self._registry.revoke(did)
+                    self._audit("phone.unpair.synced", device_id=did)
+                    flushed.append(did)
+                    continue
+                self._audit(
+                    "phone.unpair.retry_failed",
+                    device_id=did,
+                    reason=str(exc),
+                )
+                continue
+            self._registry.revoke(did)
+            self._audit("phone.unpair.synced", device_id=did)
+            flushed.append(did)
+        return flushed
 
     def _read_plugin_state(self, verb: str) -> Any:
         state = self._read_state()
@@ -827,21 +1061,54 @@ class PhoneLink:
             raise PhoneLinkError(f"the device reported no {key} state")
         return plugins[key]
 
-    def _select_device(self, state: Mapping[str, Any]) -> dict[str, Any]:
+    def _find_device(
+        self, state: Mapping[str, Any], device_id: str
+    ) -> dict[str, Any] | None:
+        for device in state.get("devices") or []:
+            if str(device.get("id")) == str(device_id):
+                return device
+        return None
+
+    def _select_device(
+        self,
+        state: Mapping[str, Any],
+        *,
+        refuse_unpaired: bool = False,
+    ) -> dict[str, Any]:
         devices = list(state.get("devices") or [])
         if self.device_id:
-            for device in devices:
-                if str(device.get("id")) == str(self.device_id):
-                    return device
-            raise PhoneLinkError(
-                f"the configured device {self.device_id} is not known to the sidecar"
-            )
+            device = self._find_device(state, self.device_id)
+            if device is None:
+                raise PhoneLinkError(
+                    f"the configured device {self.device_id} is not known to the sidecar"
+                )
+            if not device.get("paired"):
+                if refuse_unpaired:
+                    self._refuse(
+                        "sms.send_sms",
+                        f"device {self.device_id} is not paired;"
+                        " the owner must pair it before sending",
+                        device_id=str(self.device_id),
+                    )
+                raise PhoneLinkError(
+                    f"the configured device {self.device_id} is not paired"
+                )
+            if not device.get("reachable"):
+                raise PhoneLinkError(
+                    f"the configured device {self.device_id} is not reachable"
+                )
+            return device
         usable = [
             device
             for device in devices
             if device.get("paired") and device.get("reachable")
         ]
         if not usable:
+            if refuse_unpaired:
+                self._refuse(
+                    "sms.send_sms",
+                    "no paired and reachable device — the owner must pair the phone",
+                )
             raise PhoneLinkError(
                 "no paired and reachable device — the owner must pair the phone"
             )

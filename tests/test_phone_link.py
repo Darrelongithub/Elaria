@@ -13,6 +13,7 @@ untrusted data) drive the cases; IF-1 drives the approval gate.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import stat
@@ -25,7 +26,12 @@ import pytest
 from assistant.drafts import APPROVED, FAILED, DraftStore, MemoryDraftBackend
 from assistant.phone_link import (
     _ALLOWED_UPSTREAM_ACTIONS,
+    CAELESTIA_COMMIT,
+    CAELESTIA_PINNED_ACTION_COUNT,
+    CAELESTIA_TAG,
+    CAELESTIA_TARBALL_SHA256,
     FORBIDDEN_PLUGINS,
+    FORBIDDEN_PREFIXES,
     FORBIDDEN_VERBS,
     READ_VERBS,
     UPSTREAM_ACTIONS,
@@ -52,13 +58,20 @@ FORBIDDEN_CASES = (
     "remotekeyboard",
     "sftp",
     "sftp.browse",
+    "sftp.mount",
     "sftp.unmount",
     "lockdevice",
     "call",
+    "send-text",
     "share.share_text",
     "share.share_files",
     "clipboard.send_clipboard",
     "findmyphone.ring",
+    "phoneaudio.toggle",
+    "phoneaudio.set_on_computer",
+    "virtualmonitor.start",
+    "virtualmonitor.stop",
+    "android.mirror",
 )
 
 #: The upstream plugin.actions E's own allowlist reaches. Everything else
@@ -144,6 +157,7 @@ class FakeAndroidPeer:
         self.packets: list[dict[str, Any]] = []
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
         self.sends: list[dict[str, Any]] = []
+        self.unpairs: list[str] = []
         self.fail_sends = False
         self._clients: list[socket.socket] = []
         self._lock = threading.Lock()
@@ -174,6 +188,10 @@ class FakeAndroidPeer:
             clients = list(self._clients)
             self._clients.clear()
         for client in clients:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 client.close()
             except OSError:
@@ -238,9 +256,23 @@ class FakeAndroidPeer:
         with self._lock:
             self.packets.append({"id": mid, "method": method, "params": params})
         if method == "state":
-            self._reply(conn, mid, {"version": "1.2.0", "devices": self.devices})
+            self._reply(conn, mid, {"version": "1.1.1", "devices": self.devices})
         elif method == "subscribe":
             self._reply(conn, mid, {"devices": self.devices})
+        elif method == "device.unpair":
+            did = str(params.get("device", ""))
+            found = False
+            with self._lock:
+                self.unpairs.append(did)
+                for dev in self.devices:
+                    if str(dev.get("id")) == did:
+                        dev["paired"] = False
+                        dev["pairState"] = "notPaired"
+                        found = True
+            if found:
+                self._reply(conn, mid, True)
+            else:
+                self._reply(conn, mid, None, error=f"unknown device {did}")
         elif method == "device.call":
             plugin = str(params.get("plugin", ""))
             action = str(params.get("action", ""))
@@ -415,13 +447,25 @@ def test_the_send_is_journalled(harness: Harness) -> None:
 
 @pytest.mark.parametrize("verb", FORBIDDEN_CASES)
 def test_every_forbidden_verb_is_refused_and_sends_nothing(
-    harness: Harness, verb: str
+    harness: Harness,
+    caplog: pytest.LogCaptureFixture,
+    verb: str,
 ) -> None:
-    with pytest.raises(Refused):
+    with (
+        caplog.at_level(logging.WARNING, logger="assistant.phone_link"),
+        pytest.raises(Refused),
+    ):
         harness.link.request(verb)
     assert harness.peer.packets == []
     assert harness.peer.calls == []
     assert harness.peer.sends == []
+    assert harness.journal_events().count("phone.refused") == 1
+    assert harness.journal[-1][1]["verb"] == verb
+    assert harness.link.refusals[-1]["verb"] == verb
+    assert any(
+        rec.levelno == logging.WARNING and f"refused {verb}:" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 def test_the_generic_call_interpreter_is_refused(harness: Harness) -> None:
@@ -527,12 +571,156 @@ def test_revocation_blocks_later_sends(harness: Harness) -> None:
     harness.store.approve(draft_id)
     harness.link.sync_pairing()
     harness.link.revoke("phone-1")
+    packets_before_send = len(harness.peer.packets)
     with pytest.raises(Refused):
-        harness.link.send_approved(harness.record(draft_id), store=harness.store)
+        harness.link.send_approved(
+            harness.record(draft_id),
+            store=harness.store,
+            device="phone-1",
+        )
+    assert len(harness.peer.packets) == packets_before_send
+    assert harness.peer.unpairs == ["phone-1"]
     assert harness.peer.sends == []
     assert harness.registry.is_revoked("phone-1")
     assert "phone-1" not in harness.registry.paired_devices()
     assert "phone.revoked" in harness.journal_events()
+
+
+def test_revoke_emits_device_unpair_on_sidecar(harness: Harness) -> None:
+    harness.link.sync_pairing()
+    harness.link.revoke("phone-1")
+    assert harness.peer.unpairs == ["phone-1"]
+    assert any(
+        p["method"] == "device.unpair" and p["params"] == {"device": "phone-1"}
+        for p in harness.peer.packets
+    )
+    assert harness.peer.devices[0]["paired"] is False
+    assert harness.registry.is_revoked("phone-1")
+    assert harness.registry.pending_unpairs() == []
+
+
+def test_revoke_when_sidecar_unreachable_marks_pending_unpair_and_retries(
+    tmp_path: Path,
+) -> None:
+    sock_path = tmp_path / "ipc.sock"
+    pairs_path = tmp_path / "pairs.json"
+    peer = FakeAndroidPeer(sock_path, devices=[fake_device()])
+    peer.start()
+    journal: list[tuple[str, dict[str, Any]]] = []
+    registry = PairingRegistry(pairs_path)
+    link = PhoneLink(
+        sock_path,
+        registry=registry,
+        journal=lambda ev, **kw: journal.append((ev, kw)),
+    )
+    store = DraftStore(MemoryDraftBackend())
+    draft_id = store.create_draft("thread-7", RECIPIENT, BODY)
+    store.approve(draft_id)
+    try:
+        link.sync_pairing()
+        assert registry.is_paired("phone-1")
+        # Stop the sidecar so device.unpair cannot reach it.
+        peer.stop()
+        link.revoke("phone-1")
+        assert registry.is_revoked("phone-1")
+        assert registry.is_pending_unpair("phone-1")
+        assert registry.pending_unpairs() == ["phone-1"]
+        assert not registry.is_paired("phone-1")
+        raw = json.loads(pairs_path.read_text(encoding="utf-8"))
+        assert raw["pending_unpair"] == ["phone-1"]
+        assert "phone-1" in raw["paired"]
+        assert raw["paired"]["phone-1"]["status"] == "pending-unpair"
+        # Refusal stands immediately even while pending-unpair.
+        with pytest.raises(Refused):
+            link.send_approved(draft_id, store=store, device="phone-1")
+        link.close()
+
+        # Sidecar returns still holding phone-1 paired; next link-up retries device.unpair.
+        peer2 = FakeAndroidPeer(sock_path, devices=[fake_device(paired=True)])
+        peer2.start()
+        try:
+            reloaded = PairingRegistry(pairs_path)
+            assert reloaded.is_pending_unpair("phone-1")
+            assert reloaded.is_revoked("phone-1")
+            link2 = PhoneLink(
+                sock_path,
+                registry=reloaded,
+                journal=lambda ev, **kw: journal.append((ev, kw)),
+            )
+            try:
+                link2.sync_pairing()
+                assert peer2.unpairs == ["phone-1"]
+                assert peer2.devices[0]["paired"] is False
+                assert reloaded.pending_unpairs() == []
+                assert "phone-1" not in reloaded.paired_devices()
+                assert reloaded.is_revoked("phone-1")
+                raw2 = json.loads(pairs_path.read_text(encoding="utf-8"))
+                assert raw2["pending_unpair"] == []
+                assert "phone-1" not in raw2["paired"]
+                assert "phone.unpair.synced" in [ev for ev, _ in journal]
+            finally:
+                link2.close()
+        finally:
+            peer2.stop()
+    finally:
+        peer.stop()
+
+
+def test_send_approved_refuses_unpaired_reachable_device_with_zero_packets(
+    tmp_path: Path,
+) -> None:
+    peer = FakeAndroidPeer(
+        tmp_path / "ipc.sock",
+        devices=[fake_device(device_id="phone-1", paired=False, reachable=True)],
+    )
+    peer.start()
+    journal: list[tuple[str, dict[str, Any]]] = []
+    registry = PairingRegistry(tmp_path / "pairs.json")
+    link = PhoneLink(
+        peer.path,
+        registry=registry,
+        journal=lambda ev, **kw: journal.append((ev, kw)),
+    )
+    store = DraftStore(MemoryDraftBackend())
+    draft_id = store.create_draft("thread-7", RECIPIENT, BODY)
+    store.approve(draft_id)
+    try:
+        with pytest.raises(Refused):
+            link.send_approved(draft_id, store=store, device="phone-1")
+        assert peer.packets == []
+        assert peer.calls == []
+        assert peer.sends == []
+        assert any(ev == "phone.refused" for ev, _ in journal)
+    finally:
+        link.close()
+        peer.stop()
+
+
+def test_send_approved_catches_sidecar_unpair_before_calling_send_sms(
+    tmp_path: Path,
+) -> None:
+    peer = FakeAndroidPeer(
+        tmp_path / "ipc.sock",
+        devices=[fake_device(device_id="phone-1", paired=True, reachable=True)],
+    )
+    peer.start()
+    registry = PairingRegistry(tmp_path / "pairs.json")
+    link = PhoneLink(peer.path, registry=registry)
+    store = DraftStore(MemoryDraftBackend())
+    draft_id = store.create_draft("thread-7", RECIPIENT, BODY)
+    store.approve(draft_id)
+    try:
+        link.sync_pairing()
+        # Simulate the phone/sidecar unpairing out-of-band before the next sync.
+        peer.devices = [fake_device(device_id="phone-1", paired=False, reachable=True)]
+        with pytest.raises(Refused):
+            link.send_approved(draft_id, store=store, device="phone-1")
+        assert peer.calls == []
+        assert peer.sends == []
+        assert not registry.is_paired("phone-1")
+    finally:
+        link.close()
+        peer.stop()
 
 
 def test_a_revoked_device_is_not_paired_again_silently(harness: Harness) -> None:
@@ -640,21 +828,66 @@ def test_the_write_allowlist_is_sms_send_sms_only() -> None:
 # -- the upstream-derived refusal layer -----------------------------------------
 
 
+def test_pinned_caelestia_release_is_v1_1_1_with_verified_sha256() -> None:
+    """IF-3 pin: v1.1.1 tag, commit, tarball sha256 and action count match."""
+    assert CAELESTIA_TAG == "v1.1.1"
+    assert CAELESTIA_COMMIT == "b49ca2c9f76dd6feccf40fb6b82fc98db344c613"
+    assert (
+        CAELESTIA_TARBALL_SHA256
+        == "fa305344123b481d9ba09b5aee46b31a9cb46ad73fef6ef8dfa3d83ae4ee8bd6"
+    )
+    assert CAELESTIA_PINNED_ACTION_COUNT == 47
+
+
 def test_the_upstream_action_table_covers_the_pinned_release() -> None:
-    """The table names the 40 plugin.actions upstream v1.2.0 exposes."""
-    assert len(UPSTREAM_ACTIONS) == 40
-    assert "sms.send_sms" in UPSTREAM_ACTIONS
-    assert "share.share_text" in UPSTREAM_ACTIONS
-    assert "telephony.mute" in UPSTREAM_ACTIONS
-    assert "notifications.reply" in UPSTREAM_ACTIONS
+    """The table names all 47 plugin.actions upstream v1.1.1 exposes."""
+    assert len(UPSTREAM_ACTIONS) == CAELESTIA_PINNED_ACTION_COUNT
+    assert len(UPSTREAM_ACTIONS) == 47
+    for verb in (
+        "sms.send_sms",
+        "share.share_text",
+        "telephony.mute",
+        "notifications.reply",
+        "phoneaudio.set_on_computer",
+        "phoneaudio.toggle",
+        "sftp.browse",
+        "sftp.mount",
+        "sftp.unmount",
+        "virtualmonitor.start",
+        "virtualmonitor.stop",
+    ):
+        assert verb in UPSTREAM_ACTIONS
+    for v120_only in ("android.camera", "android.mirror", "android.scan", "android.stop_camera"):
+        assert v120_only not in UPSTREAM_ACTIONS
 
 
 def test_every_upstream_action_outside_the_allowlist_is_forbidden() -> None:
-    """Fail closed: 35 of the 40 upstream actions can never be allowlisted."""
+    """Fail closed: 42 of the 47 upstream actions can never be allowlisted."""
     refused = sorted(a for a in UPSTREAM_ACTIONS if _is_forbidden(a))
     allowed = sorted(a for a in UPSTREAM_ACTIONS if not _is_forbidden(a))
     assert allowed == sorted(ALLOWED_UPSTREAM_ACTIONS)
-    assert len(refused) == 35
+    assert len(refused) == CAELESTIA_PINNED_ACTION_COUNT - len(ALLOWED_UPSTREAM_ACTIONS)
+    assert len(refused) == 42
+
+
+def test_phoneaudio_and_android_prefixes_are_forbidden_independently() -> None:
+    """Refusal of phoneaudio.* and android.* does not rely on READ_VERBS alone."""
+    import assistant.phone_link as module
+
+    assert "phoneaudio." in FORBIDDEN_PREFIXES
+    assert "android." in FORBIDDEN_PREFIXES
+    assert _is_forbidden("phoneaudio.toggle")
+    assert _is_forbidden("phoneaudio.set_on_computer")
+    assert _is_forbidden("android.mirror")
+    assert _is_forbidden("android.camera")
+    original = module.READ_VERBS
+    try:
+        for forbidden_verb in ("phoneaudio.toggle", "android.mirror"):
+            module.READ_VERBS = frozenset(original | {forbidden_verb})
+            with pytest.raises(RuntimeError, match="never-allowlist"):
+                module._validate_allowlist()
+    finally:
+        module.READ_VERBS = original
 
 
 #: The upstream actions that EMIT A PACKET TO THE PHONE. Determined
