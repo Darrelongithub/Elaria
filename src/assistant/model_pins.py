@@ -17,17 +17,37 @@ mechanism honest in a container with no network and no model cache.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import re
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 PINS_FILE = "model-pins.json"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_PIN_SPEC_RE = re.compile(
+    r"^(?P<artifact_id>[^@\s]+)@(?P<revision>[0-9a-f]{7,64})#sha256:(?P<sha256>[0-9a-f]{64})$"
+)
 
 
 class PinMismatch(RuntimeError):
     """A tier that was pinned at one hash came back at another."""
+
+
+@dataclass(frozen=True)
+class VerifiedArtifact:
+    """Local model artifact whose on-disk bytes passed SHA-256 verification."""
+
+    role: str
+    artifact_id: str
+    revision: str
+    sha256: str
+    path: Path
+    data: bytes
 
 
 def pins_path(config) -> Path:
@@ -138,3 +158,147 @@ def validate_pin(pins: Mapping[str, str], slot: str, model_id: str) -> str:
     if slot not in pins or not isinstance(model_id, str) or pins[slot] != model_id:
         raise PinMismatch(f"Model {model_id!r} does not match the exact pin for {slot!r}")
     return model_id
+
+
+def sha256_bytes(data: bytes) -> str:
+    """Hex SHA-256 of raw bytes."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: str | os.PathLike) -> str:
+    """Hex SHA-256 of a regular file, failing closed on missing/unreadable paths."""
+    target = Path(path)
+    try:
+        if not target.is_file():
+            raise PinMismatch(f"pinned artifact missing or not a regular file: {target}")
+        digest = hashlib.sha256()
+        with target.open("rb") as handle:
+            while chunk := handle.read(1 << 20):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError as exc:
+        raise PinMismatch(f"cannot read pinned artifact {target}: {exc}") from exc
+
+
+def parse_pinned_role_spec(spec: str) -> dict[str, str]:
+    """Parse `<artifact_id>@<revision>#sha256:<hex64>` from `PINNED_ROLES`."""
+    if not isinstance(spec, str):
+        raise PinMismatch(f"invalid pinned role spec: {spec!r}")
+    match = _PIN_SPEC_RE.match(spec.strip())
+    if match is None:
+        raise PinMismatch(
+            f"pinned role spec {spec!r} must have form "
+            "'<artifact_id>@<revision>#sha256:<64-hex>'"
+        )
+    return match.groupdict()
+
+
+def resolve_pinned_artifact(
+    role: str = "speaker",
+    *,
+    path: str | os.PathLike | None = None,
+    repo_root: str | os.PathLike | None = None,
+    expected_sha256: str | None = None,
+    config=None,
+) -> VerifiedArtifact:
+    """Resolve a pinned local artifact by role, read its bytes, and verify SHA-256.
+
+    Fails closed (`PinMismatch`) whenever:
+      - `role` is missing or malformed in `model_registry.PINNED_ROLES` /
+        `PINNED_ARTIFACTS`,
+      - `expected_sha256` disagrees with the registry pin,
+      - `config`'s `model-pins.json` is corrupt or records a conflicting pin,
+      - the file does not exist, is not a regular file, cannot be read, or its
+        computed SHA-256 differs by even a single bit from the pinned digest.
+
+    Returns a `VerifiedArtifact` carrying the immutable `data: bytes` whose
+    SHA-256 was verified so callers load the model directly from verified
+    memory with no TOCTOU gap.
+    """
+    from .model_registry import PINNED_ARTIFACTS, PINNED_ROLES
+
+    role_key = str(role or "").strip()
+    if role_key not in PINNED_ROLES or role_key not in PINNED_ARTIFACTS:
+        raise PinMismatch(f"unknown pinned artifact role {role_key!r}")
+
+    parsed = parse_pinned_role_spec(PINNED_ROLES[role_key])
+    meta = PINNED_ARTIFACTS[role_key]
+    pinned_sha = str(meta.get("sha256") or "")
+    pinned_rev = str(meta.get("revision") or "")
+    pinned_id = str(meta.get("artifact_id") or "")
+    if (
+        not hmac.compare_digest(parsed["sha256"], pinned_sha)
+        or parsed["revision"] != pinned_rev
+        or parsed["artifact_id"] != pinned_id
+    ):
+        raise PinMismatch(
+            f"registry pin drift for role {role_key!r}: PINNED_ROLES and "
+            "PINNED_ARTIFACTS disagree"
+        )
+
+    if expected_sha256 is not None:
+        caller_sha = str(expected_sha256).strip().lower()
+        if not hmac.compare_digest(caller_sha, pinned_sha):
+            raise PinMismatch(
+                f"expected sha256 {caller_sha!r} does not match registry pin "
+                f"{pinned_sha!r} for role {role_key!r}"
+            )
+
+    if config is not None:
+        pins = load_pins(config)
+        if "__corrupt__" in pins:
+            raise PinMismatch(
+                f"model pin file is unreadable ({pins['__corrupt__']})"
+            )
+        recorded = pins.get(role_key)
+        if recorded is not None:
+            rec_sha = str(recorded.get("sha256") or "")
+            rec_rev = str(recorded.get("revision") or "")
+            if not hmac.compare_digest(rec_sha, pinned_sha) or rec_rev != pinned_rev:
+                raise PinMismatch(
+                    f"recorded pin for {role_key!r} conflicts with registry pin"
+                )
+
+    root = Path(repo_root) if repo_root is not None else REPO_ROOT
+    if path is not None:
+        raw_path = Path(path).expanduser()
+        target = raw_path if raw_path.is_absolute() else (root / raw_path)
+    else:
+        relpath = str(meta.get("relpath") or "").strip()
+        if not relpath:
+            raise PinMismatch(f"no artifact path configured for role {role_key!r}")
+        target = root / relpath
+
+    try:
+        if not target.is_file():
+            raise PinMismatch(
+                f"pinned {role_key} artifact missing or not a regular file: {target}"
+            )
+        data = target.read_bytes()
+    except OSError as exc:
+        raise PinMismatch(
+            f"cannot read pinned {role_key} artifact {target}: {exc}"
+        ) from exc
+
+    actual_sha = sha256_bytes(data)
+    if not hmac.compare_digest(actual_sha, pinned_sha):
+        raise PinMismatch(
+            f"pinned {role_key} artifact sha256 mismatch at {target}: "
+            f"expected {pinned_sha}, got {actual_sha}"
+        )
+
+    expected_bytes = meta.get("size_bytes")
+    if isinstance(expected_bytes, int) and len(data) != expected_bytes:
+        raise PinMismatch(
+            f"pinned {role_key} artifact size mismatch at {target}: "
+            f"expected {expected_bytes} B, got {len(data)} B"
+        )
+
+    return VerifiedArtifact(
+        role=role_key,
+        artifact_id=pinned_id,
+        revision=pinned_rev,
+        sha256=actual_sha,
+        path=target,
+        data=data,
+    )
