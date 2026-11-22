@@ -671,3 +671,53 @@ def test_j_short_window_does_not_open_the_microphone_either(
         assert len(guard.outbound) == 0
     finally:
         store.close()
+
+
+def test_j_clip_save_failure_cannot_leave_audio_resident(
+    tmp_path: Path,
+    speech_pcm: dict[str, bytes],
+    owner_scorer: EcapaCommandScorer,
+):
+    """A failing opt-in clip write must not strand the guard mid-verify.
+
+    State, zeroing and the metadata record are settled before any clip write,
+    so even a hostile clip directory leaves either ATTENDING (owner verified,
+    audio is the owner's own command head) or a clean IDLE — never the
+    `verifying` state holding the pending buffer.
+    """
+    guard, store, _initiative = make_guard(tmp_path, owner_scorer)
+    try:
+        clips = guard.clips
+        clips.enabled = True
+        clips.directory = tmp_path / "clips"
+
+        def boom(pcm, *, verified):
+            raise OSError("clip store unavailable")
+
+        clips.save = boom
+        live = speech_pcm["spk1_snt4"][BYTES_0P6S:BYTES_2P5S]
+        guard.trigger(keyword_score=0.92)
+        feed(guard, live)
+        try:
+            guard.verify()
+        except OSError:
+            pass    # the caller may see it; the guard state must be settled
+        assert guard.state in (ATTENDING, IDLE), guard.state
+        if guard.state == IDLE:
+            assert guard.pending.data() == b""
+            assert guard._wake_clip == b""
+
+        # And a failing clip write on a DISCARD path is never reached.
+        guard2, _, _initiative2 = make_guard(tmp_path, _FixedScore(owner_scorer, 0.30),
+                                            store=store)
+        guard2.clips.enabled = True
+        guard2.clips.directory = tmp_path / "clips2"
+        guard2.clips.save = boom
+        guard2.trigger(keyword_score=0.92)
+        feed(guard2, speech_pcm["diff_example1"][BYTES_0P6S:BYTES_2P5S])
+        outcome = guard2.verify()      # must not raise: a discard saves nothing
+        assert outcome["state"] == IDLE
+        assert guard2.pending.data() == b""
+        assert not (tmp_path / "clips2").exists()
+    finally:
+        store.close()

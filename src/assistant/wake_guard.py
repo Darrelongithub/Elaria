@@ -869,12 +869,9 @@ class WakeGuard:
         knock (`_raise_wake_knock`) is an owner-authentication prompt and has
         no call site from an unrecognised voice (defect 2).
         """
-        clip_path = None
         if outcome == OUTCOME_ATTENDING:
             self.state = ATTENDING
             self.attending_detail = ATTEND_INHERIT
-            if self.clips.may_save(verified=True):
-                clip_path = self.clips.save(self._session_head, verified=True)
         elif outcome == OUTCOME_REFUSED_ENERGY:
             self.state = CLOSED
             self.attending_detail = None
@@ -891,6 +888,13 @@ class WakeGuard:
             self._session_head = b""
             self._hit = {"keyword_score": self._hit.get("keyword_score", 0.0),
                          "unsafe_energy": unsafe}
+
+        # The transition and any zeroing are complete before the opt-in clip
+        # write: a save failure can never leave audio resident in a state that
+        # was supposed to be silent.
+        clip_path = None
+        if outcome == OUTCOME_ATTENDING and self.clips.may_save(verified=True):
+            clip_path = self.clips.save(self._session_head, verified=True)
 
         record = TriggerRecord(
             ts=str(self.now()),
