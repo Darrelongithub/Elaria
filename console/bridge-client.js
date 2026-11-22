@@ -3,6 +3,7 @@
   'use strict';
   const STATES = ['idle', 'listening', 'thinking', 'speaking', 'error', 'offline',
     'pending-draft', 'phone-connected'];
+  const CAPTURE_STATES = ['armed', 'open', 'muted', 'stalled', 'released', 'unavailable', 'verifying'];
   const RESOLVED = ['approved', 'rejected', 'expired', 'sent'];
   const same = (left, right) => left && Object.keys(right).every(key => left[key] === right[key]);
   const keys = (value, expected) => value && typeof value === 'object'
@@ -34,6 +35,9 @@
         ready = true;
       }
       if (frame.t === 'state' && !STATES.includes(frame.name)) throw new Error('Unknown console state');
+      if (frame.t === 'capture-state' && !CAPTURE_STATES.includes(frame.name)) throw new Error('Unknown capture state');
+      if (frame.t === 'capture-state' && frame.reason !== undefined && typeof frame.reason !== 'string') throw new Error('Invalid capture state reason');
+      if (frame.t === 'capture-state' && frame.reason !== undefined && frame.reason.length > 256) throw new Error('Invalid capture state reason');
       if (frame.t === 'levels' && !(frame.role === 'input' && frame.measured === true
           && frame.source === 'capture.levels' && frame.level === frame.processed_peak
           && [frame.raw_peak, frame.processed_peak].every(n => typeof n === 'number' && n >= 0 && n <= 1)

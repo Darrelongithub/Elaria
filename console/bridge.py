@@ -141,6 +141,7 @@ def rpc_result(frame):
 
 STATES = ('idle', 'listening', 'thinking', 'speaking', 'error', 'offline',
           'pending-draft', 'phone-connected')
+CAPTURE_STATES = ('armed', 'open', 'muted', 'stalled', 'released', 'unavailable', 'verifying')
 DRAFT_STATES = ('approved', 'rejected', 'expired', 'sent')
 
 
@@ -180,6 +181,18 @@ def console_event(frame, draft_replay):
         if set(frame) != {'event', 'state'} or frame['state'] not in STATES:
             raise ValueError('unknown console state')
         return {'t': 'state', 'name': frame['state']}
+    if event == 'capture.state':
+        if set(frame) not in ({'event', 'state'}, {'event', 'state', 'reason'}):
+            raise ValueError('invalid capture state frame')
+        if frame['state'] not in CAPTURE_STATES:
+            raise ValueError('unknown capture state')
+        reason = frame.get('reason')
+        if reason is not None and not bounded_text(reason, 256):
+            raise ValueError('invalid capture state reason')
+        forward = {'t': 'capture-state', 'name': frame['state']}
+        if reason:
+            forward['reason'] = reason
+        return forward
     if event == 'capture.levels':
         keys = ('raw_peak', 'processed_peak', 'limited_samples')
         if (set(frame) != {'event', *keys}
@@ -1030,7 +1043,7 @@ background:#110d1c;color:#e3bd80;z-index:1}
                 await ws.close(code=1013, reason='Daemon not live-ready; reconnect later')
                 return
             await self.emit(ws, t='hello-ok', v=1, name='elaria-daemon (text only)',
-                            capabilities=['text', 'state', 'capture.levels'], simulate=False)
+                            capabilities=['text', 'state', 'capture.levels', 'capture.state'], simulate=False)
             await self.emit(ws, t='state', name=('offline' if self.uncertain else
                                                 'thinking' if self.busy else 'idle'))
             event_task = asyncio.create_task(self.events(ws))

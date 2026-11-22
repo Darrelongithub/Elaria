@@ -140,6 +140,7 @@ async def main():
                         hello = await receive(ws)
                         assert hello['t'] == 'hello-ok' and hello['simulate'] is False
                         assert 'synthesised-text-levels' not in hello['capabilities']
+                        assert 'capture.state' in hello['capabilities']
                         assert await receive(ws) == {'t': 'state', 'name': 'idle'}
 
                     async with connect(endpoint, origin=instance.origin) as ws:
@@ -174,6 +175,10 @@ async def main():
                         subscriber, = subscribers
                         await write(subscriber, {'event': 'console.state', 'state': 'listening'})
                         assert await receive(ws) == {'t': 'state', 'name': 'listening'}
+                        await write(subscriber, {'event': 'capture.state', 'state': 'armed',
+                                                 'reason': 'hotword armed'})
+                        assert await receive(ws) == {'t': 'capture-state', 'name': 'armed',
+                                                    'reason': 'hotword armed'}
                         await write(subscriber, {'event': 'console.state', 'state': 'invalid'})
                         try:
                             await receive(ws)

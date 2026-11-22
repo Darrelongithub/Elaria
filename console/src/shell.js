@@ -137,7 +137,7 @@
   const statusText = () => 'lamps, honestly:\n\n' +
     '  console   [ON]              this window, running, local\n' +
     '  daemon    [' + (daemon ? 'CONNECTED' : 'NOT CONNECTED') + ']   ' + (daemon ? 'adapter attached' : 'connection not established') + '\n' +
-    '  voice     [' + (micOn ? 'CONNECTED' : 'NOT CONNECTED') + ']   ' + (micOn ? 'microphone live' : 'no audio path from this window') + '\n' +
+    '  voice     [' + (micPipelineLive() ? 'CONNECTED' : captureState === 'unavailable' ? 'UNAVAILABLE' : 'NOT CONNECTED') + ']   ' + (micPipelineLive() || captureState === 'unavailable' ? captureStateText() : 'no capture signal from this window') + '\n' +
     '  wire      [' + (daemon ? 'CONNECTED' : 'ABSENT') + ']          ' + (daemon ? 'bridge up' : 'connection not established') + '\n\n' +
     'Text replies use the attached adapter. Connection is not a claim that journal, manifest, memory or speech feeds are present; each pane keeps its own status.';
 
@@ -154,7 +154,26 @@
 
   /* runtime state */
   let V = null, vizErr = '';
-  let state = 'idle', busy = false, forcedOffline = false, micOn = false, simOn = true;
+  let state = 'idle', busy = false, forcedOffline = false, simOn = true;
+  /* The mic is read from the daemon's capture.state — never a browser-local
+     microphone flag. Null until a validated frame arrives: the shell says so. */
+  let captureState = null, captureReason = null;
+  const MATCH_STATE = { open: 1, armed: 1, muted: 1, stalled: 1, released: 1, unavailable: 1, verifying: 1 };
+  const micPipelineLive = () => captureState === 'open' || captureState === 'armed' || captureState === 'muted';
+  const micListening = () => captureState === 'open' || captureState === 'armed';
+  const CAPTURE_LABEL = {
+    open: 'mic open — frames capturing',
+    armed: 'mic armed — hotword listening',
+    muted: 'mic muted — she is speaking',
+    stalled: 'mic stalled — no frames within the stall budget',
+    released: 'mic released',
+    unavailable: 'mic unavailable — capture cannot open or the speech path is dead',
+    verifying: 'mic verifying — wake lane reserving this state (not yet emitted)',
+  };
+  const captureStateText = () => {
+    if (!captureState || !MATCH_STATE[captureState]) return '';
+    return CAPTURE_LABEL[captureState] + (captureReason ? ' — ' + captureReason : '');
+  };
   let daemon = null, skip = false, voiceTimer = 0, typeT = 0;
   let pinned = true, demoOn = false, wipeArmed = false, away = null;
   let openSec = null;          // which sidebar section is folded open
@@ -192,7 +211,7 @@
     const pend = pendingDrafts().length;
     if (pend > 0) return setState('pending-draft');        // needs the owner: speaks first
     if (phoneConnected) return setState('phone-connected');
-    if (fallback === true || BASE_STATE[state]) setState(micOn ? 'listening' : 'idle');
+    if (fallback === true || BASE_STATE[state]) setState(micListening() ? 'listening' : 'idle');
   }
   // F29: only output levels can enter speaking. A reply/state flag is not playback evidence.
   function setState(s, fromLevels = false) {
@@ -205,20 +224,24 @@
     if (V) V.setLevels(role, { level });
     if (role === 'output' && !forcedOffline) {
       if (level > 0) setState('speaking', true);
-      else if (state === 'speaking') { setState(busy ? 'thinking' : micOn ? 'listening' : 'idle'); applyPhone(false); }
+      else if (state === 'speaking') { setState(busy ? 'thinking' : micListening() ? 'listening' : 'idle'); applyPhone(false); }
     }
   };
   function settle() {
     if (busy || voiceTimer) return;
-    setState(forcedOffline ? 'offline' : micOn ? 'listening' : 'idle');
+    setState(forcedOffline ? 'offline' : micListening() ? 'listening' : 'idle');
     if (!forcedOffline) applyPhone(false);
   }
   function lamps() {
-    const on = { console: 'ok', daemon: daemon ? 'ok' : 'wait', voice: (micOn) ? 'ok' : 'wait', wire: daemon ? 'ok' : 'gone' };
+    const voiceUnavailable = captureState === 'unavailable';
+    const voiceLit = micPipelineLive();
+    const on = { console: 'ok', daemon: daemon ? 'ok' : 'wait',
+      voice: voiceLit ? 'ok' : (voiceUnavailable ? 'gone' : 'wait'),
+      wire: daemon ? 'ok' : 'gone' };
     const titles = {
       console: 'console — this local window is running',
       daemon: daemon ? 'daemon — adapter attached' : 'daemon — not connected',
-      voice: micOn ? 'microphone input live' : 'voice — no audio path from this window',
+      voice: (voiceLit || voiceUnavailable) ? ('voice — ' + captureStateText()) : 'voice — no capture signal from this window',
       wire: daemon ? 'wire — connected; not proof of model output or an action' : 'wire — not connected'
     };
     document.querySelectorAll('[data-lamp]').forEach((li) => {
@@ -523,9 +546,6 @@
       const rows = liveAU || (demoOn ? DEMO_AU : null);
       b.append(h('p', 'mini', rows ? rows.length + ' rows shown.' : 'Deferred — no production audio pane feed. No audio manifest rows received. ' + AU_COLS + '.'));
       b.append(h('p', 'mini', CENSUS));
-      const mb = h('button', 'sbtn'); mb.type = 'button';
-      mb.textContent = micOn ? 'stop microphone' : 'use microphone';
-      mb.addEventListener('click', toggleMic); b.append(mb);
       const note = h('p', 'mini micnote'); b.append(note);
       if (rows) rows.slice(0, 3).forEach((r) => {
         const d = h('div', 'mrow');
@@ -611,11 +631,8 @@
       b.append(h('p', 'tnote', CENSUS));
       if (rows) b.append(table('manifest rows', ['file', 'size', 'age', 'tier'],
         rows.map((r) => [r.name, r.size, r.age, r.tier]), ['w', 't', 't', 'v-k']));
-      const mic = h('button', 'sbtn'); mic.type = 'button'; mic.style.maxWidth = '260px';
-      mic.textContent = micOn ? 'stop microphone' : 'use microphone (drives her orb)';
-      mic.addEventListener('click', toggleMic); b.append(mic);
       const note = h('p', 'tnote micnote'); b.append(note);
-      b.append(h('p', 'tnote', 'the microphone stays in this browser. it drives the orb only — nothing is recorded, uploaded or stored by this shell.'));
+      b.append(h('p', 'tnote', 'capture state is read from the daemon over the wire — this shell never opens a browser microphone. nothing in this window records or stores audio.'));
     }
     if (q && name !== 'memory') Array.prototype.forEach.call(b.querySelectorAll('tbody tr'), filt);
   }
@@ -623,21 +640,25 @@
   /* The mic feedback line lives in two places at once (sidebar fold-out and full-screen pane), so the
      message is written to every copy AFTER the bodies are rebuilt, never before. */
   const renderMic = () => { if (openSec === 'audio') renderSec('audio'); if (fullPane === 'audio') renderFull(); };
-  async function toggleMic() {
-    const say = (t) => qa('.micnote').forEach((n) => { n.textContent = t; });
-    if (micOn) { if (V) V.releaseMicrophone(); micOn = false; lamps(); settle(); renderMic(); say(''); return; }
-    if (!V) { say('[ERR] the visualizer is unavailable, so there is nothing to attach a microphone to.'); return; }
-    say('asking for the microphone\u2026');
-    try {
-      await V.useMicrophone(); micOn = true; simOn = false; V.simulate(false); syncOrb(); lamps(); setState('listening');
-      renderMic(); say('[OK] microphone live. speak \u2014 the panel on the right is reading you. nothing is recorded or stored.');
-    } catch (err) {
-      const n = err && err.name;
-      renderMic();
-      say(n === 'NotAllowedError' || n === 'SecurityError'
-        ? '[ERR] blocked. browsers need https or localhost, plus your permission.'
-        : n === 'NotFoundError' ? '[ERR] no microphone found.' : '[ERR] ' + ((err && err.message) || 'unknown error'));
+  const setMicNote = (t) => qa('.micnote').forEach((n) => { n.textContent = t; });
+  /* capture.state arrives over the wire. Honest by construction: the orb and the mic read the
+     daemon's own state, never a browser-local microphone flag. Names come validated from the
+     bridge; anything else is dropped by the wire consumer before it reaches here. */
+  function renderCapture() {
+    renderMic();
+    setMicNote(captureStateText() || 'no capture signal from this window');
+    lamps(); syncOrb();
+    if (!busy && !forcedOffline && state !== 'speaking') {
+      setState(micListening() ? 'listening' : 'idle');
     }
+  }
+  function captureStateFromFrame(name, reason) {
+    if (!MATCH_STATE[name]) throw new Error('unknown capture state "' + name + '" — no silent default');
+    if (reason !== undefined && reason !== null && typeof reason !== 'string') throw new Error('capture state reason must be text');
+    if (reason !== undefined && reason !== null && reason.length > 256) throw new Error('capture state reason too long');
+    captureState = name;
+    captureReason = reason || null;
+    renderCapture();
   }
 
   /* ---- orb readout ----
@@ -646,7 +667,8 @@
      by the wire, the microphone, or her typing. /state and /sim stay as hidden commands for testing,
      and nothing on screen pretends otherwise. */
   function syncOrb() {
-    el.orbnote.textContent = (micOn ? 'microphone input live · text output: ' : '') +
+    const cap = captureStateText();
+    el.orbnote.textContent = (cap ? cap + ' · text output: ' : '') +
         'synthesised text cadence, not measured audio · text-only, no speech';
   }
 
@@ -900,7 +922,6 @@
       if (s === 'speaking') return out('Speaking follows output levels only; synthetic cadence is not speech.');
       forcedOffline = s === 'offline'; setState(s); } },
     { n: 'notify', u: '/notify TEXT', d: 'preview the mini-orb notification', f: (a) => notify({ text: a || 'Elaria here. I look like this when I have something to say.', speak: true, log: false }) },
-    { n: 'mic', u: '/mic', d: 'attach or release the microphone', f: () => toggleMic() },
     { n: 'sim', u: '/sim', d: 'synthetic voice on or off, so her orb is not frozen', f: () => { simOn = !simOn; if (V) V.simulate(simOn); syncOrb();
       out('simulated voice ' + (simOn ? '[ON]' : '[OFF]') + (simOn ? ' — her orb moves with no wire attached.' : '')); } },
     { n: 'sidebar', u: '/sidebar', d: 'hide or show the left sidebar   (alt+K)', f: () => toggleSb() },
@@ -1177,7 +1198,7 @@
     if (t.includes('transcri') || t.includes('memor') || t.includes('audio') || t.includes('wav'))
       return 'those are sections in the sidebar, under sessions. transcript opens full screen across the chat and the orb — the sidebar stays where it is. memory and audio fold open in the sidebar and each has an "open full screen" button inside.\n\nkeys: alt+1 transcript, alt+2 memory, alt+3 audio, alt+K sidebar, alt+B orb.\n\ntranscript and audio wait for their own data feeds — /demo shows the shape they will take, marked [SAMPLE]. memory already has 11 real cards baked into this file.';
     if (t.includes('orb') || t.includes('visual') || t.includes('ball'))
-      return 'she is on the right in a proportional panel, yielding to chat on narrow screens. the readout names the current state and signal. /mic attaches your microphone and she reacts to your voice instead. /sim turns the synthetic voice off.';
+      return 'she is on the right in a proportional panel, yielding to chat on narrow screens. the readout names the current state and signal. the mic is read from the daemon\'s capture.state — this window never opens a browser microphone. /sim turns the synthetic voice off.';
     if (t.includes('notif') || t.includes('pop') || t.includes('tap'))
       return 'top right, a mini orb with her name and the message — that is the tap on the shoulder. an amber pip stays on the orb rail after the toast fades, so you still know she wanted you. /notify fires one now.';
     return STUBS[stubI++ % STUBS.length];
@@ -1228,7 +1249,7 @@
   let typingT = 0, tab = { base: null, i: -1 };
   el.ta.addEventListener('input', () => {
     autosize(); tab.base = null; calmWants();
-    if (busy || forcedOffline || micOn) return;
+    if (busy || forcedOffline || micPipelineLive()) return;
     if (el.ta.value.trim()) { setState('listening'); setLevels('input', .3 + Math.random() * .55); }
     clearTimeout(typingT); typingT = setTimeout(settle, 2200);
   });
@@ -1292,7 +1313,7 @@
       if (dead || typeof WebSocket === 'undefined') return;
       try { ws = new WebSocket(url); } catch (e) { retry(); return; }
       ws.onopen = () => {
-        ws.send(JSON.stringify({ t: 'hello', v: WIRE_V, client: 'console', caps: ['text', 'transcript', 'audio', 'memory'] }));
+        ws.send(JSON.stringify({ t: 'hello', v: WIRE_V, client: 'console', caps: ['text', 'state', 'transcript', 'audio', 'memory', 'capture.levels', 'capture.state'] }));
       };
       ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch (e) { return; } route(m); };
       ws.onclose = () => {
@@ -1314,6 +1335,7 @@
       if (m.t === 'reply') { const p = pend.get(m.id); pend.delete(m.id); if (p) { if (m.undo_review) undoPrivate = true; p(m); } return; }
       if (m.t === 'state') return window.ElariaShell.setState(m.name);   // unknown names THROW inside
       if (m.t === 'levels') return window.ElariaShell.levels(m.role, m.level);
+      if (m.t === 'capture-state') return window.ElariaShell.captureState(m.name, m.reason);
       if (m.t === 'notify') return window.ElariaShell.notify({ text: m.text || '', speak: !!m.speak });
       if (m.t === 'transcript') return window.ElariaShell.transcript(m.rows || []);
       if (m.t === 'audio') return window.ElariaShell.audio(m.rows || []);
@@ -1375,7 +1397,10 @@
     connect(adapter) {
       if (!adapter || typeof adapter.send !== 'function') throw new Error('ElariaShell.connect needs { send(text, ctx) }.');
       daemon = adapter; forcedOffline = false;
-      simOn = false; if (V) V.simulate(false); syncOrb();
+      simOn = false; if (V) V.simulate(false);
+      // The wire is live; any capture state from a previous connection is stale.
+      captureState = null; captureReason = null;
+      syncOrb();
       lamps(); settle();
       notify({ text: 'Daemon connected' + (adapter.name ? ': ' + adapter.name : '') + '.', log: false });
       out('[OK] wire up. replies use the attached adapter; each pane keeps its own data status.');
@@ -1384,7 +1409,9 @@
       clearHandsAsk();
       undoPrivate = false; clearUndo('Disconnected; old card invalidated.');
       if (!daemon) return;
-      daemon = null; forcedOffline = true; lamps(); setState('offline'); syncOrb();
+      daemon = null; forcedOffline = true;
+      captureState = null; captureReason = null;
+      renderMic(); setMicNote('no capture signal from this window'); lamps(); setState('offline'); syncOrb();
       notify({ text: 'Lost the daemon wire. Marked offline until it returns.', log: false });
     },
     notify(o) { notify(o || {}); },
@@ -1407,10 +1434,11 @@
     draftState(id) { const d = draftStore.get(String(id)); return d ? d.state : null; },  // test helper
     get phoneConnected() { return phoneConnected; },
     levels(role, level) { setLevels(role, level); },
+    captureState(name, reason) { captureStateFromFrame(name, reason); },
     transcript(rows) { liveTR = nonempty(rows); demoOn = false; syncBadges(); if (openSec === 'transcript') renderSec('transcript'); if (fullPane === 'transcript') renderFull(); },
     audio(rows) { liveAU = nonempty(rows); demoOn = false; syncBadges(); if (openSec === 'audio') renderSec('audio'); if (fullPane === 'audio') renderFull(); },
     memory(cards) { liveMEM = nonempty(cards); syncBadges(); if (openSec === 'memory') renderSec('memory'); if (fullPane === 'memory') renderFull(); },
-    get state() { return { daemon: !!daemon, mic: micOn, state, pane: fullPane, section: openSec }; }
+    get state() { return { daemon: !!daemon, mic: captureState, state, pane: fullPane, section: openSec }; }
   };
 
   /* boot */
@@ -1443,6 +1471,7 @@
     el.tgOrb.setAttribute('aria-expanded', String(data.prefs.orb));
     renderLog(); renderSess(); lamps(); paintState(state); syncBadges(); syncOrb(); renderDrafts();
     renderSec('transcript'); renderSec('memory'); renderSec('audio');
+    setMicNote(captureStateText() || 'no capture signal from this window');
     el.ta.focus();
   }
   boot(false);

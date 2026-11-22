@@ -318,6 +318,15 @@ class Daemon:
         # gate closed for the real worker lifetime; a text-duration estimate can
         # expire while synthesis is still delayed (I4).
         self._speech_playbacks: set[asyncio.Task] = set()
+        # Capture state, tracked for the console orb/mic (capture.state on the
+        # wire). Transitions are emitted honestly: repeated emissions of the same
+        # (state, reason) pair are suppressed.
+        self._capture_state_last: tuple | None = None
+        # When the speech path is dead, capture.state says so (never a calm
+        # idle). Held here so live-state emissions after a failure (done
+        # callbacks, gate reopen) cannot contradict it. The reason rides the
+        # emission; success clears it.
+        self._speech_path_dead: str | None = None
         # G.6 latency stages per session: release → final → reply →
         # synth → audible, each a monotonic mark, emitted as latency.table.
         self._stage_marks: dict[str, dict[str, float]] = {}
@@ -365,6 +374,75 @@ class Daemon:
                           f"{type(exc).__name__}: {exc}", flush=True)
             self._track_task(asyncio.create_task(_drain()))
 
+    # -- capture.state: transitions for the console orb/mic --------------
+    @staticmethod
+    def _bound_reason(text) -> str | None:
+        """Reason for capture.state, byte-bounded the way the bridge requires."""
+        reason = " ".join(str(text or "").split())
+        if not reason:
+            return None
+        while len(reason.encode("utf-8")) > 256:
+            reason = reason[: max(1, len(reason) // 2)]
+        return reason or None
+
+    async def _emit_capture_state(self, state: str, *, reason: str | None = None) -> None:
+        """Broadcast a capture.state event on an ACTUAL transition.
+
+        The console orb and mic read capture.state from the wire; a local
+        browser-side mic flag is never the source of truth. Emission is
+        transition-based: repeating the last (state, reason) pair is
+        suppressed, so the stream carries state changes, not noise.
+        Delivery failures are logged and never fatal: capture state is
+        advisory, a session must never die because a watcher missed it.
+        """
+        reason = self._bound_reason(reason)
+        key = (state, reason)
+        if getattr(self, "_capture_state_last", None) == key:
+            return
+        self._capture_state_last = key
+        event = {"event": "capture.state", "state": state}
+        if reason:
+            event["reason"] = reason
+        try:
+            await self.broadcast(event)
+        except Exception as exc:
+            print(f"[assistd] capture.state emit failed: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+
+    async def _emit_live_capture_state(self, *, reason: str | None = None) -> None:
+        """Emit the honest current capture state.
+
+        Used when the half-duplex gate closes: the shell must learn what the
+        pipeline actually is — a live or finishing PTT session keeps the mic
+        open, a live hotword path keeps it armed, and otherwise the pipeline
+        is closed. Repeated emissions are suppressed inside
+        _emit_capture_state.
+        """
+        dead = getattr(self, "_speech_path_dead", None)
+        if dead:
+            # The speech path is dead; a "live" pick would claim a pipeline
+            # that cannot speak. The console must learn that, not a calm idle.
+            await self._emit_capture_state("unavailable", reason=dead)
+            return
+        if (self._dictation_task is not None and not self._dictation_task.done()) \
+                or bool(self._ptt_finishing):
+            state = "open"
+        elif self.wake_guard.armed:
+            state = "armed"
+        else:
+            state = "released"
+        await self._emit_capture_state(state, reason=reason)
+
+    def _emit_unmuted_now(self, *, reason: str = "unmuted") -> None:
+        """Fire-and-forget: the half-duplex gate just closed — tell the
+        shell what the pipeline actually is. Done-callbacks run inside the
+        event loop; a failure here is logged, never fatal."""
+        try:
+            asyncio.ensure_future(self._emit_live_capture_state(reason=reason))
+        except Exception as exc:
+            print(f"[assistd] unmuted emit failed: {type(exc).__name__}: {exc}",
+                  flush=True)
+
     # -- half-duplex: capture muted while speaking (BUG5) -----------------
     def _set_speaking(self, speaking: bool, *, text: str | None = None) -> None:
         if speaking:
@@ -403,6 +481,7 @@ class Daemon:
             def finished(task: asyncio.Task) -> None:
                 self._speech_playbacks.discard(task)
                 self._set_speaking(False, text=text)
+                self._emit_unmuted_now()
                 self._collect_speech_marks(session_id, task)
                 self._consume_task_result(task)
 
@@ -561,6 +640,7 @@ class Daemon:
         def finished(task: asyncio.Task) -> None:
             self._ack_playbacks.discard(task)
             self._set_speaking(False, text=text)
+            self._emit_unmuted_now()
             self._consume_task_result(task)
 
         playback.add_done_callback(finished)
@@ -584,9 +664,16 @@ class Daemon:
             try:
                 result = await asyncio.shield(playback)
             except Exception as exc:
-                await self.broadcast({"event": "speech.error", "ack_kind": kind,
-                                      "error": str(exc)})
                 result = {"played": False, "error": str(exc)}
+            # The ack path uses the same voice; a dead ack is a dead path.
+            if isinstance(result, dict) and result.get("error") and not result.get("muted"):
+                reason = f"voice unavailable (ack {kind}: {result['error']})"
+                self._speech_path_dead = reason
+                await self.broadcast({"event": "speech.error", "ack_kind": kind,
+                                      "error": result["error"]})
+                await self._emit_capture_state("unavailable", reason=reason)
+            elif not isinstance(result, dict) or not result.get("error"):
+                self._speech_path_dead = None
             log_outcome(result if isinstance(result, dict) else {"played": False,
                                                                  "error": "no result"})
             return result
@@ -609,9 +696,17 @@ class Daemon:
             return getattr(self._inner, name)
 
         async def frames(self):
+            muted = False
             async for frame in self._inner.frames():
                 # Half-duplex: mic muted while she speaks + guard after
-                if self._daemon.is_speaking():
+                speaking = self._daemon.is_speaking()
+                if speaking and not muted:
+                    muted = True
+                    await self._daemon._emit_capture_state("muted", reason="speaking")
+                elif not speaking and muted:
+                    muted = False
+                    await self._daemon._emit_capture_state("open")
+                if speaking:
                     continue
                 yield frame
         async def aclose(self):
@@ -766,11 +861,19 @@ class Daemon:
             if getattr(result, "error", None):
                 result.muted = True
             if result.error and not route.get("muted"):
+                reason = f"voice unavailable ({result.error})"
+                self._speech_path_dead = reason
                 await self.broadcast({"event": "speech.error", "error": result.error,
                                       **route})
+                await self._emit_capture_state("unavailable", reason=reason)
+                return result
+            self._speech_path_dead = None
             return result
         except Exception as exc:
+            reason = f"voice unavailable ({exc})"
+            self._speech_path_dead = reason
             await self.broadcast({"event": "speech.error", "error": str(exc), **route})
+            await self._emit_capture_state("unavailable", reason=reason)
             return SpeechResult(text=text.strip(), backend="none", voice_id="none",
                                 muted=True, error=str(exc))
 
@@ -827,7 +930,10 @@ class Daemon:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
         except TimeoutError:
             # Live TTS is slow; the task already owns the speaking flag and
-            # will clear it when the real playback finishes.
+            # will clear it when the real playback finishes. The shell must
+            # know the mic is held for the pending reply, not just note it
+            # from the speaking flag.
+            await self._emit_capture_state("muted", reason="reply pending")
             return {**route, "played": False, "queued": True,
                     "speech_status": "pending",
                     "note": "speech continues in the background (timeout)"}
@@ -971,7 +1077,8 @@ class Daemon:
                                    "mode.changed", "offline.drained",
                                    "speech.error", "conversation.message",
                                    "class.changed", "knock.raised",
-                                   "knock.accepted", "knock.changed", "error"]}
+                                   "knock.accepted", "knock.changed", "error",
+                                   "capture.levels", "capture.state"]}
             handler = handlers.get(method)
             if handler is None:
                 raise ValueError(f"unknown method '{method}' — supported: "
@@ -1539,8 +1646,18 @@ class Daemon:
         """
         guard = self.wake_guard
         source = None
+        await self._emit_capture_state("armed")
         try:
             source = self._hotword_capture_factory()
+        except Exception as exc:
+            # Capture cannot open on this box — the hotword path is dark.
+            guard.disarm(reason="error")
+            await self.broadcast({"event": "hotword.stalled",
+                                  "state": "stalled", "error": str(exc)[:200]})
+            await self._emit_capture_state("unavailable",
+                                           reason=f"hotword capture unavailable: {exc}"[:256])
+            return
+        try:
             async for frame in source.frames():
                 if not guard.armed:
                     break
@@ -1549,6 +1666,7 @@ class Daemon:
                     guard.disarm(reason="stalled")
                     await self.broadcast({"event": "hotword.stalled",
                                           "state": "stalled"})
+                    await self._emit_capture_state("stalled", reason="stalled")
                     break
             # BH-K7: the stream ending underneath an armed guard IS the
             # stall (PipeWireCapture ends frames() at its stall deadline).
@@ -1559,12 +1677,14 @@ class Daemon:
                 guard.disarm(reason="stalled")
                 await self.broadcast({"event": "hotword.stalled",
                                       "state": "stalled"})
+                await self._emit_capture_state("stalled", reason="stalled")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             guard.disarm(reason="error")
             await self.broadcast({"event": "hotword.stalled",
                                   "state": "stalled", "error": str(exc)[:200]})
+            await self._emit_capture_state("stalled", reason="error")
         finally:
             if source is not None:
                 aclose = getattr(source, "aclose", None)
@@ -1592,6 +1712,9 @@ class Daemon:
         try:
             status = self.wake_guard.arm(unsafe_energy_test=unsafe)
         except KeywordModelUnavailable as exc:
+            # The wake path cannot open — the console must learn that, not a calm idle.
+            await self._emit_capture_state("unavailable",
+                                           reason=f"wake path unavailable: {exc}"[:256])
             raise ValueError(str(exc)) from exc
         if self._hotword_task is None or self._hotword_task.done():
             self._hotword_task = asyncio.create_task(self._hotword_loop())
@@ -1607,6 +1730,7 @@ class Daemon:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        await self._emit_capture_state("released", reason="hotword stopped")
         return {"hotword": self.wake_guard.disarm(reason="manual")}
 
     async def _hotword_status(self, params: dict) -> dict:
@@ -1966,6 +2090,8 @@ class Daemon:
                 # A policy refusal is an ANSWER, never a silent simulation.
                 self.audio.end_ptt()
                 self._ptt_log("ptt.start.refused_policy", reason=str(exc)[:200])
+                await self._emit_capture_state("unavailable",
+                                               reason=f"capture refused: {exc}"[:256])
                 return {"listening": False, "refused": str(exc),
                         "gateway": self.audio.status(),
                         "note": "nothing captured — the node is not configured"}
@@ -2090,7 +2216,11 @@ class Daemon:
                 str(getattr(self._capture_source, "target", None) or ""))))
         except Exception as exc:
             self._ptt_log("ptt.start.dictate_spawn_failed", session_id=session_id, error=f"{type(exc).__name__}: {exc}"[:200])
+            await self._emit_capture_state("unavailable",
+                                           reason=f"capture spawn failed: {exc}"[:256])
             raise
+        # The session is up and capturing; tell the console what the pipeline is.
+        await self._emit_capture_state("open")
         return {"listening": True, **ack, "simulated_capture": simulated,
                 "session_mode": self._dictation_session_mode,
                 "session_id": session_id,
@@ -2259,6 +2389,7 @@ class Daemon:
                           f"node_released={released}; nothing transcribed"))
         self._ptt_log("ptt.cancel.done", session_id=str(session_id or ""),
                       zeroized=zeroized, released=released)
+        await self._emit_capture_state("released", reason="cancelled")
         return {"cancelled": True, "session_id": session_id,
                 "zeroized": zeroized, "task_killed": cancelled_task,
                 "node_released": released, "transcribed": False,
@@ -2866,6 +2997,9 @@ class Daemon:
                     "dictate.result_broadcast_ignored",
                     session_id=str(session_id or ""),
                     error=f"{type(exc).__name__}: {exc}"[:200])
+            # The session is over: the pipeline is closed, or a newer session
+            # is already live — tell the shell the honest current state.
+            await self._emit_live_capture_state(reason="session finished")
 
     async def _ptt_result(self, params: dict) -> dict:
         """Fetch the terminal answer for ONE session, optionally waiting.

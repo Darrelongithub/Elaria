@@ -64,6 +64,7 @@ ElariaShell.notify({ text, speak }) // proactive tap on the shoulder: mini-orb t
 ElariaShell.say(text)               // push an unprompted reply into the log
 ElariaShell.setState(name)          // idle | listening | thinking | offline; speaking only via output levels
 ElariaShell.levels(role, level)     // push amplitude 0..1, role 'input' | 'output'
+ElariaShell.captureState(name, reason?) // validate + render a validated capture-state frame
 ElariaShell.transcript(rows)        // rows: { ts, id, who, text, peak, verdict }  -> transcript pane goes LIVE
 ElariaShell.audio(rows)             // rows: { name, size, age, tier }              -> audio pane goes LIVE
 ElariaShell.memory(cards)           // cards: { t, v, w }                          -> memory pane goes LIVE
@@ -99,7 +100,7 @@ message. The client reconnects with exponential backoff (700 ms × 1.7, capped 1
 client → daemon
 
 ```jsonc
-{ "t": "hello", "v": 1, "client": "console", "caps": ["text","transcript","audio","memory"] }
+{ "t": "hello", "v": 1, "client": "console", "caps": ["text","state","transcript","audio","memory","capture.levels","capture.state"] }
 { "t": "send",  "id": 7, "text": "…", "session": "boot", "history": [ {r,t,ts}, … ] }   // history ≤ 20
 ```
 
@@ -111,6 +112,7 @@ daemon → client
 { "t": "reply", "id": 7, "error": "reason" }                 // rejected promise, shown as [BROKEN]
 { "t": "state",  "name": "listening" }
 { "t": "levels", "role": "input", "level": 0.42 }
+{ "t": "capture-state", "name": "armed", "reason": "hotword armed" }  // name one of open|armed|muted|stalled|released|unavailable|verifying; reason ≤ 256 B
 { "t": "notify", "text": "…", "speak": true }
 { "t": "transcript", "rows": [ … ] }
 { "t": "audio",      "rows": [ … ] }
@@ -252,9 +254,11 @@ the unchanged maker engine offers that API; playback belongs solely to the daemo
 console never removes the rail; the floating mini-orb is a move, not a removal). The maker's cautions
 are verified shell-side: the container has a real height (`.stage-box` is `flex: 1 1 auto;
 min-height: 0` inside a definite grid row, with an 80% maximum stage height; no floating
-narrow-screen stage); three.js is inlined ahead of the engine; `useMicrophone()` needs https
-or localhost (`serve.py` still binds **0.0.0.0:8123**, not loopback-only; the bridge uses
-127.0.0.1:8744; `/mic` fails honestly through try/catch on `file://`).
+narrow-screen stage); three.js is inlined ahead of the engine; The shell never opens a browser microphone; the mic is a read of the daemon's
+capture.state over the wire. The maker engine's own `useMicrophone()` helper is
+unchanged (the engine remains byte-identical), but nothing in the console calls it.
+`serve.py` still binds **0.0.0.0:8123**, not loopback-only; the bridge uses
+127.0.0.1:8744.
 
 **Colour ruling stands (2026-11-02): the maker's per-state worlds are the owner's adopted look.**
 `PALS` — nine-stop palettes per state, cross-faded on every `setState`: idle violet, listening
@@ -297,7 +301,7 @@ the GLSL gate passes.
   grid columns 2/-1, row 1, leaving the bottom footer visible. Below 940px the sidebar opens
   only on explicit request and offers a close control; the chat retains its column.
 - **Her panel has no buttons.** State and signal rows exist in the standalone demo only, to stimulate
-  modes by hand; in the console every state arrives in real time. `/state`, `/sim`, `/mic` remain as
+  modes by hand; in the console every state arrives in real time. `/state` and `/sim` remain as
   typed commands. The panel top line is `ELARIA` + live readout (state word · source · meter).
 - **Header is a whisper:** session path and three controls. Four status dots now live in the
   bottom-pinned footer, with state-specific hover text. The outer three-line bridge banner

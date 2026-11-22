@@ -244,7 +244,7 @@ setTimeout(() => { console.log("\nWATCHDOG: the suite did not finish in 30s"); c
   ok("daemon lamp amber = not connected", on.daemon === "wait");
   ok("wire lamp red = not connected", on.wire === "gone");
   ok("ElariaShell wire surface exported", typeof window.ElariaShell === "object");
-  ["connect", "disconnect", "notify", "say", "setState", "transcript", "audio", "memory"].forEach((k) =>
+  ["connect", "disconnect", "notify", "say", "setState", "transcript", "audio", "memory", "captureState"].forEach((k) =>
     ok("  ElariaShell." + k + "()", typeof window.ElariaShell[k] === "function"));
 
   console.log("\n=== LIVE DATA PATH (what the wire will drive) ===");
