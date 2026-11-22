@@ -34,8 +34,22 @@ CHAT_INTENT = "gemini-3.5-flash-lite"
 ESCALATION = "gemini-3.8-flash"
 CACHED_TTS = "gemini-3.8-flash-lite-tts"
 
+# -- local speaker verification artifact pin (§19.2 / Stage B ECAPA-TDNN) --
+SPEAKER_MODEL_REPO = "Wespeaker/wespeaker-ecapa-tdnn512-LM"
+SPEAKER_MODEL_REVISION = "a2f3dcb1c8702caccc7a55ceb57f5e8d1842112b"
+SPEAKER_MODEL_SHA256 = (
+    "d71b85d9b48058ef68004f04f1b78acebefb9dfcf542e19b976a12a5ad1f10b0"
+)
+SPEAKER_MODEL_RELPATH = "models/voxceleb_ECAPA512_LM.onnx"
+SPEAKER_MODEL_BYTES = 24861931
+SPEAKER_VERIFICATION = (
+    f"{SPEAKER_MODEL_REPO}@{SPEAKER_MODEL_REVISION}"
+    f"#sha256:{SPEAKER_MODEL_SHA256}"
+)
+
 #: role label -> pinned id. Roles the daemon resolves through
-#: `Config.model_for_role()` map 1:1 (plus housekeeping's three keys).
+#: `Config.model_for_role()` map 1:1 (plus housekeeping's three keys and the
+#: local `speaker` verification artifact pin).
 PINNED_ROLES: dict[str, str] = {
     "voice": VOICE_CONVERSATION,
     "transcribe_live": PTT_TRANSCRIPTION,
@@ -47,7 +61,23 @@ PINNED_ROLES: dict[str, str] = {
     "cleanup": CHAT_INTENT,
     "escalation": ESCALATION,
     "cached_tts": CACHED_TTS,
+    "speaker": SPEAKER_VERIFICATION,
 }
+
+#: structured local artifact metadata keyed by role (resolved + verified on
+#: load via `model_pins.resolve_pinned_artifact`).
+PINNED_ARTIFACTS = MappingProxyType({
+    "speaker": MappingProxyType({
+        "role": "speaker",
+        "artifact_id": SPEAKER_MODEL_REPO,
+        "revision": SPEAKER_MODEL_REVISION,
+        "sha256": SPEAKER_MODEL_SHA256,
+        "relpath": SPEAKER_MODEL_RELPATH,
+        "size_bytes": SPEAKER_MODEL_BYTES,
+        "sample_rate": 16000,
+        "embed_dim": 192,
+    }),
+})
 
 #: every id that may legitimately appear in config or on the wire
 ALLOWED_IDS: frozenset[str] = frozenset(PINNED_ROLES.values())
