@@ -83,6 +83,19 @@ producer supplies it; the bridge cannot infer it from intended text.
 | Resolved draft | `{"event":"draft.resolved","draft":{"draft_id":"…","state":"approved\|rejected\|expired\|sent","outcome":"…"}}` |
 | State | `{"t":"state","name":"…"}`, one of `idle`, `listening`, `thinking`, `speaking`, `error`, `offline`, `pending-draft`, `phone-connected`. Unknown state throws; no fallback mapping. |
 | Levels | `{"t":"levels","role":"input","level":0.35,"source":"capture.levels","measured":true,"raw_peak":0.8,"processed_peak":0.35,"limited_samples":2}`. Input only. Capture format/threshold semantics owned by A/F/Z. |
+| Capture state | `{"t":"capture-state","name":"…"}` (optionally with `reason`), where name is one of `open`, `armed`, `muted`, `stalled`, `released`, `unavailable`, `verifying`. reason is at most 256 UTF-8 bytes, non-empty trimmed text. The shell reads the mic from this frame — never from a browser-side microphone flag. Silence means no signal is known yet, never "listening". Unknown names throw. |
+
+**IF-4 rename (owner decision 2026-11-22):** the IF-4 set was originally
+`idle | listening | armed | verifying | suspended | unavailable`. It was renamed at the
+wire to the daemon's own states — `open`, `armed`, `muted`, `stalled`, `released`,
+`unavailable` (+ `verifying`, reserved) — because those names ARE the daemon's pipeline,
+not a mapping onto invented vocabulary. `open` = a session is capturing, `armed` = the
+wake path is armed, `muted` = the half-duplex gate holds the mic while she speaks,
+`stalled` = no frames within the budget, `released` = the pipeline is closed, `unavailable`
+= capture cannot open or the speech path is dead (never a calm idle face). `verifying` is
+accepted by the bridge and the shell but emitted by no producer yet — the wake lane will
+use it; its reservation avoids a breaking wire change later. The shell maps `unavailable`
+to a red voice lamp, not amber. |
 | Draft command receipt | `{"t":"draft-command-result","draft_id":"…","status":"accepted\|refused\|unknown"}`. A receipt is not evidence of an effect. Only `draft.resolved` changes the draft's resolution. |
 
 Only the exact event fields above are forwarded. Draft IDs and conversation/time fields
@@ -109,8 +122,9 @@ until reconciled; it never guesses success or issues a send itself.
   pending events can appear in replay. A legacy ack without the replay flag disables
   drafts and their commands. L does not add a second wire, durable queue, or database.
 - Proposed IF-4 producer frames on that same subscriber stream:
-  `{event:"console.state",state:"…"}` and
-  `{event:"capture.levels",raw_peak:n,processed_peak:n,limited_samples:n}`. Peaks are
+  `{event:"console.state",state:"…"}`,
+  `{event:"capture.levels",raw_peak:n,processed_peak:n,limited_samples:n}` and
+  `{event:"capture.state",state:"open|armed|muted|stalled|released|unavailable|verifying"[,reason:"…"]}`. Peaks are
   finite normalized numbers in [0,1]; limited samples is a nonnegative safe integer.
   Legacy unrelated subscription frames are ignored, not passed through to the browser.
 - Proposed `console.command` receives the exact IF-2 envelope at the shared consent/journal

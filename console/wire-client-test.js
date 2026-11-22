@@ -18,6 +18,13 @@ assert.throws(() => consumer.receive(pending), /before handshake/);
 assert.throws(() => consumer.receive({...hello, simulate: true}), /handshake/);
 assert.equal(consumer.receive(hello), true);
 assert.throws(() => consumer.receive({t: 'state', name: 'unknown'}), /Unknown/);
+assert.throws(() => consumer.receive({t: 'capture-state', name: 'unknown'}), /Unknown capture state/);
+assert.throws(() => consumer.receive({t: 'capture-state', name: 'open', reason: 123}), /reason/);
+assert.throws(() => consumer.receive({t: 'capture-state', name: 'open', reason: 'x'.repeat(257)}), /reason/);
+assert.equal(consumer.receive({t: 'capture-state', name: 'open'}), true);
+assert.equal(consumer.receive({t: 'capture-state', name: 'armed', reason: 'hotword armed'}), true);
+assert.equal(consumer.receive({t: 'capture-state', name: 'unavailable', reason: 'capture cannot open'}), true);
+assert.equal(consumer.receive({t: 'capture-state', name: 'verifying'}), true);
 assert.throws(() => consumer.receive({t: 'levels', role:'output', level:.4}), /measured/);
 assert.equal(consumer.receive({t:'levels', role:'input', measured:true, source:'capture.levels',
   level:.4, processed_peak:.4, raw_peak:.8, limited_samples:2}), true);
