@@ -11,17 +11,31 @@ NEVER grants command authority.** A hit only moves the machine to
 human accept. Fail closed everywhere: missing embedding, missing scorer,
 missing keyword model, stalled capture — none of these lead to listening.
 
+VERIFY THE COMMAND, NEVER THE WAKE WORD (round J, 2026-11-22). Measured on
+the real pinned ECAPA model: a ~0.6 s wake-length window scores 0.341 /
+0.588 for the enrolled speaker (0/12 sliding windows reach 0.75), while a
+2.5 s command window scores 0.793 / 0.842; impostors score 0.043 / 0.013.
+A wake-length window therefore CANNOT be a verification unit.
+
+* The wake hit ANSWERS NOTHING, SAYS NOTHING, VERIFIES NOTHING. It opens
+  the ring and arms the pending window. The scorer runs only on command
+  audio after that window closes, and only if it holds at least
+  `MIN_WINDOW_S` (1.5 s) of command audio. Below that there is **no
+  scoring call at all** — not a low score, no call.
 * High-confidence owner -> ATTENDING -> listening. The dual-use pending
   buffer is INHERITED as the head of the command utterance (the owner never
   repeats themselves).
-* Uncertain / non-owner / no embedding -> a `wake` knock on the existing
-  knock system, with a citable reason ("phrase 'Elaria' detected, voice
-  confidence 0.61"). It is an EVENT REPORT — the anti-psychosis clause
-  applies in full; there is no simulated emotion anywhere in this file.
-  Accept opens listening (fresh capture; a discarded buffer is never
-  resurrected). Decline/ignore returns to sleep. In class mode an accept
-  opens the CONSOLE, not PTT. Guest conversation is NEVER opened on this
-  path — show-off mode stays the only guest door.
+* Fewer than 1.5 s of command audio -> SILENT DISCARD and idle. Nothing is
+  scored, and nothing opens the microphone: a window too short to verify is
+  too short to listen on.
+* Uncertain / non-owner / no embedding on a REAL command window -> SILENT
+  DISCARD. No knock, no reply, no acknowledgement, no speech of any kind;
+  the pending buffer is zeroed, one metadata-only record is written, and
+  the machine returns to idle. This is a security rule: an impostor must
+  not be able to tell they were heard. `ecapa_uncertain` is a reporting
+  band only — anything below `ecapa_high` is NO authority.
+* Replayed / recorded / non-live windows (the `showoff.py` BH-H15 rule)
+  are rejected exactly like an impostor: silence, no knock, buffer zeroed.
 * Acoustic arming REFUSES without a real keyword model (.onnx). The
   `--unsafe-energy-test` flag exists for plumbing tests only and can never
   open command listening.
@@ -38,7 +52,9 @@ failed-verify audio is never saved unless the explicit debug flag is set.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -70,18 +86,33 @@ CONF_HIGH = "high"
 CONF_UNCERTAIN = "uncertain"
 CONF_NONE = "none"
 
-STAGE_WAKE_PLUS_POST = "wake_plus_post"
-STAGE_WAKE_ONLY = "wake_only_fallback"
+# Stage B input. Round J: the ONLY verified input is COMMAND audio captured
+# after the wake hit. A wake-length clip is never scored (`wake_too_short`).
+STAGE_COMMAND = "command_window"        # >= 1.5 s of post-wake command audio
+STAGE_UNVERIFIED = "wake_too_short"     # < 1.5 s: NO scoring call was made
+STAGE_REJECTED = "replay_refused"       # replayed / recorded / non-live
 
 DISP_INHERITED = "inherited"
 DISP_DISCARDED = "discarded"
-DISP_AWAITING = "awaiting_command"
 
 OUTCOME_ATTENDING = "attending"
 OUTCOME_WAKE_KNOCK = "wake_knock"
+OUTCOME_DISCARDED = "discarded"
 OUTCOME_IGNORED = "ignored"
 OUTCOME_REFUSED_ENERGY = "refused_energy_test"
 OUTCOME_STALLED = "stalled"
+
+# Round J defect 1: the minimum command window that may be scored at all.
+# 1.5 s is the measured floor at which the owner's post-wake command audio
+# separates from impostors on the real model — below it, do not call the
+# scorer (a wake-length window is a guess dressed as a number).
+MIN_WINDOW_S = 1.5
+
+# Round J defect 3: the BH-H15 replay rule, applied to the closed command
+# window. `showoff.py` refuses `source != mic` / `live_mic=False` /
+# `replayed=True` / a previously accepted `audio_sha256`; WakeGuard refuses
+# the same window here before any scoring call.
+LIVE_SOURCES = frozenset({"mic", "pipewire", "live"})
 
 TRIGGER_EVENT = "wake_trigger"
 
@@ -176,7 +207,14 @@ class EnergyTestModel:
 
 # -- authority gate --------------------------------------------------------
 class AuthorityGate:
-    """confidence: high | uncertain | none. Only high + verified may attend."""
+    """confidence: high | uncertain | none. Only high + verified may attend.
+
+    Round J defect 4: `uncertain` is a REPORTING band, never a permission.
+    The two thresholds keep their meanings (`ecapa_high` = authority,
+    `ecapa_uncertain` = the lower edge of the ambiguous band) and neither is
+    lowered here. `may_attend()` is the only authority question the guard
+    asks, and it answers True for exactly one band.
+    """
 
     def __init__(self, high: float = 0.75, uncertain: float = 0.5):
         self.high = float(high)
@@ -190,6 +228,104 @@ class AuthorityGate:
         if score >= self.uncertain:
             return CONF_UNCERTAIN
         return CONF_NONE
+
+    def may_attend(self, score: float | None, *, verified: bool) -> bool:
+        """True iff this is authority. Ambiguity is not a weak yes."""
+        return self.evaluate(score, verified=verified) == CONF_HIGH
+
+
+# -- replay guard (BH-H15, applied to the wake path) -----------------------
+class ReplayGuard:
+    """The `showoff.py` BH-H15 rule for the closed command window.
+
+    A window is live only if the capture stack says so (`source` in
+    `mic`/`pipewire`/`live`, `live_mic=True`, `replayed=False`) AND its exact
+    bytes have not already been accepted as a live command window. Both
+    checks are cheap and deterministic; the store-backed variant
+    (`set_state`/`get_state`) survives a daemon restart.
+
+    A replay is not an error and not a knock: it is silence, exactly like an
+    impostor (defect 3).
+    """
+
+    STATE_KEY = "wake_guard.accepted_window_hashes"
+
+    def __init__(self, store=None, *, keep: int = 100):
+        self.store = store
+        self.keep = int(keep)
+
+    @staticmethod
+    def window_hash(pcm: bytes) -> str:
+        return hashlib.sha256(bytes(pcm or b"")).hexdigest()
+
+    def _accepted(self) -> list[str]:
+        if self.store is None:
+            return getattr(self, "_memory", [])
+        raw = self.store.get_state(self.STATE_KEY) or "[]"
+        try:
+            values = json.loads(raw)
+        except ValueError:
+            return []
+        return [v for v in values if isinstance(v, str)] if isinstance(values, list) else []
+
+    def _remember(self, digest: str) -> None:
+        values = (self._accepted() + [digest])[-self.keep:]
+        if self.store is None:
+            self._memory = values
+            return
+        self.store.set_state(self.STATE_KEY, json.dumps(values))
+
+    def refusal(self, pcm: bytes, *, source: str = "mic",
+                replayed: bool = False, live_mic: bool = True,
+                audio_sha256: str | None = None) -> str | None:
+        """`None` = live and fresh; otherwise the refusal reason (metadata only)."""
+        src = str(source or "").strip().lower()
+        if replayed or not live_mic or src not in LIVE_SOURCES:
+            return (f"recorded or replayed audio rejected (source={src!r}, "
+                    f"live_mic={live_mic}, replayed={replayed})")
+        digest = str(audio_sha256 or "").strip() or self.window_hash(pcm)
+        if digest in self._accepted():
+            return "replayed audio clip detected — a used window is not fresh speech"
+        return None
+
+    def remember(self, pcm: bytes, *, audio_sha256: str | None = None) -> str:
+        """Record a window as accepted-live. Returns the digest used."""
+        digest = str(audio_sha256 or "").strip() or self.window_hash(pcm)
+        self._remember(digest)
+        return digest
+
+
+class OutboundSink:
+    """Every user-visible emission point for a wake decision, in one object.
+
+    The guard's silence contract (defect 2) is only checkable if there is one
+    place to look: a reply, an acknowledgement, speech and the knock all
+    arrive here. Nothing in `verify()`/`_settle()` writes to it on any
+    outcome — the only writer is `_raise_wake_knock`, the owner-prompt path —
+    so a test can assert that an unrecognised voice leaves it empty.
+    """
+
+    def __init__(self):
+        self.events: list[tuple[str, dict]] = []
+
+    def reply(self, text: str, **meta) -> None:
+        self.events.append(("reply", {"text": text, **meta}))
+
+    def ack(self, text: str = "", **meta) -> None:
+        self.events.append(("ack", {"text": text, **meta}))
+
+    def speak(self, text: str, **meta) -> None:
+        self.events.append(("speech", {"text": text, **meta}))
+
+    def knock(self, **meta) -> None:
+        self.events.append(("knock", dict(meta)))
+
+    def bytes_out(self) -> int:
+        """Bytes a real speaker/console would have produced. Zero or bust."""
+        return sum(len(str(payload.get("text", ""))) for _, payload in self.events)
+
+    def __len__(self) -> int:
+        return len(self.events)
 
 
 # -- watchdog --------------------------------------------------------------
@@ -343,7 +479,13 @@ class PrefilledSource:
 
 @dataclass
 class TriggerRecord:
-    """Metadata only. This is the whole log — no audio, ever."""
+    """Metadata only. This is the whole log — no audio, ever.
+
+    Round J defect 2: a discarded window's ECAPA score stays on the record
+    object for an operator/debugger, but is NOT in `as_dict()` — the copy
+    that reaches `status()`, the console or any user-visible channel carries
+    no score for a security-silent decision.
+    """
 
     ts: str
     keyword_score: float
@@ -351,18 +493,22 @@ class TriggerRecord:
     confidence: str
     outcome: str
     knock_id: int | None = None
-    stage_b_input: str = STAGE_WAKE_ONLY
+    stage_b_input: str = STAGE_UNVERIFIED
     pending_speech_s: float = 0.0
     pending_disposition: str = DISP_DISCARDED
     clip_saved: bool = False
     unsafe_energy: bool = False
     phrase: str = "Elaria"
 
+    @property
+    def discarded(self) -> bool:
+        return self.outcome in (OUTCOME_DISCARDED, OUTCOME_IGNORED)
+
     def as_dict(self) -> dict:
         return {
             "ts": self.ts,
             "keyword_score": round(float(self.keyword_score), 4),
-            "ecapa_score": (None if self.ecapa_score is None
+            "ecapa_score": (None if self.discarded or self.ecapa_score is None
                             else round(float(self.ecapa_score), 4)),
             "confidence": self.confidence,
             "outcome": self.outcome,
@@ -429,8 +575,14 @@ def _runtime_core_limit() -> str:
 # -- the guard -------------------------------------------------------------
 @dataclass
 class WakeGuard:
-    """Wake-knock state machine. Frames in, decisions out, nothing persisted
-    but trigger metadata."""
+    """Wake-authority state machine. Frames in, decisions out, nothing
+    persisted but trigger metadata.
+
+    Round J: a hit grants nothing and answers nothing; authority comes only
+    from a command window of >= 1.5 s that scores >= `ecapa_high` on the
+    real scorer. Below that, or replayed, or unscoreable: silence, zeroized
+    buffers, one metadata record, back to idle.
+    """
 
     settings: dict = field(default_factory=dict)
     store: object = None
@@ -461,9 +613,17 @@ class WakeGuard:
         self.gate = AuthorityGate(
             high=float(s.get("ecapa_high", 0.75)),
             uncertain=float(s.get("ecapa_uncertain", 0.5)))
+        # Round J defect 1: `[hotword] pending_speech_threshold_s` no longer
+        # selects a wake-audio verification stage; it only labels a short
+        # command window (`pending_speech_s`) in the record. The hard floor
+        # for ANY scoring call is MIN_WINDOW_S, in code, not in config.
         self.speechful_s = float(s.get("pending_speech_threshold_s", 0.5))
         self.speech_rms = float(s.get("speech_rms", 0.01))
         self.stall_timeout_s = float(s.get("stall_timeout_s", 2.0))
+        # Round J defect 2: `[hotword] missing_embedding_action` used to be
+        # able to raise a knock for an unrecognised voice. There is no
+        # configuration that makes an impostor audible: the key is accepted
+        # for config compatibility and never acts.
         self.missing_embedding_action = str(
             s.get("missing_embedding_action", "wake_knock"))
         self.clips = WakeClipStore(
@@ -483,6 +643,14 @@ class WakeGuard:
         self._hit: dict = {}
         self._wake_clip: bytes = b""
         self._session_head: bytes = b""
+        self._replay_guard = ReplayGuard(
+            self.store if hasattr(self.store, "get_state")
+            and hasattr(self.store, "set_state") else None)
+        # Round J: silence for anything the guard decides not to answer.
+        # Tests and the daemon may inject a recorder here; production never
+        # writes to it, so every sentence below is a statement about the
+        # code path, not about a mock.
+        self.outbound = OutboundSink()
 
     # -- arming ------------------------------------------------------------
     def arm(self, *, unsafe_energy_test: bool = False,
@@ -534,14 +702,32 @@ class WakeGuard:
     def feed(self, frame: bytes, *, now: float | None = None) -> dict | None:
         """One always-on frame through ring, watchdog and the keyword model.
 
-        Returns the outcome dict when a hit was triggered and verified, else
-        None. The keyword model is consulted only while armed.
+        A hit only OPENS the ring and arms the pending window (defect 1): the
+        scorer is never consulted here — not on the frame, not on the wake
+        clip, not on the trailing keyword window. After a hit, frames
+        accumulate into the pending window; when it fills (2–3 s) the command
+        window closes and is verified. A hit whose stream ends first closes
+        at whatever `verify()` finds, and a short window is never scored.
+
+        The keyword model is consulted only while armed and never raises into
+        the capture loop: a broken spotter is an honest no-hit.
         """
         self.note_frame(frame, now)
         if not self.armed or self.keyword_model is None:
             return None
+        if self.state in (ATTENDING, LISTENING, ENDPOINTING):
+            # The window is closed for good; a second hit may not reopen it
+            # while listening is on offer.
+            return None
+        if self.state in (TRIGGERED, VERIFYING):
+            if self.pending.full:
+                return self.verify()
+            return None
         window = self.ring.snapshot()[-self.keyword_window_bytes:] or frame
-        score = float(self.keyword_model.score_window(window))
+        try:
+            score = float(self.keyword_model.score_window(window))
+        except Exception:
+            return None
         if isinstance(self.keyword_model, EnergyTestModel):
             threshold = getattr(self.keyword_model, "threshold", 0.05)
         else:
@@ -551,13 +737,21 @@ class WakeGuard:
         self.trigger(keyword_score=score,
                      unsafe_energy=isinstance(self.keyword_model,
                                               EnergyTestModel))
-        return self.verify()
+        if self.pending.full:
+            return self.verify()
+        return None
 
     # -- state machine -----------------------------------------------------
     def trigger(self, *, keyword_score: float,
                 wake_clip: bytes | None = None,
                 unsafe_energy: bool = False) -> str:
-        """Hit -> `triggered`. Still NO authority of any kind."""
+        """Hit -> `triggered`. Still NO authority of any kind.
+
+        Opens the ring and arms the pending window. It answers nothing, says
+        nothing and verifies nothing. `wake_clip` is retained only so the
+        existing call surface keeps working — no code path below ever scores
+        it (defect 1).
+        """
         if self.state in (TRIGGERED, VERIFYING):
             raise WakeGuardError(f"already {self.state}")
         self.state = TRIGGERED
@@ -570,8 +764,27 @@ class WakeGuard:
         self.pending = PendingWindow(self.pending.seconds)
         return self.state
 
-    def verify(self) -> dict:
-        """Stage B on wake clip + pending buffer. Runs BEFORE any routing."""
+    def verify(self, *, source: str = "mic", replayed: bool = False,
+               live_mic: bool = True,
+               audio_sha256: str | None = None) -> dict:
+        """Verify the COMMAND window. Runs BEFORE any routing.
+
+        Round J contract, in order:
+
+        1. The wake clip is never scored (defect 1): the scorer sees the
+           command window only, exactly as it was captured.
+        2. A replayed / recorded / non-live window is a silent discard,
+           exactly like an impostor (defect 3) — checked before any scoring
+           call is even considered.
+        3. Fewer than `MIN_WINDOW_S` (1.5 s) of command audio: **no scoring
+           call at all**. Not a low score — no call. And no listening either:
+           a window too short to verify is too short to open the microphone
+           for, so this is a silent discard, not an invitation.
+        4. Otherwise the scorer sees the command audio. `ecapa_high` grants
+           ATTENDING; anything below it — including the `uncertain` band — is
+           a silent discard (defects 2 and 4): no knock, no reply, no ack, no
+           speech, pending buffer zeroed, one metadata record.
+        """
         if self.state not in (TRIGGERED, VERIFYING):
             raise WakeGuardError(f"cannot verify from state {self.state!r}")
         self.state = VERIFYING
@@ -579,55 +792,105 @@ class WakeGuard:
         pending_pcm = self.pending.data()
         pending_speech_s = speech_seconds(pending_pcm,
                                           speech_rms=self.speech_rms)
-        use_post = pending_speech_s >= self.speechful_s
-        stage = STAGE_WAKE_PLUS_POST if use_post else STAGE_WAKE_ONLY
-        stage_pcm = (self._wake_clip + pending_pcm) if use_post else self._wake_clip
-
-        scorer = self.scorer
-        score = None
-        verified = False
-        if scorer is not None and scorer.available():
-            score = scorer.score_owner(stage_pcm)
-            verified = score is not None
-
-        confidence = self.gate.evaluate(score, verified=verified)
         unsafe = bool(self._hit.get("unsafe_energy"))
-        knock_id = None
+        score: float | None = None
+
+        # -- defect 3: BH-H15 replay rule, before any scoring call ----------
+        refusal = self._replay_guard.refusal(
+            pending_pcm, source=source, replayed=replayed, live_mic=live_mic,
+            audio_sha256=audio_sha256)
+        if refusal is not None:
+            return self._settle(
+                confidence=CONF_NONE, score=None, stage=STAGE_REJECTED,
+                pending_speech_s=pending_speech_s, unsafe=unsafe,
+                outcome=OUTCOME_DISCARDED, detail=refusal)
+
+        # -- defect 1: the minimum window is a hard floor -------------------
+        if len(pending_pcm) < bytes_for(MIN_WINDOW_S):
+            return self._settle(
+                confidence=CONF_NONE, score=None, stage=STAGE_UNVERIFIED,
+                pending_speech_s=pending_speech_s, unsafe=unsafe,
+                outcome=(OUTCOME_REFUSED_ENERGY if unsafe
+                         else OUTCOME_DISCARDED),
+                detail="no command window: nothing was scored")
+
+        # -- the one verification: command audio, never the wake word -------
+        scout = self.scorer
+        try:
+            available = bool(scout is not None and scout.available())
+        except Exception:
+            available = False
+        if available:
+            try:
+                value = scout.score_owner(pending_pcm)
+            except Exception:
+                value = None
+            if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(float(value))):
+                score = float(value)
+        verified = score is not None
+        confidence = self.gate.evaluate(score, verified=verified)
+
+        if unsafe:
+            # The plumbing flag may score, but it can never open listening.
+            return self._settle(
+                confidence=confidence, score=score, stage=STAGE_COMMAND,
+                pending_speech_s=pending_speech_s, unsafe=True,
+                outcome=OUTCOME_REFUSED_ENERGY,
+                detail="energy trigger: ceiling is console, never voice")
+
+        # -- authority is CONF_HIGH only; uncertain is NOT a weak yes -------
+        if self.gate.may_attend(score, verified=verified):
+            self._replay_guard.remember(pending_pcm, audio_sha256=audio_sha256)
+            self.attending_detail = ATTEND_INHERIT
+            self._session_head = pending_pcm
+            return self._settle(
+                confidence=confidence, score=score, stage=STAGE_COMMAND,
+                pending_speech_s=pending_speech_s, unsafe=False,
+                outcome=OUTCOME_ATTENDING,
+                detail="owner verified on the command window")
+
+        # -- defects 2 + 4: an unrecognised voice gets silence --------------
+        return self._settle(
+            confidence=confidence, score=score, stage=STAGE_COMMAND,
+            pending_speech_s=pending_speech_s, unsafe=False,
+            outcome=OUTCOME_DISCARDED, detail="not the owner: discarded silently")
+
+    def _settle(self, *, confidence: str, score: float | None, stage: str,
+                pending_speech_s: float, unsafe: bool, outcome: str,
+                detail: str) -> dict:
+        """One exit path: decide, zero, record metadata, answer nothing.
+
+        Every branch of `verify()` lands here, so the silence contract lives
+        in one place. Only `OUTCOME_ATTENDING` keeps audio (`_session_head`,
+        and an opt-in wake clip for the owner's own verified speech); every
+        other outcome zeroes the pending buffer and the wake clip, and emits
+        **nothing** — no knock, no reply, no acknowledgement, no speech. The
+        knock (`_raise_wake_knock`) is an owner-authentication prompt and has
+        no call site from an unrecognised voice (defect 2).
+        """
         clip_path = None
-
-        if confidence == CONF_HIGH and not unsafe:
-            disposition = DISP_INHERITED if use_post else DISP_AWAITING
-            self.attending_detail = (ATTEND_INHERIT if use_post else ATTEND_AWAIT)
-            self._session_head = pending_pcm if use_post else b""
+        if outcome == OUTCOME_ATTENDING:
             self.state = ATTENDING
-            outcome = OUTCOME_ATTENDING
-        elif confidence == CONF_HIGH and unsafe:
-            # Plumbing saw a high score; authority still refuses. Energy
-            # triggers can never open command listening.
-            disposition = DISP_DISCARDED
-            self.pending.zero()
+            self.attending_detail = ATTEND_INHERIT
+            if self.clips.may_save(verified=True):
+                clip_path = self.clips.save(self._session_head, verified=True)
+        elif outcome == OUTCOME_REFUSED_ENERGY:
             self.state = CLOSED
-            outcome = OUTCOME_REFUSED_ENERGY
-        else:
-            # Uncertain / non-owner / no embedding. Fail closed: the pending
-            # buffer is DISCARDED untranscribed — no ASR, no ledger, no
-            # transcript row, ever.
-            disposition = DISP_DISCARDED
+            self.attending_detail = None
             self.pending.zero()
-            pending_pcm = b""
+            self._wake_clip = b""
             self._session_head = b""
-            self.state = WAKE_KNOCK
-            outcome = OUTCOME_WAKE_KNOCK
-            if confidence == CONF_NONE and not verified and \
-                    self.missing_embedding_action == "ignore":
-                self.state = CLOSED
-                outcome = OUTCOME_IGNORED
-            else:
-                knock_id = self._raise_wake_knock(score)
-
-        save_verified = outcome == OUTCOME_ATTENDING
-        if self.clips.may_save(verified=save_verified):
-            clip_path = self.clips.save(stage_pcm, verified=save_verified)
+        else:
+            # Silent discard: zeroize, return to idle, emit metadata only.
+            self.state = IDLE
+            self.attending_detail = None
+            self.session = None
+            self.pending.zero()
+            self._wake_clip = b""
+            self._session_head = b""
+            self._hit = {"keyword_score": self._hit.get("keyword_score", 0.0),
+                         "unsafe_energy": unsafe}
 
         record = TriggerRecord(
             ts=str(self.now()),
@@ -635,25 +898,34 @@ class WakeGuard:
             ecapa_score=score,
             confidence=confidence,
             outcome=outcome,
-            knock_id=knock_id,
+            knock_id=None,
             stage_b_input=stage,
             pending_speech_s=pending_speech_s,
-            pending_disposition=disposition,
+            pending_disposition=(DISP_INHERITED if outcome == OUTCOME_ATTENDING
+                                 else DISP_DISCARDED),
             clip_saved=clip_path is not None,
             unsafe_energy=unsafe,
             phrase=self.phrase)
         self.last_trigger = record
         self._log_trigger(record)
         return {"state": self.state, "attending_detail": self.attending_detail,
-                "trigger": record.as_dict(), "knock_id": knock_id,
-                "head_bytes": len(self._session_head)}
+                "trigger": record.as_dict(), "knock_id": None,
+                "head_bytes": len(self._session_head), "detail": detail}
 
     def _raise_wake_knock(self, score: float | None) -> int | None:
+        """OWNER-AUTHENTICATION PROMPT — never an impostor reply.
+
+        Round J defect 2 removed its only call site: a voice the daemon did
+        not recognise produces silence, never a knock. The method stays for
+        an explicit owner-initiated prompt and records through `outbound`, so
+        a test can prove the unrecognised-voice path never reaches it.
+        """
         if self.initiative is None:
             return None
         confidence_text = ("no voice confidence" if score is None
                            else f"voice confidence {score:.2f}")
         reason = f"phrase {self.phrase!r} detected, {confidence_text}"
+        self.outbound.knock(reason=reason)
         try:
             knock = self.initiative.raise_knock(
                 topic=f"wake phrase {self.phrase!r}",
@@ -715,6 +987,8 @@ class WakeGuard:
         self._zero_buffers()
         return {"state": self.state, "action": action, "knock_id": knock_id}
 
+
+
     def open_listening(self, *, knock_id: int | None = None,
                        fresh: bool = False) -> dict:
         """Direct (attending) path into listening.
@@ -761,6 +1035,7 @@ class WakeGuard:
         # A fresh capture after an accept: the discarded buffer is gone for
         # good — never resurrected.
         self._session_head = b""
+        self._wake_clip = b""
         return {"open": "listening", "knock_id": knock_id,
                 "session_id": self.session.session_id,
                 "head_bytes": len(self.session.head),
@@ -816,6 +1091,12 @@ class WakeGuard:
             "armed_with": self.armed_with,
             "state": self.state,
             "attending_detail": self.attending_detail,
+            # Round J: the two numbers that make the silence contract
+            # checkable from outside — no score below ecapa_high, and no
+            # scoring call at all for a window under 1.5 s.
+            "min_window_s": MIN_WINDOW_S,
+            "ecapa_high": self.gate.high,
+            "ecapa_uncertain": self.gate.uncertain,
             "ring": {
                 "capacity_s": round(self.ring.seconds, 3),
                 "residence_s": round(self.ring.residence_s(), 3),
