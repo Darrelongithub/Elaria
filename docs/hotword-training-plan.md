@@ -139,10 +139,16 @@ one. The bars below are unchanged; only the input they are measured on is.
 | Owner, arm/across/noise | **≥ 90%** |
 | Non-owner (other speakers) | **≥ 95% reject** |
 
-Cohorts are measured on **command windows ≥ 1.5 s** (the in-code floor
-`MIN_WINDOW_S`, `wake_guard.py` — not a config value). Below 1.5 s there is
+Cohorts are measured on **command windows ≥ 1.75 s** (the in-code floor
+`MIN_WINDOW_S`, `wake_guard.py` — not a config value). Below 1.75 s there is
 **no scoring call at all**, so a short window can neither pass nor fail: it
 does not enter the cohort, and it opens nothing.
+
+The floor is measured, not chosen: at the pinned model's post-wake windows
+the held-out owner utterance reaches +0.05 of margin over `ecapa_high` at
+~1.56 s, but only at 1.75 s does every owner window in a 0.1 s sliding sweep
+clear 0.75 (at 1.50–1.70 s, 1–2 of the 5–11 windows fall to 0.736–0.744).
+Impostors stay ≤ 0.166 at every duration from 0.6 s to 2.0 s.
 
 ### Stage C (gate behaviour)
 

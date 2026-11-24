@@ -401,7 +401,7 @@ def test_endpointing_shares_the_one_silence_ladder(tmp_path):
 
 
 def test_short_windows_never_reach_the_scorer(tmp_path):
-    """Round J defect 1: below 1.5 s there is NO scoring call at all."""
+    """Round J defect 1: below `MIN_WINDOW_S` there is NO scoring call at all."""
     guard, _store = make_guard(tmp_path, score=0.92)
     guard.trigger(keyword_score=0.9, wake_clip=pcm(0.6))
     for frame in frames(1.0, amp=0):     # 1.0 s of post-wake silence
@@ -542,7 +542,9 @@ def test_hotword_status_surface_has_every_documented_field(tmp_path):
 
     assert status["armed"] is False
     assert status["state"] == wg.IDLE
-    assert status["min_window_s"] == 1.5
+    assert status["min_window_s"] == 1.75
+    assert status["window_close_s"] == 2.5
+    assert 0.0 <= status["window_elapsed_s"] <= 2.5
     assert status["ecapa_high"] == 0.75 and status["ecapa_uncertain"] == 0.5
     assert set(status["ring"]) == {"capacity_s", "residence_s", "path"}
     assert status["ring"]["path"] is None

@@ -263,7 +263,7 @@ def test_j_one_second_window_is_never_scored_at_all(
         scored = guard.verify()
         assert counting.calls == [len(post)]
         assert scored["trigger"]["stage_b_input"] == STAGE_COMMAND
-        assert MIN_WINDOW_S == 1.5
+        assert MIN_WINDOW_S == 1.75
     finally:
         store.close()
 
@@ -721,3 +721,252 @@ def test_j_clip_save_failure_cannot_leave_audio_resident(
         assert not (tmp_path / "clips2").exists()
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# R3 — the duration sweep, and the window-close TIMER
+# ---------------------------------------------------------------------------
+BYTES_1P75S = bytes_for(1.75)
+
+# The sweep durations from the round-3 order, plus the 1.56/1.75 boundary
+# points where the held-out utterance crosses +0.05 of margin.
+SWEEP_S = (0.6, 0.8, 1.0, 1.25, 1.5, 1.75, 2.0)
+
+
+@pytest.fixture(scope="module")
+def sweep_scorer(enrolled_owner_centroid: list[float]) -> EcapaCommandScorer:
+    return EcapaCommandScorer("onnx", reference=enrolled_owner_centroid)
+
+
+def _post_wake_window(pcm: bytes, duration: float) -> bytes | None:
+    """The bytes `verify()` would score: the clip from 0.6 s, `duration` long."""
+    start = BYTES_0P6S
+    end = start + bytes_for(duration)
+    return pcm[start:end] if end <= len(pcm) else None
+
+
+def _measure_sweep(scorer: EcapaCommandScorer,
+                   clips: dict[str, bytes]) -> dict:
+    """Score every owner/impostor clip at every sweep duration, post-wake."""
+    owner_clips = ("spk1_snt4", "spk1_snt5")
+    impostor_clips = ("diff_example1", "spk2_snt1", "spk2_snt2")
+    report: dict = {"per_clip": {}, "owner_post_wake": {}, "impostor_post_wake": {}}
+    for name, pcm in clips.items():
+        per_duration = {}
+        for duration in SWEEP_S:
+            window = _post_wake_window(pcm, duration)
+            if window is None:
+                continue
+            value = scorer.score_owner(window)
+            assert value is not None, scorer.last_error
+            per_duration[f"{duration:.2f}"] = value
+        report["per_clip"][name] = per_duration
+    for duration in SWEEP_S:
+        key = f"{duration:.2f}"
+        report["owner_post_wake"][key] = [
+            report["per_clip"][name][key] for name in owner_clips
+            if key in report["per_clip"][name]]
+        report["impostor_post_wake"][key] = [
+            report["per_clip"][name][key] for name in impostor_clips
+            if key in report["per_clip"][name]]
+    return report
+
+
+def _measure_sliding(scorer: EcapaCommandScorer,
+                     clips: dict[str, bytes], *,
+                     duration: float, step_s: float = 0.1) -> dict:
+    """Score every 0.1 s window of `duration` that starts after the wake word."""
+    report: dict = {}
+    for name, pcm in clips.items():
+        values = []
+        step = 0
+        while True:
+            start = BYTES_0P6S + bytes_for(step * step_s)
+            window = pcm[start:start + bytes_for(duration)]
+            if len(window) < bytes_for(duration):
+                break
+            value = scorer.score_owner(window)
+            assert value is not None, scorer.last_error
+            values.append(value)
+            step += 1
+        report[name] = values
+    return report
+
+
+def test_j_min_window_is_the_measured_sweep_minimum(
+    speech_pcm: dict[str, bytes],
+    sweep_scorer: EcapaCommandScorer,
+):
+    """`MIN_WINDOW_S` = 1.75 s, and here is exactly what that rests on.
+
+    The round-3 order says: the shortest duration that clears 0.75 with
+    >= 0.05 margin on the held-out owner utterance, and < 0.50 on every
+    impostor. Measured post-wake (the bytes `verify()` actually scores):
+
+      * impostors never exceed 0.166 at ANY duration 0.6 -> 2.0 s, so the
+        second half of the criterion holds everywhere;
+      * the held-out utterance (spk1_snt5) reaches +0.05 of margin at 1.56 s
+        on a 0.02 s grid — so the ORDER's literal minimum is ~1.6 s;
+      * but at 1.5 / 1.6 / 1.7 s, one or two of the 5–11 OWNER windows in a
+        0.1 s sliding sweep still land at 0.736–0.744, i.e. below 0.75. A
+        floor that clears the margin only at one fixed offset is not a
+        margin, it is a coincidence of where the utterance was cut.
+      * 1.75 s is the shortest duration at which EVERY owner window measured
+        (both utterances, every 0.1 s start) clears 0.75.
+
+    1.75 s is therefore ABOVE the order's literal minimum, chosen so the
+    claim holds for all window starts rather than one. Moving the floor up
+    refuses more owner audio (the closed direction); it never admits more.
+    """
+    assert MIN_WINDOW_S == 1.75
+
+    sweep = _measure_sweep(sweep_scorer, speech_pcm)
+    held_out = sweep["per_clip"]["spk1_snt5"]
+
+    # Held-out curve: cannot reach the gate at 1.25 s, thin at 1.50 s,
+    # comfortable at 1.75 s.
+    assert held_out["1.25"] < 0.75, held_out
+    assert held_out["1.50"] > 0.75, held_out
+    assert held_out["1.50"] - 0.75 < 0.05, held_out    # why 1.50 is refused
+    assert held_out["1.75"] - 0.75 >= 0.05, held_out   # the floor's own claim
+
+    # Impostors stay far below the uncertain band at every duration.
+    for duration, values in sweep["impostor_post_wake"].items():
+        assert all(v < 0.50 for v in values), (duration, values)
+
+    # The sliding evidence that pushes the floor from ~1.6 s to 1.75 s.
+    for duration, expected_refusals in ((1.6, True), (1.75, False)):
+        sliding = _measure_sliding(sweep_scorer, speech_pcm,
+                                  duration=duration)
+        owner_windows = sliding["spk1_snt4"] + sliding["spk1_snt5"]
+        assert owner_windows, duration
+        short = [v for v in owner_windows if v < 0.75]
+        if expected_refusals:
+            assert short, (
+                f"at {duration}s the sweep is supposed to catch owner "
+                f"windows below 0.75; it caught none — the 1.75 s floor "
+                f"would then need re-justifying from scratch")
+        else:
+            assert not short, (
+                f"at {duration}s every owner window must clear 0.75, "
+                f"found {short}")
+        # Impostors stay low in the sliding sweep too.
+        for values in (sliding[name] for name in
+                       ("diff_example1", "spk2_snt1", "spk2_snt2")):
+            assert all(v < 0.50 for v in values), values
+
+    # A known limitation, asserted so it cannot be quietly forgotten:
+    # spk1_snt4 does NOT reach +0.05 of margin at any duration that fits in
+    # its 1.93 s of post-wake audio. The floor was not tuned to make this
+    # utterance comfortable, and no test pretends it is.
+    assert sweep["per_clip"]["spk1_snt4"]["1.75"] - 0.75 < 0.05
+    assert sweep["per_clip"]["spk1_snt4"]["1.75"] > 0.75
+
+
+def test_j_a_command_window_shorter_than_the_floor_is_never_scored(
+    tmp_path: Path,
+    speech_pcm: dict[str, bytes],
+    owner_scorer: EcapaCommandScorer,
+):
+    """1.60 s of the owner's own command audio: still no scorer call.
+
+    This is the sweep's "thin margin" row (0.7812 / 0.8083 — it PASSES 0.75
+    at 1.60 s). The floor is not 1.60 s because a window that passes with
+    +0.03 of margin is a coin flip on the next utterance, so 1.60 s is
+    refused *before* scoring and never gets the chance.
+    """
+    counting = _CountingScorer(owner_scorer)
+    guard, store, _initiative = make_guard(tmp_path, counting)
+    try:
+        post = speech_pcm["spk1_snt4"][BYTES_0P6S:BYTES_0P6S + bytes_for(1.60)]
+        assert len(post) < BYTES_1P75S
+        guard.trigger(keyword_score=0.92,
+                      wake_clip=speech_pcm["spk1_snt4"][:BYTES_0P6S])
+        feed(guard, post)
+        outcome = guard.verify()
+        assert counting.calls == [], "below the floor there is no call at all"
+        assert outcome["trigger"]["stage_b_input"] == STAGE_UNVERIFIED
+        assert outcome["trigger"]["ecapa_score"] is None
+        assert outcome["state"] == IDLE
+        assert outcome["head_bytes"] == 0
+    finally:
+        store.close()
+
+
+def test_j_the_floor_window_itself_is_scored_and_the_owner_attends(
+    tmp_path: Path,
+    speech_pcm: dict[str, bytes],
+    owner_scorer: EcapaCommandScorer,
+):
+    """Exactly `MIN_WINDOW_S` bytes: scored once, owner ATTENDS.
+
+    The boundary belongs to the owner, not to the refusal: `>= MIN_WINDOW_S`
+    is scoreable, and the sweep says that window scores 0.8282 on the
+    held-out utterance.
+    """
+    counting = _CountingScorer(owner_scorer)
+    guard, store, _initiative = make_guard(tmp_path, counting)
+    try:
+        post = speech_pcm["spk1_snt5"][BYTES_0P6S:BYTES_0P6S + BYTES_1P75S]
+        assert len(post) == BYTES_1P75S
+        guard.trigger(keyword_score=0.92,
+                      wake_clip=speech_pcm["spk1_snt5"][:BYTES_0P6S])
+        feed(guard, post)
+        outcome = guard.verify()
+        assert counting.calls == [BYTES_1P75S]
+        assert outcome["trigger"]["stage_b_input"] == STAGE_COMMAND
+        assert outcome["trigger"]["ecapa_score"] >= 0.75
+        assert outcome["trigger"]["confidence"] == CONF_HIGH
+        assert outcome["state"] == ATTENDING
+        assert outcome["head_bytes"] == BYTES_1P75S
+    finally:
+        store.close()
+
+
+def test_j_window_close_is_a_named_audio_time_condition():
+    """The command window closes on elapsed AUDIO, via one named predicate.
+
+    What this pins, and what it deliberately does not:
+
+    * `window_due()` is False at 2.49 s of command audio and True at 2.50 s,
+      and it is never True on an un-armed guard. It is a property of the
+      window's own clock, not of the capture's frame timing.
+    * The frame that trips the timer is the frame that closes the window, and
+      it is INCLUDED in the scored audio — no audio is dropped at the close
+      and none is collected after it.
+    * It does NOT claim to change behaviour: with `window_close_s` equal to
+      `pending.seconds` (the shipped config), elapsed audio and buffer bytes
+      are the same quantity, so the timer and `pending.full` agree by
+      construction. The value is that the close is now one explicit, testable
+      condition with its own constant instead of an emergent property of the
+      buffer's rounding.
+    """
+    guard = WakeGuard(settings={"pending_window_s": 2.5,
+                                "ring_window_s": 2.0,
+                                "keyword_window_s": 1.0})
+    guard.trigger(keyword_score=0.9)
+    frame = b"\x01\x00" * 160                      # 10 ms @ 16 kHz s16le
+
+    for _ in range(249):                            # 2.49 s
+        guard.note_frame(frame)
+    assert guard.window_due() is False, "2.49 s is before the close"
+
+    guard.note_frame(frame)                         # 2.50 s
+    assert guard.window_due() is True
+    # ... and the buffer agrees, for the reason stated above.
+    assert guard.pending.used_s() >= 2.5
+
+    # An un-armed guard never reports a due window, however much audio it sees.
+    idle = WakeGuard(settings={"pending_window_s": 2.5})
+    for _ in range(400):
+        idle.note_frame(frame)
+    assert idle.window_due() is False
+
+    # The clock is audio time and resets with the hit, so a second hit starts
+    # a fresh 2.5 s window instead of inheriting the first one's age.
+    guard.state = "closed"
+    guard._zero_buffers()
+    guard.trigger(keyword_score=0.9)
+    assert guard._window_elapsed_s == 0.0
+    guard.note_frame(frame)
+    assert guard.window_due() is False
