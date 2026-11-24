@@ -35,12 +35,20 @@ class _FixedScorer:
 
 
 def _pending_wake_knock(daemon, *, trigger_score: float = 0.55) -> int:
+    """Set up a pending OWNER-authentication wake-knock.
+
+    Round J: an unrecognised voice no longer raises a wake-knock (silence
+    instead), so the knock is raised through its own owner-prompt door. The
+    I5 property under test — a caller-supplied score is never authority — is
+    unchanged.
+    """
     daemon.wake_guard.scorer = _FixedScorer(trigger_score)
-    daemon.wake_guard.trigger(keyword_score=0.9)
-    outcome = daemon.wake_guard.verify()
-    assert outcome["state"] == "wake_knock"
-    assert outcome["knock_id"] is not None
-    return outcome["knock_id"]
+    knock = daemon.initiative.raise_knock(
+        topic="wake phrase 'Elaria'",
+        reason="phrase 'Elaria' detected, voice confidence unavailable",
+        kind="wake")
+    daemon.wake_guard.state = "wake_knock"
+    return int(knock["id"])
 
 
 def _activate_showoff_for_test(daemon) -> None:

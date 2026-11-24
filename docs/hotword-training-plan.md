@@ -119,7 +119,19 @@ available (their speech must never trigger — record it under
 | Recall, noisy (tv_on, kitchen, music) | **≥ 60%** | |
 | Near-word false accept rate | **≤ 5%** | |
 
-### Stage B (wake-clip + pending buffer as the primary input)
+### Stage B (the COMMAND window as the primary input — round J, 2026-11-22)
+
+**Verify the command, never the wake word.** Measured on the pinned model
+(`voxceleb_ECAPA512_LM.onnx`, real 16 kHz corpus in
+`models/ecapa_eval_samples.npz`):
+
+| Window | Enrolled owner | Impostor |
+|---|---|---|
+| 0.6 s (wake length) | 0.341 / 0.588; **0/12** sliding windows reach 0.75 | 0.043 / 0.013 |
+| 2.5 s (command length) | 0.793 / 0.842 | 0.043 / 0.013 |
+
+A wake-length window is not a verification unit, so Stage B does not accept
+one. The bars below are unchanged; only the input they are measured on is.
 
 | Cohort | Bar |
 |---|---|
@@ -127,17 +139,34 @@ available (their speech must never trigger — record it under
 | Owner, arm/across/noise | **≥ 90%** |
 | Non-owner (other speakers) | **≥ 95% reject** |
 
-Wake+post and wake-only cohorts are reported **SEPARATELY** — the dual-use
-pending buffer inherits speechful post-trigger audio when there is any, and
-the insufficient-speech branch scores the wake clip alone. A single blended
-number hides which branch is failing.
+Cohorts are measured on **command windows ≥ 1.75 s** (the in-code floor
+`MIN_WINDOW_S`, `wake_guard.py` — not a config value). Below 1.75 s there is
+**no scoring call at all**, so a short window can neither pass nor fail: it
+does not enter the cohort, and it opens nothing.
+
+The floor is measured, not chosen: at the pinned model's post-wake windows
+the held-out owner utterance reaches +0.05 of margin over `ecapa_high` at
+~1.56 s, but only at 1.75 s does every owner window in a 0.1 s sliding sweep
+clear 0.75 (at 1.50–1.70 s, 1–2 of the 5–11 windows fall to 0.736–0.744).
+Impostors stay ≤ 0.166 at every duration from 0.6 s to 2.0 s.
 
 ### Stage C (gate behaviour)
 
-* high-confidence owner → ATTENDING → listening;
-* anything else → wake-knock (accept opens listening; decline/ignore sleeps);
+* high-confidence owner (≥ `ecapa_high` 0.75) on a command window →
+  ATTENDING → listening, with the command window inherited as the head;
+* anything below `ecapa_high` — including the `uncertain` band 0.50–0.75 —
+  → **silent discard**: no knock, no reply, no acknowledgement, no speech,
+  pending buffer zeroed, one metadata-only record, back to idle. The
+  ambiguous band is never permissive, and neither threshold is lowered by
+  data from this corpus (impostors at 0.04 would "justify" 0.55, and that
+  change opens the microphone: forbidden);
+* replayed / recorded / non-live windows → the `showoff.py` BH-H15 rule,
+  i.e. the same silent discard;
+* the wake-knock remains for an **owner-authentication prompt** only; an
+  unrecognised voice never raises one, so an impostor cannot tell they were
+  heard;
 * **zero** Stage-A→command paths without Stage B: no trigger may reach
-  command listening without a verification verdict or a human accept.
+  command listening without a `≥ ecapa_high` verdict on command audio.
 
 ## 5. Capture tooling
 

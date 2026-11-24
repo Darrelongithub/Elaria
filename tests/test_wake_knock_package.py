@@ -101,8 +101,16 @@ def make_guard(tmp_path, *, score=0.9, with_knocks=True, **overrides):
 
 
 # ---------------------------------------------------------------------------
-# §1 — no straight hit->listening / wake-knock flow / accept paths
+# §1 — no straight hit->listening / silent discard / accept paths
 # ---------------------------------------------------------------------------
+def _command_window(guard, seconds: float = 2.0, amp: int = 6000) -> bytes:
+    """Feed `seconds` of command audio into the open pending window."""
+    data = pcm(seconds, amp=amp)
+    for frame in frames(seconds, amp=amp):
+        guard.note_frame(frame)
+    return data
+
+
 def test_a_hit_alone_never_opens_listening(tmp_path):
     guard, _store = make_guard(tmp_path, score=0.99)
 
@@ -111,40 +119,50 @@ def test_a_hit_alone_never_opens_listening(tmp_path):
     with pytest.raises(wg.WakeGuardError, match="hit alone never opens"):
         guard.open_listening()
 
-    # Even the full flow with a HIGH owner score only reaches ATTENDING;
-    # listening still needs the explicit open — and another hit from scratch
-    # is still just a trigger.
-    guard.verify()
-    assert guard.state == wg.ATTENDING
+    # Round J defect 1: with no command window there is NOTHING to verify —
+    # and no listening either. Nothing was scored, nothing opens the mic.
+    outcome = guard.verify()
+    assert outcome["state"] == wg.IDLE
+    assert outcome["trigger"]["outcome"] == wg.OUTCOME_DISCARDED
+    assert guard.scorer.calls == [], "the wake clip must never be scored"
+    with pytest.raises(wg.WakeGuardError, match="hit alone never opens"):
+        guard.open_listening()
+
+    # A fresh guard still refuses a bare hit (no verify at all).
     guard2, _store2 = make_guard(tmp_path, score=0.99)
     guard2.trigger(keyword_score=0.5)
     with pytest.raises(wg.WakeGuardError, match="hit alone never opens"):
         guard2.open_listening()
 
 
-def test_uncertain_voice_raises_a_citable_wake_knock(tmp_path):
+def test_unrecognised_voice_is_silent_and_raises_no_knock(tmp_path):
+    """Round J defect 2: an impostor cannot tell they were heard."""
     guard, store = make_guard(tmp_path, score=0.61)
     guard.trigger(keyword_score=0.9, wake_clip=pcm(1.0))
+    _command_window(guard, 2.0)
 
     outcome = guard.verify()
-    assert guard.state == wg.WAKE_KNOCK
-    assert outcome["knock_id"] is not None
+    assert outcome["state"] == wg.IDLE
+    assert outcome["knock_id"] is None
+    assert outcome["trigger"]["outcome"] == wg.OUTCOME_DISCARDED
+    assert outcome["trigger"]["pending_disposition"] == wg.DISP_DISCARDED
+    # No knock row of any kind, wake or otherwise.
+    assert store.list_knocks(status=None) == []
+    # No score in the user-visible record for a discarded window.
+    assert outcome["trigger"]["ecapa_score"] is None
+    # Zero outbound of any kind.
+    assert len(guard.outbound) == 0 and guard.outbound.bytes_out() == 0
 
-    knock = store.get_knock(outcome["knock_id"])
-    assert knock["kind"] == "wake"
-    assert knock["reason"] == "phrase 'Elaria' detected, voice confidence 0.61"
-    assert knock["status"] == "pending"
-
-    # No embedding at all -> also the knock (fail closed), never listening.
-    guard2, store2 = make_guard(tmp_path, score=None, with_knocks=True)
-    guard2.scorer = None
-    guard2.trigger(keyword_score=0.9)
-    outcome2 = guard2.verify()
-    assert guard2.state == wg.WAKE_KNOCK
-    assert store2.get_knock(outcome2["knock_id"])["kind"] == "wake"
+    # Uncertain is the ambiguous band, and it is still silence.
+    guard.trigger(keyword_score=0.9)
+    _command_window(guard, 2.0)
+    uncertain = guard.verify()
+    assert uncertain["trigger"]["confidence"] == wg.CONF_UNCERTAIN
+    assert uncertain["state"] == wg.IDLE
+    assert store.list_knocks(status=None) == []
 
 
-def test_uncertain_discards_pending_untranscribed_and_accept_is_fresh(tmp_path):
+def test_uncertain_discards_pending_untranscribed_and_nothing_resurrects(tmp_path):
     guard, store = make_guard(tmp_path, score=0.61)
     guard.trigger(keyword_score=0.9, wake_clip=pcm(0.5))
     for frame in frames(1.0):
@@ -154,69 +172,61 @@ def test_uncertain_discards_pending_untranscribed_and_accept_is_fresh(tmp_path):
     assert outcome["trigger"]["pending_disposition"] == "discarded"
     # the pending buffer is gone — no ASR input, no ledger, no transcript row
     assert guard.pending.data() == b""
+    assert guard._wake_clip == b""
     row_count = store._conn.execute(
         "SELECT COUNT(*) FROM transcripts").fetchone()[0]
     llm_count = store._conn.execute(
         "SELECT COUNT(*) FROM llm_calls").fetchone()[0]
     assert row_count == 0 and llm_count == 0
 
-    # Accept-after-knock starts FRESH capture — the discarded bytes must
-    # never resurrect.
-    opened = guard.wake_knock_accepted(
-        knock_id=outcome["knock_id"], principal=_local_owner_principal())
-    assert opened["open"] == "listening"
-    assert opened["fresh_capture"] is True
-    assert opened["head_bytes"] == 0
-    assert guard.session.head == b""
+    # The discard returned to idle: there is no pending knock to accept, and
+    # no path back to listening from a voice the daemon did not recognise.
+    with pytest.raises(wg.WakeGuardError):
+        guard.wake_knock_accepted(principal=_local_owner_principal())
+    with pytest.raises(wg.WakeGuardError, match="hit alone never opens"):
+        guard.open_listening()
 
 
-def test_accept_opens_listening_and_decline_returns_to_sleep(tmp_path):
-    guard, _store = make_guard(tmp_path, score=0.4)
+def test_owner_command_opens_listening_on_verified_audio(tmp_path):
+    guard, _store = make_guard(tmp_path, score=0.92)
     guard.trigger(keyword_score=0.9)
+    _command_window(guard, 2.0)
     outcome = guard.verify()
-    assert guard.state == wg.WAKE_KNOCK
+    assert outcome["state"] == wg.ATTENDING
+    assert outcome["knock_id"] is None
 
-    denied = guard.wake_knock_denied(knock_id=outcome["knock_id"],
-                                     action="declined")
-    assert denied["state"] == wg.CLOSED
-
-    # a fresh uncertain trigger can knock again (wake topics never retire)
-    guard.trigger(keyword_score=0.9)
-    outcome2 = guard.verify()
-    assert guard.state == wg.WAKE_KNOCK
-    assert outcome2["knock_id"] != outcome["knock_id"]
-    opened = guard.wake_knock_accepted(
-        knock_id=outcome2["knock_id"], principal=_local_owner_principal())
+    opened = guard.open_listening()
     assert opened["open"] == "listening"
+    assert opened["head_bytes"] > 0
+    assert opened["fresh_capture"] is False
 
 
-def test_wake_accept_requires_kernel_authenticated_owner_principal(tmp_path):
-    """I5: WakeGuard accepts identity evidence, not a channel or score claim."""
-    guard, _store = make_guard(tmp_path, score=0.55)
+def test_verified_owner_flow_never_requires_a_knock_accept(tmp_path):
+    """The accept machinery is for an owner PROMPT, never for a stranger.
+
+    It still refuses a caller that is not the kernel-authenticated local
+    owner (I5), and a class-mode accept still opens the CONSOLE, not PTT.
+    """
+    guard, _store = make_guard(tmp_path, score=0.55, class_mode=lambda: True)
     guard.trigger(keyword_score=0.9)
-    outcome = guard.verify()
+    _command_window(guard, 2.0)
+    guard.verify()
+    assert guard.state == wg.IDLE
 
+    guard.state = wg.WAKE_KNOCK
     with pytest.raises(wg.WakeGuardError, match="authenticated local owner"):
-        guard.wake_knock_accepted(knock_id=outcome["knock_id"])
+        guard.wake_knock_accepted(principal=None)
     from assistant.ipc import IpcPrincipal
 
     wrong_uid = IpcPrincipal(pid=os.getpid(), uid=os.getuid() + 1,
                              gid=os.getgid())
     with pytest.raises(wg.WakeGuardError, match="authenticated local owner"):
-        guard.wake_knock_accepted(knock_id=outcome["knock_id"],
-                                  principal=wrong_uid)
-    opened = guard.wake_knock_accepted(
-        knock_id=outcome["knock_id"], principal=_local_owner_principal())
-    assert opened["open"] == "listening"
+        guard.wake_knock_accepted(principal=wrong_uid)
 
-
-def test_class_mode_accept_opens_console_not_ptt(tmp_path):
-    guard, _store = make_guard(tmp_path, score=0.55,
-                               class_mode=lambda: True)
-    guard.trigger(keyword_score=0.9)
-    outcome = guard.verify()
-    opened = guard.wake_knock_accepted(
-        knock_id=outcome["knock_id"], principal=_local_owner_principal())
+    # An owner-authored prompt still exists (wake_knock_accepted is intact)
+    # and still refuses the guest door, still prefers the console in class.
+    guard.state = wg.WAKE_KNOCK
+    opened = guard.wake_knock_accepted(principal=_local_owner_principal())
     assert opened["open"] == "console"
     assert guard.state != wg.LISTENING
 
@@ -226,12 +236,18 @@ def test_wake_path_never_opens_the_guest_door(tmp_path):
         def status(self):
             return {"active": True}
 
-    guard, _store = make_guard(tmp_path, score=0.55, showoff=ShowoffOn())
+    guard, _store = make_guard(tmp_path, score=0.92, showoff=ShowoffOn())
     guard.trigger(keyword_score=0.9)
-    outcome = guard.verify()
+    _command_window(guard, 2.0)
+    guard.verify()
+    assert guard.state == wg.ATTENDING
     with pytest.raises(wg.WakeGuardError, match="guest door is show-off"):
-        guard.wake_knock_accepted(
-            knock_id=outcome["knock_id"], principal=_local_owner_principal())
+        guard.open_listening()
+
+    # and on the owner-prompt path too
+    guard.state = wg.WAKE_KNOCK
+    with pytest.raises(wg.WakeGuardError, match="guest door is show-off"):
+        guard.wake_knock_accepted(principal=_local_owner_principal())
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +260,15 @@ def test_authority_gate_levels_fail_closed():
     assert gate.evaluate(0.4, verified=True) == wg.CONF_NONE
     assert gate.evaluate(0.99, verified=False) == wg.CONF_NONE
     assert gate.evaluate(None, verified=False) == wg.CONF_NONE
+
+    # Round J defect 4: uncertain is never permissive. Only high may attend.
+    assert gate.may_attend(0.9, verified=True) is True
+    assert gate.may_attend(0.6, verified=True) is False
+    assert gate.may_attend(0.4, verified=True) is False
+    assert gate.may_attend(None, verified=True) is False
+    assert gate.may_attend(0.99, verified=False) is False
+    # and the thresholds themselves are untouched
+    assert (gate.high, gate.uncertain) == (0.75, 0.5)
 
 
 def test_hotword_start_refuses_without_a_real_keyword_model(tmp_path):
@@ -263,58 +288,69 @@ def test_hotword_start_refuses_without_a_real_keyword_model(tmp_path):
 def test_unsafe_energy_trigger_can_never_open_command_listening(tmp_path):
     guard, _store = make_guard(tmp_path, score=0.99)
     guard.trigger(keyword_score=0.8, unsafe_energy=True)
+    _command_window(guard, 2.0)
     outcome = guard.verify()
     assert outcome["trigger"]["outcome"] == "refused_energy_test"
     assert outcome["trigger"]["unsafe_energy"] is True
     with pytest.raises(wg.WakeGuardError, match="unsafe energy"):
         guard.open_listening()
 
-    # Even a knock accepted from an energy trigger cannot reach listening.
+    # and a short energy trigger cannot even claim "awaiting command"
     guard2, _store2 = make_guard(tmp_path, score=0.2)
     guard2.trigger(keyword_score=0.8, unsafe_energy=True)
     outcome2 = guard2.verify()
-    assert guard2.state == wg.WAKE_KNOCK
-    with pytest.raises(wg.WakeGuardError, match="unsafe energy"):
+    assert outcome2["state"] == wg.CLOSED
+    assert outcome2["trigger"]["outcome"] == "refused_energy_test"
+    with pytest.raises(wg.WakeGuardError):
         guard2.wake_knock_accepted(
             knock_id=outcome2["knock_id"], principal=_local_owner_principal())
+    with pytest.raises(wg.WakeGuardError, match="unsafe energy"):
+        guard2.open_listening()
 
 
 def test_every_trigger_is_logged_metadata_only(tmp_path):
     guard, store = make_guard(tmp_path, score=0.61)
     guard.trigger(keyword_score=0.9)
+    _command_window(guard, 2.0)
     guard.verify()
 
     events = [e for e in store.list_persona_events(kind="wake_trigger")]
     assert len(events) == 1
     meta = json.loads(events[0]["detail"])
     assert meta["keyword_score"] == 0.9
-    assert meta["ecapa_score"] == 0.61
+    # Round J defect 2: a discarded window's score is not in the record that
+    # anything can read back. The confidence BAND is still reported.
+    assert meta["ecapa_score"] is None
     assert meta["confidence"] == "uncertain"
-    assert meta["outcome"] == "wake_knock"
-    assert meta["knock_id"] is not None
+    assert meta["outcome"] == "discarded"
+    assert meta["knock_id"] is None
     forbidden = {"audio", "pcm", "bytes", "clip", "frames", "samples"}
     assert forbidden.isdisjoint(meta.keys())
 
+    # The in-process record keeps the number for an operator/debugger only.
+    assert guard.last_trigger.ecapa_score == pytest.approx(0.61)
+
 
 # ---------------------------------------------------------------------------
-# §3 — dual-use pending buffer
+# §3 — dual-use pending buffer (command-window only)
 # ---------------------------------------------------------------------------
 def test_verified_owner_inherits_pending_buffer_as_command_head(tmp_path):
     guard, _store = make_guard(tmp_path, score=0.92)
     wake_clip = pcm(0.4)
     guard.trigger(keyword_score=0.9, wake_clip=wake_clip)
-    for frame in frames(1.2):            # speechful post-trigger window
+    for frame in frames(2.0):            # speechful post-trigger command window
         guard.note_frame(frame)
     pending_pcm = guard.pending.data()
 
     outcome = guard.verify()
-    assert outcome["trigger"]["stage_b_input"] == "wake_plus_post"
+    assert outcome["trigger"]["stage_b_input"] == "command_window"
     assert outcome["trigger"]["pending_disposition"] == "inherited"
     assert guard.state == wg.ATTENDING
     assert guard.attending_detail == wg.ATTEND_INHERIT
-    # Stage B primary input = wake clip + pending buffer, scored before any
-    # command routing.
-    assert guard.scorer.calls[0] == wake_clip + pending_pcm
+    # Round J defect 1: the scorer saw the COMMAND window only — the exact
+    # bytes captured after the hit, with no wake clip prepended.
+    assert guard.scorer.calls == [pending_pcm]
+    assert wake_clip == pcm(0.4) and len(wake_clip) == 12480
 
     opened = guard.open_listening()
     assert opened["open"] == "listening"
@@ -346,7 +382,7 @@ def test_endpointing_shares_the_one_silence_ladder(tmp_path):
     guard, _store = make_guard(tmp_path, score=0.92, checkin_after_s=1.0,
                                grace_s=8.0)
     guard.trigger(keyword_score=0.9, wake_clip=pcm(0.3))
-    for frame in frames(1.0):
+    for frame in frames(2.0):
         guard.note_frame(frame)
     guard.verify()
     guard.open_listening()
@@ -364,36 +400,38 @@ def test_endpointing_shares_the_one_silence_ladder(tmp_path):
     assert not ladder.close_due()
 
 
-def test_insufficient_speech_falls_back_to_wake_clip_only(tmp_path):
+def test_short_windows_never_reach_the_scorer(tmp_path):
+    """Round J defect 1: below `MIN_WINDOW_S` there is NO scoring call at all."""
     guard, _store = make_guard(tmp_path, score=0.92)
-    guard.trigger(keyword_score=0.9, wake_clip=pcm(0.5))
-    for frame in frames(0.2, amp=0):     # wake phrase + pause only
+    guard.trigger(keyword_score=0.9, wake_clip=pcm(0.6))
+    for frame in frames(1.0, amp=0):     # 1.0 s of post-wake silence
         guard.note_frame(frame)
 
     outcome = guard.verify()
-    assert outcome["trigger"]["stage_b_input"] == "wake_only_fallback"
-    assert outcome["trigger"]["pending_disposition"] == "awaiting_command"
-    assert guard.state == wg.ATTENDING
-    assert guard.attending_detail == wg.ATTEND_AWAIT
-
-    # AWAITING_COMMAND: fresh capture for the coming command (no inherit)
-    opened = guard.open_listening()
-    assert opened["fresh_capture"] is False
-    assert opened["head_bytes"] == 0
-
-    # the scorer saw the wake clip only, not a phantom post-trigger tail
-    scorer = guard.scorer
-    assert len(scorer.calls) == 1
+    assert outcome["trigger"]["stage_b_input"] == "wake_too_short"
+    assert outcome["trigger"]["outcome"] == wg.OUTCOME_DISCARDED
+    assert outcome["trigger"]["ecapa_score"] is None
+    assert guard.scorer.calls == [], "a short window must not be scored"
+    # A window too short to verify is too short to open the microphone for.
+    assert guard.state == wg.IDLE
+    assert guard.pending.data() == b""
+    assert guard._wake_clip == b""
+    assert len(guard.outbound) == 0
+    with pytest.raises(wg.WakeGuardError, match="hit alone never opens"):
+        guard.open_listening()
 
 
-def test_insufficient_speech_low_confidence_still_knocks(tmp_path):
-    guard, _store = make_guard(tmp_path, score=0.3)
+def test_insufficient_speech_low_confidence_is_silent_not_a_knock(tmp_path):
+    guard, store = make_guard(tmp_path, score=0.3)
     guard.trigger(keyword_score=0.9, wake_clip=pcm(0.5))
     for frame in frames(0.1, amp=0):
         guard.note_frame(frame)
     outcome = guard.verify()
-    assert outcome["trigger"]["stage_b_input"] == "wake_only_fallback"
-    assert guard.state == wg.WAKE_KNOCK
+    assert outcome["trigger"]["stage_b_input"] == "wake_too_short"
+    assert outcome["state"] == wg.IDLE
+    assert guard.scorer.calls == []
+    assert store.list_knocks(status=None) == []
+    assert len(guard.outbound) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -449,32 +487,45 @@ def test_watchdog_stall_disarms_zeroes_and_stays_visible(tmp_path):
 
 
 def test_wake_clips_off_by_default_with_0700_purge_and_fail_rules(tmp_path):
+    """Clip policy only. Each window is DISTINCT audio: byte-identical command
+    windows are a replay and are refused by design (see the D3 tests)."""
     clip_dir = tmp_path / "clips"
+    command = pcm(2.0, amp=6000)
 
     # OFF by default: nothing is ever written.
     guard, _store = make_guard(tmp_path, score=0.9,
                                clip_dir=str(clip_dir), save_wake_clips=False)
     guard.trigger(keyword_score=0.9)
+    for frame in frames(2.0):
+        guard.note_frame(frame)
     outcome = guard.verify()
+    assert outcome["trigger"]["outcome"] == wg.OUTCOME_ATTENDING
     assert outcome["trigger"]["clip_saved"] is False
     assert not clip_dir.exists()
 
-    # Opt-in: <=5s, 0700 dir, purge works.
-    guard2, _store2 = make_guard(tmp_path, score=0.6,
+    # A discarded window is NEVER saved — not even a verified-looking one.
+    guard_d, _store_d = make_guard(tmp_path, score=0.4,
+                                   clip_dir=str(clip_dir),
+                                   save_wake_clips=True, debug_save_failed=True)
+    guard_d.trigger(keyword_score=0.9)
+    for frame in frames(2.0, amp=5000):
+        guard_d.note_frame(frame)
+    assert guard_d.verify()["trigger"]["clip_saved"] is False
+    assert not list(clip_dir.glob("wake-*"))
+
+    # Opt-in: the OWNER's verified command audio is saved, <=5s, 0700 dir.
+    guard2, _store2 = make_guard(tmp_path, score=0.92,
                                  clip_dir=str(clip_dir),
                                  save_wake_clips=True, clip_max_s=5.0)
     guard2.trigger(keyword_score=0.9)
+    for frame in frames(2.0, amp=7000):
+        guard2.note_frame(frame)
     outcome2 = guard2.verify()
-    assert outcome2["trigger"]["clip_saved"] is False   # failed verify: not saved
-
-    guard2.settings["debug_save_failed"] = True
-    guard2.clips.debug_save_failed = True
-    guard2.trigger(keyword_score=0.9)
-    outcome3 = guard2.verify()
-    assert outcome3["trigger"]["clip_saved"] is True    # explicit debug flag
+    assert outcome2["trigger"]["clip_saved"] is True
     saved = list(clip_dir.glob("wake-*"))
     assert len(saved) == 1
     assert saved[0].stat().st_size <= 5.0 * 16000 * 2
+    assert saved[0].read_bytes()[: len(command)] == pcm(2.0, amp=7000)
     assert clip_dir.stat().st_mode & 0o777 == 0o700
 
     assert guard2.clips.purge() == 1
@@ -484,13 +535,17 @@ def test_wake_clips_off_by_default_with_0700_purge_and_fail_rules(tmp_path):
 def test_hotword_status_surface_has_every_documented_field(tmp_path):
     guard, _store = make_guard(tmp_path, score=0.61)
     guard.trigger(keyword_score=0.9, wake_clip=pcm(0.5))
-    for frame in frames(1.0):
+    for frame in frames(2.0):
         guard.note_frame(frame)
     guard.verify()
     status = guard.status()
 
     assert status["armed"] is False
-    assert status["state"] == wg.WAKE_KNOCK
+    assert status["state"] == wg.IDLE
+    assert status["min_window_s"] == 1.75
+    assert status["window_close_s"] == 2.5
+    assert 0.0 <= status["window_elapsed_s"] <= 2.5
+    assert status["ecapa_high"] == 0.75 and status["ecapa_uncertain"] == 0.5
     assert set(status["ring"]) == {"capacity_s", "residence_s", "path"}
     assert status["ring"]["path"] is None
     assert status["scorer"] == "scripted-ecapa"
@@ -540,19 +595,33 @@ def test_ecapa_command_scorer_embedding_and_fail_closed(tmp_path):
 # ---------------------------------------------------------------------------
 # §1 over REAL socket wiring (daemon + real knock system)
 # ---------------------------------------------------------------------------
-def _wake_knock_over_socket(config, daemon, *, score):
+def _owner_command_over_socket(daemon, *, score):
+    """Feed a real 2 s command window through the daemon's guard."""
     daemon.wake_guard.scorer = ScriptedScorer(score)
     daemon.wake_guard.trigger(keyword_score=0.9)
-    outcome = daemon.wake_guard.verify()
-    return outcome
+    for frame in frames(2.0):
+        daemon.wake_guard.note_frame(frame)
+    return daemon.wake_guard.verify()
+
+
+def _owner_prompt_over_socket(daemon):
+    """An OWNER-authentication knock, raised explicitly (not by a stranger).
+
+    Round J: an unverified voice never knocks. The knock machinery itself is
+    unchanged, so it is exercised through its own door.
+    """
+    knock = daemon.initiative.raise_knock(
+        topic="wake phrase 'Elaria'",
+        reason="phrase 'Elaria' detected, voice confidence unavailable",
+        kind="wake")
+    daemon.wake_guard.state = wg.WAKE_KNOCK
+    return int(knock["id"])
 
 
 def test_socket_accept_opens_listening_on_real_knock_system(
         config, running_daemon):
     daemon, _server = running_daemon
-    outcome = _wake_knock_over_socket(config, daemon, score=0.55)
-    knock_id = outcome["knock_id"]
-    assert knock_id is not None
+    knock_id = _owner_prompt_over_socket(daemon)
 
     result = call(config.socket_path, "knock.accept",
                   {"id": knock_id}, timeout=5.0)
@@ -565,12 +634,23 @@ def test_socket_accept_opens_listening_on_real_knock_system(
     assert status["hotword"]["state"] == wg.LISTENING
 
 
+def test_socket_unrecognised_voice_discards_without_a_knock(config, running_daemon):
+    """Round J, end to end: no knock row, no reply, gate back to idle."""
+    daemon, _server = running_daemon
+    outcome = _owner_command_over_socket(daemon, score=0.55)
+    assert outcome["knock_id"] is None
+    assert daemon.wake_guard.state == wg.IDLE
+    assert daemon.store.list_knocks(status=None) == []
+    status = call(config.socket_path, "hotword.status", timeout=5.0)
+    assert status["hotword"]["state"] == wg.IDLE
+    assert status["hotword"]["last_trigger"]["ecapa_score"] is None
+
+
 def test_socket_wake_accept_rejects_caller_channel_and_score_claims(
         config, running_daemon):
     """I5: caller labels and scores are rejected; the local owner action works."""
     daemon, _server = running_daemon
-    outcome = _wake_knock_over_socket(config, daemon, score=0.55)
-    knock_id = outcome["knock_id"]
+    knock_id = _owner_prompt_over_socket(daemon)
 
     for forged in (
             {"channel": "voice"},
@@ -589,20 +669,20 @@ def test_socket_wake_accept_rejects_caller_channel_and_score_claims(
 
 def test_socket_wake_accept_in_class_mode_opens_console(config, running_daemon):
     daemon, _server = running_daemon
-    outcome = _wake_knock_over_socket(config, daemon, score=0.55)
+    knock_id = _owner_prompt_over_socket(daemon)
     # class mode via the real presence service
     call(config.socket_path, "class.set", {"enabled": True}, timeout=5.0)
     result = call(config.socket_path, "knock.accept",
-                  {"id": outcome["knock_id"]}, timeout=5.0)
+                  {"id": knock_id}, timeout=5.0)
     assert result["open"] == "console"
     assert daemon.wake_guard.state != wg.LISTENING
 
 
 def test_socket_decline_returns_gate_to_sleep(config, running_daemon):
     daemon, _server = running_daemon
-    outcome = _wake_knock_over_socket(config, daemon, score=0.3)
+    knock_id = _owner_prompt_over_socket(daemon)
     result = call(config.socket_path, "knock.decline",
-                  {"id": outcome["knock_id"]}, timeout=5.0)
+                  {"id": knock_id}, timeout=5.0)
     assert result["knock"]["status"] == "declined"
     assert daemon.wake_guard.state == wg.CLOSED
 

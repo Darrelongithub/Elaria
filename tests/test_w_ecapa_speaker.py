@@ -56,8 +56,8 @@ from assistant.wake_guard import (
     CONF_UNCERTAIN,
     DISP_DISCARDED,
     DISP_INHERITED,
-    STAGE_WAKE_ONLY,
-    STAGE_WAKE_PLUS_POST,
+    STAGE_COMMAND,
+    STAGE_UNVERIFIED,
     AuthorityGate,
     WakeGuard,
 )
@@ -551,6 +551,12 @@ def test_m4_wake_guard_real_ecapa_command_window_vs_wake_clip_and_impostor_disca
     - 2.5 s owner command window (0.6 s wake + 1.9 s post-wake speech) grants ATTENDING.
     - 2.5 s different-speaker utterance yields CONF_NONE and discards pending audio
       untranscribed (`head_bytes == 0`, metadata-only trigger row).
+
+    Round J made the protocol explicit: the wake clip is never scored, the
+    scorer sees the 1.9 s post-wake command window (>= the 1.5 s floor), and
+    a rejected window's score is metadata-only (`ecapa_score` is None on the
+    record that leaves the guard). The window sizes and the 0.75 threshold
+    this test was written for are unchanged.
     """
     pytest.importorskip("onnxruntime")
     store = Store(tmp_path / "wake_guard.db")
@@ -566,11 +572,18 @@ def test_m4_wake_guard_real_ecapa_command_window_vs_wake_clip_and_impostor_disca
         owner_wake_06 = owner_full[:BYTES_0P6S]
         owner_post_19 = owner_full[BYTES_0P6S:BYTES_2P5S]
 
-        # 1. Owner 0.6 s wake clip ONLY (no command follow-through) -> NOT attending
+        # 1. Owner 0.6 s wake clip ONLY (no command follow-through) -> NOT attending.
+        #    Round J: the wake clip is never scored at all, so there is no
+        #    "low score" to report — there is no score and no listening.
+        #    W's measuring stick is kept verbatim: ask the REAL model what that
+        #    wake-length window actually scores, and assert it fails 0.75. The
+        #    guard's own record carries no score precisely because J refuses to
+        #    treat a wake-length window as a verification unit.
+        assert scorer.score_owner(owner_wake_06) < 0.75
         guard.trigger(keyword_score=0.92, wake_clip=owner_wake_06)
         wake_only_res = guard.verify()
-        assert wake_only_res["trigger"]["stage_b_input"] == STAGE_WAKE_ONLY
-        assert wake_only_res["trigger"]["ecapa_score"] < 0.75
+        assert wake_only_res["trigger"]["stage_b_input"] == STAGE_UNVERIFIED
+        assert wake_only_res["trigger"]["ecapa_score"] is None
         assert wake_only_res["state"] != ATTENDING
         assert wake_only_res["head_bytes"] == 0
         assert wake_only_res["trigger"]["pending_disposition"] == DISP_DISCARDED
@@ -579,7 +592,7 @@ def test_m4_wake_guard_real_ecapa_command_window_vs_wake_clip_and_impostor_disca
         guard.trigger(keyword_score=0.92, wake_clip=owner_wake_06)
         guard.note_frame(owner_post_19)
         owner_cmd_res = guard.verify()
-        assert owner_cmd_res["trigger"]["stage_b_input"] == STAGE_WAKE_PLUS_POST
+        assert owner_cmd_res["trigger"]["stage_b_input"] == STAGE_COMMAND
         assert owner_cmd_res["trigger"]["ecapa_score"] >= 0.75
         assert owner_cmd_res["trigger"]["confidence"] == CONF_HIGH
         assert owner_cmd_res["state"] == ATTENDING
@@ -588,16 +601,21 @@ def test_m4_wake_guard_real_ecapa_command_window_vs_wake_clip_and_impostor_disca
 
         # 3. Unrecognised speaker 2.5 s utterance -> CONF_NONE, pending discarded
         impostor_full = speech_pcm["diff_example1"][:BYTES_2P5S]
+        # the different speaker's command window really is far below the bar
+        assert scorer.score_owner(impostor_full[BYTES_0P6S:BYTES_2P5S]) < 0.25
+        impostor_wake_06 = impostor_full[:BYTES_0P6S]
         guard.trigger(
-            keyword_score=0.92, wake_clip=impostor_full[:BYTES_0P6S]
+            keyword_score=0.92, wake_clip=impostor_wake_06
         )
         guard.note_frame(impostor_full[BYTES_0P6S:BYTES_2P5S])
         imp_res = guard.verify()
-        assert imp_res["trigger"]["stage_b_input"] == STAGE_WAKE_PLUS_POST
-        assert imp_res["trigger"]["ecapa_score"] < 0.25
+        assert imp_res["trigger"]["stage_b_input"] == STAGE_COMMAND
         assert imp_res["trigger"]["confidence"] == CONF_NONE
         assert imp_res["state"] != ATTENDING
         assert imp_res["head_bytes"] == 0
+        # metadata-only: the rejected voice's score never leaves the guard
+        assert imp_res["trigger"]["ecapa_score"] is None
+        assert imp_res["knock_id"] is None
         assert imp_res["trigger"]["pending_disposition"] == DISP_DISCARDED
     finally:
         store.close()
