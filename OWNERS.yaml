@@ -1,17 +1,20 @@
-  P:   # PHONE
-    - src/assistant/phone_link.py
-    - tests/test_phone_link*.py
-    - tests/test_drafts.py
-    - docs/contracts/IF-3*
-  W:   # WAKE
-    - models/**
-    - src/assistant/model_registry.py
-    - src/assistant/model_pins.py
-    - src/assistant/voiceprint.py
-    - tests/test_w_*.py
-  C:   # CONSOLE
-    - console/**
-    - tests/test_capture_state_wire.py{
+{
+  "P": [
+    "docs/contracts/IF-3*",
+    "reports/RPT-P-*",
+    "src/assistant/hands/headless/__init__.py",
+    "src/assistant/hands/headless/consent.py",
+    "src/assistant/hands/headless/contract.py",
+    "src/assistant/hands/headless/host.py",
+    "src/assistant/hands/headless/instance.py",
+    "src/assistant/hands/headless/worker.py",
+    "tests/test_hands_headless_consent.py",
+    "tests/test_hands_headless_contract.py",
+    "tests/test_hands_headless_host.py",
+    "tests/test_hands_headless_instance.py",
+    "tests/test_hands_headless_worker.py",
+    "tests/test_p_*.py"
+  ],
   "Z": [
     "OWNERS.yaml",
     "README.md",
@@ -235,7 +238,11 @@
     "src/assistant/model_pins.py",
     "src/assistant/model_registry.py",
     "tests/test_bughunt_k_quota.py",
-    "tests/test_i_*.py"
+    "tests/test_i_*.py",
+    "models/README.md",
+    "models/ecapa_eval_samples.npz",
+    "models/voxceleb_ECAPA512_LM.onnx",
+    "tests/test_w_ecapa_speaker.py"
   ],
   "J": [
     "HOTWORD-REVIEW.md",
@@ -350,21 +357,6 @@
     "tests/test_hands_core.py",
     "tests/test_hands_partial_sink.py",
     "tests/test_o_*.py"
-  ],
-  "P": [
-    "reports/RPT-P-*",
-    "src/assistant/hands/headless/__init__.py",
-    "src/assistant/hands/headless/consent.py",
-    "src/assistant/hands/headless/contract.py",
-    "src/assistant/hands/headless/host.py",
-    "src/assistant/hands/headless/instance.py",
-    "src/assistant/hands/headless/worker.py",
-    "tests/test_hands_headless_consent.py",
-    "tests/test_hands_headless_contract.py",
-    "tests/test_hands_headless_host.py",
-    "tests/test_hands_headless_instance.py",
-    "tests/test_hands_headless_worker.py",
-    "tests/test_p_*.py"
   ],
   "Q": [
     "reports/RPT-Q-*",
