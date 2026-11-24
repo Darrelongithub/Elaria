@@ -575,6 +575,11 @@ def test_m4_wake_guard_real_ecapa_command_window_vs_wake_clip_and_impostor_disca
         # 1. Owner 0.6 s wake clip ONLY (no command follow-through) -> NOT attending.
         #    Round J: the wake clip is never scored at all, so there is no
         #    "low score" to report — there is no score and no listening.
+        #    W's measuring stick is kept verbatim: ask the REAL model what that
+        #    wake-length window actually scores, and assert it fails 0.75. The
+        #    guard's own record carries no score precisely because J refuses to
+        #    treat a wake-length window as a verification unit.
+        assert scorer.score_owner(owner_wake_06) < 0.75
         guard.trigger(keyword_score=0.92, wake_clip=owner_wake_06)
         wake_only_res = guard.verify()
         assert wake_only_res["trigger"]["stage_b_input"] == STAGE_UNVERIFIED
@@ -596,6 +601,8 @@ def test_m4_wake_guard_real_ecapa_command_window_vs_wake_clip_and_impostor_disca
 
         # 3. Unrecognised speaker 2.5 s utterance -> CONF_NONE, pending discarded
         impostor_full = speech_pcm["diff_example1"][:BYTES_2P5S]
+        # the different speaker's command window really is far below the bar
+        assert scorer.score_owner(impostor_full[BYTES_0P6S:BYTES_2P5S]) < 0.25
         impostor_wake_06 = impostor_full[:BYTES_0P6S]
         guard.trigger(
             keyword_score=0.92, wake_clip=impostor_wake_06
