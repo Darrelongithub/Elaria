@@ -5,15 +5,24 @@ TypingRunner is the gated text-injection seam; its only shipped sinks are synthe
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
+import re
+import secrets
+import time
 import logging
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from .gate import TYPE_TOOL, child_environment, typing_text_ok
-from .plan import Step
+from assistant.observation import Frame, ground
+from assistant.safety import is_halted
+
+from .gate import TYPE_TOOL, _MOUSE_FIXTURE_KEY, adjudicate, child_environment, typing_text_ok
+from .plan import Plan, Step
+from .queue import ParkedQueue
 from .sandbox import SyntheticSpace
 
 log = logging.getLogger(__name__)
@@ -287,3 +296,123 @@ class TypingRunner:
 
     def cleanup(self, step: Step):
         self.cleaned.append(step.i)
+
+
+@dataclass(frozen=True)
+class MouseSeat:
+    """Independent fixture compositor facts, not accessibility or model text."""
+    frame: Frame
+    window: str
+    unlocked: bool
+    owner_present: bool
+    safe_surface: bool  # independent positive allowlist: excludes auth/payment
+
+
+@dataclass
+class FakeMouseInput:
+    calls: list = field(default_factory=list)
+    during: Callable | None = None
+
+    def click(self, point):
+        self.calls.append(point)
+        if self.during is not None:
+            self.during()
+
+
+def mouse_screen(seat: MouseSeat) -> str:
+    """Bind pixels, geometry, focus and accessibility data, not capture IDs."""
+    f = seat.frame
+    payload = (seat.window, f.focus, f.png_sha256, f.width, f.height,
+               asdict(f.output), [asdict(e) for e in f.elements])
+    return hashlib.sha256(json.dumps(payload, allow_nan=False).encode()).hexdigest()
+
+
+def run_mouse_fixture(queue, errand, plan, *, capture, sink, owner_prompt,
+                      principal, clock=time.monotonic):
+    """Click-only tier-3 batch. No live adapter or remote approval path ships.
+
+    Each canonical click has argv (window, role, name, before, after), with
+    exact screen fingerprints as expected states. ``owner_prompt`` represents
+    the trusted local seat in tests; it is not a daemon/model callback.
+    """
+    if type(queue) is not ParkedQueue or type(plan) is not Plan:
+        raise TypeError("mouse fixture requires canonical plan and synthetic queue")
+    digest = plan.digest
+
+    def record(outcome):
+        queue.record_observation(errand, 'mouse-fixture', digest, outcome)
+        return outcome
+
+    def check_stop():
+        if clock() >= deadline or is_halted(queue.path.parent) or queue.cancelled(errand):
+            raise PermissionError('kill')
+
+    def observe(window, expected):
+        check_stop()
+        seat = capture()
+        check_stop()
+        if (type(seat) is not MouseSeat or seat.unlocked is not True
+                or seat.owner_present is not True or seat.safe_surface is not True
+                or seat.window != window or not seat.frame.focus):
+            raise PermissionError('unsafe-seat')
+        if mouse_screen(seat) != expected:
+            raise PermissionError('unexpected-screen')
+        return seat.frame
+
+    try:
+        if principal != 'owner' or type(sink) is not FakeMouseInput:
+            return record('refused/no-authority')
+        steps = plan.steps
+        if not 1 <= len(steps) <= 12:
+            return record('refused/click-budget')
+        for step in steps:
+            if (step.tool != 'click' or step.tier != 3 or step.env_diff or len(step.argv) != 5):
+                return record('refused/invalid-click')
+            window, role, name, before, after = step.argv
+            if (not window or not re.fullmatch(r'button|push button|toggle button', role)
+                    or not name.isprintable() or not re.search(r'[^\W\d_]', name)
+                    or before == after or any(not re.fullmatch('[0-9a-f]{64}', h)
+                                              for h in (before, after))):
+                return record('refused/invalid-click')
+        if any(a.argv[4] != b.argv[3] or a.argv[0] != b.argv[0]
+               for a, b in zip(steps, steps[1:])):
+            return record('refused/discontinuous-plan')
+        deadline = clock() + 90
+        observe(steps[0].argv[0], steps[0].argv[3])
+        nonce = secrets.token_hex(16)
+        # Exact canonical batch, not a summary or a reusable yes.
+        if owner_prompt(plan.canonical.decode(), f'{digest} {nonce}') != f'{digest} {nonce}':
+            return record('refused/unapproved')
+        check_stop()
+        if not queue.claim_mouse_digest(errand, digest, len(steps)):
+            return record('refused/replay-or-budget')
+        record(f'approved/{nonce}')
+        recent = []
+        for step in steps:
+            window, role, name, before, after = step.argv
+            frame = observe(window, before)
+            matches = [e for e in frame.elements if (e.role, e.name) == (role, name)]
+            if len(matches) != 1 or sum(e.id == matches[0].id for e in frame.elements) != 1:
+                raise PermissionError('ungrounded')
+            element = matches[0]
+            resolution = ground(frame, dict(kind='element', id=element.id, confidence=1,
+                                           frame_id=frame.frame_id, snapshot_id=frame.snapshot_id))
+            if resolution is None:
+                raise PermissionError('ungrounded')
+            triple = (window, element.id, before)
+            if triple in recent[-3:]:
+                raise PermissionError('click-loop')
+            recent.append(triple)
+            record(f'click/{step.i}/before')
+            observe(window, before)  # recheck after the durable pre-action record
+            if adjudicate(step.tier, 3, _mouse_key=_MOUSE_FIXTURE_KEY).verdict != "ok":
+                raise PermissionError("tier-3-refused")
+            sink.click(resolution.point)
+            observe(window, after)
+            record(f'click/{step.i}/verified')
+        return record('complete')
+    except Exception as exc:
+        # Unknown adapter/observation failures never retry or resume the batch.
+        reason = str(exc) if type(exc) is PermissionError and str(exc) in {
+            'kill', 'unsafe-seat', 'unexpected-screen', 'ungrounded', 'click-loop'} else 'fixture-error'
+        return record(f'halted/{reason}')

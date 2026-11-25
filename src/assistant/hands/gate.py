@@ -73,7 +73,12 @@ class Verdict:
     ask: bool = False
 
 
-def adjudicate(model, checker, mismatches: int = 0) -> Verdict:
+# Private in-process capability; only the fixture mouse runner may supply it,
+# immediately after its batch, screen, journal and halt checks.
+_MOUSE_FIXTURE_KEY = object()
+
+
+def adjudicate(model, checker, mismatches: int = 0, *, _mouse_key=None) -> Verdict:
     if any(t is not None and (type(t) is not int or t not in range(4)) for t in (model, checker)):
         return Verdict(None, "refused", "unadjudicable", mismatches)
     if model is None and checker is None:
@@ -92,6 +97,8 @@ def adjudicate(model, checker, mismatches: int = 0) -> Verdict:
     if count >= 2:
         return Verdict(tier, "refused", "two-mismatch-halt", count, halt=True)
     if tier == 3:
+        if model == checker == 3 and count == 0 and _mouse_key is _MOUSE_FIXTURE_KEY:
+            return Verdict(3, "ok", "owner-present-mouse-fixture")
         return Verdict(3, "refused", "forbidden", count)
     return Verdict(tier, "mismatch-escalated" if mismatch else "ok", mismatches=count,
                    ask=tier == 2)

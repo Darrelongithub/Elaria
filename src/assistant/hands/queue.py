@@ -178,3 +178,19 @@ class ParkedQueue:
 
     def close(self):
         self._db.close()
+
+    def claim_mouse_digest(self, errand: str, digest: str, clicks: int) -> bool:
+        """Burn the entire approved batch before dispatch, even on interruption."""
+        with self._lock, self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute('''CREATE TABLE IF NOT EXISTS mouse_claims (
+                errand TEXT NOT NULL, digest TEXT NOT NULL, clicks INTEGER NOT NULL,
+                PRIMARY KEY (errand, digest))''')
+            used, = self._db.execute(
+                'SELECT COALESCE(SUM(clicks),0) FROM mouse_claims WHERE errand=?',
+                (errand,)).fetchone()
+            if not 1 <= clicks <= 12 - used:
+                return False
+            return self._db.execute(
+                'INSERT OR IGNORE INTO mouse_claims VALUES (?,?,?)',
+                (errand, digest, clicks)).rowcount == 1
