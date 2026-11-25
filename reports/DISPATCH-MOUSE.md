@@ -61,3 +61,28 @@ Same as NUS: I re-read the blueprint as its enemy, then write the
 build dispatch. Mouse and NUS-pointer share the screenshot +
 grounding layer — the two blueprints must name how they share it
 instead of building it twice.
+
+## GATE DECISIONS (2026-11-25, after PR #106)
+
+- **Q1 — OWNER RULED: tier-3 mouse is ALLOWED, behind safe gates
+  "to ensure she is trustable."** The gate design is therefore:
+  tier-3 never auto, never standing permission; allowed only via
+  an in-person, per-digest owner confirmation implemented as the
+  single keyed exception to `adjudicate`'s tier-3 refusal, with
+  expected-effect verification, the five-layer click-loop kill
+  condition, and the 12 hard refusals as conditions of the
+  exception — a gate that cannot express all of them stays
+  refused. Build lane may proceed on this basis; the exception's
+  tests must prove refusal when any condition is absent.
+- **Q2 — manager: the shared `observation` layer (capture/ground,
+  §3 of the blueprint) is owned by Agent H** (surfaces/overlay),
+  consumed by Agent O's mouse verbs and the NUS pointer. One
+  `frame_id`+`snapshot` contract, built once.
+- **Q3 — manager: rung order is pointer-first.** Build sequence:
+  (1) observation + NUS point (no act), (2) mouse act behind the
+  Q1 gates. Acting never precedes pointing.
+- **Q4 — already settled by OWNERS.yaml:** `tests/test_o_*.py`
+  belongs to O; mouse tests live there.
+- Hyprland 0.56+ Lua-dispatch and ydotoold findings from PR #106
+  are accepted as the build's factual basis (string dispatch is
+  dead; no coordinates in argv; ydotoold AGPL = take nothing).
