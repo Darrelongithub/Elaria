@@ -454,6 +454,7 @@
     "README.md",
     "pyproject.toml",
     "reports/AUDIT-*.md",
+    "reports/CLONES-*.md",
     "reports/DISPATCH-*",
     "reports/PROCEDURE-*.md",
     "reports/RPT-Z-*",
