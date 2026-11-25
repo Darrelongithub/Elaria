@@ -456,6 +456,7 @@
     "reports/AUDIT-*.md",
     "reports/CLONES-*.md",
     "reports/DISPATCH-*",
+    "reports/OWNER-RULING-*.md",
     "reports/PROCEDURE-*.md",
     "reports/RPT-Z-*",
     "scripts/check_ownership.py",
