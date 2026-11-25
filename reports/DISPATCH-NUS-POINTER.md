@@ -50,6 +50,10 @@ proprietary determines take-code vs take-blueprint vs take-nothing.
 
 ## CHANNEL R2 — Agent O: Claude-Desktop-style mouse, on Wayland
 
+**MOVED 2026-11-25 (owner correction): the mouse is a standalone
+lane — `reports/DISPATCH-MOUSE.md`, CHANNEL M1. The text below is
+kept for history; execute the standalone file, not this one.**
+
 > You are Agent O, RESEARCH ONLY — write no product code. In your
 > Elaria checkout read `reports/PROCEDURE-NEW-IDEAS.md`,
 > `src/assistant/hands/` (the consent gate your design must live
