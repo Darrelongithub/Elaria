@@ -11,11 +11,11 @@ from dataclasses import dataclass, field
 from assistant.cost import iso_now
 from assistant.safety import check_blast_radius, is_halted
 
-from .gate import GateChecker, SyntheticFacts, adjudicate
+from .gate import TYPE_TOOL, GateChecker, SyntheticFacts, adjudicate
 from .injection import DataInput, load_observation, suspected
 from .plan import Plan
 from .queue import ParkedQueue
-from .runner import FakeRunner
+from .runner import FakeRunner, TypingRunner
 from .verify import Expected, operation_expectations, verify
 
 
@@ -33,8 +33,8 @@ class Reporter:
 class SandboxCore:
     def __init__(self, space, queue: ParkedQueue, runner: FakeRunner, sink, *, facts=None,
                  expectations: dict[int, tuple[Expected, ...]] | None = None):
-        if type(runner) is not FakeRunner or runner.space is not space:
-            raise TypeError("only the fake runner for this workspace is permitted")
+        if type(runner) not in (FakeRunner, TypingRunner) or runner.space is not space:
+            raise TypeError("only the fake or typing runner for this workspace is permitted")
         if queue.path.parent != space.control:
             raise ValueError("state workspace mismatch")
         self.space, self.queue, self.runner, self.sink = space, queue, runner, sink
@@ -153,14 +153,25 @@ class SandboxCore:
                     self.emit("ask", "ok", hashes=[plan.digest])
                     self.reporter.say("exact argv, cwd and env-diff await your decision; this is not sandboxing")
                     return self.report("parked")
-            try:
-                expected = operation_expectations(self.space, step) or self.expectations.get(step.i, ())
-            except (OSError, ValueError, PermissionError):
-                self.emit("step", "refused")
-                return self.report("source changed or not indexed; re-plan")
-            if not expected:
-                self.emit("step", "degraded")
-                return self.report("no independent re-read verifier; nothing executed")
+            if step.tool == TYPE_TOOL:
+                # Typing has no file oracle: it needs a sink that can read back what it typed.
+                if type(self.runner) is not TypingRunner:
+                    self.emit("step", "refused")
+                    return self.report("typing not wired to this core; nothing typed")
+                ok, _reason = self.runner.available(step)
+                if not ok or not self.runner.readback_available():
+                    self.emit("step", "refused")
+                    return self.report("typing unavailable or unverifiable; nothing typed")
+                expected = ()
+            else:
+                try:
+                    expected = operation_expectations(self.space, step) or self.expectations.get(step.i, ())
+                except (OSError, ValueError, PermissionError):
+                    self.emit("step", "refused")
+                    return self.report("source changed or not indexed; re-plan")
+                if not expected:
+                    self.emit("step", "degraded")
+                    return self.report("no independent re-read verifier; nothing executed")
             if not self.queue.claim(self.errand, plan, step.i, needs_yes=needs_yes):
                 return self.report("stale or uncertain claim; nothing replayed")
             self.active = True
@@ -171,7 +182,10 @@ class SandboxCore:
                 for origin, value in (("stdout", outcome.stdout), ("stderr", outcome.stderr)):
                     if value:
                         self.ingest(DataInput(origin, value))
-                verified = outcome.returncode == 0 and verify(self.space, expected)
+                if step.tool == TYPE_TOOL:
+                    verified = outcome.returncode == 0 and self.runner.readback() == step.argv[0]
+                else:
+                    verified = outcome.returncode == 0 and verify(self.space, expected)
                 if step.tool in {"move", "resolve_collision", "trash"}:
                     verified = (verified and bool(outcome.op_ids)
                                 and not self.space.executor.verify()["problems"])

@@ -40,6 +40,16 @@ READ_VERBS = {
 }
 
 
+TYPE_TOOL = "type"  # text injection: exactly one printable string, nothing else
+TYPE_MAX_CHARS = 200
+
+
+def typing_text_ok(argv) -> bool:
+    """One nonempty printable string. No control bytes (no Enter/Tab/ESC chords)."""
+    return (type(argv) is tuple and len(argv) == 1 and type(argv[0]) is str
+            and 0 < len(argv[0]) <= TYPE_MAX_CHARS and argv[0].isprintable())
+
+
 def child_environment(diff: tuple[tuple[str, str], ...]) -> dict[str, str]:
     """Positive baseline, never os.environ. Refuse rather than silently edit the hash."""
     result = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
@@ -148,6 +158,9 @@ class GateChecker:
             child_environment(step.env_diff)
         except PermissionError:
             return 3
+        if step.tool == TYPE_TOOL:
+            # Always an owner decision (tier 2) for valid text; never a path or argv.
+            return 2 if typing_text_ok(step.argv) and not step.env_diff else 3
         if any(not self.path_allowed(p, facts) for p in self.paths(step)):
             return 3
         if step.tool == "resolve_collision":
