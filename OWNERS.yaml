@@ -459,6 +459,7 @@
     "reports/OWNER-RULING-*.md",
     "reports/PROCEDURE-*.md",
     "reports/RPT-Z-*",
+    "reports/SPEC-*.md",
     "scripts/check_ownership.py",
     "src/assistant/__init__.py",
     "src/assistant/cli.py",
