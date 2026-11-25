@@ -2136,8 +2136,17 @@ def build_parser() -> argparse.ArgumentParser:
         "fetch", help="cold read path: manifest lookup, restore, hash-verify")
     backup_fetch.add_argument("artifact", help="the artifact to restore")
     backup_fetch.add_argument("--out", help="where to put the restored copy")
+    backup_restore = backup_sub.add_parser("restore", help="restore and hash-check an artifact")
+    backup_restore.add_argument("artifact", help="the backed-up artifact to restore")
+    backup_restore.add_argument("--out", help="where to put the restored copy")
+    backup_verify = backup_sub.add_parser("verify", help="hash-check a remote copy")
+    backup_verify.add_argument("artifact", help="the uploaded artifact to verify")
+    backup_drill = backup_sub.add_parser("drill", help="journal a scratch restore and hash check")
+    backup_drill.add_argument("artifact", nargs="?", help="artifact to drill; default random")
+    backup_drill.add_argument("--kind", choices=("monthly", "quarterly"), default="monthly")
     backup_run = backup_sub.add_parser("run", help="one backup pass: tier, plan, reconcile")
     backup_run.add_argument("--artifact", help="exact absolute audio file to upload; required for a live run")
+    backup_run.add_argument("--all-cold", action="store_true", help="back up all newly cold candidates")
     backup_run.add_argument("--dry-run", action="store_true",
                             help="report the plan; change nothing, contact nothing")
     backup_check = backup_sub.add_parser(
@@ -2161,6 +2170,7 @@ def build_parser() -> argparse.ArgumentParser:
         "watch",
         help="one trigger poll: report whether a backup should wake (no backup runs)")
     backup_watch.add_argument("--root", help="audio root to observe (default: config)")
+    backup_watch.add_argument("--run-cold", action="store_true", help="scan and back up cold captures on this poll")
     sub.add_parser("halt", help="panic switch (§4.4)")
     sub.add_parser("resume", help="clear the halt flag")
     ladder_p = sub.add_parser(

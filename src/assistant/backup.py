@@ -115,7 +115,7 @@ def plan_reconcile(manifest: StorageManifest, *, now,
                     f"flip deferred")
                 continue
             actual = try_sha256_file(path)
-            if record.sha256 and actual != record.sha256:
+            if not record.sha256 or actual != record.sha256:
                 plan.problems.append(
                     f"{state}: local hash does not match the manifest record; "
                     f"flip deferred")
@@ -125,9 +125,13 @@ def plan_reconcile(manifest: StorageManifest, *, now,
                     f"{state}: no remote verifier configured; flip deferred "
                     f"rather than asserted")
                 continue
-            verdict = verify_remote(artifact)
+            try:
+                verdict = verify_remote(artifact)
+            except OSError:
+                plan.problems.append(f"{state}: remote verification failed; flip deferred")
+                continue
             backend, ok, method = _read_verdict(verdict)
-            if not ok:
+            if not ok or method != "hash":
                 plan.problems.append(
                     f"{state}: {backend} does not confirm the artifact "
                     f"({method}); flip deferred")
@@ -272,9 +276,8 @@ def _read_verdict(verdict) -> tuple[str, bool, str]:
     A `Verification` (from `assistant.remote`) carries the backend that produced it, and
     that name is the whole point: it travels into the action reason and so into the
     manifest detail, which is what stops a `LocalPathBackend` confirmation from ever being
-    readable as real remote confirmation. A plain bool still works — for callers that
-    predate the remote module — but it reports `opaque-verifier`, because a bool genuinely
-    cannot say who answered.
+    readable as real remote confirmation. A plain bool is reported as opaque and cannot
+    authorize a flip.
     """
 
     # Imported lazily: backup.py must not depend on remote.py to be importable.

@@ -390,8 +390,8 @@ def test_the_backend_name_reaches_the_manifest_detail(tmp_path):
     assert "hash" in action.reason
 
 
-def test_the_real_remote_name_reaches_the_manifest_detail(tmp_path):
-    """The same path with the real backend records rclone:mega-elaria."""
+def test_presence_only_never_authorizes_flip(tmp_path):
+    """Presence alone is not content verification, even with a remote name."""
 
     stub = tmp_path / "rclone"
     stub.write_text(
@@ -402,13 +402,12 @@ def test_the_real_remote_name_reaches_the_manifest_detail(tmp_path):
     stub.chmod(0o755)
     man = StorageManifest(tmp_path / "backup" / "manifest.jsonl")
     art = _wav(tmp_path / "audio" / "a.wav")
-    man.append(ManifestRecord(artifact=str(art), state=UPLOADED, ts=NOW_ISO))
+    man.append(ManifestRecord(artifact=str(art), state=UPLOADED, ts=NOW_ISO, sha256=hashlib.sha256(art.read_bytes()).hexdigest()))
     backend = RcloneBackend("mega-elaria", binary=str(stub))
 
     plan = plan_reconcile(man, now=NOW, verify_remote=make_verifier(backend))
-    assert plan.actions
-    assert "rclone:mega-elaria" in plan.actions[0].reason
-    assert "presence" in plan.actions[0].reason
+    assert not plan.actions
+    assert "presence" in plan.problems[0]
 
 
 def test_a_fixture_flip_is_written_through_with_the_name_recorded(tmp_path):
@@ -504,15 +503,15 @@ def test_an_absent_clock_is_reported_as_such_not_as_a_bad_timestamp(tmp_path):
     assert "unreadable timestamp" not in plan.problems[0]
 
 
-def test_a_bool_verifier_still_works_but_is_named_as_opaque(tmp_path):
-    """Backwards compatibility, honestly labelled rather than silently accepted."""
+def test_a_bool_verifier_cannot_authorize_flip(tmp_path):
+    """An opaque boolean cannot prove a hash match."""
 
     man = StorageManifest(tmp_path / "backup" / "manifest.jsonl")
     art = _wav(tmp_path / "audio" / "a.wav")
-    man.append(ManifestRecord(artifact=str(art), state=UPLOADED, ts=NOW_ISO))
+    man.append(ManifestRecord(artifact=str(art), state=UPLOADED, ts=NOW_ISO, sha256=hashlib.sha256(art.read_bytes()).hexdigest()))
     plan = plan_reconcile(man, now=NOW, verify_remote=lambda p: True)
-    assert plan.actions
-    assert "opaque-verifier" in plan.actions[0].reason
+    assert not plan.actions
+    assert "opaque-verifier" in plan.problems[0]
 
 
 def test_reconcile_all_drives_the_fixture_to_quiescence(tmp_path):
@@ -523,7 +522,7 @@ def test_reconcile_all_drives_the_fixture_to_quiescence(tmp_path):
     man.append(ManifestRecord(artifact=str(art), state=LOCAL, ts=NOW_ISO))
     backend = LocalPathBackend(tmp_path / "remote")
     backend.store(art)
-    man.append(ManifestRecord(artifact=str(art), state=UPLOADED, ts=NOW_ISO))
+    man.append(ManifestRecord(artifact=str(art), state=UPLOADED, ts=NOW_ISO, sha256=hashlib.sha256(art.read_bytes()).hexdigest()))
 
     from assistant.tiering import TrashMover
     mover = TrashMover(tmp_path / "trash")
@@ -545,7 +544,7 @@ def test_reconcile_all_detects_non_quiescence_instead_of_looping(tmp_path):
     man.append(ManifestRecord(artifact=str(art), state=LOCAL, ts=NOW_ISO))
     backend = LocalPathBackend(tmp_path / "remote")
     backend.store(art)
-    man.append(ManifestRecord(artifact=str(art), state=UPLOADED, ts=NOW_ISO))
+    man.append(ManifestRecord(artifact=str(art), state=UPLOADED, ts=NOW_ISO, sha256=hashlib.sha256(art.read_bytes()).hexdigest()))
 
     plan = reconcile_all(man, now=NOW, verify_remote=make_verifier(backend))
     assert any("did not reach quiescence" in p for p in plan.problems)
