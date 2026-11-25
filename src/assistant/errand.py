@@ -47,9 +47,16 @@ from pathlib import Path
 from typing import Any
 
 from .cost import iso_now
-from .safety import expand, is_protected
+from .nus_pointer import (
+    DISABLED_REFUSAL,
+    UNAUTHORIZED_REFUSAL,
+    PointOutcome,
+    parse_point_instruction,
+)
+from .safety import expand, is_halted, is_protected
 
 # -- strict read-only skill allowlist (no writes, no moves, no sends) --------
+# `point` is point-only screen guidance (BUILD-3): NO clicking, NO acting.
 READ_ONLY_SKILLS: frozenset[str] = frozenset({
     "fs.locate",
     "file.read",
@@ -57,6 +64,7 @@ READ_ONLY_SKILLS: frozenset[str] = frozenset({
     "memory.infer",
     "owner.ask",
     "errand.report",
+    "point",
 })
 
 TERMINAL_ERRAND_STATUSES: frozenset[str] = frozenset({
@@ -1138,6 +1146,9 @@ class ErrandRunner:
         client=None,
         safety_journal=None,
         broadcast: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        pointer=None,
+        pointer_provider: Callable[[], Any] | None = None,
+        is_offline: Callable[[], bool] | None = None,
     ):
         self.config = config
         self.store = store
@@ -1145,10 +1156,75 @@ class ErrandRunner:
         self.client = client
         self.safety_journal = safety_journal
         self._broadcast = broadcast
+        self._pointer = pointer
+        self._pointer_provider = pointer_provider
+        self._is_offline = is_offline
         self._tasks: dict[int, asyncio.Task] = {}
         self._cancel_events: dict[int, asyncio.Event] = {}
         self._resume_events: dict[int, asyncio.Event] = {}
         self._resume_payloads: dict[int, dict[str, Any]] = {}
+
+    def _resolve_pointer(self):
+        if self._pointer_provider is not None:
+            return self._pointer_provider()
+        return self._pointer
+
+    def _pointer_permitted(self) -> bool:
+        sec = self.config.section("nus_pointer") if self.config is not None else {}
+        return bool(
+            sec.get("enabled") is True
+            and not is_halted(self.config.socket_path.parent)
+        )
+
+    async def _execute_point_step(
+        self,
+        *,
+        errand_id: int,
+        step_no: int,
+        query: str,
+        explicit_target: str | None,
+        allow_vlm: bool,
+    ) -> PointOutcome:
+        sec = self.config.section("nus_pointer") if self.config is not None else {}
+        if sec.get("enabled") is not True:
+            return PointOutcome(
+                pointed=False,
+                reply=DISABLED_REFUSAL,
+                query=query,
+                target_name=str(explicit_target or ""),
+                refusal="disabled",
+            )
+        if is_halted(self.config.socket_path.parent):
+            return PointOutcome(
+                pointed=False,
+                reply=UNAUTHORIZED_REFUSAL,
+                query=query,
+                target_name=str(explicit_target or ""),
+                refusal="unauthorized",
+            )
+        pointer = self._resolve_pointer()
+        if pointer is None:
+            return PointOutcome(
+                pointed=False,
+                reply="No pointer surface is configured on this runner.",
+                query=query,
+                target_name=str(explicit_target or ""),
+                refusal="disabled",
+            )
+        return await pointer.point_instruction(
+            query,
+            explicit_target=explicit_target,
+            reduced_motion=bool(sec.get("reduced_motion", False)),
+            permitted=self._pointer_permitted,
+            allow_vlm=allow_vlm,
+            purpose=f"errand:{errand_id}:step:{step_no}:point.grounding",
+            correlation_id=f"errand-{errand_id}-step-{step_no}",
+            consent_via=f"errand:{errand_id}",
+            config=self.config,
+            store=self.store,
+            safety_journal=self.safety_journal,
+            is_offline=self._is_offline,
+        )
 
     def _protected(self) -> list[str]:
         return list(self.config.section("policy").get("protected") or [])
@@ -1231,10 +1307,26 @@ class ErrandRunner:
                     raise TypeError(f"invalid plan step: {item!r}")
 
         scope_roots = self._resolve_roots(roots)
+        point_req = parse_point_instruction(cleaned) if not validated_plan else None
         initial_plan_desc = (
             [{"skill": s.skill, "args": s.args} for s in validated_plan]
             if validated_plan
-            else [{"skill": "fs.locate", "args": {"roots": scope_roots}}]
+            else (
+                [
+                    {
+                        "skill": "point",
+                        "args": {
+                            "query": cleaned,
+                            "target": point_req.target_name,
+                            "raw_target": point_req.raw_target,
+                            "role_hint": point_req.role_hint,
+                        },
+                    },
+                    {"skill": "errand.report", "args": {}},
+                ]
+                if point_req is not None
+                else [{"skill": "fs.locate", "args": {"roots": scope_roots}}]
+            )
         )
         now = iso_now()
         errand_id = self.store.create_errand(
@@ -1590,6 +1682,7 @@ class ErrandRunner:
         inferred_records: list[dict[str, Any]] = []
         confirmed_records: list[dict[str, Any]] = []
         unanswered_notes: list[dict[str, Any]] = []
+        point_outcomes: list[dict[str, Any]] = []
         analysis_result: dict[str, Any] = {}
         locate_result: dict[str, Any] = {}
         terms = extract_query_terms(instruction)
@@ -1620,10 +1713,26 @@ class ErrandRunner:
         })
 
         # Seed step queue: either caller custom plan or adaptive composition.
+        point_req = parse_point_instruction(instruction) if custom_plan is None else None
         queue: list[PlannedStep] = (
             list(custom_plan)
             if custom_plan is not None
-            else [PlannedStep("fs.locate", {"roots": roots, "terms": terms})]
+            else (
+                [
+                    PlannedStep(
+                        "point",
+                        {
+                            "query": instruction,
+                            "target": point_req.target_name,
+                            "raw_target": point_req.raw_target,
+                            "role_hint": point_req.role_hint,
+                        },
+                    ),
+                    PlannedStep("errand.report"),
+                ]
+                if point_req is not None
+                else [PlannedStep("fs.locate", {"roots": roots, "terms": terms})]
+            )
         )
         adaptive = custom_plan is None
 
@@ -1992,11 +2101,60 @@ class ErrandRunner:
                             "resolution": resolution,
                         }
 
+                    elif step.skill == "point":
+                        query_text = str(
+                            step.args.get("query")
+                            or step.args.get("target")
+                            or instruction
+                        ).strip()
+                        explicit_target = step.args.get("target")
+                        allow_vlm = bool(
+                            use_llm
+                            and budget.max_step_api_calls >= 1
+                            and api_calls_used < budget.max_api_calls
+                        )
+                        outcome = await self._execute_point_step(
+                            errand_id=errand_id,
+                            step_no=step_no,
+                            query=query_text,
+                            explicit_target=str(explicit_target) if explicit_target else None,
+                            allow_vlm=allow_vlm,
+                        )
+                        step_api_calls = outcome.vlm_calls
+                        step_model = (
+                            f"{outcome.vlm_provider}:{outcome.vlm_model}"
+                            if outcome.vlm_calls and outcome.vlm_provider and outcome.vlm_model
+                            else None
+                        )
+                        step_tokens_in = outcome.tokens_in
+                        step_tokens_out = outcome.tokens_out
+                        step_shadow_cost = outcome.shadow_cost_usd
+                        step_untrusted_bytes = outcome.untrusted_bytes
+                        step_summary = outcome.as_receipt()
+                        point_outcomes.append(step_summary)
+                        if outcome.refusal in (
+                            "sensitive",
+                            "injection",
+                            "policy",
+                            "disabled",
+                            "unauthorized",
+                            "quota",
+                            "unverified",
+                            "offline",
+                        ):
+                            step_status = "refused"
+                            unanswered_notes.append({
+                                "reason": f"point refused ({outcome.refusal}): {outcome.reply}",
+                            })
+                        elif not outcome.pointed:
+                            unanswered_notes.append({"reason": outcome.reply})
+
                     elif step.skill == "errand.report":
                         step_summary = {
                             "files_inspected": len(files_inspected),
                             "inferred_count": len(inferred_records),
                             "confirmed_count": len(confirmed_records),
+                            "point_outcomes": len(point_outcomes),
                         }
 
                 except asyncio.CancelledError:
@@ -2112,6 +2270,7 @@ class ErrandRunner:
             confirmed=confirmed_records,
             unanswered_notes=unanswered_notes,
             injection_signals=analysis_result.get("injection_signals", []),
+            point_outcomes=point_outcomes,
         )
         self.store.update_errand(
             errand_id,
@@ -2148,6 +2307,7 @@ class ErrandRunner:
         confirmed: list[dict[str, Any]],
         unanswered_notes: list[dict[str, Any]],
         injection_signals: list[dict[str, Any]] | None = None,
+        point_outcomes: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         steps = self.store.list_errand_steps(errand_id)
         questions = self.store.list_pending_questions(errand_id=errand_id)
@@ -2215,12 +2375,20 @@ class ErrandRunner:
                 for s in done_steps
             ],
         }
-        summary = (
-            f"Errand #{errand_id} {status}: {len(done_steps)} step(s), "
-            f"{len(files_inspected)} file(s) inspected, {len(inferred)} inferred, "
-            f"{len(confirmed)} confirmed, {len(answered_qs)} question(s) answered, "
-            f"{len(unanswered)} unanswered/remaining."
-        )
+        point_list = list(point_outcomes or [])
+        if point_list and not files_inspected:
+            last_reply = str(point_list[-1].get("reply") or "").strip()
+            summary = (
+                f"Errand #{errand_id} {status}: {len(done_steps)} step(s), "
+                f"{last_reply or 'pointer step finished'}"
+            )
+        else:
+            summary = (
+                f"Errand #{errand_id} {status}: {len(done_steps)} step(s), "
+                f"{len(files_inspected)} file(s) inspected, {len(inferred)} inferred, "
+                f"{len(confirmed)} confirmed, {len(answered_qs)} question(s) answered, "
+                f"{len(unanswered)} unanswered/remaining."
+            )
         return {
             "errand_id": errand_id,
             "instruction": instruction,
@@ -2229,6 +2397,7 @@ class ErrandRunner:
             "files_inspected": files_inspected,
             "inferred": inferred,
             "confirmed": confirmed,
+            "point_outcomes": point_list,
             "questions_answered": answered_qs,
             "unanswered_or_unasked": unanswered,
             "injection_signals_seen": len(injection_signals or []),

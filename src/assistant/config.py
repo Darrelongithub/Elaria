@@ -290,6 +290,22 @@ DEFAULTS: dict = {
             "transcribe-live": {"rpm": 0, "tpm": 20_000, "rpd": 0},
             "transcribe-batch": {"rpm": None, "tpm": None, "rpd": 25},
         },
+        # Diverted-material VLM fallback for the NUS pointer (BUILD-3 /
+        # SPEC-PROVIDER-ROUTING.md). Grounding is NEVER the personality tier
+        # (gemini-3.5-flash-lite) and NEVER the 20/day flash escalation
+        # (gemini-3.8-flash). Default is disabled (AT-SPI-only, 0 VLM calls).
+        # `rpd_cap = 0` also disables VLM calls (never unlimited). `verified`
+        # is strictly per-lane and never inherited from `[quota].verified`.
+        "grounding": {
+            "enabled": False,
+            "provider": "",
+            "model": "",
+            "verified": False,
+            "verified_at": "",
+            "verified_source": "",
+            "rpd_cap": 30,
+            "timeout_s": 4.0,
+        },
         # Flat aliases remain readable by older code/configs and by the client's
         # limiter. `0` means "not rate-limited" (Transcribe Live).
         "flash_rpm": 5,
@@ -1335,6 +1351,83 @@ def validate_config(config: Config) -> dict:
                         f"[quota] {prefix}_{rkey}={fval} and "
                         f"[quota.models.{mname}] {rkey}={rval} disagree — "
                         "the stricter value is enforced")
+
+    # -- diverted vision grounding quota (BUILD-3 / SPEC-PROVIDER-ROUTING) ---
+    grounding = quota.get("grounding")
+    if grounding is not None and not isinstance(grounding, dict):
+        errors.append("[quota.grounding] must be a table")
+    elif isinstance(grounding, dict):
+        _g_allowed = {
+            "enabled", "provider", "model", "verified",
+            "verified_at", "verified_source", "rpd_cap", "timeout_s",
+        }
+        for key in grounding:
+            if key not in _g_allowed:
+                warnings.append(f"unknown key [quota.grounding] {key}")
+        _bool_error(errors, "[quota.grounding] enabled", grounding.get("enabled"))
+        _bool_error(errors, "[quota.grounding] verified", grounding.get("verified"))
+        for key in ("provider", "model", "verified_at", "verified_source"):
+            val = grounding.get(key)
+            if val is not None and not isinstance(val, str):
+                errors.append(f"[quota.grounding] {key}={val!r} must be a string")
+        _number_error(errors, "[quota.grounding] rpd_cap", grounding.get("rpd_cap"),
+                      minimum=0, integer=True)
+        _number_error(errors, "[quota.grounding] timeout_s", grounding.get("timeout_s"),
+                      minimum=0.1)
+        g_provider = str(grounding.get("provider") or "").strip().lower()
+        g_model = str(grounding.get("model") or "").strip()
+        g_model_low = g_model.lower()
+        if g_provider and (
+            g_provider in {"gemini", "google", "google-genai", "google_genai"}
+            or "gemini" in g_provider
+        ):
+            errors.append(
+                f"[quota.grounding] provider={grounding.get('provider')!r} is forbidden: "
+                "vision grounding is diverted material and must NEVER use Gemini "
+                "(personality tier / 20 RPD flash escalation)"
+            )
+        if g_model:
+            from .model_registry import (
+                FORBIDDEN_IDS,
+                PINNED_ROLES,
+                is_forbidden,
+                normalise_model_id,
+            )
+            norm_g_model = normalise_model_id(g_model)
+            pinned_models = {m.lower() for m in PINNED_ROLES.values()}
+            if (
+                "gemini-" in norm_g_model.lower()
+                or "gemini-" in g_model_low
+                or "flash-lite" in g_model_low
+                or norm_g_model.lower() in pinned_models
+                or norm_g_model in FORBIDDEN_IDS
+                or is_forbidden(g_model)
+            ):
+                errors.append(
+                    f"[quota.grounding] model={g_model!r} is forbidden: "
+                    "vision grounding must NEVER use the personality tier, "
+                    "the 20/day flash escalation, or a forbidden model"
+                )
+        if grounding.get("enabled") is True:
+            if not g_provider:
+                errors.append(
+                    "[quota.grounding] enabled=true requires a non-empty diverted provider"
+                )
+            if not g_model:
+                errors.append(
+                    "[quota.grounding] enabled=true requires a non-empty model"
+                )
+
+    # -- nus_pointer ---------------------------------------------------------
+    nus_pointer = raw.get("nus_pointer") if isinstance(raw.get("nus_pointer"), dict) else {}
+    _bool_error(errors, "[nus_pointer] enabled", nus_pointer.get("enabled"))
+    _bool_error(errors, "[nus_pointer] reduced_motion", nus_pointer.get("reduced_motion"))
+    if nus_pointer.get("surface_path") is not None and not isinstance(nus_pointer.get("surface_path"), str):
+        errors.append(
+            f"[nus_pointer] surface_path={nus_pointer.get('surface_path')!r} must be a string"
+        )
+    _number_error(errors, "[nus_pointer] ttl_ms", nus_pointer.get("ttl_ms"),
+                  minimum=1000, maximum=30000, integer=True)
 
     # -- discovery & errand bounds (GAP-1 / GAP-2) ---------------------------
     discovery = raw.get("discovery") if isinstance(raw.get("discovery"), dict) else {}

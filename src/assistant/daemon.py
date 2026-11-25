@@ -326,6 +326,8 @@ class Daemon:
             client=self.client,
             safety_journal=self.safety_journal,
             broadcast=self.broadcast,
+            pointer_provider=lambda: self._nus_pointer,
+            is_offline=lambda: self.mode_manager.status().is_offline,
         )
         from .meeting import MEETING_TRANSCRIPTION_TIMEOUT_S, MeetingService
         self.meetings = MeetingService(
@@ -470,7 +472,13 @@ class Daemon:
         nus_path = config.section("nus_pointer").get("surface_path", "~/Elaria/ui/quickshell/nus")
         self._nus_surface = NusDispatch(Path(nus_path).expanduser())
         self._nus_state_lock = asyncio.Lock()
-        self._nus_pointer = Pointer(self._nus_surface)
+        self._nus_pointer = Pointer(
+            self._nus_surface,
+            config=config,
+            store=self.store,
+            safety_journal=self.safety_journal,
+            is_offline=lambda: self.mode_manager.status().is_offline,
+        )
         self._capture_state_last: tuple | None = None
         # When the speech path is dead, capture.state says so (never a calm
         # idle). Held here so live-state emissions after a failure (done
@@ -1257,29 +1265,102 @@ class Daemon:
             if principal_token is not None:
                 self._ipc_principal.reset(principal_token)
 
-    async def _nus_point(self, params: dict) -> dict:
+    async def _execute_point(
+        self,
+        query: str,
+        *,
+        explicit_target: str | None = None,
+        consent_via: str = "ask",
+        purpose: str = "nus_pointer.grounding",
+        require_explicit_flag: bool = False,
+        allow_local_frame: bool = False,
+    ):
+        """Shared read-only point skill used by ask/console/voice and `nus.point`."""
+        from .nus_pointer import (
+            DISABLED_REFUSAL,
+            UNAUTHORIZED_REFUSAL,
+            PointOutcome,
+        )
         from .observation import NOT_FOUND
 
-        self._require_ipc_owner()
         settings = self.config.section("nus_pointer")
+
+        def permitted() -> bool:
+            return (
+                settings.get("enabled") is True
+                and not is_halted(self.config.socket_path.parent)
+                and (not require_explicit_flag or allow_local_frame is True)
+            )
+
+        if settings.get("enabled") is not True:
+            reply = UNAUTHORIZED_REFUSAL if require_explicit_flag else DISABLED_REFUSAL
+            return PointOutcome(
+                pointed=False,
+                reply=reply,
+                query=query,
+                target_name=str(explicit_target or ""),
+                refusal="unauthorized" if require_explicit_flag else "disabled",
+            )
+        if not permitted():
+            return PointOutcome(
+                pointed=False,
+                reply=UNAUTHORIZED_REFUSAL,
+                query=query,
+                target_name=str(explicit_target or ""),
+                refusal="unauthorized",
+            )
+        try:
+            return await self._nus_pointer.point_instruction(
+                query,
+                explicit_target=explicit_target,
+                reduced_motion=settings.get("reduced_motion") is True,
+                permitted=permitted,
+                purpose=purpose,
+                consent_via=consent_via,
+                config=self.config,
+                store=self.store,
+                safety_journal=self.safety_journal,
+                is_offline=lambda: self.mode_manager.status().is_offline,
+            )
+        except Exception as exc:
+            print(f"[assistd] NUS observation failed: {type(exc).__name__}", flush=True)
+            return PointOutcome(
+                pointed=False,
+                reply=NOT_FOUND,
+                query=query,
+                target_name=str(explicit_target or ""),
+                refusal="failed",
+            )
+
+    async def _nus_point(self, params: dict) -> dict:
+        self._require_ipc_owner()
         name = params.get("name")
         if not isinstance(name, str) or not name.strip() or len(name) > 140:
             raise ValueError("expected an accessible element name (1–140 characters)")
-        def permitted():
-            return not is_halted(self.config.socket_path.parent)
-        if (settings.get("enabled") is not True or params.get("allow_local_frame") is not True
-                or not permitted()):
-            return {"pointed": False, "reply": "Local screen observation was not authorized."}
-        try:
-            resolution = await self._nus_pointer.point(
-                name, reduced_motion=settings.get("reduced_motion") is True, permitted=permitted)
-        except Exception as exc:
-            print(f"[assistd] NUS observation failed: {type(exc).__name__}", flush=True)
-            resolution = None
-        if resolution is None:
-            return {"pointed": False, "reply": NOT_FOUND}
-        return {"pointed": True, "reply": resolution.label or "Pointed on screen.",
-                "frame_id": resolution.frame_id, "snapshot_id": resolution.snapshot_id}
+        outcome = await self._execute_point(
+            name,
+            explicit_target=name,
+            consent_via="cli:nus.point",
+            purpose="nus_pointer.grounding",
+            require_explicit_flag=True,
+            allow_local_frame=(params.get("allow_local_frame") is True),
+        )
+        res = outcome.resolution
+        if not outcome.pointed or res is None:
+            out = {"pointed": False, "reply": outcome.reply}
+            if outcome.refusal:
+                out["refusal"] = outcome.refusal
+            return out
+        return {
+            "pointed": True,
+            "reply": outcome.reply,
+            "frame_id": res.frame_id,
+            "snapshot_id": res.snapshot_id,
+            "grounding_source": outcome.grounding_source,
+            "label": res.label or "sure",
+            "best_guess": outcome.best_guess,
+            "unidentified": outcome.unidentified,
+        }
 
     async def _ping(self, params: dict) -> dict:
         return {"pong": True, "version": __version__}
@@ -4505,6 +4586,7 @@ class Daemon:
                      "on the table.")
             via = "local-awareness"
         intent = (None if company_command is not None or unparsed_command
+                  or bool(params.get("errand"))
                   else route(route_text))
         # J3: a MUTATING voice intent must clear the command floor (0.85) until
         # the owner rules otherwise. The confidence rides in from the dictation
@@ -4882,6 +4964,14 @@ class Daemon:
             ids = ", ".join(f"#{s['plan_id']}" for s in started["started"])
             return ((f"Shadow plan(s) {ids} building — nothing moves without "
                     "your review + apply. Watch `assist events`."), "local-intent", None)
+        if intent.kind == "point":
+            outcome = await self._execute_point(
+                intent.raw or intent.argument,
+                explicit_target=intent.argument or None,
+                consent_via=f"intent:{intent.source}",
+                purpose="nus_pointer.grounding",
+            )
+            return (outcome.reply, "local-intent", outcome.as_receipt())
         return (None, "local-intent", None)
 
     async def _connectivity_tick(self) -> None:
@@ -5038,9 +5128,12 @@ class Daemon:
         if self._wake_listen_task is not None and not self._wake_listen_task.done():
             self._wake_listen_abort("daemon closing")
         listen_task, self._wake_listen_task = self._wake_listen_task, None
+        pointer_watcher = getattr(self._nus_pointer, "watcher", None)
+        if self._nus_pointer is not None:
+            self._nus_pointer.watcher = None
         tasks = [
             t for t in (*extra_tasks, self._dictation_task, meeting_task,
-                        listen_task,
+                        listen_task, pointer_watcher,
                         *self._meeting_stop_tasks, *self._background_tasks,
                         *self._probe_tasks)
             if t is not None
