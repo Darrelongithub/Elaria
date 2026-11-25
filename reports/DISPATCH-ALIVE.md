@@ -53,7 +53,19 @@ only in both channels; builds come after the manager gate.
 > dedicated WhatsApp question, fact-checked with sources: official
 > paths only (WhatsApp Business Platform, a second number on the
 > owner's phone, or other) — no unofficial automation that risks
-> the owner's accounts, ever (Fork 3 applies); (4) the wake/sync
+> the owner's accounts, ever (Fork 3 applies); (3b) the
+> stranger-facing mode from the owner ruling: her number is given
+> to strangers to chat and make plans, so design the identity
+> tiers — owner-authenticated messages queue as instructions,
+> stranger messages are conversation only and can never become
+> commands (injection is the headline attack: a stranger talking
+> her into emailing, deleting, disclosing, or committing the
+> owner); disclose nothing about the owner beyond what the owner
+> pre-approves (free/busy granularity is a question your report
+> must answer); every negotiated plan lands as a non-binding
+> proposal for owner approval — cite and extend the existing
+> guest contract in `src/assistant/showoff.py` rather than
+> inventing a second one; (4) the wake/sync
 > protocol: queue format, ordering, expiry ("okay I will" means
 > acknowledged-and-queued, never promised-done), how full Elaria
 > drains it on laptop start, and how the two halves reconcile
