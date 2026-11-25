@@ -10,7 +10,9 @@ import struct
 import numpy as np
 import pytest
 
+from assistant.config import DEFAULTS, load_config, validate_config
 from assistant.wake_guard import (
+    MIN_WINDOW_S,
     KeywordModelUnavailable,
     OpenWakeWordModel,
     WakeGuard,
@@ -80,3 +82,43 @@ def test_silent_frames_never_reach_the_spotter():
         assert guard.feed(silence) is None
     assert melspec.calls == 0  # energy gate: inference never ran
     assert guard.state == "idle"
+
+
+def test_quiet_real_frames_reach_spotter_while_digital_silence_stays_gated():
+    model, melspec, _e, _h = _pipeline(score=0.0)
+    guard = WakeGuard(settings={"keyword_threshold": 0.5},
+                      keyword_model=model)
+    guard.arm()
+    silence = b"\x00\x00" * 480
+    quiet_real = b"\x01\x00" * 480  # rms ~ 3.05e-5 < speech_rms (0.01), non-zero
+    for _ in range(10):
+        assert guard.feed(silence) is None
+    assert melspec.calls == 0
+    for _ in range(5):
+        assert guard.feed(quiet_real) is None
+    assert melspec.calls == 5
+    for _ in range(5):
+        assert guard.feed(silence) is None
+    assert melspec.calls == 5
+    assert guard.speech_rms == 0.01
+
+
+def test_openwakeword_config_keys_in_defaults_and_thresholds_frozen(
+        tmp_path, monkeypatch):
+    hotword = DEFAULTS["hotword"]
+    assert hotword["keyword_melspec_model"] == ""
+    assert hotword["keyword_embedding_model"] == ""
+    assert hotword["ecapa_high"] == 0.75
+    assert hotword["keyword_threshold"] == 0.5
+    assert hotword["speech_rms"] == 0.01
+    assert MIN_WINDOW_S == 1.75
+
+    monkeypatch.setenv("ASSIST_CONFIG", str(tmp_path / "missing.toml"))
+    cfg = load_config()
+    cfg.raw["hotword"]["keyword_model"] = "models/elaria_head.onnx"
+    cfg.raw["hotword"]["keyword_melspec_model"] = "models/melspectrogram.onnx"
+    cfg.raw["hotword"]["keyword_embedding_model"] = "models/embedding_model.onnx"
+    verdict = validate_config(cfg)
+    assert verdict["ok"] is True, verdict
+    assert verdict["warnings"] == []
+    assert verdict["errors"] == []

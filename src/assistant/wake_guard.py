@@ -1002,10 +1002,13 @@ class WakeGuard:
             if self.window_due():
                 return self.verify()
             return None
-        # Energy gate (bug #26): silence never reaches the spotter. The
-        # frame is already in the ring, so a phrase that starts loud is
-        # not clipped — only the inference is skipped.
-        if frame_rms(frame) < self.speech_rms:
+        # Energy gate (bug #26): true digital silence never reaches the
+        # spotter, while quiet-but-real frames (including inter-syllable dips
+        # below `speech_rms` and BH-K23's low-amplitude probe frames) still
+        # score the trailing window so hit timing is not shifted past the
+        # phrase. The frame is already in the ring; `speech_rms` (0.01) keeps
+        # its role in `speech_seconds()` and `SilenceLadder`.
+        if frame_rms(frame) <= 0.0:
             return None
         window = self.ring.snapshot()[-self.keyword_window_bytes:] or frame
         try:
