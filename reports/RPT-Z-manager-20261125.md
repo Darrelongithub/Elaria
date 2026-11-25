@@ -1,6 +1,9 @@
 # MANAGER BOARD — finish Elaria (2026-11-25)
 
 Manager = this session. Job: verify, split, prompt, re-verify.
+**Owner correction (2026-11-25): the manager delegates — it does not
+build product lanes itself; parallel channels exist to cut time.
+Dispatch prompts live in `reports/DISPATCH-20261125.md`.**
 **2026-11-25 update (owner ruling): agents merge their own PRs** —
 verify, then merge, don't wait. Nobody edits `OWNERS.yaml` but the
 owner. Never lower a threshold. Voice lock in every wake plan.
@@ -32,7 +35,7 @@ hardware lanes are parked, never blocking.
 | 3 J-HEAD | train "Elaria" head on ~1,500 synthetic clips | prompt ready, blocked on Lane 1 models |
 | 4 Z-RING | audit pre-roll ring feed/use end-to-end | **DONE — `RPT-Z-ring-audit-20261125.md`: fed + used for detection, not inherited by pinned design** |
 | 5 H-OVERLAY | draw `ui/quickshell/nus/shell.qml`, fake-runner harness | **built 2026-11-25: pill renders `capture.state` via `setCaptureState`; eye-check `tests/test_nus_overlay_capture_state.py`; rendering itself = owner's eyes, parked** |
-| 6 O-HANDS | real typing path behind the existing gate | prompt ready — NEXT |
+| 6 O-HANDS | real typing path behind the existing gate | **DELEGATED — Channel 1 in `reports/DISPATCH-20261125.md` (manager does not build)** |
 | 7 OWNER-HW | SUPER+F2 → speak → hear answer; then wake end-to-end | **PARKED — owner cannot run voice tests right now; not blocking any lane** |
 
 ## Lane 1 — done in this board's commit (manager-built, verified)
