@@ -9,7 +9,13 @@ building is the LAST step, not the first:
    code where the licence allows. (Standing rule: licence decides
    method — check the licence before admiring the code.)
 2. **Make our own blueprint** from what was found: what we take,
-   what we change, what we refuse, and why.
+   what we change, what we refuse, and why. Every blueprint must
+   also declare its **API budget**: which pinned model tier it
+   calls, estimated calls/day, and its hard cap — checked against
+   the owner-verified `[quota]` table (flash is 20 requests/day:
+   escalation only, never routine; flash-lite is the workhorse,
+   config-capped). A feature whose replies scale with strangers
+   or feeds must state its per-source rate cap. No budget, no gate.
 3. **Stress-test the blueprint** (where does it break at scale,
    under load, on a cold mic, on a stranger's voice?).
 4. **Fact-check it** (do the referenced APIs/protocols/claims

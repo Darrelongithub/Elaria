@@ -28,6 +28,19 @@ the work. Architecture consequence, recorded as direction:
   acknowledge, and queue. It cannot act, send-as-owner, spend, or
   change anything. When the laptop wakes, full Elaria drains the
   queue under every existing gate.
+- **Her number is a public front door (owner addition, 2026-11-25):**
+  the owner may give her number to strangers — "make plans with
+  this number." She chats with them socially and can *discuss*
+  plans, but a stranger's messages are untrusted input (IF-6) that
+  can **never become commands**: no acting, no sending-as-owner, no
+  disclosing the owner's schedule/location/details, and no binding
+  commitment — any plan a stranger negotiates is a *proposal*
+  queued for the owner's approval, exactly the guest posture
+  `src/assistant/showoff.py` already enforces in person ("I don't
+  send messages for guests. That stays with him."), extended to
+  asynchronous messaging. Identity tiers are structural: the
+  owner's authenticated instructions queue as commands; everyone
+  else's words are conversation, forever.
 - Backup (landed storage, rclone → owner's own Drive) is how the
   two halves stay the same person.
 
