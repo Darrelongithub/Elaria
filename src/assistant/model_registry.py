@@ -19,6 +19,9 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from types import MappingProxyType
@@ -130,18 +133,128 @@ def is_registered(model: str) -> bool:
     return normalise_model_id(model) in {normalise_model_id(m) for m in ALLOWED_IDS}
 
 
-def assert_model_permitted(model: str) -> str:
+def assert_model_permitted(
+    model: str,
+    *,
+    provider: str | None = None,
+    role: str | None = None,
+    capability: str | None = None,
+) -> str:
     """Runtime guard for every API invocation. Raises on a forbidden id.
 
     A non-registry id is NOT blocked here (doctor reports it as a defect;
     blocking it at runtime would break owner experimentation mid-call) — but
     a forbidden id never reaches the wire, by construction.
+
+    BUILD-8: when a routed call has opened a `provider_boundary`, this same
+    function also checks the route's provider/capability/model against the
+    code-owned pin. Legacy direct Gemini callers open no boundary and keep
+    their historical behaviour; they cannot reach another provider because
+    no other transport is available to them.
     """
     if is_forbidden(model):
         raise ForbiddenModelError(
             f"refusing to call forbidden model {model!r}: it is on the §4.1 "
             "forbidden list (retired or rejected). Pin a registry id from "
             "the [gemini] section — see `assist doctor`.")
+    if provider is not None and not _model_belongs_to_provider(provider, model):
+        raise ProviderBoundaryError(
+            f"model {model!r} does not belong to routed provider {provider!r}")
+    boundary = _route_boundary.get()
+    if boundary is not None:
+        if provider is not None and provider != boundary["provider"]:
+            raise ProviderBoundaryError(
+                f"routed {capability or boundary['capability']} call declared "
+                f"provider {provider!r} but the open boundary is "
+                f"{boundary['provider']!r} — refusing to cross providers")
+        if capability is not None and capability != boundary["capability"]:
+            raise ProviderBoundaryError(
+                f"routed call declared capability {capability!r} but the open "
+                f"boundary is {boundary['capability']!r}")
+        if boundary["capability"] == "personality":
+            assert_personality_route(boundary["role"], model,
+                                     provider=boundary["provider"])
+    elif capability == "personality":
+        assert_personality_route(role, model, provider=provider)
+    return model
+
+
+# -- BUILD-8: code-owned personality pin -----------------------------------
+# These constants are deliberately here (I-owned code), NOT in config. A
+# config that can re-route her voice is a config that will. `provider` is a
+# closed id: no URL, alias, base model or fallback can be supplied by config.
+PERSONALITY_PROVIDER = "gemini"
+PERSONALITY_ROLE_MODELS: MappingProxyType[str, str] = MappingProxyType({
+    "chat": CHAT_INTENT,
+    "default": CHAT_INTENT,
+    "escalation": ESCALATION,
+})
+PERSONALITY_MODEL_IDS: frozenset[str] = frozenset(PERSONALITY_ROLE_MODELS.values())
+KNOWN_PROVIDER_IDS: frozenset[str] = frozenset({
+    "gemini", "groq", "openrouter", "cloudflare", "local",
+})
+
+
+class PersonalityRouteError(RuntimeError):
+    """Personality was aimed at a non-pinned provider, role, model or URL."""
+
+
+class ProviderBoundaryError(RuntimeError):
+    """A routed call tried to cross its open provider/capability boundary."""
+
+
+_route_boundary: ContextVar[dict | None] = ContextVar("elaria_route_boundary", default=None)
+
+
+@contextmanager
+def provider_boundary(*, provider: str, capability: str, role: str,
+                      model: str) -> Iterator[None]:
+    """Open a checked route at the network boundary until the block exits.
+
+    Adapters call `assert_model_permitted(..., provider=..., capability=...)`
+    inside this context. A personality route is additionally checked against
+    the exact code-owned role/model table here, so a foreign adapter cannot
+    quietly emit Elaria's words.
+    """
+    if provider not in KNOWN_PROVIDER_IDS:
+        raise ProviderBoundaryError(f"unknown provider id {provider!r}")
+    if capability == "personality":
+        assert_personality_route(role, model, provider=provider)
+    token = _route_boundary.set({"provider": provider, "capability": capability,
+                                 "role": role, "model": model})
+    try:
+        yield
+    finally:
+        _route_boundary.reset(token)
+
+
+def _model_belongs_to_provider(provider: str, model: str) -> bool:
+    """A Gemini id cannot be sent through a diverted adapter, or vice versa."""
+    ident = normalise_model_id(model)
+    if provider == PERSONALITY_PROVIDER:
+        return ident.startswith("gemini-")
+    return bool(ident) and not ident.startswith("gemini-")
+
+
+def assert_personality_route(role: str | None, model: str, *,
+                             provider: str | None = PERSONALITY_PROVIDER) -> str:
+    """Return the model only when this is the pinned Gemini personality route.
+
+    Exact id equality, no prefix match, no provider fallback, no config
+    escape: flash-lite is the workhorse and flash is escalation-only.
+    """
+    if provider != PERSONALITY_PROVIDER:
+        raise PersonalityRouteError(
+            f"personality is pinned to {PERSONALITY_PROVIDER!r}; refusing "
+            f"provider {provider!r} (no failover of Elaria's voice)")
+    expected = PERSONALITY_ROLE_MODELS.get(str(role or "").strip())
+    if expected is None:
+        raise PersonalityRouteError(
+            f"role {role!r} is not a pinned personality role "
+            f"({', '.join(sorted(PERSONALITY_ROLE_MODELS))})")
+    if normalise_model_id(model) != normalise_model_id(expected):
+        raise PersonalityRouteError(
+            f"role {role!r} must use pinned model {expected!r}, not {model!r}")
     return model
 
 

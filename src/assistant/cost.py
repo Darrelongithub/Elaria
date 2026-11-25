@@ -13,7 +13,9 @@ shape. Audio bills at 25 tokens/second (§7).
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from types import MappingProxyType
 
 # (input, output) USD per 1M tokens. Matched by substring, cheapest first.
 PRICES_PER_1M: list[tuple[str, float, float]] = [
@@ -221,4 +223,338 @@ def format_cost_report(month: dict, today: dict, quota: dict, tier: str = "free"
         lines.append(
             "Reminder: quota shape in config is ASSUMED until verified at "
             "aistudio.google.com/rate-limit (blueprint §11).")
+    return "\n".join(lines)
+
+
+# -- BUILD-8: per-provider quota rows and provider ledger ------------------
+# Deliberately separate from `quota_rows()` above: the existing `[quota]`
+# parser treats 0 as "unlimited" and its `verified` marker belongs to the
+# owner's Gemini measurements. Neither may leak into a diverted provider's
+# row. Unknown/absent/zero caps here mean UNAVAILABLE, never unlimited.
+
+PROVIDER_LEDGER_COLUMNS: dict[str, str] = {
+    "provider": "TEXT NOT NULL DEFAULT 'unknown'",
+    "capability": "TEXT DEFAULT 'unknown'",
+    "provider_request_id": "TEXT",
+    "billing_unit": "TEXT",
+    "billing_amount": "REAL",
+    "cost_known": "INTEGER NOT NULL DEFAULT 0",
+    "quota_bucket": "TEXT",
+}
+PENDING_MARK = "pending:provider_router"
+
+
+class LedgerWriteError(RuntimeError):
+    """A provider call was refused because its ledger row could not be written."""
+
+
+@dataclass(frozen=True)
+class ProviderModelCap:
+    """Positive caps only. `None` means unknown/unavailable, never unlimited."""
+
+    rpm: int | None = None
+    tpm: int | None = None
+    rpd: int | None = None
+    tpd: int | None = None
+    billing_unit: str = ""
+    reset_tz: str = "UTC"
+
+    def cap(self, unit: str) -> int | None:
+        value = getattr(self, unit, None)
+        return value if isinstance(value, (int, float)) and value > 0 else None
+
+
+@dataclass(frozen=True)
+class ProviderQuotaRow:
+    provider: str
+    enabled: bool = False
+    verified: bool = False
+    verified_at: str = ""
+    verified_source: str = ""
+    plan: str = ""
+    terms_reviewed_at: str = ""
+    no_card_required: bool = False
+    data_use_policy: str = ""
+    models: MappingProxyType[str, ProviderModelCap] = field(
+        default_factory=lambda: MappingProxyType({}))
+
+    @property
+    def evidence_complete(self) -> bool:
+        """Owner-account evidence that the design requires before enablement."""
+        return bool(self.verified and self.no_card_required and self.verified_at
+                    and self.verified_source and self.plan
+                    and self.terms_reviewed_at and self.data_use_policy)
+
+    @property
+    def runnable(self) -> bool:
+        return bool(self.enabled and self.evidence_complete and self.models)
+
+    def cap_for(self, model: str) -> ProviderModelCap | None:
+        return self.models.get(str(model).strip()) if self.runnable else None
+
+    def as_dict(self) -> dict:
+        return {
+            "provider": self.provider, "enabled": self.enabled,
+            "verified": self.verified,
+            "verified_at": self.verified_at,
+            "verified_source": self.verified_source, "plan": self.plan,
+            "terms_reviewed_at": self.terms_reviewed_at,
+            "no_card_required": self.no_card_required,
+            "data_use_policy": self.data_use_policy,
+            "evidence_complete": self.evidence_complete,
+            "runnable": self.runnable,
+            "models": {name: {"rpm": cap.rpm, "tpm": cap.tpm, "rpd": cap.rpd,
+                              "tpd": cap.tpd, "billing_unit": cap.billing_unit,
+                              "reset_tz": cap.reset_tz}
+                       for name, cap in self.models.items()},
+        }
+
+
+_BOOL_KEYS = ("enabled", "verified", "no_card_required")
+_TEXT_KEYS = ("verified_at", "verified_source", "plan", "terms_reviewed_at",
+              "data_use_policy")
+_CAP_KEYS = ("rpm", "tpm", "rpd", "tpd")
+
+
+def _positive_cap(value, label: str, errors: list[str]) -> int | None:
+    """Zero, absent, negative, 'unlimited' and bool are NOT positive caps."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        errors.append(f"{label}={value!r} must be a positive number or absent; "
+                      "0 is unavailable, not unlimited")
+        return None
+    return int(value) if float(value).is_integer() else float(value)
+
+
+def parse_provider_quota_rows(quota: dict) -> tuple[dict[str, ProviderQuotaRow], list[str]]:
+    """Parse `[quota.providers.*]` with strict, provider-local verification.
+
+    Does not read `[quota].verified`, `[quota.models.*]` or any Gemini figure.
+    Returns `(rows, errors)`; an error makes that provider unrunnable.
+    """
+    from .model_registry import KNOWN_PROVIDER_IDS
+
+    errors: list[str] = []
+    rows: dict[str, ProviderQuotaRow] = {}
+    if not isinstance(quota, dict):
+        return rows, ["[quota] must be a table"]
+    providers = quota.get("providers")
+    if providers is None:
+        return rows, errors
+    if not isinstance(providers, dict):
+        return rows, ["[quota.providers] must be a table"]
+    for name, raw in providers.items():
+        label = f"[quota.providers.{name}]"
+        provider = str(name).strip()
+        if provider not in KNOWN_PROVIDER_IDS:
+            errors.append(f"{label} names unknown provider {name!r}")
+            continue
+        if not isinstance(raw, dict):
+            errors.append(f"{label} must be a table")
+            continue
+        local_errors: list[str] = []
+        unknown = set(raw) - (set(_BOOL_KEYS) | set(_TEXT_KEYS) | {"models"})
+        if unknown:
+            local_errors.append(f"{label} unknown keys: {', '.join(sorted(unknown))}")
+        flags = {}
+        for key in _BOOL_KEYS:
+            value = raw.get(key, False)
+            if not isinstance(value, bool):
+                local_errors.append(f"{label} {key}={value!r} must be true or false")
+                flags[key] = False
+            else:
+                flags[key] = value
+        texts = {}
+        for key in _TEXT_KEYS:
+            value = raw.get(key, "")
+            if not isinstance(value, str):
+                local_errors.append(f"{label} {key} must be a string")
+                texts[key] = ""
+            else:
+                texts[key] = value.strip()
+        models: dict[str, ProviderModelCap] = {}
+        model_rows = raw.get("models", {})
+        if not isinstance(model_rows, dict):
+            local_errors.append(f"{label} models must be a table")
+            model_rows = {}
+        for model_name, model_raw in model_rows.items():
+            mlabel = f"{label}.models.{model_name}"
+            if not isinstance(model_raw, dict):
+                local_errors.append(f"{mlabel} must be a table")
+                continue
+            m_unknown = set(model_raw) - (set(_CAP_KEYS) | {"billing_unit", "reset_tz"})
+            if m_unknown:
+                local_errors.append(f"{mlabel} unknown keys: {', '.join(sorted(m_unknown))}")
+            caps = {key: _positive_cap(model_raw.get(key), f"{mlabel}.{key}", local_errors)
+                    for key in _CAP_KEYS}
+            billing_unit = model_raw.get("billing_unit", "")
+            reset_tz = model_raw.get("reset_tz", "UTC")
+            if not isinstance(billing_unit, str) or not isinstance(reset_tz, str):
+                local_errors.append(f"{mlabel} billing_unit/reset_tz must be strings")
+                billing_unit, reset_tz = "", "UTC"
+            models[str(model_name)] = ProviderModelCap(
+                **caps, billing_unit=billing_unit.strip(), reset_tz=reset_tz.strip() or "UTC")
+        errors.extend(local_errors)
+        row = ProviderQuotaRow(
+            provider=provider, enabled=flags["enabled"], verified=flags["verified"],
+            no_card_required=flags["no_card_required"], models=MappingProxyType(models),
+            verified_at=texts["verified_at"], verified_source=texts["verified_source"],
+            plan=texts["plan"], terms_reviewed_at=texts["terms_reviewed_at"],
+            data_use_policy=texts["data_use_policy"])
+        if local_errors and row.enabled:
+            # An invalid row must never be routable. Keep it visible to doctor,
+            # with `enabled` retained so the error cannot be mistaken for off.
+            row = replace(row, verified=False, no_card_required=False)
+            errors.append(f"{label} is NOT runnable: fix the errors above")
+        rows[provider] = row
+    return rows, errors
+
+
+def ensure_provider_ledger(store) -> dict:
+    """Add provider columns, backfill provable rows, tag future Gemini rows.
+
+    Backfill is deliberately narrow: only model ids that are provably Gemini
+    get `provider='gemini'`. Everything else stays `unknown`; capability is
+    `unknown` for old rows because purpose alone cannot prove personality.
+    """
+    conn, lock = store._conn, store._lock
+    added: list[str] = []
+    with lock:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(llm_calls)")}
+        for name, ddl in PROVIDER_LEDGER_COLUMNS.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE llm_calls ADD COLUMN {name} {ddl}")
+                added.append(name)
+        conn.execute(
+            "UPDATE llm_calls SET provider='gemini' "
+            "WHERE provider='unknown' AND lower(model) LIKE 'gemini-%'")
+        conn.execute(
+            "UPDATE llm_calls SET capability='unknown' "
+            "WHERE capability IS NULL OR capability=''")
+        # Existing writers (gemini_client, asr, transcribe) live in other
+        # owners' lanes. An AFTER-INSERT tag attributes their new rows to the
+        # only transport they can reach, without editing those files.
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS llm_calls_tag_gemini
+            AFTER INSERT ON llm_calls
+            WHEN NEW.provider = 'unknown' AND lower(NEW.model) LIKE 'gemini-%'
+            BEGIN
+              UPDATE llm_calls SET provider='gemini' WHERE id = NEW.id;
+            END
+        """)
+        conn.commit()
+    return {"added_columns": added, "trigger": "llm_calls_tag_gemini"}
+
+
+def _require_provider_columns(store) -> None:
+    try:
+        columns = {row[1] for row in store._conn.execute("PRAGMA table_info(llm_calls)")}
+    except Exception as exc:
+        raise LedgerWriteError(f"provider ledger unreadable: {exc}") from exc
+    missing = set(PROVIDER_LEDGER_COLUMNS) - columns
+    if missing:
+        raise LedgerWriteError(
+            "provider ledger columns missing: " + ", ".join(sorted(missing))
+            + " — refusing the cloud call")
+
+
+def reserve_provider_call(store, *, provider: str, capability: str, role: str,
+                          model: str, purpose: str, correlation_id: str,
+                          quota_bucket: str, mode: str = "mock",
+                          is_user_turn: bool = False) -> int:
+    """Journal an attempt BEFORE the network send. Failure refuses the call."""
+    _require_provider_columns(store)
+    columns = [
+        "ts", "correlation_id", "role", "model", "mode", "tokens_in", "tokens_out",
+        "tokens_estimated", "audio_seconds", "cost_usd", "latency_ms", "ok",
+        "verified", "attempt", "fixture_key", "error", "purpose", "is_user_turn",
+        "provider", "capability", "provider_request_id", "billing_unit",
+        "billing_amount", "cost_known", "quota_bucket",
+    ]
+    values = [
+        iso_now(), correlation_id, str(role), str(model), str(mode), 0, 0, 0, 0.0,
+        0.0, 0.0, 0, None, 1, None, PENDING_MARK, purpose or str(role),
+        1 if is_user_turn else 0, str(provider), str(capability), None, None,
+        None, 0, str(quota_bucket),
+    ]
+    try:
+        with store._lock:
+            cur = store._conn.execute(
+                f"INSERT INTO llm_calls ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' * len(columns))})", values)
+            store._conn.commit()
+            return int(cur.lastrowid)
+    except Exception as exc:
+        raise LedgerWriteError(f"provider reservation not journaled: {exc}") from exc
+
+
+def finalize_provider_call(store, row_id: int, *, ok: bool, tokens_in: int = 0,
+                           tokens_out: int = 0, error: str | None = None,
+                           latency_ms: float = 0.0, cost_usd: float = 0.0,
+                           provider_request_id: str | None = None,
+                           billing_unit: str | None = None,
+                           billing_amount: float | None = None) -> None:
+    """Close the attempt row. Unknown usage stays nullable, never guessed."""
+    _require_provider_columns(store)
+    try:
+        with store._lock:
+            cur = store._conn.execute(
+                "UPDATE llm_calls SET ok=?, tokens_in=?, tokens_out=?, error=?, "
+                "latency_ms=?, cost_usd=?, provider_request_id=?, billing_unit=?, "
+                "billing_amount=?, cost_known=? WHERE id=?",
+                (1 if ok else 0, int(tokens_in), int(tokens_out), error,
+                 float(latency_ms), float(cost_usd), provider_request_id,
+                 billing_unit, billing_amount, 1 if billing_amount is not None else 0,
+                 int(row_id)))
+            store._conn.commit()
+            if cur.rowcount != 1:
+                raise LedgerWriteError(f"provider ledger row {row_id} vanished")
+    except LedgerWriteError:
+        raise
+    except Exception as exc:
+        raise LedgerWriteError(f"provider result not journaled: {exc}") from exc
+
+
+def provider_cost_report(store, since_iso: str | None = None) -> dict:
+    """Per-provider/per-capability answer to 'what did today cost?'."""
+    ensure_provider_ledger(store)
+    _require_provider_columns(store)
+    where = "WHERE ts >= ?" if since_iso else ""
+    params = (since_iso,) if since_iso else ()
+    with store._lock:
+        rows = store._conn.execute(
+            f"""SELECT provider, capability, model,
+                       COUNT(*) AS calls,
+                       COALESCE(SUM(tokens_in + tokens_out), 0) AS tokens,
+                       COALESCE(SUM(cost_usd), 0) AS shadow_usd,
+                       COALESCE(SUM(ok = 0), 0) AS failures,
+                       COALESCE(SUM(cost_known = 0), 0) AS unknown_cost,
+                       COALESCE(SUM(error = ?), 0) AS pending
+                FROM llm_calls {where}
+                GROUP BY provider, capability, model
+                ORDER BY provider, capability, model""",
+            (PENDING_MARK, *params)).fetchall()
+    return {
+        "since": since_iso,
+        "rows": [dict(row) for row in rows],
+        "providers": sorted({row["provider"] for row in rows}),
+    }
+
+
+def format_provider_report(report: dict) -> str:
+    lines = ["Per-provider ledger (shadow USD, not billing):"]
+    if not report["rows"]:
+        lines.append("  no provider calls recorded")
+    for row in report["rows"]:
+        extra = []
+        if row["unknown_cost"]:
+            extra.append(f"{row['unknown_cost']} unknown-cost")
+        if row["pending"]:
+            extra.append(f"{row['pending']} pending/unclosed")
+        suffix = f" ({', '.join(extra)})" if extra else ""
+        lines.append(
+            f"  {row['provider']} · {row['capability']} · {row['model']}: "
+            f"{row['calls']} call(s), {row['tokens']} tokens, "
+            f"${row['shadow_usd']:.4f} shadow, {row['failures']} failure(s){suffix}")
     return "\n".join(lines)
