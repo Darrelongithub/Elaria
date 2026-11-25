@@ -1914,6 +1914,98 @@ def _print_plan_summary(result: dict) -> None:
     print(f"Nothing moved. Read and judge: {result['shadow_log']}")
 
 
+def _errand_command(args, config) -> int:
+    action = args.errand_cmd
+    if action == "start":
+        budget: dict = {}
+        if args.max_steps is not None:
+            budget["max_steps"] = args.max_steps
+        if args.max_seconds is not None:
+            budget["max_seconds"] = args.max_seconds
+        if args.max_api_calls is not None:
+            budget["max_api_calls"] = args.max_api_calls
+        params: dict = {"instruction": args.instruction}
+        if args.roots:
+            params["roots"] = args.roots
+        if budget:
+            params["budget"] = budget
+        result = call(config.socket_path, "errand.start", params, timeout=10.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"Errand #{result['errand_id']} started ({result['status']}): "
+                  f"{result['instruction']}")
+        return 0
+
+    if action == "status":
+        result = call(config.socket_path, "errand.status",
+                      {"errand_id": args.errand_id}, timeout=10.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            b = result["budget"]
+            print(f"Errand #{result['errand_id']} [{result['status']}]: "
+                  f"{result['instruction']}")
+            print(f"  steps: {b['steps_done']}/{b['max_steps']} · "
+                  f"api_calls: {b['api_calls_used']}/{b['max_api_calls']} · "
+                  f"tokens: {b['tokens_in']} in / {b['tokens_out']} out · "
+                  f"shadow: ${b['shadow_cost_usd']:.6f}")
+            for step in result["steps"]:
+                print(f"  step {step['step_no']}: {step['skill']} [{step['status']}] "
+                      f"model={step.get('model') or 'local'} "
+                      f"calls={step['api_calls']} "
+                      f"cost=${step['shadow_cost_usd']:.6f}")
+            for q in result["questions"]:
+                print(f"  question #{q['id']} [{q['status']}]: {q['question']}")
+            if result.get("report"):
+                print(f"  report: {result['report'].get('summary')}")
+        return 0
+
+    if action == "list":
+        params = {"limit": args.limit}
+        if args.status:
+            params["status"] = args.status
+        result = call(config.socket_path, "errand.list", params, timeout=10.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            for item in result["errands"]:
+                print(f"#{item['errand_id']} [{item['status']}] "
+                      f"steps={item['steps_done']}/{item['max_steps']} "
+                      f"calls={item['api_calls_used']}/{item['max_api_calls']} · "
+                      f"{item['instruction']}")
+            if not result["errands"]:
+                print("(no errands)")
+        return 0
+
+    if action == "cancel":
+        result = call(config.socket_path, "errand.cancel",
+                      {"errand_id": args.errand_id}, timeout=10.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"Errand #{result['errand_id']} -> {result['status']}")
+        return 0
+
+    if action == "answer":
+        params = {
+            "errand_id": args.errand_id,
+            "decision": args.decision,
+            "answer_text": args.text,
+        }
+        if args.question_id is not None:
+            params["question_id"] = args.question_id
+        result = call(config.socket_path, "errand.answer", params, timeout=10.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"Question #{result['question_id']} -> {result['status']} "
+                  f"(promoted={result['promoted_fact_ids']}, resumed={result['resumed']})")
+        return 0
+
+    raise ValueError(f"unknown errand action: {action!r}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Every `assist` command surface, built in one place.
 
@@ -2244,6 +2336,35 @@ def build_parser() -> argparse.ArgumentParser:
     events_p.add_argument("--kind",
                           help="with --recent: only events of this kind "
                                "(e.g. ptt.lifecycle, capture.stats)")
+    errand_p = sub.add_parser(
+        "errand", help="bounded async read-only errands (GAP-1)")
+    errand_sub = errand_p.add_subparsers(dest="errand_cmd", required=True)
+    err_start = errand_sub.add_parser("start", help="start a bounded read-only errand")
+    err_start.add_argument("instruction", help="owner instruction to compose and execute")
+    err_start.add_argument("--root", action="append", dest="roots",
+                           help="override read-only root(s) to scan (repeatable)")
+    err_start.add_argument("--max-steps", type=int, default=None)
+    err_start.add_argument("--max-seconds", type=float, default=None)
+    err_start.add_argument("--max-api-calls", type=int, default=None)
+    err_start.add_argument("--json", action="store_true")
+    err_status = errand_sub.add_parser("status", help="inspect one errand (steps, costs, report)")
+    err_status.add_argument("errand_id", type=int)
+    err_status.add_argument("--json", action="store_true")
+    err_list = errand_sub.add_parser("list", help="list recent errands")
+    err_list.add_argument("--status", default=None)
+    err_list.add_argument("--limit", type=int, default=20)
+    err_list.add_argument("--json", action="store_true")
+    err_cancel = errand_sub.add_parser("cancel", help="cancel a running or paused errand")
+    err_cancel.add_argument("errand_id", type=int)
+    err_cancel.add_argument("--json", action="store_true")
+    err_answer = errand_sub.add_parser(
+        "answer", help="resolve a paused errand's clarifying question and resume")
+    err_answer.add_argument("errand_id", type=int)
+    err_answer.add_argument("--question-id", type=int, default=None)
+    err_answer.add_argument("--decision", choices=("confirm", "amend", "reject", "answer"),
+                            default="confirm")
+    err_answer.add_argument("--text", default="", help="owner answer or amended fact text")
+    err_answer.add_argument("--json", action="store_true")
     return parser
 
 
@@ -2576,6 +2697,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "hotword":
             return _hotword_command(args, config)
+
+        if args.command == "errand":
+            return _errand_command(args, config)
 
         if args.command == "dictate":
             started = call(config.socket_path, "ptt.start",

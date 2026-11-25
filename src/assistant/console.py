@@ -105,6 +105,15 @@ class ConsoleService:
         jobs = self.store.list_cloud_jobs(status=None, limit=50)
         queue_counts = self.store.cloud_job_counts()
         active_jobs = [job for job in jobs if job["status"] in ACTIVE_JOB_STATUSES]
+        active_errands = (
+            self.store.list_errands(
+                status=("queued", "running", "paused_for_question"), limit=limit)
+            if hasattr(self.store, "list_errands") else []
+        )
+        pending_questions = (
+            self.store.list_pending_questions(status="pending", limit=limit)
+            if hasattr(self.store, "list_pending_questions") else []
+        )
         job_progress = [
             {"kind": "plan", "plan_id": plan["id"], "status": plan["status"],
              "done": plan["placed_tier0"], "total": plan["total"],
@@ -114,6 +123,12 @@ class ConsoleService:
             {"kind": job["kind"], "job_id": job["id"], "status": job["status"],
              "attempts": job["attempts"], "label": f"job #{job['id']} · {job['kind']}"}
             for job in active_jobs
+        ] + [
+            {"kind": "errand", "errand_id": err["id"], "status": err["status"],
+             "done": err["steps_done"], "total": err["max_steps"],
+             "api_calls_used": err["api_calls_used"],
+             "label": f"errand #{err['id']} · {err['instruction'][:48]}"}
+            for err in active_errands
         ]
         holding = self.store.list_holdings("active", limit=limit)
         knocks = []
@@ -132,6 +147,8 @@ class ConsoleService:
             "parked_items": parked[:limit],
             "offline_queue": {"counts": queue_counts, "jobs": active_jobs[:limit]},
             "job_progress": job_progress,
+            "errands": active_errands,
+            "pending_questions": pending_questions,
             "holding": holding,
             "knocks": knocks,
             "class_mode": class_mode,
@@ -154,7 +171,8 @@ def _safe_snapshot(socket_path) -> dict:
         return {"ts": iso_now(), "daemon": {"running": False, "reason": str(exc)},
                 "conversation": {"id": None, "messages": []},
                 "pending_plans": [], "parked_items": [], "job_progress": [],
-                "offline_queue": {"counts": {}, "jobs": []}, "holding": [],
+                "offline_queue": {"counts": {}, "jobs": []},
+                "errands": [], "pending_questions": [], "holding": [],
                 "knocks": [], "class_mode": {"enabled": False},
                 "showoff": {"active": False},
                 "company": {"company": False, "note": "daemon down"},

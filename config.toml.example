@@ -480,6 +480,20 @@ capacity_floor_gb = 10
 drill_read_data_subset_pct = 5
 drill_read_data_subset_mb = 500
 
+# Read-only discovery roots (decoupled from [[organise.roots]] folder moving).
+# Opt-in: empty by default. Protected paths stay untouchable either way.
+[discovery]
+roots = []
+
+# Bounded async read-errand runner (GAP-1). Cheapest-first under [quota].
+[errand]
+max_steps = 12
+max_seconds = 120.0
+max_api_calls = 10
+max_step_api_calls = 2
+max_read_bytes = 65536
+allow_escalation = false
+
 [nus_pointer]
 # Owner CLI only. Each request explicitly authorizes one local frame.
 enabled = false

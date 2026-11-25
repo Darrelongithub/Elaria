@@ -714,6 +714,29 @@ DEFAULTS: dict = {
         "drill_read_data_subset_pct": 5,
         "drill_read_data_subset_mb": 500,
     },
+    # Read-only discovery roots (GAP-2 minimum seam, decoupled from folder-
+    # moving [[organise.roots]]). Default empty: nothing is walked until the
+    # owner names a root. Protected paths (§4.1) stay untouchable either way.
+    "discovery": {
+        "roots": [],
+    },
+    # Bounded async read-errand runner (GAP-1). Every cap is total (I3),
+    # cheapest-first under [quota] (flash-lite default; flash escalation off
+    # by default so background errands never spend the 20 RPD interactive tier).
+    "errand": {
+        "max_steps": 12,
+        "max_seconds": 120.0,
+        "max_api_calls": 10,
+        "max_step_api_calls": 2,
+        "max_read_bytes": 65_536,
+        "allow_escalation": False,
+    },
+    # Local point-only NUS screen observation (BUILD-1). Disabled by default.
+    "nus_pointer": {
+        "enabled": False,
+        "surface_path": "~/Elaria/ui/quickshell/nus",
+        "reduced_motion": False,
+    },
 }
 
 
@@ -813,6 +836,45 @@ class Config:
                 "mode": mode,
                 "taxonomy": taxonomy,
             })
+        return roots
+
+    def discovery_roots(self) -> list[dict]:
+        """Normalised read-only discovery roots (GAP-2 minimum seam).
+
+        Combines `[discovery] roots` (strings or `{path = ...}` tables) with
+        any `[[organise.roots]]` paths, deduplicated in order. Never implies
+        write or move authority: discovery roots are read-only by construction.
+        """
+        discovery = self.section("discovery")
+        entries = discovery.get("roots") or []
+        if not isinstance(entries, list):
+            raise TypeError("[discovery] roots must be a list of paths or tables")
+        seen: set[str] = set()
+        roots: list[dict] = []
+        for index, entry in enumerate(entries):
+            if isinstance(entry, str):
+                raw_path = entry
+            elif isinstance(entry, dict):
+                raw_path = entry.get("path")
+            else:
+                raise TypeError(
+                    f"[discovery] roots entry {index} must be a path string or table")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise ValueError(
+                    f"[discovery] roots entry {index} is missing a non-empty path")
+            expanded = str(Path(raw_path).expanduser())
+            if expanded not in seen:
+                seen.add(expanded)
+                roots.append({"path": expanded, "source": "discovery"})
+        try:
+            organise = self.organise_roots()
+        except (TypeError, ValueError):
+            organise = []
+        for entry in organise:
+            expanded = entry["path"]
+            if expanded not in seen:
+                seen.add(expanded)
+                roots.append({"path": expanded, "source": "organise"})
         return roots
 
     # -- paths -------------------------------------------------------------
@@ -1255,6 +1317,37 @@ def validate_config(config: Config) -> dict:
                         f"[quota] {prefix}_{rkey}={fval} and "
                         f"[quota.models.{mname}] {rkey}={rval} disagree — "
                         "the stricter value is enforced")
+
+    # -- discovery & errand bounds (GAP-1 / GAP-2) ---------------------------
+    discovery = raw.get("discovery") if isinstance(raw.get("discovery"), dict) else {}
+    d_roots = discovery.get("roots")
+    if d_roots is not None:
+        if not isinstance(d_roots, list):
+            errors.append("[discovery] roots must be a list of paths or tables")
+        else:
+            for index, entry in enumerate(d_roots):
+                if isinstance(entry, str):
+                    if not entry.strip():
+                        errors.append(f"[discovery] roots[{index}] must be non-empty")
+                elif isinstance(entry, dict):
+                    raw_path = entry.get("path")
+                    if not isinstance(raw_path, str) or not raw_path.strip():
+                        errors.append(f"[discovery] roots[{index}].path must be a non-empty string")
+                else:
+                    errors.append(f"[discovery] roots[{index}] must be a path string or table")
+
+    errand = raw.get("errand") if isinstance(raw.get("errand"), dict) else {}
+    _number_error(errors, "[errand] max_steps", errand.get("max_steps"),
+                  minimum=1, integer=True)
+    _number_error(errors, "[errand] max_seconds", errand.get("max_seconds"),
+                  minimum=0.1)
+    _number_error(errors, "[errand] max_api_calls", errand.get("max_api_calls"),
+                  minimum=0, integer=True)
+    _number_error(errors, "[errand] max_step_api_calls",
+                  errand.get("max_step_api_calls"), minimum=0, integer=True)
+    _number_error(errors, "[errand] max_read_bytes", errand.get("max_read_bytes"),
+                  minimum=256, integer=True)
+    _bool_error(errors, "[errand] allow_escalation", errand.get("allow_escalation"))
 
     if errors:
         detail = "INVALID: " + "; ".join(errors + warnings)

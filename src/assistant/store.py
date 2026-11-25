@@ -268,6 +268,67 @@ CREATE TABLE IF NOT EXISTS state (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- Bounded async read-errands (GAP-1) and per-step cost/progress journal.
+CREATE TABLE IF NOT EXISTS errands (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  updated_ts TEXT NOT NULL,
+  instruction TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',  -- queued|running|paused_for_question|completed|cancelled|budget_exhausted|failed
+  root_scope_json TEXT NOT NULL DEFAULT '[]',
+  max_steps INTEGER NOT NULL,
+  max_seconds REAL NOT NULL,
+  max_api_calls INTEGER NOT NULL,
+  steps_done INTEGER NOT NULL DEFAULT 0,
+  api_calls_used INTEGER NOT NULL DEFAULT 0,
+  tokens_in INTEGER NOT NULL DEFAULT 0,
+  tokens_out INTEGER NOT NULL DEFAULT 0,
+  shadow_cost_usd REAL NOT NULL DEFAULT 0.0,
+  active_elapsed_s REAL NOT NULL DEFAULT 0.0,
+  plan_json TEXT NOT NULL DEFAULT '[]',
+  report_json TEXT,
+  error TEXT,
+  cancelled_by TEXT,
+  conversation_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS errand_steps (
+  id INTEGER PRIMARY KEY,
+  errand_id INTEGER NOT NULL REFERENCES errands(id),
+  step_no INTEGER NOT NULL,
+  ts TEXT NOT NULL,
+  finished_ts TEXT,
+  skill TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running',  -- running|ok|paused|skipped|refused|failed|cancelled
+  args_json TEXT NOT NULL DEFAULT '{}',
+  result_summary_json TEXT,
+  model TEXT,
+  api_calls INTEGER NOT NULL DEFAULT 0,
+  tokens_in INTEGER NOT NULL DEFAULT 0,
+  tokens_out INTEGER NOT NULL DEFAULT 0,
+  shadow_cost_usd REAL NOT NULL DEFAULT 0.0,
+  duration_ms REAL NOT NULL DEFAULT 0.0,
+  untrusted_bytes INTEGER NOT NULL DEFAULT 0,
+  error TEXT
+);
+
+-- Clarifying-question / owner-verification state seam (GAP-6 minimum).
+CREATE TABLE IF NOT EXISTS pending_questions (
+  id INTEGER PRIMARY KEY,
+  errand_id INTEGER NOT NULL REFERENCES errands(id),
+  ts TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'clarify',    -- scope_choice|verify_inference|conflict|clarify
+  question TEXT NOT NULL,
+  options_json TEXT NOT NULL DEFAULT '[]',
+  candidate_fact_ids_json TEXT NOT NULL DEFAULT '[]',
+  evidence_ref TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending|confirmed|amended|rejected|answered|cancelled
+  answer_text TEXT,
+  resolved_ts TEXT,
+  resolved_by_uid INTEGER,
+  resolved_by_msg_id INTEGER
+);
 """
 
 
@@ -1145,3 +1206,251 @@ class Store:
                 (key, value),
             )
             self._conn.commit()
+
+    # -- GAP-1/GAP-2/GAP-6: errands, per-step cost, pending questions --------
+    def llm_usage_for_purpose(self, purpose: str) -> dict:
+        """Measured cost/token usage recorded in `llm_calls` for one purpose tag."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT COUNT(*) AS calls,
+                          COALESCE(SUM(tokens_in), 0) AS tokens_in,
+                          COALESCE(SUM(tokens_out), 0) AS tokens_out,
+                          COALESCE(SUM(cost_usd), 0.0) AS shadow_cost_usd,
+                          MAX(model) AS model
+                   FROM llm_calls
+                   WHERE purpose = ?""",
+                (purpose,),
+            ).fetchone()
+        return {
+            "calls": int(row["calls"]),
+            "tokens_in": int(row["tokens_in"]),
+            "tokens_out": int(row["tokens_out"]),
+            "shadow_cost_usd": float(row["shadow_cost_usd"]),
+            "model": row["model"],
+        }
+
+    def search_document_paths(self, terms: Iterable[str], *,
+                              cloud_bound: bool = False,
+                              limit: int = 50) -> list[dict]:
+        """Metadata/path search over `documents` (GAP-2/GAP-5 seam).
+
+        When `cloud_bound=True`, rows flagged `never_send=1` are excluded by
+        SQL so privacy-fenced files never reach cloud callers (§10.7).
+        """
+        cleaned = _search_terms(" ".join(terms))
+        where_parts = ["status != 'missing'"]
+        params: list = []
+        if cloud_bound:
+            where_parts.append("never_send = 0")
+        if cleaned:
+            patterns = _like_patterns(cleaned)
+            where_parts.append(
+                "(" + " OR ".join(["LOWER(path) LIKE ? ESCAPE '\\'"] * len(patterns)) + ")"
+            )
+            params.extend(patterns)
+        params.append(max(1, int(limit)))
+        sql = (
+            "SELECT id, path, root, sha256, size, mtime, mime, ext, never_send, status "
+            f"FROM documents WHERE {' AND '.join(where_parts)} "
+            "ORDER BY mtime DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def confirm_fact(self, fact_id: int, *,
+                     evidence_note: str | None = None) -> bool:
+        """Promote an active `inferred` fact to `source='stated'` (GAP-6 / I5).
+
+        Only authenticated owner confirmation paths may call this. Existing
+        provenance `evidence` is preserved and annotated, never erased.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, source, evidence, active FROM facts WHERE id = ?",
+                (int(fact_id),),
+            ).fetchone()
+            if row is None or not row["active"]:
+                return False
+            existing_ev = (row["evidence"] or "").strip()
+            if evidence_note:
+                merged_ev = (f"{existing_ev} | {evidence_note}"
+                             if existing_ev else evidence_note)
+            else:
+                merged_ev = existing_ev or None
+            cur = self._conn.execute(
+                "UPDATE facts SET source = 'stated', confidence = 1.0, evidence = ? "
+                "WHERE id = ? AND active = 1",
+                (merged_ev, int(fact_id)),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def create_errand(self, *, ts: str, instruction: str, root_scope_json: str,
+                      max_steps: int, max_seconds: float, max_api_calls: int,
+                      plan_json: str = "[]",
+                      conversation_id: int | None = None) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO errands
+                   (ts, updated_ts, instruction, status, root_scope_json,
+                    max_steps, max_seconds, max_api_calls, plan_json,
+                    conversation_id)
+                   VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)""",
+                (ts, ts, instruction, root_scope_json, int(max_steps),
+                 float(max_seconds), int(max_api_calls), plan_json,
+                 conversation_id),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def get_errand(self, errand_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM errands WHERE id = ?", (int(errand_id),)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_errands(self, status: str | Sequence[str] | None = None,
+                     limit: int = 50) -> list[dict]:
+        query = "SELECT * FROM errands"
+        params: list = []
+        if isinstance(status, str):
+            query += " WHERE status = ?"
+            params.append(status)
+        elif status:
+            placeholders = ", ".join("?" * len(status))
+            query += f" WHERE status IN ({placeholders})"
+            params.extend(status)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_errand(self, errand_id: int, **fields) -> bool:
+        allowed = {
+            "updated_ts", "status", "steps_done", "api_calls_used",
+            "tokens_in", "tokens_out", "shadow_cost_usd", "active_elapsed_s",
+            "plan_json", "report_json", "error", "cancelled_by",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return False
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE errands SET {assignments} WHERE id = ?",
+                (*updates.values(), int(errand_id)),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def add_errand_step(self, *, errand_id: int, step_no: int, ts: str,
+                        skill: str, args_json: str = "{}",
+                        status: str = "running") -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO errand_steps
+                   (errand_id, step_no, ts, skill, status, args_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (int(errand_id), int(step_no), ts, skill, status, args_json),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def finish_errand_step(self, step_id: int, *, finished_ts: str,
+                           status: str,
+                           result_summary_json: str | None = None,
+                           model: str | None = None,
+                           api_calls: int = 0,
+                           tokens_in: int = 0,
+                           tokens_out: int = 0,
+                           shadow_cost_usd: float = 0.0,
+                           duration_ms: float = 0.0,
+                           untrusted_bytes: int = 0,
+                           error: str | None = None) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE errand_steps
+                   SET finished_ts = ?, status = ?, result_summary_json = ?,
+                       model = ?, api_calls = ?, tokens_in = ?, tokens_out = ?,
+                       shadow_cost_usd = ?, duration_ms = ?,
+                       untrusted_bytes = ?, error = ?
+                   WHERE id = ?""",
+                (finished_ts, status, result_summary_json, model,
+                 int(api_calls), int(tokens_in), int(tokens_out),
+                 float(shadow_cost_usd), float(duration_ms),
+                 int(untrusted_bytes), error, int(step_id)),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def list_errand_steps(self, errand_id: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM errand_steps WHERE errand_id = ? ORDER BY step_no, id",
+                (int(errand_id),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def create_pending_question(self, *, errand_id: int, ts: str,
+                                question: str, kind: str = "clarify",
+                                options_json: str = "[]",
+                                candidate_fact_ids_json: str = "[]",
+                                evidence_ref: str | None = None) -> int:
+        if not str(question or "").strip():
+            raise ValueError("pending question text must be non-empty")
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO pending_questions
+                   (errand_id, ts, kind, question, options_json,
+                    candidate_fact_ids_json, evidence_ref, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')""",
+                (int(errand_id), ts, kind, question.strip(), options_json,
+                 candidate_fact_ids_json, evidence_ref),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def get_pending_question(self, question_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM pending_questions WHERE id = ?",
+                (int(question_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_pending_questions(self, *, errand_id: int | None = None,
+                               status: str | None = None,
+                               limit: int = 50) -> list[dict]:
+        query = "SELECT * FROM pending_questions WHERE 1=1"
+        params: list = []
+        if errand_id is not None:
+            query += " AND errand_id = ?"
+            params.append(int(errand_id))
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY id ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_pending_question(self, question_id: int, *, status: str,
+                                 answer_text: str | None,
+                                 resolved_ts: str,
+                                 resolved_by_uid: int | None = None,
+                                 resolved_by_msg_id: int | None = None) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE pending_questions
+                   SET status = ?, answer_text = ?, resolved_ts = ?,
+                       resolved_by_uid = ?, resolved_by_msg_id = ?
+                   WHERE id = ? AND status = 'pending'""",
+                (status, answer_text, resolved_ts, resolved_by_uid,
+                 resolved_by_msg_id, int(question_id)),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
