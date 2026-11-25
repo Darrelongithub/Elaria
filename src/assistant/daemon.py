@@ -29,6 +29,9 @@ import socket as socket_mod
 import sys
 import time
 import uuid
+import tempfile
+import wave
+from datetime import datetime
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -1866,6 +1869,8 @@ class Daemon:
         source = _WakeFrameSource(
             stop=self._wake_listen_stop,
             ceiling_s=self._wake_listen_ceiling_s())
+        # The inherited verified window counts towards the same audio ceiling.
+        source._audio_s = len(session.head) / float(WAKE_SAMPLE_RATE * 2)
         self._wake_listen_source = source
         self._wake_listen_session_id = str(
             getattr(session, "session_id", "") or "") or None
@@ -1906,7 +1911,9 @@ class Daemon:
         `capture.state`.
         """
         session_id = self._wake_listen_session_id
-        closed_by = "ceiling"
+        closed_by = "stopped"
+        # The verified command window is the first part of the utterance.
+        audio = bytearray(session.head)
         try:
             ladder = session.ladder
             async for frame in source.frames():
@@ -1920,6 +1927,7 @@ class Daemon:
                     break
                 # Audio time, never wall-clock: a stalled stream cannot age a
                 # session shut while holding no audio.
+                audio.extend(frame)
                 frame_s = len(frame) / float(WAKE_SAMPLE_RATE * 2)
                 if ladder.observe(frame, frame_s) or ladder.close_due():
                     closed_by = "silence"
@@ -1961,6 +1969,56 @@ class Daemon:
                         reason=f"wake session closed ({closed_by})")
                 except Exception:  # noqa: S110 - capture state is advisory
                     pass
+
+        # Only an ordinary endpoint or ceiling produces a dictation. A stop,
+        # overflow, stall, half-duplex collision, or failure discards it.
+        if closed_by in ("silence", "ceiling") and audio and session_id:
+            self._track_task(asyncio.create_task(
+                self._wake_transcribe_and_finish(bytes(audio), session_id)))
+
+    async def _wake_transcribe_and_finish(self, audio: bytes, session_id: str) -> None:
+        """Batch the verified capture through dictation's ASR and finisher.
+
+        A private temporary WAV is required by the existing ASR API. It is
+        removed even on failure; failed transcription never enters the PTT
+        finisher (which otherwise emits a visible error result).
+        """
+        from . import asr
+
+        def transcribe():
+            with tempfile.TemporaryDirectory(prefix="elaria-wake-") as directory:
+                path = str(Path(directory) / "capture.wav")
+                with wave.open(path, "wb") as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(WAKE_SAMPLE_RATE)
+                    wav.writeframes(audio)
+                return asr.transcribe_dictation(
+                    self.config, self.client, path, offline=offline,
+                    local_backend=self.dictation.local_backend, session_id=session_id)
+
+        try:
+            connectivity = self.dictation._connectivity()
+            offline = bool(connectivity and connectivity.is_offline)
+            outcome = await asyncio.to_thread(transcribe)
+            if not isinstance(outcome, asr.DictationOutcome) or not outcome.text.strip():
+                return
+            result = await self.dictation._persist(
+                session_id=session_id, when=datetime.now().astimezone(),
+                raw=outcome.text, backend=outcome.backend, language=outcome.language,
+                audio_path=None, duration_s=len(audio) / float(WAKE_SAMPLE_RATE * 2),
+                model=None, notes=[], confidence=outcome.confidence,
+                skip_cleanup=offline,
+                connectivity_mode=connectivity.effective_mode if connectivity else None,
+                lifecycle_dictate=True)
+            # Same echo suppression, command confidence gate, approval/reply
+            # routing and ptt.result callback as the SUPER+F2 finisher.
+            completed = asyncio.get_running_loop().create_future()
+            completed.set_result(result)
+            await self._finish_dictation(completed, {}, session_id, "command")
+        except Exception:
+            # ASR and delivery failures must never take down always-on capture.
+            return
 
     def _wake_log(self, event: str, **fields) -> None:
         """Metadata-only lifecycle marker — never audio, never a score."""
