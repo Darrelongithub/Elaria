@@ -97,3 +97,20 @@ knock = short "already sent" form.
 policy-clean); (2) host — Pi Zero 2 W (~$25–35 one-time) vs
 existing NAS/old phone ($0, fragile) vs Oracle free VM ($0,
 third-party custody).
+
+## OWNER UPDATE (2026-11-25, later): host = "like a website"
+
+Owner wants the alive layer hosted like a website (cloud,
+always-on, public HTTPS for the WhatsApp webhook) rather than
+home hardware; and will register their existing spare SIM (in
+use, just not on WhatsApp — keep-alive chore gone). Manager
+amendment to the build basis: prefer **free serverless**
+(Cloudflare Workers-class: webhook receiver + KV/D1-class queue;
+$0, nothing to patch, no home power/internet dependency) over a
+free VPS (Oracle-class: $0 but a small Linux box to maintain);
+the compromise table in PR #116 already bounds what a host may
+hold — reminders, queue, two revocable tokens, never
+voiceprint/keys/DB/authority — which is precisely what makes
+third-party custody acceptable here. Platform effectively
+settled by the owner at WhatsApp Cloud API + S-0 templates
+(≈ KES 0.50 per cold reminder; owner-started 24 h windows free).
