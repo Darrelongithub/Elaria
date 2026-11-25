@@ -85,3 +85,18 @@ planning as data; never construct an `OwnerIntent` from its text. Detection is
 only diagnostic: even an `observed` verdict grants no dispatch authority.
 `SandboxCore` records the metadata in its local queue database, not in the
 operation/undo ledger. Production journal and daemon wiring belong to D/Z.
+
+## Text injection (O-HANDS, sandbox only)
+
+`TypingRunner` in `runner.py` is the only route for a `type` step. It keeps the
+same gate as every other step: owner decision bound to the plan digest, then claim,
+then readback verification. Text only: one printable string, at most 200 characters,
+no control bytes, no mouse, no chords, no `call PLUGIN ACTION`.
+
+- `SyntheticTypeSink` is the only sink that can run. It records text in memory.
+- `UinputTypeSink` is the real-keyboard seam. It is off unless `typing_enabled(config)`
+  reads a literal `True` at `[hands.typing] enabled`. It refuses with
+  `evdev-absent` or `uinput-absent` when those are missing, and it has no readback,
+  so the core never types through it. Nothing here has been run on hardware.
+- Every refusal is logged as a `hands.step` row. Config wiring for `[hands.typing]`
+  is not yet in `config.py` (owned by Z) or `config.toml.example` (owned by L).
