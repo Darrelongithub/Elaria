@@ -76,3 +76,24 @@ only in both channels; builds come after the manager gate.
 > duplicate reminders. Stress/fact/bug-check your design per the
 > procedure. Report only. PR + merge yourself. Never edit
 > OWNERS.yaml.
+
+---
+
+## GATE VERDICT — A-1 alive layer (manager, 2026-11-25, PR #116)
+
+**PASS.** Enemy-read notes: the no-authority list is tied to
+enforcements, not promises; stranger/owner tiers are fixed by
+transport identity and different envelope kinds, so injection has
+no path to command even if every filter fails; compromise yields
+two revocable tokens and non-secret reminders, nothing else.
+Manager adopts the agent's safe defaults as binding for any
+build: responder **S-0** on WhatsApp (templates only, no LLM
+concierge there) *or* S-1 on Telegram if the owner picks
+Telegram; free/busy **L1 (day-level)** for strangers; reminder
+fast-lane **OFF**; content-free secret reminders **OFF**; laptop
+knock = short "already sent" form.
+**Two owner decisions remain**: (1) platform — WhatsApp
+(KES-cents, Meta grey-zone G1) vs Telegram bot ($0,
+policy-clean); (2) host — Pi Zero 2 W (~$25–35 one-time) vs
+existing NAS/old phone ($0, fragile) vs Oracle free VM ($0,
+third-party custody).
