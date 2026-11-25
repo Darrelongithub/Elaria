@@ -297,6 +297,11 @@ pending_window_s = 2.5              # post-trigger buffer, 2-3s band
 pending_speech_threshold_s = 0.5    # below this speechful audio: wake-clip-only
 speech_rms = 0.01                   # frame gate for "speechful" detection
 keyword_model = ""                  # path to the real .onnx keyword model
+                                    # (openWakeWord: the trained head)
+keyword_melspec_model = ""          # openWakeWord melspectrogram.onnx;
+                                    # set (with the embedding model) to arm
+                                    # the 3-model ONNX pipeline, CPU only
+keyword_embedding_model = ""        # openWakeWord embedding_model.onnx
 keyword_threshold = 0.5
 keyword_window_s = 1.0              # trailing audio scored per frame (<= ring)
 # ECAPA backend (hardware-side): command `cmd <clip.wav>` printing either

@@ -220,6 +220,127 @@ class OnnxKeywordModel:
                 f"keyword model output unusable: {exc}") from exc
 
 
+class OpenWakeWordModel:
+    """openWakeWord v0.5.1 ONNX pipeline: melspec -> embedding -> head.
+
+    This is NOT the `openwakeword` Python package (which hard-requires
+    tflite-runtime — killed on evidence, see HANDOFF). It runs the three
+    upstream ONNX artefacts directly on onnxruntime, CPU only, no network:
+
+      1. ``melspectrogram.onnx``  raw float32 PCM (1, N) -> mel frames
+         (upstream transform ``x / 10 + 2`` applied to the output);
+      2. ``embedding_model.onnx`` windows of 76 mel frames, step 8,
+         -> 96-dim speech embeddings;
+      3. the trained head (``keyword_model``) over the last N embeddings
+         (N from the head's fixed input shape, else 16) -> score 0..1.
+
+    A hit from this model grants nothing: it only opens the pending
+    command window, which ECAPA verifies exactly as before. Short
+    embedding contexts are front-padded by repeating the first embedding
+    (the upstream feature buffer is likewise pre-filled, never zeros of
+    authority). Sessions are injectable for tests; production loads real
+    files or refuses honestly — never an energy fallback.
+    """
+
+    name = "openwakeword-onnx"
+    MEL_WINDOW = 76
+    MEL_STEP = 8
+    DEFAULT_HEAD_FRAMES = 16
+
+    def __init__(self, head_path, melspec_path, embedding_path,
+                 sessions=None):
+        self.path = str(head_path)
+        self.melspec_path = str(melspec_path)
+        self.embedding_path = str(embedding_path)
+        self._sessions = sessions  # (melspec, embedding, head) for tests
+
+    @classmethod
+    def load(cls, head_path, melspec_path, embedding_path):
+        for label, raw in (("keyword_model", head_path),
+                           ("keyword_melspec_model", melspec_path),
+                           ("keyword_embedding_model", embedding_path)):
+            path = str(raw or "").strip()
+            if not path or not Path(path).is_file():
+                raise KeywordModelUnavailable(
+                    f"wake word paused: no {label} (.onnx) at {path!r} — "
+                    "openWakeWord arming needs melspectrogram.onnx + "
+                    "embedding_model.onnx + a trained head; energy "
+                    "fallback is not a wake path")
+        try:
+            import onnxruntime  # noqa: F401
+        except (ImportError, OSError) as exc:
+            raise KeywordModelUnavailable(
+                "wake word paused: onnxruntime is unavailable — run "
+                "`uv sync --extra voice`; energy fallback is not a wake "
+                "path") from exc
+        return cls(head_path, melspec_path, embedding_path)
+
+    def _load_sessions(self):
+        if self._sessions is None:
+            import onnxruntime
+
+            def make(path):
+                return onnxruntime.InferenceSession(
+                    str(path), providers=["CPUExecutionProvider"])
+
+            self._sessions = (make(self.melspec_path),
+                              make(self.embedding_path),
+                              make(self.path))
+        return self._sessions
+
+    @staticmethod
+    def _input_name(session, fallback):
+        try:
+            return session.get_inputs()[0].name
+        except Exception:
+            return fallback
+
+    @staticmethod
+    def _head_frames(head_session, np):
+        try:
+            shape = head_session.get_inputs()[0].shape
+            if len(shape) >= 2 and isinstance(shape[1], int) and shape[1] > 0:
+                return int(shape[1])
+        except Exception:
+            pass
+        return OpenWakeWordModel.DEFAULT_HEAD_FRAMES
+
+    def score_window(self, pcm: bytes) -> float:
+        """Keyword confidence for a PCM window (0..1)."""
+        import numpy as np
+
+        melspec_s, embedding_s, head_s = self._load_sessions()
+        samples = np.frombuffer(pcm[: len(pcm) - len(pcm) % 2],
+                                dtype=np.int16).astype(np.float32)
+        if samples.size == 0:
+            return 0.0
+        spec = melspec_s.run(
+            None, {self._input_name(melspec_s, "input"):
+                   samples[None, :]})[0]
+        spec = np.squeeze(spec) / 10.0 + 2.0
+        if spec.ndim != 2 or spec.shape[0] < self.MEL_WINDOW:
+            return 0.0
+        windows = [spec[i:i + self.MEL_WINDOW]
+                   for i in range(0, spec.shape[0] - self.MEL_WINDOW + 1,
+                                  self.MEL_STEP)]
+        batch = np.array(windows, dtype=np.float32)[..., None]
+        embeddings = np.squeeze(embedding_s.run(
+            None, {self._input_name(embedding_s, "input_1"): batch})[0])
+        embeddings = np.atleast_2d(embeddings)
+        n = self._head_frames(head_s, np)
+        if embeddings.shape[0] < n:
+            pad = np.repeat(embeddings[:1], n - embeddings.shape[0], axis=0)
+            embeddings = np.concatenate([pad, embeddings], axis=0)
+        feed = embeddings[-n:][None, :, :].astype(np.float32)
+        out = head_s.run(
+            None, {self._input_name(head_s, "input"): feed})[0]
+        try:
+            return max(0.0, min(1.0, float(np.asarray(out).flatten()[0])))
+        except (TypeError, ValueError, IndexError) as exc:
+            raise KeywordModelUnavailable(
+                f"keyword model output unusable: {exc}") from exc
+
+
 class EnergyTestModel:
     """Plumbing-only stand-in behind `--unsafe-energy-test`.
 
@@ -811,6 +932,11 @@ class WakeGuard:
         if self.state in (TRIGGERED, VERIFYING):
             if self.window_due():
                 return self.verify()
+            return None
+        # Energy gate (bug #26): silence never reaches the spotter. The
+        # frame is already in the ring, so a phrase that starts loud is
+        # not clipped — only the inference is skipped.
+        if frame_rms(frame) < self.speech_rms:
             return None
         window = self.ring.snapshot()[-self.keyword_window_bytes:] or frame
         try:
