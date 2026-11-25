@@ -336,7 +336,7 @@ def run_drill(*, kind: str, ctx, restic: ResticCheck | None,
     import io
 
     sink = io.StringIO()
-    restore_code = _check(ctx, artifact=None, kind=kind, out=sink, rng=rng)
+    restore_code = _check(ctx, artifact=None, kind=kind, out=sink, rng=rng, hash_only=True)
     restore_ok = restore_code == 0
     hash_ok = restore_ok
 

@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from assistant.backup import plan_reconcile, reconcile, reconcile_all
+from assistant.remote import Verification
 from assistant.storage import (
     FLIPPED,
     LOCAL,
@@ -57,7 +58,7 @@ def test_crash_between_upload_and_flip_completes_the_flip(tmp_path):
 
     def verify(path):
         seen.append(path)
-        return True
+        return Verification("fixture-verifier", True, "hash")
 
     plan = plan_reconcile(man, now=NOW, verify_remote=verify)
     assert len(plan.actions) == 1
@@ -78,7 +79,7 @@ def test_flip_is_refused_when_local_hash_drifts(tmp_path):
     man.append(ManifestRecord(artifact=str(art), state=UPLOADED, sha256=sha, size=8))
     art.write_bytes(b"tampered")  # same path, different bytes
 
-    plan = plan_reconcile(man, now=NOW, verify_remote=lambda p: True)
+    plan = plan_reconcile(man, now=NOW, verify_remote=lambda p: Verification("fixture-verifier", True, "hash"))
     assert plan.actions == []
     assert len(plan.problems) == 1
     assert "hash" in plan.problems[0]
@@ -123,7 +124,7 @@ def test_flip_is_refused_when_local_artifact_vanished(tmp_path):
     art = tmp_path / "gone.wav"
     man.append(ManifestRecord(artifact=str(art), state=UPLOADED,
                               sha256="ab" * 32, size=5))
-    plan = plan_reconcile(man, now=NOW, verify_remote=lambda p: True)
+    plan = plan_reconcile(man, now=NOW, verify_remote=lambda p: Verification("fixture-verifier", True, "hash"))
     assert plan.actions == []
     assert "missing" in plan.problems[0]
 
@@ -204,7 +205,7 @@ def test_flip_is_fsynced_before_the_trim_mover_runs(tmp_path):
     man.append(ManifestRecord(artifact=str(art), state=UPLOADED, sha256=sha, size=5))
 
     observed = []
-    reconcile_all(man, now=NOW, verify_remote=lambda p: True,
+    reconcile_all(man, now=NOW, verify_remote=lambda p: Verification("fixture-verifier", True, "hash"),
                   trim_mover=lambda p: observed.append(man.state_of(p)) or p)
     assert observed == [FLIPPED], "the trim must see the flip already durable"
     assert man.state_of(art) == TRASHED
@@ -222,7 +223,7 @@ def test_one_pass_advances_at_most_one_state(tmp_path):
     sha = _write(art, b"bytes")
     man.append(ManifestRecord(artifact=str(art), state=UPLOADED, sha256=sha, size=5))
 
-    first = plan_reconcile(man, now=NOW, verify_remote=lambda p: True)
+    first = plan_reconcile(man, now=NOW, verify_remote=lambda p: Verification("fixture-verifier", True, "hash"))
     assert [(a.from_state, a.to_state) for a in first.actions] == [(UPLOADED, FLIPPED)]
     reconcile(man, first)
     assert man.state_of(art) == FLIPPED
@@ -238,7 +239,7 @@ def test_ordering_holds_across_a_fresh_process(tmp_path):
     sha = _write(art, b"bytes")
     man.append(ManifestRecord(artifact=str(art), state=UPLOADED, sha256=sha, size=5))
 
-    reconcile_all(man, now=NOW, verify_remote=lambda p: True,
+    reconcile_all(man, now=NOW, verify_remote=lambda p: Verification("fixture-verifier", True, "hash"),
                   trim_mover=lambda p: p)
     # re-open cold: a brand-new manifest object reading the same file
     cold = StorageManifest(man.path)
@@ -253,11 +254,11 @@ def test_reconcile_all_reaches_quiescence(tmp_path):
         sha = _write(art, f"bytes-{i}".encode())
         man.append(ManifestRecord(artifact=str(art), state=UPLOADED,
                                   sha256=sha, size=7))
-    plan = reconcile_all(man, now=NOW, verify_remote=lambda p: True,
+    plan = reconcile_all(man, now=NOW, verify_remote=lambda p: Verification("fixture-verifier", True, "hash"),
                          trim_mover=lambda p: p)
     assert plan.problems == []
     assert all(man.state_of(tmp_path / f"a{i}.wav") == TRASHED for i in range(3))
-    again = reconcile_all(man, now=NOW, verify_remote=lambda p: True,
+    again = reconcile_all(man, now=NOW, verify_remote=lambda p: Verification("fixture-verifier", True, "hash"),
                           trim_mover=lambda p: p)
     assert again.actions == []
     assert again.problems == []
@@ -370,7 +371,7 @@ def test_plan_summary_carries_no_paths(tmp_path):
 
 def test_absent_manifest_reconciles_to_nothing(tmp_path):
     man = _man(tmp_path)
-    plan = plan_reconcile(man, now=NOW, verify_remote=lambda p: True)
+    plan = plan_reconcile(man, now=NOW, verify_remote=lambda p: Verification("fixture-verifier", True, "hash"))
     assert plan.actions == []
     assert plan.problems == []
     assert plan.summary() == {"actions": 0, "problems": 0, "by_transition": {}}
@@ -381,7 +382,7 @@ def test_local_artifact_is_left_alone(tmp_path):
     man = _man(tmp_path)
     art = tmp_path / "a.wav"
     man.append(ManifestRecord(artifact=str(art), state=LOCAL, sha256="ab" * 32))
-    plan = plan_reconcile(man, now=NOW, verify_remote=lambda p: True)
+    plan = plan_reconcile(man, now=NOW, verify_remote=lambda p: Verification("fixture-verifier", True, "hash"))
     assert plan.actions == []
     assert plan.problems == []
     assert man.state_of(art) == LOCAL

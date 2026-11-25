@@ -345,6 +345,9 @@ def _status(ctx: BackupContext, out) -> int:
     gauge = ctx.gauge()
     sensors.storage_gauge(gauge, stream=out)
     print(ctx.manifest.summary(), file=out)
+    print("backup state: uploaded is unverified; flipped/trashed/purged indicate "
+          "a prior flip, not proof of current remote health", file=out)
+    print(f"backend: {ctx.backend.name if ctx.backend is not None else 'not configured'}", file=out)
     print(f"hot={gauge.hot_bytes}B cold={gauge.cold_bytes}B "
           f"artifacts={gauge.hot_count + gauge.cold_count}", file=out)
     if gauge.hot_count + gauge.cold_count == 0:
@@ -354,6 +357,17 @@ def _status(ctx: BackupContext, out) -> int:
     elif gauge.below_floor():
         print("CAPACITY FLOOR BREACHED — the designed pressure gauge has fired",
               file=out)
+    events = _drill_journal(ctx).records()
+    failures = sum(not event.ok for event in events)
+    if failures:
+        print(f"BACKUP HEALTH WARNING: {failures} recorded failure(s); "
+              "review the health journal; later passes do not clear prior failures", file=out)
+    last = events[-1] if events else None
+    if last:
+        print(f"last backup health event: {last.kind} "
+              f"{'passed' if last.ok else 'FAILED'} (backend={last.backend})", file=out)
+    else:
+        print("backup health: no recorded verification or restore drill", file=out)
     return 0
 
 
@@ -440,8 +454,53 @@ def _fetch(ctx: BackupContext, artifact: str, *, dest: str | None, out) -> int:
     return 0
 
 
+def _hash_confirmed(verifier, path: Path) -> bool:
+    try:
+        verdict = verifier(path)
+        return isinstance(verdict, Verification) and verdict.confirmed and verdict.method == "hash"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _verify(ctx: BackupContext, artifact: str, *, out) -> int:
+    path, reason = _resolve_artifact(ctx, artifact)
+    record = ctx.manifest.current().get(str(path)) if path else None
+    if record is None or record.state not in _COLD_STATES | {UPLOADED}:
+        print(f"backup verify: REFUSED - {reason if record is None else 'not uploaded'}", file=out)
+        return 2
+    if ctx.restorer is None or not record.sha256:
+        print("backup verify: FAILED - no restorer or recorded hash", file=out)
+        _record_drill(_drill_journal(ctx), kind="verify", ok=False, ctx=ctx,
+                      detail="no restorer or recorded hash", now=ctx.now)
+        return 1
+    margin = int(ctx.section.get("restore_headroom_margin_gb", 1)) * 1000 ** 3
+    required = preflight.restore_headroom_bytes(record.size or 0, margin_bytes=margin)
+    gate = ctx.local_preflight(required_bytes=required, artifact_bytes=record.size or 0,
+                               margin_bytes=margin, directory=tempfile.gettempdir())
+    if not gate.ok:
+        print(f"backup verify: REFUSED - {gate.detail()}", file=out)
+        _record_drill(_drill_journal(ctx), kind="verify", ok=False, ctx=ctx,
+                      detail="local headroom refused", now=ctx.now)
+        return 2
+    try:
+        with tempfile.TemporaryDirectory(prefix="elaria-verify-") as scratch:
+            restored = ctx.restorer.restore(path, Path(scratch) / "artifact")
+            ok = try_sha256_file(restored) == record.sha256
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    backend = ctx.restorer.name
+    sensors.backup_verify(backend=backend, method="hash", confirmed=ok, stream=out)
+    recorded = _record_drill(_drill_journal(ctx), kind="verify", ok=ok, ctx=ctx,
+                             detail="remote hash match" if ok else "remote hash FAILED", now=ctx.now)
+    print(f"backup verify: {'hash matched' if ok else 'FAILED - remote hash mismatch or unreadable'} "
+          f"(backend={backend}; state unchanged)", file=out)
+    if not recorded:
+        print("backup verify: FAILED - health journal unavailable", file=out)
+    return 0 if ok and recorded else 1
+
+
 def _run(ctx: BackupContext, *, out, dry_run: bool = False,
-         artifact: str | None = None) -> int:
+         artifact: str | None = None, allow_multiple: bool = False) -> int:
     """Back up exactly one explicitly selected audio file; never purge automatically."""
     now = ctx.now or _fallback_now()
     audio = (ctx.data_dir / "audio").resolve()
@@ -459,7 +518,8 @@ def _run(ctx: BackupContext, *, out, dry_run: bool = False,
             or path.suffix.lower() != ".wav" or not path.is_file()):
         print("backup run: REFUSED - expected an exact regular WAV in the audio directory", file=out)
         return 2
-    if len(decision.send_cold) != 1 or decision.send_cold[0].path != path:
+    if not any(c.path == path for c in decision.send_cold) or (
+            not allow_multiple and len(decision.send_cold) != 1):
         print("backup run: REFUSED - selected file must be the only cold candidate", file=out)
         return 2
     gate = ctx.remote_preflight()
@@ -534,7 +594,7 @@ def _run(ctx: BackupContext, *, out, dry_run: bool = False,
     start_step = 1 if record.state == "flipped" else 0
     for step in range(start_step, 2):
         # A changed source must never be removed, even after the flip record.
-        if step == 1 and (try_sha256_file(path) != digest or not ctx.verifier(path).confirmed):
+        if step == 1 and (try_sha256_file(path) != digest or not _hash_confirmed(ctx.verifier, path)):
             print("backup run: verification changed before trim; local copy retained", file=out)
             return 1
         plan = plan_reconcile(ctx.manifest, now=now, verify_remote=ctx.verifier,
@@ -549,14 +609,15 @@ def _run(ctx: BackupContext, *, out, dry_run: bool = False,
         if result.problems:
             print("backup run: reconcile refused", file=out)
             return 1
-    print("backup run: uploaded, verified and moved to grace trash", file=out)
+    print(f"backup run: uploaded, verified and moved to grace trash "
+          f"(backend={ctx.backend.name if ctx.backend else 'unknown'})", file=out)
     return 0
 
 
 def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
            rng: random.Random | None = None,
            journal=None, restic=None,
-           now=None) -> int:
+           now=None, hash_only: bool = False) -> int:
     """The integrity-drill shape: restore a cold artifact and hash-verify it.
 
     Increment 8 adds two OPTIONAL seams, both defaulting to None so every existing caller
@@ -651,7 +712,7 @@ def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
     ok = bool(chosen.sha256) and actual == chosen.sha256
     hash_result = "verified" if ok else "MISMATCH"
     check_result = "declared skip"
-    if ok and restic is None:
+    if ok and restic is None and not hash_only:
         ok = False
     if ok and restic is not None:
         ok, check_detail = restic.run()
@@ -666,9 +727,12 @@ def _check(ctx: BackupContext, *, artifact: str | None, kind: str, out,
     print(f"backup check: {'passed' if ok else 'FAILED'} "
           f"(restored 1 artifact, hash {hash_result}; restic check: {check_result})",
           file=out)
-    _record_drill(journal, kind=kind, ok=ok, ctx=ctx, restic=restic,
-                  detail=f"restore=ok; hash={hash_result}; restic={check_result}",
-                  now=now)
+    recorded = _record_drill(journal, kind=kind, ok=ok, ctx=ctx, restic=restic,
+                             detail=f"restore=ok; hash={hash_result}; restic={check_result}",
+                             now=now)
+    if journal is not None and not recorded:
+        print("backup check: FAILED - drill journal unavailable", file=out)
+        return 1
     return 0 if ok else 1
 
 
@@ -689,7 +753,7 @@ def _record_drill(journal, *, kind: str, ok: bool, ctx: BackupContext,
         method = "restore+hash+restic-check"
     else:
         method = "restore+hash"
-    return journal.append(DrillRecord(
+    recorded = journal.append(DrillRecord(
         ts=(now or _fallback_now()).isoformat(),
         kind=kind,
         ok=ok,
@@ -698,6 +762,9 @@ def _record_drill(journal, *, kind: str, ok: bool, ctx: BackupContext,
         label="wav",
         detail=detail,
     ))
+    if not recorded:
+        sensors.backup_failed(reason="drill journal unavailable")
+    return recorded
 
 
 def _fallback_now():
@@ -769,6 +836,62 @@ def _last_drill(ctx: BackupContext, *, kind: str, out) -> None:
           f"(backend={record.backend}; method={record.method})", file=out)
 
 
+def _run_with_retry(ctx: BackupContext, args, *, out) -> int:
+    """Explicit pass over newly cold WAVs; retry failures without losing local files."""
+    auto = getattr(args, "all_cold", False)
+    artifact = getattr(args, "artifact", None)
+    if auto and artifact:
+        print("backup run: REFUSED - choose --artifact or --all-cold", file=out)
+        return 2
+    if auto:
+        decision = scan((ctx.data_dir / "audio").resolve(), now=ctx.now or _fallback_now(),
+                        data_dir=ctx.data_dir, window_days=ctx.window_days,
+                        window_gb=ctx.window_gb)
+        paths = [str(c.path) for c in decision.send_cold]
+        if not paths:
+            print("backup run: no cold candidates", file=out)
+            return 0
+    else:
+        paths = [artifact]
+    sensors.backup_started(reason="tier scan", stream=out)
+    failed = False
+    for path in paths:
+        code = 1
+        for attempt in range(1, 4):
+            try:
+                code = _run(ctx, out=out, artifact=path, allow_multiple=auto)
+            except (OSError, subprocess.SubprocessError):
+                code = 1
+                print("backup run: remote or journal error; inspect local state", file=out)
+            if code == 0:
+                break
+            sensors.backup_failed(reason=f"attempt {attempt} failed; code={code}", stream=out)
+            if not _record_drill(_drill_journal(ctx), kind="backup-run", ok=False, ctx=ctx,
+                                 detail=f"attempt={attempt}; code={code}", now=ctx.now):
+                print("backup run: FAILED - health journal unavailable", file=out)
+                return 1
+            if code == 2:
+                # Unknown quota may be a transient unreachable remote. Re-read it,
+                # but never bypass either the capacity or free-space gate.
+                if (ctx.remote_free_bytes is None and ctx.backend is not None
+                        and hasattr(ctx.backend, "remote_free") and attempt < 3):
+                    ctx.remote_free_bytes = ctx.backend.remote_free()
+                else:
+                    break
+            if attempt < 3:
+                print(f"backup run: retrying ({attempt + 1}/3)", file=out)
+        failed |= code != 0
+    if failed:
+        print("backup run: FAILED - see health journal; retry on next run", file=out)
+        return 1
+    if not _record_drill(_drill_journal(ctx), kind="backup-run", ok=True, ctx=ctx,
+                         detail=f"backed_up={len(paths)}", now=ctx.now):
+        print("backup run: FAILED - health journal unavailable", file=out)
+        return 1
+    sensors.backup_done(sent_cold=len(paths), trimmed=len(paths), stream=out)
+    return 0
+
+
 def backup_command(args, config, *, out=None, ctx: BackupContext | None = None) -> int:
     """`assist backup <action>`. Returns a process exit code."""
 
@@ -777,13 +900,17 @@ def backup_command(args, config, *, out=None, ctx: BackupContext | None = None) 
     out = out if out is not None else sys.stdout
     action = getattr(args, "backup_action", "status")
     if ctx is None:
-        read_quota = action == "status" or (action == "run" and not getattr(args, "dry_run", False))
+        read_quota = (action == "status"
+                      or (action == "run" and not getattr(args, "dry_run", False))
+                      or (action == "watch" and getattr(args, "run_cold", False)))
         ctx = build_context(config, read_quota=read_quota)
 
     if action == "status":
         return _status(ctx, out)
-    if action == "fetch":
+    if action in ("fetch", "restore"):
         return _fetch(ctx, args.artifact, dest=getattr(args, "out", None), out=out)
+    if action == "verify":
+        return _verify(ctx, args.artifact, out=out)
     if action == "run":
         if getattr(args, "dry_run", False):
             return _run(ctx, out=out, dry_run=True)
@@ -798,13 +925,13 @@ def backup_command(args, config, *, out=None, ctx: BackupContext | None = None) 
                            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return _run(ctx, out=out, artifact=getattr(args, "artifact", None))
+                return _run_with_retry(ctx, args, out=out)
             finally:
                 os.close(lock)
         except (OSError, BlockingIOError):
             print("backup run: REFUSED - another run holds the lock or lock unavailable", file=out)
             return 2
-    if action == "check":
+    if action in ("check", "drill"):
         if getattr(args, "last", False):
             _last_drill(ctx, kind=getattr(args, "kind", "monthly"), out=out)
             return 0
@@ -816,10 +943,19 @@ def backup_command(args, config, *, out=None, ctx: BackupContext | None = None) 
                                  path=ctx.backend.path, timeout=ctx.restorer.timeout)
         return _check(ctx, artifact=getattr(args, "artifact", None), restic=restic,
                       kind=getattr(args, "kind", "monthly"), out=out,
-                      journal=_drill_journal(ctx) if getattr(args, "record", False)
+                      journal=_drill_journal(ctx) if action == "drill" or getattr(args, "record", False)
                       else None,
-                      now=ctx.now)
+                      now=ctx.now, hash_only=action == "drill" and restic is None)
     if action == "watch":
+        if getattr(args, "run_cold", False):
+            if getattr(args, "root", None):
+                print("backup watch: REFUSED - --run-cold uses the configured audio root", file=out)
+                return 2
+            # Evaluate age/size even if the directory watcher sees no new writes.
+            from types import SimpleNamespace
+            return backup_command(SimpleNamespace(backup_action="run", all_cold=True,
+                                                   artifact=None, dry_run=False),
+                                  config, out=out, ctx=ctx)
         return _watch(ctx, root=getattr(args, "root", None), out=out)
     print(f"backup: unknown action {action!r}", file=out)
     return 2
