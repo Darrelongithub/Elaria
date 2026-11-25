@@ -464,6 +464,13 @@ class Daemon:
         # Capture state, tracked for the console orb/mic (capture.state on the
         # wire). Transitions are emitted honestly: repeated emissions of the same
         # (state, reason) pair are suppressed.
+        from .nus_pointer import Pointer
+        from .nus_surface import NusDispatch
+
+        nus_path = config.section("nus_pointer").get("surface_path", "~/Elaria/ui/quickshell/nus")
+        self._nus_surface = NusDispatch(Path(nus_path).expanduser())
+        self._nus_state_lock = asyncio.Lock()
+        self._nus_pointer = Pointer(self._nus_surface)
         self._capture_state_last: tuple | None = None
         # When the speech path is dead, capture.state says so (never a calm
         # idle). Held here so live-state emissions after a failure (done
@@ -543,6 +550,14 @@ class Daemon:
         if getattr(self, "_capture_state_last", None) == key:
             return
         self._capture_state_last = key
+        surface = getattr(self, "_nus_surface", None)
+        if surface is not None and getattr(self, "_nus_surface_state", None) != state:
+            self._nus_surface_state = state
+            try:
+                async with self._nus_state_lock:
+                    await asyncio.to_thread(surface.state, state)
+            except Exception as exc:
+                print(f"[assistd] NUS state delivery failed: {type(exc).__name__}", flush=True)
         event = {"event": "capture.state", "state": state}
         if reason:
             event["reason"] = reason
@@ -1190,6 +1205,7 @@ class Daemon:
             "errand.cancel": self._errand_cancel,
             "errand.answer": self._errand_answer,
             "ask": self._ask,
+            "nus.point": self._nus_point,
         }
 
     def _require_ipc_owner(self) -> IpcPrincipal:
@@ -1240,6 +1256,30 @@ class Daemon:
                 self._ipc_method.reset(method_token)
             if principal_token is not None:
                 self._ipc_principal.reset(principal_token)
+
+    async def _nus_point(self, params: dict) -> dict:
+        from .observation import NOT_FOUND
+
+        self._require_ipc_owner()
+        settings = self.config.section("nus_pointer")
+        name = params.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name) > 140:
+            raise ValueError("expected an accessible element name (1–140 characters)")
+        def permitted():
+            return not is_halted(self.config.socket_path.parent)
+        if (settings.get("enabled") is not True or params.get("allow_local_frame") is not True
+                or not permitted()):
+            return {"pointed": False, "reply": "Local screen observation was not authorized."}
+        try:
+            resolution = await self._nus_pointer.point(
+                name, reduced_motion=settings.get("reduced_motion") is True, permitted=permitted)
+        except Exception as exc:
+            print(f"[assistd] NUS observation failed: {type(exc).__name__}", flush=True)
+            resolution = None
+        if resolution is None:
+            return {"pointed": False, "reply": NOT_FOUND}
+        return {"pointed": True, "reply": resolution.label or "Pointed on screen.",
+                "frame_id": resolution.frame_id, "snapshot_id": resolution.snapshot_id}
 
     async def _ping(self, params: dict) -> dict:
         return {"pong": True, "version": __version__}

@@ -115,3 +115,26 @@ def active_window(runner: Runner | None = None) -> dict[str, str]:
         "class": str(payload.get("class", "")),
         "title": str(payload.get("title", "")),
     }
+
+
+class NusDispatch:
+    """One IPC route, explicitly addressed to the NUS instance."""
+
+    def __init__(self, path, runner=None):
+        self.path = str(path)
+        self.runner = runner or self._run
+        self.last_state = None
+
+    @staticmethod
+    def _run(args):
+        subprocess.run(args, check=True, capture_output=True, timeout=2)
+
+    def send(self, verb, *args):
+        self.runner(['qs', '-p', self.path, 'ipc', 'call', 'nus', verb, *map(str, args)])
+
+    def state(self, state):
+        if self.last_state == state:
+            return
+        command = NusSurfaceController().capture_state(state)
+        self.send(CAPTURE_STATE_COMMAND, command.capture_state if command.visible else 'released')
+        self.last_state = state
