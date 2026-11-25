@@ -555,15 +555,29 @@ def run_doctor(config) -> dict:
     checks.extend(_deployment_drift_checks(
         _P(__file__).resolve().parents[2], _P.home(), dict(_os.environ),
         sound=str(config.section("initiative").get("sound", "") or "")))
-    from .wake_guard import KeywordModelUnavailable, OnnxKeywordModel
+    from .wake_guard import KeywordModelUnavailable, OnnxKeywordModel, OpenWakeWordModel
 
-    keyword_model = config.section("hotword").get("keyword_model") or ""
+    hotword = config.section("hotword")
+    keyword_model = hotword.get("keyword_model") or ""
+    melspec_model = str(hotword.get("keyword_melspec_model") or "").strip()
+    embedding_model = str(hotword.get("keyword_embedding_model") or "").strip()
     try:
-        OnnxKeywordModel.load(keyword_model)
-        checks.append(_check(
-            "hotword keyword model", True,
-            f"armed-ready: {keyword_model} — acoustic path needs this real "
-            ".onnx model; there is no energy fallback"))
+        if melspec_model or embedding_model:
+            # Lane J: the 3-model openWakeWord pipeline is the arming path when
+            # the feature models are configured; report the path actually used.
+            OpenWakeWordModel.load(keyword_model, melspec_model, embedding_model)
+            checks.append(_check(
+                "hotword keyword model", True,
+                f"armed-ready: openWakeWord pipeline — head {keyword_model!r}, "
+                f"melspec {melspec_model!r}, embedding {embedding_model!r}; "
+                "a hit still grants nothing until ECAPA verifies the command "
+                "window"))
+        else:
+            OnnxKeywordModel.load(keyword_model)
+            checks.append(_check(
+                "hotword keyword model", True,
+                f"armed-ready: {keyword_model} — acoustic path needs this real "
+                ".onnx model; there is no energy fallback"))
     except KeywordModelUnavailable as exc:
         checks.append(_check(
             "hotword keyword model", False,
