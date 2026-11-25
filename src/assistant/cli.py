@@ -2111,6 +2111,10 @@ def build_parser() -> argparse.ArgumentParser:
     tr_p = sub.add_parser("transcribe", help="batch-transcribe a WAV (post tier, §3.6)")
     tr_p.add_argument("file")
     sub.add_parser("index", help="index configured roots (local only, shadow-safe)")
+    point = sub.add_parser("point", help="Mark an accessible control without clicking")
+    point.add_argument("name", help="Exact accessible control name")
+    point.add_argument("--allow-local-frame", action="store_true", required=True,
+                       help="Authorize one transient local screen capture; no upload")
     plan_p = sub.add_parser("plan", help="shadow organisation plans (Phase 3: no writes)")
     plan_sub = plan_p.add_subparsers(dest="plan_action", required=True)
     build_p = plan_sub.add_parser("build", help="index + cascade -> plan (no writes)")
@@ -2376,6 +2380,13 @@ def main(argv: list[str] | None = None) -> int:
             from .backup_cli import backup_command
 
             return backup_command(args, config)
+
+        if args.command == "point":
+            result = call(config.socket_path, "nus.point",
+                          {"name": args.name, "allow_local_frame": args.allow_local_frame},
+                          timeout=40.0)
+            print(result["reply"])
+            return 0 if result["pointed"] else 1
 
         if args.command == "ask":
             result = call(config.socket_path, "ask",
