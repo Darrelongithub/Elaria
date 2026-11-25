@@ -318,6 +318,15 @@ class Daemon:
         from .embeddings import make_embedder
         from .memory import Memory
         self.memory = Memory(self.store, make_embedder(config))
+        from .errand import ErrandRunner
+        from .safety_journal import DEFAULT_JOURNAL_NAME, JournalLog
+        self.safety_journal = JournalLog(config.data_dir / DEFAULT_JOURNAL_NAME)
+        self.errands = ErrandRunner(
+            config, self.store, self.memory,
+            client=self.client,
+            safety_journal=self.safety_journal,
+            broadcast=self.broadcast,
+        )
         from .meeting import MEETING_TRANSCRIPTION_TIMEOUT_S, MeetingService
         self.meetings = MeetingService(
             config, self.store, self.client, mode_manager=self.mode_manager)
@@ -1175,6 +1184,11 @@ class Daemon:
             "class.status": self._class_status,
             "class.set": self._class_set,
             "class.toggle": self._class_toggle,
+            "errand.start": self._errand_start,
+            "errand.status": self._errand_status,
+            "errand.list": self._errand_list,
+            "errand.cancel": self._errand_cancel,
+            "errand.answer": self._errand_answer,
             "ask": self._ask,
         }
 
@@ -1212,7 +1226,10 @@ class Daemon:
                                    "speech.error", "conversation.message",
                                    "class.changed", "knock.raised",
                                    "knock.accepted", "knock.changed", "error",
-                                   "capture.levels", "capture.state"]}
+                                   "capture.levels", "capture.state",
+                                   "errand.started", "errand.step",
+                                   "errand.paused", "errand.question_resolved",
+                                   "errand.completed", "errand.cancelled"]}
             handler = handlers.get(method)
             if handler is None:
                 raise ValueError(f"unknown method '{method}' — supported: "
@@ -4474,6 +4491,27 @@ class Daemon:
             # IS the turn-aware answer — zero Gemini calls (ADOPT-1).
             reply, via = checkin_reply(), "local-hotword-checkin"
 
+        errand_started = None
+        if reply is None and not unparsed_command:
+            from .errand import is_errand_instruction
+
+            wants_errand = bool(params.get("errand")) or is_errand_instruction(route_text)
+            if wants_errand:
+                errand_started = self.errands.start(
+                    route_text,
+                    roots=params.get("roots"),
+                    budget=params.get("budget"),
+                    conversation_id=conversation_id,
+                    use_llm=not connectivity.is_offline,
+                )
+                reply = (
+                    f"Started bounded errand #{errand_started['errand_id']} (read-only). "
+                    f"Inspect with `assist errand status {errand_started['errand_id']}` "
+                    f"or cancel with `assist errand cancel {errand_started['errand_id']}`."
+                )
+                via = "errand"
+                receipt = errand_started
+
         if reply is None:
             unparsed_command = bool(params.get("unparsed_command"))
             # Rung 5/6: assemble the exact context the cheap model needs.
@@ -4647,11 +4685,90 @@ class Daemon:
             "fixture": fixture,
             "connectivity": connectivity.as_dict(),
             "queued_job_id": queued_job_id,
+            "errand_id": (errand_started["errand_id"]
+                          if errand_started is not None else None),
+            "errand": errand_started,
             "speech": speech,
             "speaker": speaker,
             "company": self.disclosure.status(),
             "withheld": withheld,
         }
+
+    # -- bounded async read-errands (GAP-1) ----------------------------------
+    async def _errand_start(self, params: dict) -> dict:
+        """Start a bounded read-only async errand for the authenticated owner (I5)."""
+        self._require_ipc_owner()
+        if self.showoff.status().get("active"):
+            raise PermissionError("errands are disabled during show-off mode")
+        instruction = str(params.get("instruction") or params.get("text") or "").strip()
+        if not instruction:
+            raise ValueError("errand.start needs params.instruction")
+        connectivity = await self._connectivity_snapshot()
+        use_llm = bool(params.get("use_llm", not connectivity.is_offline))
+        roots = params.get("roots")
+        if roots is not None and not isinstance(roots, list):
+            raise ValueError("errand.start params.roots must be a list of paths")
+        budget = params.get("budget")
+        if budget is not None and not isinstance(budget, dict):
+            raise ValueError("errand.start params.budget must be a mapping")
+        custom_plan = params.get("plan")
+        if custom_plan is not None and not isinstance(custom_plan, list):
+            raise ValueError("errand.start params.plan must be a list of steps")
+        started = self.errands.start(
+            instruction,
+            roots=roots,
+            budget=budget,
+            conversation_id=self.sessions.active_id(iso_now()),
+            custom_plan=custom_plan,
+            use_llm=use_llm,
+        )
+        return started
+
+    async def _errand_status(self, params: dict) -> dict:
+        if "errand_id" not in params or params["errand_id"] is None:
+            raise ValueError("errand.status needs params.errand_id")
+        errand_id = _int_param(params, "errand_id")
+        return self.errands.inspect(errand_id)
+
+    async def _errand_list(self, params: dict) -> dict:
+        status = params.get("status")
+        limit = (
+            _int_param(params, "limit")
+            if params.get("limit") is not None else 20
+        )
+        return {"errands": self.errands.list_errands(status=status, limit=limit)}
+
+    async def _errand_cancel(self, params: dict) -> dict:
+        principal = self._require_ipc_owner()
+        if self.showoff.status().get("active"):
+            raise PermissionError("errand cancellation requires the owner outside show-off")
+        if "errand_id" not in params or params["errand_id"] is None:
+            raise ValueError("errand.cancel needs params.errand_id")
+        errand_id = _int_param(params, "errand_id")
+        return await self.errands.cancel(
+            errand_id, cancelled_by=f"owner-ipc uid={principal.uid} pid={principal.pid}")
+
+    async def _errand_answer(self, params: dict) -> dict:
+        """GAP-6 owner resolution seam: answer/confirm/amend/reject a paused question."""
+        principal = self._require_ipc_owner()
+        if self.showoff.status().get("active"):
+            raise PermissionError("errand answers require the owner outside show-off")
+        if "errand_id" not in params or params["errand_id"] is None:
+            raise ValueError("errand.answer needs params.errand_id")
+        errand_id = _int_param(params, "errand_id")
+        question_id = (
+            _int_param(params, "question_id")
+            if params.get("question_id") is not None else None
+        )
+        decision = str(params.get("decision") or "confirm").strip().lower()
+        answer_text = str(params.get("answer_text") or params.get("text") or "").strip()
+        return await self.errands.answer(
+            errand_id,
+            question_id=question_id,
+            decision=decision,
+            answer_text=answer_text,
+            owner_uid=principal.uid,
+        )
 
     async def _run_intent(self, intent) -> tuple[str | None, str, dict | None]:
         """Execute a local intent.
@@ -4861,6 +4978,10 @@ class Daemon:
         try:
             await self.event_service.close()
         except Exception:  # noqa: S110 - event finalize must never block daemon shutdown
+            pass
+        try:
+            await self.errands.aclose()
+        except Exception:  # noqa: S110 - errand cleanup must never block shutdown
             pass
         meeting, self._meeting = self._meeting, None
         meeting_task = meeting.get("task") if meeting is not None else None
