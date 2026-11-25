@@ -499,3 +499,22 @@ allow_escalation = false
 enabled = false
 surface_path = "~/Elaria/ui/quickshell/nus"
 reduced_motion = false
+
+[reach]
+# Phase-0 internet fetcher (BUILD-7, Agent REACH). Disabled by default.
+enabled = false
+web_host_mode = "open-public"     # open-public | named-hosts
+allowed_web_hosts = []
+github_req_per_hr = 30
+web_req_per_hr = 60
+news_req_per_hr = 30
+connect_timeout_s = 5.0
+total_timeout_s = 20.0
+max_redirects = 3
+max_wire_bytes = 2097152
+max_decoded_bytes = 8388608
+max_extract_chars = 16000
+robots_cache_ttl_s = 86400.0
+user_agent_contact = "elaria-reach@local"
+offline = false
+
