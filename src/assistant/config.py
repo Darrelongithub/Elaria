@@ -467,6 +467,10 @@ DEFAULTS: dict = {
         # Real keyword spotter (.onnx). Empty/missing => `hotword start`
         # refuses cleanly. There is no energy/loudness fallback.
         "keyword_model": "",
+        # openWakeWord v0.5.1 3-model ONNX pipeline (melspectrogram.onnx +
+        # embedding_model.onnx + trained head above), CPU only.
+        "keyword_melspec_model": "",
+        "keyword_embedding_model": "",
         "keyword_threshold": 0.5,
         "keyword_window_s": 1.0,
         # ECAPA backend (hardware-side): a command `cmd <clip.wav>` printing
