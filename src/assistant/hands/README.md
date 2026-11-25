@@ -115,3 +115,24 @@ no control bytes, no mouse, no chords, no `call PLUGIN ACTION`.
   `invalid-text`, `unsupported-character`, open/write failures) at WARNING.
   Config wiring for `[hands.typing]` is not yet in `config.py` (owned by Z) or
   `config.toml.example` (owned by L).
+
+### BUILD-4: mouse fixture
+
+`run_mouse_fixture` is a click-only tier-3 path. It accepts canonical `Plan`
+steps (`click`, tier 3, no env overrides) with argv `(window, role, name,
+before_screen_hash, after_screen_hash)`. It uses shared observation grounding
+for exact accessible buttons, not OCR or vision guesses. A simulated local
+owner prompt receives the exact batch and must echo its digest and fresh nonce.
+The synthetic queue burns the batch before dispatch and logs each click before
+emission. Exact screen mismatches, repeated target/state pairs, cancellation,
+the runtime halt file, and the 90-second execution deadline all stop the batch.
+The 12-click reservation is cumulative per errand, including interrupted runs.
+
+No production call site, owner-seat authenticator, compositor adapter, desktop
+stop binding, or live input sink ships with this fixture. The safe-surface flag
+is independent fixture evidence, not a credential/checkout classifier for real
+windows. Drag, scroll, arbitrary coordinates and button holds are unsupported.
+Exact screen hashes are deliberate for deterministic fixtures; a live build
+needs independently verified effects, trustworthy focus/safety/seat evidence,
+and a race-safe input boundary. Do not connect this fixture to real input.
+API budget: zero calls. No hardware verification claimed.
