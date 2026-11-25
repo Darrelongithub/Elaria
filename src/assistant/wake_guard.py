@@ -305,33 +305,78 @@ class OpenWakeWordModel:
             pass
         return OpenWakeWordModel.DEFAULT_HEAD_FRAMES
 
-    def score_window(self, pcm: bytes) -> float:
-        """Keyword confidence for a PCM window (0..1)."""
-        import numpy as np
+    def _melspec_frames(self, samples, np):
+        """PCM float32 (N,) -> mel frames (T, 32), upstream `x/10 + 2` applied.
 
-        melspec_s, embedding_s, head_s = self._load_sessions()
-        samples = np.frombuffer(pcm[: len(pcm) - len(pcm) % 2],
-                                dtype=np.int16).astype(np.float32)
-        if samples.size == 0:
-            return 0.0
+        Public to the trainer through `embedding_frames` so training and
+        inference share ONE feature path — a head fitted on a second,
+        re-implemented extractor is a green test on a dead product.
+        None when the window is too short to hold a single mel window.
+        """
+        melspec_s = self._load_sessions()[0]
         spec = melspec_s.run(
             None, {self._input_name(melspec_s, "input"):
-                   samples[None, :]})[0]
+                   np.asarray(samples, np.float32)[None, :]})[0]
         spec = np.squeeze(spec) / 10.0 + 2.0
         if spec.ndim != 2 or spec.shape[0] < self.MEL_WINDOW:
-            return 0.0
+            return None
+        return spec
+
+    def _embedding_frames(self, samples, np):
+        """PCM float32 (N,) -> speech embeddings (K, 96); None if too short."""
+        spec = self._melspec_frames(samples, np)
+        if spec is None:
+            return None
         windows = [spec[i:i + self.MEL_WINDOW]
                    for i in range(0, spec.shape[0] - self.MEL_WINDOW + 1,
                                   self.MEL_STEP)]
         batch = np.array(windows, dtype=np.float32)[..., None]
+        embedding_s = self._load_sessions()[1]
         embeddings = np.squeeze(embedding_s.run(
             None, {self._input_name(embedding_s, "input_1"): batch})[0])
-        embeddings = np.atleast_2d(embeddings)
+        return np.atleast_2d(embeddings).astype(np.float32)
+
+    def embedding_frames(self, pcm: bytes):
+        """The trainer's view of the runtime feature path (no head involved).
+
+        `scripts/train_elaria_head.py` calls exactly this, so the embeddings
+        it fits a head on are the embeddings the daemon will feed that head.
+        """
+        import numpy as np
+
+        samples = np.frombuffer(pcm[: len(pcm) - len(pcm) % 2],
+                                dtype=np.int16).astype(np.float32)
+        if samples.size == 0:
+            return None
+        return self._embedding_frames(samples, np)
+
+    def head_inputs(self, pcm: bytes):
+        """PCM window -> the (N, 96) head input, front-padded like inference."""
+        import numpy as np
+
+        samples = np.frombuffer(pcm[: len(pcm) - len(pcm) % 2],
+                                dtype=np.int16).astype(np.float32)
+        if samples.size == 0:
+            return None
+        embeddings = self._embedding_frames(samples, np)
+        if embeddings is None:
+            return None
+        head_s = self._load_sessions()[2]
         n = self._head_frames(head_s, np)
         if embeddings.shape[0] < n:
             pad = np.repeat(embeddings[:1], n - embeddings.shape[0], axis=0)
             embeddings = np.concatenate([pad, embeddings], axis=0)
-        feed = embeddings[-n:][None, :, :].astype(np.float32)
+        return embeddings[-n:].astype(np.float32)
+
+    def score_window(self, pcm: bytes) -> float:
+        """Keyword confidence for a PCM window (0..1)."""
+        import numpy as np
+
+        feed_in = self.head_inputs(pcm)
+        if feed_in is None:
+            return 0.0
+        head_s = self._load_sessions()[2]
+        feed = feed_in[None, :, :].astype(np.float32)
         out = head_s.run(
             None, {self._input_name(head_s, "input"): feed})[0]
         try:
@@ -837,7 +882,31 @@ class WakeGuard:
         else:
             model = keyword_model or self.keyword_model
             if model is None:
-                model = OnnxKeywordModel.load(self.settings.get("keyword_model"))
+                # Lane J (2026-11-25): the 3-model openWakeWord pipeline is the
+                # arming path when `[hotword] keyword_melspec_model` is set.
+                # Before this, `arm()` only ever built `OnnxKeywordModel`, so
+                # the documented melspec/embedding keys were read by nothing
+                # and an OpenWakeWord head fed a *raw PCM* loader — the lane
+                # was documented, tested in isolation, and unreachable here.
+                melspec = str(self.settings.get("keyword_melspec_model") or "").strip()
+                embedding = str(
+                    self.settings.get("keyword_embedding_model") or "").strip()
+                head = str(self.settings.get("keyword_model") or "").strip()
+                if melspec or embedding:
+                    if not (melspec and embedding and head):
+                        missing = [name for name, value in (
+                            ("keyword_melspec_model", melspec),
+                            ("keyword_embedding_model", embedding),
+                            ("keyword_model", head)) if not value]
+                        raise KeywordModelUnavailable(
+                            "wake word paused: the openWakeWord pipeline needs "
+                            "all three model paths; missing "
+                            + ", ".join(missing)
+                            + ". There is no energy fallback and no half-armed "
+                            "pipeline.")
+                    model = OpenWakeWordModel.load(head, melspec, embedding)
+                else:
+                    model = OnnxKeywordModel.load(self.settings.get("keyword_model"))
             if not isinstance(model, OnnxKeywordModel) and \
                     getattr(model, "name", "") == EnergyTestModel.name:
                 raise KeywordModelUnavailable(
