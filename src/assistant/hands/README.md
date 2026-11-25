@@ -93,10 +93,25 @@ same gate as every other step: owner decision bound to the plan digest, then cla
 then readback verification. Text only: one printable string, at most 200 characters,
 no control bytes, no mouse, no chords, no `call PLUGIN ACTION`.
 
-- `SyntheticTypeSink` is the only sink that can run. It records text in memory.
+- `SyntheticTypeSink` is the only sink the core can verify and run. It records text in memory.
 - `UinputTypeSink` is the real-keyboard seam. It is off unless `typing_enabled(config)`
   reads a literal `True` at `[hands.typing] enabled`. It refuses with
-  `evdev-absent` or `uinput-absent` when those are missing, and it has no readback,
-  so the core never types through it. Nothing here has been run on hardware.
-- Every refusal is logged as a `hands.step` row. Config wiring for `[hands.typing]`
-  is not yet in `config.py` (owned by Z) or `config.toml.example` (owned by L).
+  `evdev-absent` or `uinput-absent` when those are missing. When enabled with both
+  preconditions met, it emits evdev `EV_KEY` press/release pairs (one `SYN` after
+  each state change) for printable ASCII only on a US-layout key map; shift is
+  held only across the upper form of a key, never as a control chord. Non-ASCII
+  printable characters are refused rather than guessed. `evdev` is imported lazily and an injectable
+  `evdev_factory` (trusted test/hardware hook, never from config, plans or data)
+  returns an evdev-like module so tests run with a fake device. No
+  `python-evdev` install and no uinput rules ship with this repo.
+- The real sink still has **no readback** (`has_readback = False`, `last_typed()`
+  is always `None`): a keyboard cannot prove what a focused window received.
+  `SandboxCore` therefore refuses the step before calling `type_text` on it; no
+  real keystroke is ever marked verified. Emission is reachable only by a
+  trusted caller that already holds an open gate (e.g. `TypingRunner.run` in the
+  fake-device eye-check). Nothing here has been run on hardware.
+- Every refusal is logged: the core emits a `hands.step` row, and the sink logs
+  the reason (`disabled-by-config`, `evdev-absent`, `uinput-absent`,
+  `invalid-text`, `unsupported-character`, open/write failures) at WARNING.
+  Config wiring for `[hands.typing]` is not yet in `config.py` (owned by Z) or
+  `config.toml.example` (owned by L).
