@@ -463,3 +463,19 @@ embedding_dim = 192
 speaker_threshold = 0.75
 keyword_threshold = 0.5
 save_near_miss_clips = false        # privacy: off by default (§13.10)
+
+# Cold storage. Configure the rclone remote locally; never put credentials here.
+[backup]
+rclone_remote = ""
+rclone_path = "elaria-restic"
+restic_timeout = "5m"
+restic_pack_size_mib = 128
+hot_window_days = 14
+hot_window_gb = 2
+trim_grace_days = 14
+defer_above_mb = 100
+watcher_poll_s = 30
+nightly_oncalendar = "03:17"
+capacity_floor_gb = 10
+drill_read_data_subset_pct = 5
+drill_read_data_subset_mb = 500
