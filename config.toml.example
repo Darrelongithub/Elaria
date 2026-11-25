@@ -96,6 +96,22 @@ rpd = 0
 [quota.models.transcribe-batch]
 rpd = 25
 
+[quota.grounding]
+# Diverted-material VLM fallback for the NUS pointer (BUILD-3 /
+# SPEC-PROVIDER-ROUTING.md). Grounding is NEVER the personality tier
+# (gemini-3.5-flash-lite) and NEVER the 20/day flash escalation
+# (gemini-3.8-flash). Default is disabled (AT-SPI-only, 0 VLM calls).
+# rpd_cap = 0 also disables VLM calls (never unlimited). Account verification
+# is per-lane and never inherited from [quota].verified.
+enabled = false
+provider = ""          # diverted provider (e.g. "openrouter" | "local"; never "gemini")
+model = ""             # e.g. "qwen/qwen2.5-vl-7b-instruct:free"
+verified = false       # flip to true only after verifying YOUR account for this provider
+verified_at = ""
+verified_source = ""
+rpd_cap = 30           # per-day cap for diverted vision grounding calls (0 = disabled)
+timeout_s = 4.0        # hard wall-clock deadline per grounding call
+
 [presence]
 # Stage B / §19.1: one toggle, schedule only SUGGESTS (never auto-switches).
 class_mode = false

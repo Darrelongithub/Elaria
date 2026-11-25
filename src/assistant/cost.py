@@ -221,4 +221,24 @@ def format_cost_report(month: dict, today: dict, quota: dict, tier: str = "free"
         lines.append(
             "Reminder: quota shape in config is ASSUMED until verified at "
             "aistudio.google.com/rate-limit (blueprint §11).")
+    grounding = quota.get("grounding") if isinstance(quota, dict) else None
+    if isinstance(grounding, dict):
+        g_cap = grounding.get("rpd_cap")
+        g_cap_int = int(g_cap) if isinstance(g_cap, int) and not isinstance(g_cap, bool) else 0
+        if grounding.get("enabled") is True and g_cap_int > 0:
+            g_ver = (
+                f"VERIFIED {grounding.get('verified_at', '')}".strip()
+                if grounding.get("verified") is True
+                else "UNVERIFIED"
+            )
+            lines.append(
+                f"Vision grounding (diverted material): ENABLED — "
+                f"{grounding.get('provider') or '?'}:{grounding.get('model') or '?'} · "
+                f"{g_cap_int} RPD cap ({g_ver}; never Gemini personality/flash)."
+            )
+        else:
+            lines.append(
+                "Vision grounding (diverted material): DISABLED "
+                "(AT-SPI-only; 0 VLM calls; configured in [quota.grounding])."
+            )
     return "\n".join(lines)

@@ -487,6 +487,20 @@ class Store:
         with self._lock:
             return int(self._conn.execute(query, tuple(params)).fetchone()["n"])
 
+    def grounding_calls_since(self, since_iso: str, *,
+                              role: str = "vision_grounding") -> int:
+        """Count all diverted vision-grounding calls recorded since `since_iso`.
+
+        Counts every grounding mode (diverted, local, fixture) so the per-day
+        cap in `[quota.grounding]` is enforced identically in production and
+        sandbox verification, strictly isolated from the personality tier.
+        """
+        with self._lock:
+            return int(self._conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_calls WHERE ts >= ? AND role = ?",
+                (since_iso, role),
+            ).fetchone()["n"])
+
     def recent_llm_calls(self, limit: int = 5) -> list[dict]:
         """Newest ledger rows first — the §0 spike reads its measured token
         figure from the row its own call wrote (never an estimate guess)."""

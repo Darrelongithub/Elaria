@@ -101,7 +101,7 @@ MUTATING_KINDS = frozenset({
 
 READ_ONLY_KINDS = frozenset({
     "status", "cost", "queue_status", "where", "search", "capability",
-    "confirm", OBSERVATION_KIND,
+    "confirm", "point", OBSERVATION_KIND,
 })
 
 
@@ -195,7 +195,20 @@ def route(text: str, *, source: str = "owner-typed") -> Intent | None:
         return None
     canonical, trusted = normalise_source(source)
     matched: Intent | None = None
+    point_checked = False
     for kind, pattern in _PATTERNS:
+        if kind == "where" and not point_checked:
+            point_checked = True
+            from .nus_pointer import parse_point_instruction
+
+            parsed_point = parse_point_instruction(stripped)
+            if parsed_point is not None:
+                matched = Intent(
+                    kind="point",
+                    argument=parsed_point.target_name,
+                    raw=text,
+                )
+                break
         match = pattern.match(stripped)
         if match:
             argument = ""
@@ -366,6 +379,9 @@ CAPABILITIES: tuple[Capability, ...] = (
                "assistant.showoff:ShowoffService.demo_write", mutating=True),
     Capability("ladder", "report which binds and sensors are actually live",
                "assistant.ladder:main"),
+    Capability("point", "point at a visible control on your screen without clicking it",
+               "assistant.nus_pointer:Pointer.point_instruction",
+               needs="[nus_pointer] enabled = true"),
 )
 
 #: Things a language model is happy to claim and this build has no path for.
