@@ -5,7 +5,9 @@ TypingRunner is the gated text-injection seam; its only shipped sinks are synthe
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -13,6 +15,33 @@ from typing import Protocol
 from .gate import TYPE_TOOL, child_environment, typing_text_ok
 from .plan import Step
 from .sandbox import SyntheticSpace
+
+log = logging.getLogger(__name__)
+
+# Linux evdev key names for printable ASCII. Shift is only used for the upper
+# form of a key; there are no control/meta chords and no Enter/Tab/Backspace.
+# Anything outside this table (Unicode letters, control bytes) is refused: a
+# guessed keysym would type something other than the consented text.
+_ASCII_KEY_NAMES: dict[str, tuple[str, bool]] = {
+    **{c: (f"KEY_{c.upper()}", False) for c in "abcdefghijklmnopqrstuvwxyz0123456789"},
+    **{c: (f"KEY_{c}", True) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+    " ": ("KEY_SPACE", False),
+    "!": ("KEY_1", True), "@": ("KEY_2", True), "#": ("KEY_3", True),
+    "$": ("KEY_4", True), "%": ("KEY_5", True), "^": ("KEY_6", True),
+    "&": ("KEY_7", True), "*": ("KEY_8", True), "(": ("KEY_9", True),
+    ")": ("KEY_0", True),
+    "-": ("KEY_MINUS", False), "_": ("KEY_MINUS", True),
+    "=": ("KEY_EQUAL", False), "+": ("KEY_EQUAL", True),
+    "[": ("KEY_LEFTBRACE", False), "{": ("KEY_LEFTBRACE", True),
+    "]": ("KEY_RIGHTBRACE", False), "}": ("KEY_RIGHTBRACE", True),
+    "\\": ("KEY_BACKSLASH", False), "|": ("KEY_BACKSLASH", True),
+    ";": ("KEY_SEMICOLON", False), ":": ("KEY_SEMICOLON", True),
+    "'": ("KEY_APOSTROPHE", False), '"': ("KEY_APOSTROPHE", True),
+    ",": ("KEY_COMMA", False), "<": ("KEY_COMMA", True),
+    ".": ("KEY_DOT", False), ">": ("KEY_DOT", True),
+    "/": ("KEY_SLASH", False), "?": ("KEY_SLASH", True),
+    "`": ("KEY_GRAVE", False), "~": ("KEY_GRAVE", True),
+}
 
 
 @dataclass(frozen=True)
@@ -101,28 +130,116 @@ class SyntheticTypeSink:
 class UinputTypeSink:
     """Real-keyboard seam. Off by default; refuses honestly unless every precondition holds.
 
-    No key emission is implemented here. Keystrokes into a focused window have no
-    independent readback, so SandboxCore never calls ``type_text`` on this sink
-    (``has_readback`` is False and the core refuses before claiming the step).
+    Key emission is implemented here, and nowhere else: ``evdev`` is imported
+    lazily, and a trusted ``evdev_factory`` can return an evdev-like module for
+    fake-device tests (the factory is never populated from config, plans or
+    data). Without that injection the old preconditions apply unchanged.
+
+    Keystrokes into a focused window have no independent readback. This sink
+    therefore keeps ``has_readback = False`` and remembers no typed text:
+    SandboxCore refuses it before ``type_text`` rather than claim an
+    unverified step. Emission is reachable only by a trusted caller holding a
+    genuinely open gate (e.g. ``TypingRunner.run`` in tests/hardware wiring).
     """
 
     has_readback = False
 
-    def __init__(self, *, enabled: bool):
+    def __init__(self, *, enabled: bool, evdev_factory: Callable[[], object] | None = None,
+                 uinput_path: str = "/dev/uinput"):
         self._enabled = enabled is True
+        self._evdev_factory = evdev_factory  # trusted test/hardware hook only
+        self._uinput_path = uinput_path
+
+    def _refuse(self, reason: str) -> tuple[bool, str]:
+        log.warning("typing refused: %s", reason)
+        return False, reason
+
+    def _raise_refusal(self, reason: str) -> None:
+        self._refuse(reason)
+        raise PermissionError(f"typing refused: {reason}")
+
+    def _evdev(self):
+        """Return an evdev-like module lazily, or None if it cannot be had."""
+        try:
+            module = (self._evdev_factory() if self._evdev_factory is not None
+                      else importlib.import_module("evdev"))
+        except Exception:
+            return None
+        if not callable(getattr(module, "UInput", None)) or getattr(module, "ecodes", None) is None:
+            return None
+        return module
+
+    @staticmethod
+    def _emit_calls(text: str, ecodes) -> list[tuple] | None:
+        """Exact write/syn call sequence for ASCII text; None if unsupported."""
+        ev_key = getattr(ecodes, "EV_KEY", None)
+        shift = getattr(ecodes, "KEY_LEFTSHIFT", None)
+        if not isinstance(ev_key, int) or not isinstance(shift, int):
+            return None
+        calls: list[tuple] = []
+        for char in text:
+            name, needs_shift = _ASCII_KEY_NAMES.get(char, (None, False))
+            if name is None:
+                return None
+            code = getattr(ecodes, name, None)
+            if not isinstance(code, int):
+                return None
+            # Shift must be held across the key press. One SYN after each state
+            # change makes the events independently observable on real uinput.
+            if needs_shift:
+                calls.extend((("write", ev_key, shift, 1), ("syn",)))
+            calls.extend((("write", ev_key, code, 1), ("syn",),
+                          ("write", ev_key, code, 0), ("syn",)))
+            if needs_shift:
+                calls.extend((("write", ev_key, shift, 0), ("syn",)))
+        return calls
 
     def available(self) -> tuple[bool, str]:
         if not self._enabled:
-            return False, "disabled-by-config"
-        if importlib.util.find_spec("evdev") is None:
-            return False, "evdev-absent"
-        if not os.access("/dev/uinput", os.W_OK):
-            return False, "uinput-absent"
+            return self._refuse("disabled-by-config")
+        if self._evdev_factory is None:
+            if importlib.util.find_spec("evdev") is None:
+                return self._refuse("evdev-absent")
+            if not os.access(self._uinput_path, os.W_OK):
+                return self._refuse("uinput-absent")
+        elif not callable(self._evdev_factory):
+            return self._refuse("evdev-absent")
         return True, ""
 
     def type_text(self, text: str) -> None:
         ok, reason = self.available()
-        raise PermissionError(f"typing refused: {reason if not ok else 'no key-emission backend'}")
+        if not ok:
+            self._raise_refusal(reason)
+        if not typing_text_ok((text,)):
+            self._raise_refusal("invalid-text")
+        if any(char not in _ASCII_KEY_NAMES for char in text):
+            self._raise_refusal("unsupported-character")
+        module = self._evdev()
+        if module is None:
+            self._raise_refusal("evdev-absent")
+        calls = self._emit_calls(text, module.ecodes)
+        if calls is None:
+            self._raise_refusal("unsupported-character")
+        codes = sorted({call[2] for call in calls if call[0] == "write"})
+        try:
+            device = module.UInput({module.ecodes.EV_KEY: codes}, name="elaria-hands")
+        except Exception as exc:
+            self._raise_refusal(f"uinput-absent: {type(exc).__name__}: {exc}")
+        try:
+            for call in calls:
+                if call[0] == "write":
+                    device.write(*call[1:])
+                else:
+                    device.syn()
+        except Exception as exc:
+            self._raise_refusal(f"uinput-write-failed: {type(exc).__name__}: {exc}")
+        finally:
+            close = getattr(device, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    log.warning("typing device close failed after emission")
 
     def last_typed(self) -> str | None:
         return None
