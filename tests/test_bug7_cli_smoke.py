@@ -123,6 +123,7 @@ def _smoke_table(tmp_path: Path) -> list[list[str]]:
         ["errand", "list"],
         ["errand", "cancel", "1"],
         ["errand", "answer", "1", "--decision", "confirm"],
+        ["point", "Save", "--allow-local-frame"],
         ["hotword", "status"],
         ["hotword", "start"],
         ["hotword", "start", "--unsafe-energy-test"],

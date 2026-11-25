@@ -731,6 +731,12 @@ DEFAULTS: dict = {
         "max_read_bytes": 65_536,
         "allow_escalation": False,
     },
+    # Local point-only NUS screen observation (BUILD-1). Disabled by default.
+    "nus_pointer": {
+        "enabled": False,
+        "surface_path": "~/Elaria/ui/quickshell/nus",
+        "reduced_motion": False,
+    },
 }
 
 
