@@ -196,3 +196,48 @@ Samples live under `~/elaria-wake-samples/` (chmod 700), outside every repo.
   failed-verify audio is never saved unless the explicit debug flag is set.
 * Watchdog: > 2 s without frames while armed → disarm, zero buffers, visible
   `stalled` state. Never a silent forever-recording.
+
+## 7. Lane J-HEAD — the first trained head (2026-11-25)
+
+`models/elaria_head.onnx` is the first real head for
+`wake_guard.OpenWakeWordModel` (openWakeWord melspec + embedding → 4×96
+embeddings → 256→64 MLP → sigmoid). It was trained **in a sandbox on
+espeak-ng synthesis only**, because no human "Elaria" recordings exist
+there. The recipe, sha256 and raw numbers live in
+[`models/README.md`](../models/README.md); the eye-check is
+`tests/test_j_elaria_head.py`.
+
+**What changed in code (lane J):** `WakeGuard.arm()` now builds
+`OpenWakeWordModel` when `[hotword] keyword_melspec_model` is set. Before
+that, `arm()` only ever constructed `OnnxKeywordModel`, so the documented
+melspec/embedding keys were read by nothing and a trained head was
+unreachable from `assist hotword start`. `assist doctor` reports which of
+the two pipelines is configured. A half-configured pipeline is a refusal
+naming the missing keys, never a guess.
+
+**What the numbers do and do not say.** At the frozen
+`keyword_threshold = 0.5`: false-reject 6.0 %, false-accept 4.0 % on 780
+held-out windows from 7 voices the head never heard (the reproducible recipe
+trains on 34 of the 208 espeak timbres, because only those synthesise
+byte-identically run to run). Those are *synthetic-to-synthetic* numbers.
+They do **not** discharge the Stage-A bars above — no TV soak, no distance
+sweeps, no real rooms, no other-speaker recordings — and **two of those bars
+already fail here**: recall 94.0 % against the ≥95 % bar, and near-words
+6.4 % against the ≤5 % bar (the residual false accepts are true homophones:
+`Ilaria`, `Alaria`, `el area`, on unseen voices). The 208-voice variant of
+the same recipe scored 2.0 % / 3.5 % (near-words 5.3 %); the difference is
+recorded in `models/README.md` rather than traded for a quieter threshold.
+
+**Reproducibility is part of the recipe.** Two runs of the documented
+command produce byte-identical `models/elaria_head.onnx` and fixture.
+That is why the trainer pins its own ONNX sessions to one thread and skips
+the 174 espeak voices that synthesize differently every call — an artefact
+nobody can re-derive makes every number above unverifiable.
+
+**The next training round is the owner's corpus, not more espeak.**
+Milestone A (~120 takes, section 2) is the missing ingredient: real
+positives and real hard negatives. `scripts/train_elaria_head.py` already
+takes its feature path from the runtime, so a future round can replay that
+corpus through the same extractor with no code change. Never buy recall by
+raising `keyword_threshold`; the ambiguity band is not a permission
+(Stage C).
