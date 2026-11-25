@@ -24,10 +24,11 @@ ShellRoot {
     id: root
 
     property bool surfaceVisible: false
-    property int targetX: 0
-    property int targetY: 0
-    property int targetWidth: 1
-    property int targetHeight: 1
+    property string captureState: "idle"
+    property int targetX: 24
+    property int targetY: 24
+    property int targetWidth: 220
+    property int targetHeight: 56
 
     PanelWindow {
         id: nusSurface
@@ -52,6 +53,28 @@ ShellRoot {
 
         // Positive allow list with zero allowed rects: fully click-through.
         mask: Region {}
+
+        // The pill: a dumb renderer of the daemon's capture.state.
+        // No decision logic here — text and colour bind to the state
+        // string the daemon last sent; transitions only.
+        Rectangle {
+            anchors.fill: parent
+            radius: 16
+            color: root.captureState === "listening" ? "#1d4ed8"
+                 : root.captureState === "verifying" ? "#b45309"
+                 : root.captureState === "speaking" ? "#047857"
+                 : root.captureState === "stalled" ? "#b91c1c"
+                 : root.captureState === "unavailable" ? "#b91c1c"
+                 : "#111827"
+            opacity: root.captureState === "idle" ? 0.55 : 0.92
+
+            Text {
+                anchors.centerIn: parent
+                text: "Elaria · " + root.captureState
+                color: "#f9fafb"
+                font.pixelSize: 15
+            }
+        }
     }
 
     IpcHandler {
@@ -62,6 +85,7 @@ ShellRoot {
         function reveal(): void { root.surfaceVisible = true }
         function hide(): void { root.surfaceVisible = false }
         function isVisible(): bool { return root.surfaceVisible }
+        function setCaptureState(state: string): void { root.captureState = state }
 
         // Geometry only — the target shape is data, never a capture.
         function setTarget(x: int, y: int, width: int, height: int): void {
