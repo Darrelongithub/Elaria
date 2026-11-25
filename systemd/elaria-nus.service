@@ -1,0 +1,14 @@
+[Unit]
+Description=Elaria NUS pointer and capture-state surface
+After=graphical-session.target assistant.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Adjust -p to wherever you checked out / installed the ui/ tree.
+ExecStart=/usr/bin/quickshell -p %h/Elaria/ui/quickshell/nus
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

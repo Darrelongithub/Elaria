@@ -479,3 +479,9 @@ nightly_oncalendar = "03:17"
 capacity_floor_gb = 10
 drill_read_data_subset_pct = 5
 drill_read_data_subset_mb = 500
+
+[nus_pointer]
+# Owner CLI only. Each request explicitly authorizes one local frame.
+enabled = false
+surface_path = "~/Elaria/ui/quickshell/nus"
+reduced_motion = false
