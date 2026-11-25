@@ -426,15 +426,19 @@
     "reports/RPT-U-*",
     "src/assistant/drill.py",
     "src/assistant/preflight.py",
+    "src/assistant/wp7_drill.py",
+    "src/assistant/wp7_preflight.py",
     "tests/test_u_*.py"
   ],
   "V": [
     "docs/phase-reports/0[0-9][0-9]-*",
     "docs/storage-handoff.md",
     "docs/wp7-accd33a-readback-findings.md",
+    "docs/wp7-port-status.md",
     "reports/RPT-V-*",
     "scripts/storage-census-check.py",
-    "tests/test_v_*.py"
+    "tests/test_v_*.py",
+    "tests/test_wp7_*.py"
   ],
   "W": [
     "models/**",
@@ -459,6 +463,7 @@
     "reports/OWNER-RULING-*.md",
     "reports/PROCEDURE-*.md",
     "reports/RPT-Z-*",
+    "reports/SPEC-*.md",
     "scripts/check_ownership.py",
     "src/assistant/__init__.py",
     "src/assistant/cli.py",
