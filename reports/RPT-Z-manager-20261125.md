@@ -32,7 +32,7 @@ hardware lanes are parked, never blocking.
 |---|---|---|
 | 1 J-DETECTOR | openWakeWord ONNX pipeline + energy gate + bench | **built by manager, needs models + head** |
 | 2 W-OWNERSHIP | add `W`, claim 57 zero-owner paths | owner-only edit; proposal below |
-| 3 J-HEAD | train "Elaria" head on ~1,500 synthetic clips | prompt ready, blocked on Lane 1 models |
+| 3 J-HEAD | train "Elaria" head on ~1,500 synthetic clips | **DONE 2026-11-25 — PR #95 merged, issue #93 closed. `models/elaria_head.onnx` (reproducible), pipeline reachable from `arm()`; FRR 6.0 %/FAR 4.0 % SANDBOX, two Stage-A bars fail (recall 94.0 %, near 6.4 %) and are published as failing. See `RPT-J-r4-20261125T093000Z.md`** |
 | 4 Z-RING | audit pre-roll ring feed/use end-to-end | **DONE — `RPT-Z-ring-audit-20261125.md`: fed + used for detection, not inherited by pinned design** |
 | 5 H-OVERLAY | draw `ui/quickshell/nus/shell.qml`, fake-runner harness | **built 2026-11-25: pill renders `capture.state` via `setCaptureState`; eye-check `tests/test_nus_overlay_capture_state.py`; rendering itself = owner's eyes, parked** |
 | 6 O-HANDS | real typing path behind the existing gate | **DELEGATED — Channel 1 in `reports/DISPATCH-20261125.md` (manager does not build)** |
@@ -64,7 +64,20 @@ Each prompt is self-contained. Every agent: work on a new
 wiring is removed, open a PR, never merge, never edit `OWNERS.yaml`,
 never lower any threshold, report raw numbers not conclusions.
 
-### Lane 3 — J-HEAD (start after owner drops the two shared models in)
+### Lane 3 — J-HEAD — CLOSED (PR #95, 2026-11-25)
+
+> **Closed.** The models prerequisite was solved from the openWakeWord v0.5.1
+> PyPI wheel (the release host is egress-blocked, the wheel is not), so
+> `melspectrogram.onnx` + `embedding_model.onnx` are now pinned in `models/`
+> with sha256s. The head shipped reproducible, and a real wiring bug was
+> found and fixed on the way: `WakeGuard.arm()` never built
+> `OpenWakeWordModel`, so the melspec/embedding keys were read by nothing and
+> this lane was unreachable from `assist hotword start` before it. Numbers and
+> the two failing Stage-A bars: `reports/RPT-J-r4-20261125T093000Z.md`.
+> **Manager re-verification owed:** re-run `tests/test_j_elaria_head.py` and
+> confirm the base-commit full-suite baseline unchanged.
+
+Original prompt, kept for the record:
 
 > You are building ONE lane of Elaria (Fedora/Hyprland voice assistant,
 > repo Darrelongithub/Elaria). Read `assistant-blueprint.md` §9/§13 and
