@@ -65,8 +65,29 @@ from .showoff import ShowoffError, ShowoffService
 from .store import Store
 from .transcribe import HEARD_NOTHING, DictationService
 from .tts import SESSION_CUE_KIND, STANDARD_ACKS, SpeechResult, SpeechService
+from .wake_guard import ATTENDING, CONF_HIGH, OUTCOME_ATTENDING
+from .wake_guard import SAMPLE_RATE as WAKE_SAMPLE_RATE
 
 MAX_PTT_WAIT_S = 90.0
+
+#: A verified wake hit's command session is HARD-BOUNDED, like every other
+#: capture this daemon opens. The guard's `SilenceLadder` closes it on silence
+#: the way dictation does; `[hotword] listen_ceiling_s` is the ceiling that
+#: catches a session whose audio never earns a ladder close (continuous noise
+#: over the energy floor). It is deliberately short: the owner's command
+#: follows their own wake phrase, and a wake session that outlives it is a
+#: stuck microphone, not a conversation.
+WAKE_LISTEN_CEILING_S = 60.0
+
+#: The longest silence window a WAKE session's ladder may wait before its
+#: silent close. `WakeGuard` builds the session's `SilenceLadder` from
+#: `[hotword] checkin_after_s`, which ships as a dictation-shaped 30 s: with
+#: nothing transcribed on this path (this lane captures no words), the ladder's
+#: close — `window + grace_s` — would be 38 s of open microphone per verified
+#: hit. The session runner clamps the window to this. It is not a verification
+#: threshold and never feeds one; `ecapa_high`, `ecapa_uncertain` and
+#: `MIN_WINDOW_S` are untouched by this lane.
+WAKE_LISTEN_WINDOW_S = 12.0
 
 
 # The fake-device seam. Tests patch capture classes either here (the BUG-6
@@ -90,6 +111,105 @@ def _capture_cls(name: str):
     if own is not None and own is not _CAPTURE_ORIGINALS.get(name):
         return own
     return getattr(capture_mod, name)
+
+
+def _is_verified_attending(result) -> bool:
+    """True only for a VERIFIED, high-confidence, scored ATTENDING verdict.
+
+    `WakeGuard._settle` writes one `TriggerRecord` for every verdict, and its
+    `as_dict()` copy is the decision itself — not a summary of it. Four
+    independent statements must agree before a microphone opens:
+
+    * the record's outcome is ``attending`` (never ``discarded``,
+      ``refused_energy_test``, ``stalled`` or ``wake_knock``);
+    * its confidence is ``high`` — `ecapa_high` is the only permissive band,
+      and an uncertain score is NOT a weak yes;
+    * it carries a real `ecapa_score` (an attending record with no score did
+      not verify anything);
+    * it is not the `--unsafe-energy-test` plumbing flag, which can never open
+      command listening.
+
+    A missing or malformed record fails closed: no session, no state change.
+    """
+    if not isinstance(result, dict):
+        return False
+    trigger = result.get("trigger")
+    if not isinstance(trigger, dict):
+        return False
+    score = trigger.get("ecapa_score")
+    return (trigger.get("outcome") == OUTCOME_ATTENDING
+            and trigger.get("confidence") == CONF_HIGH
+            and isinstance(score, (int, float)) and not isinstance(score, bool)
+            and not trigger.get("unsafe_energy"))
+
+
+class _WakeStopped(RuntimeError):
+    """The wake session was stopped from outside (hotword stop/disable)."""
+
+
+class _WakeCeiling(RuntimeError):
+    """The wake session reached its hard ceiling — it never runs unbounded."""
+
+
+class _WakeFrameSource:
+    """Frames of an OPEN wake session, taken from the always-on capture.
+
+    There is no second `pw-record` here on purpose: the hotword loop already
+    owns one, and a second capture over the same microphone would be exactly
+    the half-duplex bug this lane must not introduce. The loop offers frames;
+    this yields them.
+
+    Three bounds, all fail-closed:
+    * `stop` — an external `hotword stop` ends the session at once;
+    * `ceiling_s` of AUDIO time — the session can never run unbounded, even
+      under audio that never lets the ladder close;
+    * a bounded queue — a reader that falls behind makes the session close
+      instead of buffering a microphone in RAM.
+    """
+
+    def __init__(self, *, stop: asyncio.Event, ceiling_s: float,
+                 max_queued: int = 32):
+        self.stop = stop
+        self.ceiling_s = max(0.1, float(ceiling_s))
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=max(2, int(max_queued)))
+        self._audio_s = 0.0
+        self._closed = False
+
+    def offer(self, frame: bytes) -> bool:
+        """Called by the capture loop; never blocks it, never raises.
+
+        Returns False when the session can accept no more audio (it is
+        closing, or the reader fell behind) so the caller can stop feeding it.
+        """
+        if self._closed or not frame:
+            return not self._closed
+        try:
+            self._queue.put_nowait(bytes(frame))
+        except asyncio.QueueFull:
+            # The session is not keeping up with the microphone: close it
+            # rather than hold audio nobody is reading.
+            self._closed = True
+            self.stop.set()
+            return False
+        return True
+
+    async def frames(self):
+        while True:
+            if self.stop.is_set():
+                raise _WakeStopped("wake session stopped")
+            if self._audio_s >= self.ceiling_s:
+                raise _WakeCeiling(f"wake session ceiling {self.ceiling_s:g}s")
+            try:
+                frame = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+            except TimeoutError:
+                continue
+            if not frame:
+                raise _WakeStopped("wake session closed")
+            self._audio_s += len(frame) / float(WAKE_SAMPLE_RATE * 2)
+            yield frame
+            if self._audio_s >= self.ceiling_s:
+                raise _WakeCeiling(f"wake session ceiling {self.ceiling_s:g}s")
+
 
 class ChatTimeout(TimeoutError):
     """A chat turn that hit a deadline — with WHICH deadline attached.
@@ -242,6 +362,20 @@ class Daemon:
             silence_floor=float(config.section("voice").get(
                 "silence_floor", DEFAULTS["voice"]["silence_floor"])))
         self._hotword_task: asyncio.Task | None = None
+        # Round Z (2026-11-24): the ONE session a verified wake hit may open.
+        # `wake_guard.feed()` returns a result only on the frame that closes a
+        # verified command window; that result is acted on here (see
+        # `_wake_listen_after_feed`). The daemon never opens a second capture
+        # for it — `_hotword_loop` yields this loop's frames into the session
+        # instead, so half-duplex (`_MutedCapture`, PTT) is inherited, not
+        # raced. A busy mic drops the session silently, before any bytes move.
+        self._wake_listen_task: asyncio.Task | None = None
+        self._wake_listen_stop: asyncio.Event | None = None
+        self._wake_listen_source: object | None = None
+        self._wake_listen_session_id: str | None = None
+        #: Set on the frame where a wake session's watchdog fired, so the stall
+        #: is announced once (by the session's closer) rather than twice.
+        self._wake_listen_session_stalled = False
         self.console = ConsoleService(
             config, self.store, presence=self.presence, sessions=self.sessions,
             initiative=self.initiative, showoff=self.showoff,
@@ -1637,12 +1771,217 @@ class Daemon:
             stall_timeout_s=float(
                 self.config.section("hotword").get("stall_timeout_s", 2.0)))
 
+    # -- the verified hit -> listening seam (round Z) -----------------------
+    def _wake_capture_busy(self) -> str | None:
+        """Why the microphone may NOT be handed to a wake session, or None.
+
+        Half-duplex is answered from state this daemon already owns — no new
+        probe, no new lock. `_MutedCapture` (her own voice still playing) and
+        PTT (a press, or a released press still transcribing) both hold the
+        mic; a second capture may never open over either.
+        """
+        if self.is_speaking():
+            return "muted"
+        # A PTT press that is still transcribing holds the mic even after
+        # `_ptt_session_id` is cleared (it outlives the release), so BOTH
+        # signals are read — neither alone is the whole answer.
+        if (self._dictation_task is not None
+                or self._ptt_session_id is not None
+                or self._ptt_finishing):
+            return "ptt"
+        return None
+
+    async def _wake_listen_after_feed(self, result) -> None:
+        """Act on `WakeGuard.feed()`'s return value — the one verified seam.
+
+        FAIL CLOSED, in this order, before a single byte moves:
+
+        1. only a VERIFIED ATTENDING outcome (never `uncertain`, never an
+           unverified/short/replayed window, never a wake-only hit, never an
+           exception) may even be considered;
+        2. an unavailable scorer or an unconfigured guard means no session, no
+           state change, no reply — the guard already answered idly;
+        3. a busy microphone drops the session SILENTLY: zero sessions, zero
+           outbound bytes, and no `capture.state` event, so a stranger cannot
+           learn the mic was consulted.
+
+        Only past all three does the contract's `verifying` -> `open` pair go
+        out, and the session it opens is bounded by `_wake_listen_session`.
+        """
+        if not _is_verified_attending(result):
+            return                      # uncertain / unverified / refused
+        if getattr(self.wake_guard, "state", None) != ATTENDING:
+            return                      # the guard must agree, not just the dict
+        if self._wake_capture_busy() is not None:
+            return                      # rule 3: busy mic -> dropped silently
+        if self._wake_listen_task is not None and not self._wake_listen_task.done():
+            return                      # one session at a time
+        # Rule 4: a VERIFIED hit is the only thing that may reach the wire
+        # with "verifying", and it is followed by exactly one "open".
+        await self._emit_capture_state("verifying", reason="owner voice")
+        try:
+            opened = self.wake_guard.open_listening(fresh=False)
+        except Exception as exc:
+            # A refusal, a race, a broken guard: no session. The guard's own
+            # state machine is the authority; this path never forces it. The
+            # console is told the pipeline is closed again — not left at
+            # "verifying" over a microphone that was never opened.
+            self._wake_log("wake.listen_refused",
+                           error=f"{type(exc).__name__}: {exc}"[:200])
+            await self._emit_capture_state("released", reason="wake session refused")
+            return
+        if not isinstance(opened, dict) or opened.get("open") != "listening":
+            # Class mode answers "console", not "listening" — an honest
+            # non-session, and nothing to run.
+            await self._emit_capture_state("armed", reason="wake opened the console")
+            return
+        await self._emit_capture_state("open", reason="wake verified")
+        self._start_wake_listen()
+
+    def _start_wake_listen(self) -> None:
+        """Run the opened session against the SAME frame stream (no second capture).
+
+        The hotword loop hands every subsequent frame to this session's queue;
+        nothing here spawns `pw-record` a second time, so the mic has exactly
+        one owner. A bounded queue is the stall detector: if the reader falls
+        behind, the session closes instead of buffering audio.
+        """
+        session = getattr(self.wake_guard, "session", None)
+        if session is None:
+            return
+        # The ladder is the guard's — the SAME `SilenceLadder` dictation uses,
+        # built by `_open_listening`. It is clamped here, before a single frame
+        # is observed, because this session transcribes no words: an unclamped
+        # 30 s window plus grace would hold the microphone for 38 s per hit.
+        # `grace_s`, `resume_s` and the silent-close rule are honoured as
+        # configured — the session ends on silence, exactly as dictation does.
+        ladder = getattr(session, "ladder", None)
+        if ladder is not None:
+            try:
+                ladder.checkin_after_s = min(float(ladder.checkin_after_s),
+                                             WAKE_LISTEN_WINDOW_S)
+            except (TypeError, ValueError, AttributeError):
+                pass
+        self._wake_listen_stop = asyncio.Event()
+        source = _WakeFrameSource(
+            stop=self._wake_listen_stop,
+            ceiling_s=self._wake_listen_ceiling_s())
+        self._wake_listen_source = source
+        self._wake_listen_session_id = str(
+            getattr(session, "session_id", "") or "") or None
+        self._wake_listen_task = self._track_task(
+            asyncio.create_task(self._wake_listen_session(session, source)))
+
+    def _wake_listen_ceiling_s(self) -> float:
+        """The hard ceiling on a wake session, in seconds of captured audio.
+
+        Always the code constant: this is the one bound in the wake path that
+        may not be talked out of working, so no config value can raise it to
+        "unbounded" and no poisoned value can lower it into a zero-length
+        session.
+        """
+        return float(WAKE_LISTEN_CEILING_S)
+
+    def _wake_listen_feed(self, frame: bytes) -> bool:
+        """Hand one always-on frame to an open wake session (drop when full)."""
+        source = self._wake_listen_source
+        if source is None:
+            return False
+        return source.offer(frame)
+
+    def _wake_listen_abort(self, reason: str) -> None:
+        """Stop a running wake session from outside the loop (hotword stop)."""
+        if self._wake_listen_stop is not None:
+            self._wake_listen_stop.set()
+        self._wake_listen_source = None
+        self._wake_log("wake.listen_abort", reason=reason)
+
+    async def _wake_listen_session(self, session, source) -> None:
+        """One bounded command session: frames in, `SilenceLadder` out.
+
+        Bounded three ways, all of them enforced here: the ceiling the frame
+        source raises at, the ladder's silent close on audio time, and a
+        stop event from `hotword.stop`. Every exit releases the microphone
+        (the guard's buffers are zeroed) and emits exactly one
+        `capture.state`.
+        """
+        session_id = self._wake_listen_session_id
+        closed_by = "ceiling"
+        try:
+            ladder = session.ladder
+            async for frame in source.frames():
+                # Rule 3, mid-session: the mic was handed over free, but she
+                # starts speaking (or a PTT press lands) while it is open.
+                # Then this session is the second capture: drop it silently.
+                # No "released" event either — the half-duplex gate emits its
+                # own "muted", and this path must not add a signal.
+                if self._wake_capture_busy() is not None:
+                    closed_by = "half-duplex"
+                    break
+                # Audio time, never wall-clock: a stalled stream cannot age a
+                # session shut while holding no audio.
+                frame_s = len(frame) / float(WAKE_SAMPLE_RATE * 2)
+                if ladder.observe(frame, frame_s) or ladder.close_due():
+                    closed_by = "silence"
+                    break
+        except asyncio.CancelledError:
+            closed_by = "cancelled"
+            raise
+        except _WakeCeiling:
+            closed_by = "ceiling"
+        except _WakeStopped:
+            closed_by = "stopped"
+        except Exception as exc:
+            closed_by = "error"
+            self._wake_log("wake.listen_error",
+                           session_id=str(session_id or ""),
+                           error=f"{type(exc).__name__}: {exc}"[:200])
+        finally:
+            self._wake_listen_source = None
+            self._wake_listen_session_id = None
+            try:
+                # The guard owns the transition AND the zeroing. `endpoint_closed`
+                # is the same close dictation uses; it never leaves ATTENDING/
+                # LISTENING audio resident.
+                self.wake_guard.endpoint_closed()
+            except Exception as exc:
+                self._wake_log("wake.listen_close_failed",
+                               session_id=str(session_id or ""),
+                               error=f"{type(exc).__name__}: {exc}"[:200])
+            self._wake_log("wake.listen_closed",
+                           session_id=str(session_id or ""), reason=closed_by)
+            if closed_by == "half-duplex":
+                # Rule 3: dropping to the gate that already holds the mic emits
+                # nothing new — it is not a transition this session owns.
+                pass
+            else:
+                try:
+                    await self._emit_capture_state(
+                        "armed" if self.wake_guard.armed else "released",
+                        reason=f"wake session closed ({closed_by})")
+                except Exception:  # noqa: S110 - capture state is advisory
+                    pass
+
+    def _wake_log(self, event: str, **fields) -> None:
+        """Metadata-only lifecycle marker — never audio, never a score."""
+        try:
+            self.store.log_persona_event(
+                iso_now(), event, json.dumps(fields, sort_keys=True))
+        except Exception:
+            return
+
     async def _hotword_loop(self) -> None:
         """Feed always-on frames through the guard + watchdog.
 
         Stall semantics: no frames for `stall_timeout_s` disarms, zeroes both
         RAM buffers and leaves a visible "stalled" state. Never a silent
         forever-recording.
+
+        Round Z: the loop no longer discards `feed()`'s return value. On the
+        frame that closes a VERIFIED command window the guard answers
+        ATTENDING, `_wake_listen_after_feed` opens the one bounded session,
+        and every following frame is yielded into it. No second capture is
+        ever opened.
         """
         guard = self.wake_guard
         source = None
@@ -1661,11 +2000,37 @@ class Daemon:
             async for frame in source.frames():
                 if not guard.armed:
                     break
-                guard.feed(frame)
+                if self._wake_listen_source is not None:
+                    # A verified session owns the mic: its frames go there and
+                    # the always-on guard stays out of the way until it closes.
+                    # The ring/watchdog still see every frame — a stalled
+                    # capture must be able to end the session it is feeding.
+                    guard.note_frame(frame)
+                    self._wake_listen_feed(frame)
+                    if guard.watchdog.check():
+                        self._wake_listen_abort("stalled")
+                        # The blocker below owns the disarm + the ONE stall
+                        # announcement; the session closer emits its own state.
+                        self._wake_listen_session_stalled = True
+                else:
+                    try:
+                        result = guard.feed(frame)
+                    except Exception as exc:
+                        # Rule 1: an exception means NO session. The always-on
+                        # path survives it; nothing is opened from a failure.
+                        self._wake_log("wake.feed_failed",
+                                       error=f"{type(exc).__name__}: {exc}"[:200])
+                        result = None
+                    await self._wake_listen_after_feed(result)
                 if guard.watchdog.check():
                     guard.disarm(reason="stalled")
-                    await self.broadcast({"event": "hotword.stalled",
-                                          "state": "stalled"})
+                    if self._wake_listen_session_stalled:
+                        # The session's closer already said "stalled"; do not
+                        # announce the same stall twice for one frame.
+                        self._wake_listen_session_stalled = False
+                    else:
+                        await self.broadcast({"event": "hotword.stalled",
+                                              "state": "stalled"})
                     await self._emit_capture_state("stalled", reason="stalled")
                     break
             # BH-K7: the stream ending underneath an armed guard IS the
@@ -1686,6 +2051,11 @@ class Daemon:
                                   "state": "stalled", "error": str(exc)[:200]})
             await self._emit_capture_state("stalled", reason="error")
         finally:
+            # Round Z: the stream ending underneath a wake session is the
+            # same stall, one level up — the session must not sit on a queue
+            # nothing is filling. Its own closer emits the state.
+            if self._wake_listen_source is not None:
+                self._wake_listen_abort("hotword capture ended")
             if source is not None:
                 aclose = getattr(source, "aclose", None)
                 if callable(aclose):
@@ -1726,10 +2096,20 @@ class Daemon:
     async def _hotword_stop(self, params: dict) -> dict:
         task = self._hotword_task
         self._hotword_task = None
+        # Round Z: a wake session never outlives the path that feeds it. Its
+        # own closer (`_wake_listen_session`'s finally) emits the state and
+        # zeroes the guard's buffers, so `disarm` below cannot resurrect one.
+        if self._wake_listen_task is not None and not self._wake_listen_task.done():
+            self._wake_listen_abort("hotword stopped")
         if task is not None and not task.done():
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        listen, self._wake_listen_task = self._wake_listen_task, None
+        if listen is not None and not listen.done():
+            listen.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await listen
         await self._emit_capture_state("released", reason="hotword stopped")
         return {"hotword": self.wake_guard.disarm(reason="manual")}
 
@@ -4492,8 +4872,14 @@ class Daemon:
                 await meeting["dual"].aclose()
             except Exception as exc:
                 capture_error = exc
+        # Round Z: an open wake session is a live microphone — it is dropped
+        # before the store closes so its closer can still write its marker.
+        if self._wake_listen_task is not None and not self._wake_listen_task.done():
+            self._wake_listen_abort("daemon closing")
+        listen_task, self._wake_listen_task = self._wake_listen_task, None
         tasks = [
             t for t in (*extra_tasks, self._dictation_task, meeting_task,
+                        listen_task,
                         *self._meeting_stop_tasks, *self._background_tasks,
                         *self._probe_tasks)
             if t is not None
