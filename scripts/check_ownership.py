@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import ClassVar
 
 OWNERS = "OWNERS.yaml"
-CLUSTERS = frozenset("ABCDEFGHIJKLMOPQRSTUVZ") | {"REL", "REACH"}
+CLUSTERS = frozenset("ABCDEFGHIJKLMOPQRSTUVWZ") | {"REL", "REACH"}
 
 
 def git(*args, cwd=None):

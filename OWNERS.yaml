@@ -1,52 +1,9 @@
 {
-  "P": [
-    "docs/contracts/IF-3*",
-    "reports/RPT-P-*",
-    "src/assistant/hands/headless/__init__.py",
-    "src/assistant/hands/headless/consent.py",
-    "src/assistant/hands/headless/contract.py",
-    "src/assistant/hands/headless/host.py",
-    "src/assistant/hands/headless/instance.py",
-    "src/assistant/hands/headless/worker.py",
-    "tests/test_hands_headless_consent.py",
-    "tests/test_hands_headless_contract.py",
-    "tests/test_hands_headless_host.py",
-    "tests/test_hands_headless_instance.py",
-    "tests/test_hands_headless_worker.py",
-    "tests/test_p_*.py"
-  ],
-  "Z": [
-    "OWNERS.yaml",
-    "README.md",
-    "pyproject.toml",
-    "reports/RPT-Z-*",
-    "scripts/check_ownership.py",
-    "src/assistant/__init__.py",
-    "src/assistant/cli.py",
-    "src/assistant/config.py",
-    "src/assistant/console.py",
-    "src/assistant/daemon.py",
-    "src/assistant/ipc.py",
-    "src/assistant/store.py",
-    "tests/test_bug7_cli_smoke.py",
-    "tests/test_bug_i5_authority_ipc.py",
-    "tests/test_bughunt_k_config.py",
-    "tests/test_bughunt_k_doctor_drift.py",
-    "tests/test_bughunt_k_error_surfacing.py",
-    "tests/test_bughunt_k_param_coercion.py",
-    "tests/test_bughunt_k_status_surface.py",
-    "tests/test_bughunt_k_store.py",
-    "tests/test_bughunt_k_subscribers.py",
-    "tests/test_daemon_cli.py",
-    "tests/test_default_sync.py",
-    "tests/test_ipc_handler_integrity.py",
-    "tests/test_z_*.py",
-    "uv.lock",
-    "uv.toml"
-  ],
   "A": [
     "PROCESS-AUDIO-PROMPT.md",
     "VOICE-BUGTEST.md",
+    "docs/bug-reports/2026-10-31-gemini-live-transcribe-zero-output.md",
+    "docs/packets/2026-11-15-capture-gain-reduction.md",
     "docs/voice-audition*.md",
     "reports/RPT-A-*",
     "scripts/record_elaria_samples.py",
@@ -64,7 +21,7 @@
     "src/assistant/voicetest.py",
     "tests/measure_voice_latency.py",
     "tests/test_a_*.py",
-    "tests/test_capture_limiter.py",
+    "tests/test_ack_playback.py",
     "tests/test_bug6_dictate_capture.py",
     "tests/test_bug6_live_duplex_and_stop.py",
     "tests/test_bug6d_ptt_result_orphans.py",
@@ -82,11 +39,30 @@
     "tests/test_bughunt_k_tts_timeout.py",
     "tests/test_bughunt_k_waits.py",
     "tests/test_bughunt_k_wpctl.py",
+    "tests/test_capture_limiter.py",
+    "tests/test_capture_limiter_path.py",
+    "tests/test_local_asr_degraded.py",
     "tests/test_phase7_kiswahili.py",
+    "tests/test_response_extraction.py",
+    "tests/test_scene3b_redo.py",
+    "tests/test_script_help_smoke.py",
     "tests/test_silence_hotfix.py",
     "tests/test_stage_a_voice.py",
+    "tests/test_stream_f_wire.py",
+    "tests/test_stream_g7.py",
+    "tests/test_stream_g_primary.py",
+    "tests/test_stream_h_post_timeout.py",
+    "tests/test_stream_h_sensors.py",
+    "tests/test_stream_tts.py",
+    "tests/test_task_j_ears.py",
+    "tests/test_task_k_gateway.py",
+    "tests/test_task_l_mouth.py",
+    "tests/test_transcription_stump.py",
     "tests/test_voice_bughunt.py",
-    "tests/test_voicetest.py"
+    "tests/test_voice_chain_resilience.py",
+    "tests/test_voice_models_verification.py",
+    "tests/test_voicetest.py",
+    "tests/test_wp0_call_counters.py"
   ],
   "B": [
     "reports/RPT-B-*",
@@ -127,11 +103,13 @@
     "tests/test_bughunt_k_plan_tasks.py",
     "tests/test_bughunt_k_symlink_hash.py",
     "tests/test_c_*.py",
+    "tests/test_notify_privacy.py",
     "tests/test_phase3_organiser.py",
     "tests/test_phase4_executor.py",
     "tests/test_phase6_meeting.py",
     "tests/test_stage_c_initiative.py",
-    "tests/test_stage_d_showoff.py"
+    "tests/test_stage_d_showoff.py",
+    "tests/test_wp0_ladder.py"
   ],
   "D": [
     "INVARIANTS.md",
@@ -144,6 +122,7 @@
     "src/assistant/journal_log.py",
     "src/assistant/proc.py",
     "src/assistant/safety.py",
+    "src/assistant/safety_journal.py",
     "tests/bughunt_fixtures/**",
     "tests/test_bughunt_safety.py",
     "tests/test_cleanup_hygiene.py",
@@ -152,7 +131,8 @@
     "tests/test_disclosure_spec.py",
     "tests/test_fixtures_and_harness.py",
     "tests/test_journal_log.py",
-    "tests/test_persona_safety_latency.py"
+    "tests/test_persona_safety_latency.py",
+    "tests/test_wp0_journal_schema.py"
   ],
   "E": [
     "reports/RPT-E-*",
@@ -160,7 +140,8 @@
     "src/assistant/phone_link.py",
     "tests/test_drafts.py",
     "tests/test_e_*.py",
-    "tests/test_phone_link.py"
+    "tests/test_phone_link.py",
+    "tests/test_phone_link_refusals.py"
   ],
   "F": [
     "docs/observability-readers.md",
@@ -173,17 +154,27 @@
     "scripts/file_leg_probe.py",
     "scripts/file_leg_probe.py.sha256",
     "scripts/file_leg_probe.sha256",
+    "scripts/frame_probe.py",
+    "scripts/frame_probe.py.sha256",
     "scripts/limiter_readings.py",
     "scripts/limiter_readings.py.sha256",
     "scripts/limiter_readings.sha256",
+    "scripts/live_repro.py",
     "scripts/player_probe.py",
     "scripts/player_probe.py.sha256",
+    "scripts/record_probe_take.py",
+    "scripts/record_probe_take.py.sha256",
     "src/assistant/watcher.py",
     "tests/test_capture_source_check.py",
     "tests/test_daemon_identity.py",
     "tests/test_f_*.py",
+    "tests/test_file_leg_probe.py",
+    "tests/test_frame_probe.py",
+    "tests/test_gain_shape_fixture.py",
     "tests/test_limiter_readings.py",
+    "tests/test_live_repro_arm_b.py",
     "tests/test_player_probe.py",
+    "tests/test_record_probe_take.py",
     "tests/test_watcher.py"
   ],
   "G": [
@@ -200,6 +191,7 @@
     "tests/test_g_*.py"
   ],
   "H": [
+    "docs/dossiers/2026-10-31-hyprland-057-release-binds.md",
     "reports/RPT-H-*",
     "src/assistant/clipboard.py",
     "src/assistant/hypr_binds.py",
@@ -209,6 +201,7 @@
     "systemd/elaria-overlay.service",
     "tests/test_h_*.py",
     "tests/test_phase2_surfaces.py",
+    "tests/test_task_m_followup.py",
     "ui/README.md",
     "ui/hyprland/**",
     "ui/quickshell/shell.qml",
@@ -233,16 +226,15 @@
     "docs/phase-reports/2026-11-14-tasks-j-k-l.md",
     "docs/phase-reports/2026-11-15-clipping-pop-vs-voice.md",
     "docs/phase-reports/2026-11-15-tasks-jkl-addendum.md",
+    "docs/scene-cards/**",
     "reports/RPT-I-*",
     "src/assistant/cost.py",
     "src/assistant/model_pins.py",
     "src/assistant/model_registry.py",
     "tests/test_bughunt_k_quota.py",
     "tests/test_i_*.py",
-    "models/README.md",
-    "models/ecapa_eval_samples.npz",
-    "models/voxceleb_ECAPA512_LM.onnx",
-    "tests/test_w_ecapa_speaker.py"
+    "tests/test_model_registry.py",
+    "tests/test_wp0_model_registry.py"
   ],
   "J": [
     "HOTWORD-REVIEW.md",
@@ -261,6 +253,7 @@
   ],
   "K": [
     "console/attribution-test.js",
+    "console/capture-state-test.js",
     "console/draft-review-test.js",
     "console/elaria-visualizer.js",
     "console/hands-sidebar-test.js",
@@ -296,6 +289,8 @@
     "console/build.py",
     "console/ci.sh",
     "console/harness.js",
+    "console/package-lock.json",
+    "console/package.json",
     "console/requirements-bridge.txt",
     "console/run_bridge.py",
     "console/serve.py",
@@ -358,6 +353,22 @@
     "tests/test_hands_partial_sink.py",
     "tests/test_o_*.py"
   ],
+  "P": [
+    "docs/contracts/IF-3*",
+    "reports/RPT-P-*",
+    "src/assistant/hands/headless/__init__.py",
+    "src/assistant/hands/headless/consent.py",
+    "src/assistant/hands/headless/contract.py",
+    "src/assistant/hands/headless/host.py",
+    "src/assistant/hands/headless/instance.py",
+    "src/assistant/hands/headless/worker.py",
+    "tests/test_hands_headless_consent.py",
+    "tests/test_hands_headless_contract.py",
+    "tests/test_hands_headless_host.py",
+    "tests/test_hands_headless_instance.py",
+    "tests/test_hands_headless_worker.py",
+    "tests/test_p_*.py"
+  ],
   "Q": [
     "reports/RPT-Q-*",
     "src/assistant/hands/kitty/**",
@@ -365,6 +376,8 @@
   ],
   "R": [
     "console/undo-review-test.js",
+    "docs/design/2026-11-04-undo-consent-seam.md",
+    "docs/design/2026-11-05-producer-seam-estimates.md",
     "docs/design/hands-owner-ruling-transition.md",
     "docs/design/producer-seam-estimates.md",
     "docs/design/undo-consent-seam.md",
@@ -376,6 +389,15 @@
     "reports/RPT-R-*",
     "tests/test_r_*.py",
     "undo-review-test.js"
+  ],
+  "REACH": [
+    "reports/RPT-REACH-*",
+    "src/assistant/reach/**"
+  ],
+  "REL": [
+    "docs/release/**",
+    "reports/RPT-REL-*",
+    "scripts/release/**"
   ],
   "S": [
     "reports/RPT-S-*",
@@ -414,13 +436,52 @@
     "scripts/storage-census-check.py",
     "tests/test_v_*.py"
   ],
-  "REL": [
-    "docs/release/**",
-    "reports/RPT-REL-*",
-    "scripts/release/**"
+  "W": [
+    "models/**",
+    "reports/RPT-W-*",
+    "scripts/train_elaria_head.py",
+    "scripts/wake_bench.py",
+    "src/assistant/nus_surface.py",
+    "tests/fixtures/j_elaria_head_holdout.npz",
+    "tests/test_nus_overlay_capture_state.py",
+    "tests/test_nus_surface_m1.py",
+    "tests/test_w_*.py",
+    "ui/quickshell/nus/shell.qml"
   ],
-  "REACH": [
-    "reports/RPT-REACH-*",
-    "src/assistant/reach/**"
+  "Z": [
+    "HANDOFF.md",
+    "OWNERS.yaml",
+    "README.md",
+    "pyproject.toml",
+    "reports/DISPATCH-*",
+    "reports/RPT-Z-*",
+    "scripts/check_ownership.py",
+    "src/assistant/__init__.py",
+    "src/assistant/cli.py",
+    "src/assistant/config.py",
+    "src/assistant/console.py",
+    "src/assistant/daemon.py",
+    "src/assistant/ipc.py",
+    "src/assistant/store.py",
+    "tests/test_bug7_cli_smoke.py",
+    "tests/test_bug_i5_authority_ipc.py",
+    "tests/test_bughunt_k_config.py",
+    "tests/test_bughunt_k_doctor_drift.py",
+    "tests/test_bughunt_k_error_surfacing.py",
+    "tests/test_bughunt_k_param_coercion.py",
+    "tests/test_bughunt_k_status_surface.py",
+    "tests/test_bughunt_k_store.py",
+    "tests/test_bughunt_k_subscribers.py",
+    "tests/test_capture_state_wire.py",
+    "tests/test_daemon_cli.py",
+    "tests/test_default_sync.py",
+    "tests/test_ipc_handler_integrity.py",
+    "tests/test_producer_seams.py",
+    "tests/test_undo_consent_guard.py",
+    "tests/test_undo_review_pilot.py",
+    "tests/test_wp0_watchdog.py",
+    "tests/test_z_*.py",
+    "uv.lock",
+    "uv.toml"
   ]
 }
