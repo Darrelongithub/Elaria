@@ -1,9 +1,12 @@
 # MANAGER BOARD — finish Elaria (2026-11-25)
 
-Manager = this session. Job: verify, split, prompt, re-verify. Only the
-owner merges PRs. Nobody edits `OWNERS.yaml` but the owner. Never lower
-a threshold. Voice lock in every wake plan. Hardware claims are the
-owner's eyes/ears only — never report a sandbox number as hardware.
+Manager = this session. Job: verify, split, prompt, re-verify.
+**2026-11-25 update (owner ruling): agents merge their own PRs** —
+verify, then merge, don't wait. Nobody edits `OWNERS.yaml` but the
+owner. Never lower a threshold. Voice lock in every wake plan.
+Hardware claims are the owner's eyes/ears only — never report a
+sandbox number as hardware. Owner currently cannot run voice tests:
+hardware lanes are parked, never blocking.
 
 ## Verified baseline (this session, in the sandbox — not the laptop)
 
@@ -27,10 +30,10 @@ owner's eyes/ears only — never report a sandbox number as hardware.
 | 1 J-DETECTOR | openWakeWord ONNX pipeline + energy gate + bench | **built by manager, needs models + head** |
 | 2 W-OWNERSHIP | add `W`, claim 57 zero-owner paths | owner-only edit; proposal below |
 | 3 J-HEAD | train "Elaria" head on ~1,500 synthetic clips | prompt ready, blocked on Lane 1 models |
-| 4 Z-RING | audit pre-roll ring feed/use end-to-end | prompt ready |
-| 5 H-OVERLAY | draw `ui/quickshell/nus/shell.qml`, fake-runner harness | prompt ready, needs Lane 2 claim |
-| 6 O-HANDS | real typing path behind the existing gate | prompt ready |
-| 7 OWNER-HW | SUPER+F2 → speak → hear answer; then wake end-to-end | owner only, checklist below |
+| 4 Z-RING | audit pre-roll ring feed/use end-to-end | **DONE — `RPT-Z-ring-audit-20261125.md`: fed + used for detection, not inherited by pinned design** |
+| 5 H-OVERLAY | draw `ui/quickshell/nus/shell.qml`, fake-runner harness | **built 2026-11-25: pill renders `capture.state` via `setCaptureState`; eye-check `tests/test_nus_overlay_capture_state.py`; rendering itself = owner's eyes, parked** |
+| 6 O-HANDS | real typing path behind the existing gate | prompt ready — NEXT |
+| 7 OWNER-HW | SUPER+F2 → speak → hear answer; then wake end-to-end | **PARKED — owner cannot run voice tests right now; not blocking any lane** |
 
 ## Lane 1 — done in this board's commit (manager-built, verified)
 

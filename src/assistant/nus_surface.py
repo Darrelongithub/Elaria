@@ -33,6 +33,21 @@ NUS_INPUT_MODE = "positive-allow"
 SHOW_COMMAND = "reveal"
 HIDE_COMMAND = "hide"
 VISIBLE_COMMAND = "isVisible"
+CAPTURE_STATE_COMMAND = "setCaptureState"
+
+#: daemon `capture.state` -> (visible, label). The overlay is a dumb
+#: renderer: the daemon is the only source of truth, indicators change
+#: on transitions only, and `released` hides the pill. Unknown states
+#: hide rather than guess — a lying indicator is worse than none.
+CAPTURE_STATE_VIEW: dict[str, tuple[bool, str]] = {
+    "armed": (True, "idle"),
+    "verifying": (True, "verifying"),
+    "open": (True, "listening"),
+    "muted": (True, "speaking"),
+    "stalled": (True, "stalled"),
+    "unavailable": (True, "unavailable"),
+    "released": (False, "idle"),
+}
 
 Runner = Callable[[list[str]], str]
 
@@ -51,6 +66,7 @@ class SurfaceCommand:
     keyboard_focus: str = NUS_KEYBOARD_FOCUS
     input_mode: str = NUS_INPUT_MODE
     interactive_rects: tuple[()] = ()
+    capture_state: str = "idle"
 
     def as_dict(self) -> dict:
         data = asdict(self)
@@ -70,6 +86,14 @@ class NusSurfaceController:
 
     def hide(self) -> SurfaceCommand:
         return SurfaceCommand(False)
+
+    def capture_state(self, state: str, x: int = 24, y: int = 24,
+                      width: int = 220, height: int = 56) -> SurfaceCommand:
+        """Translate one daemon `capture.state` into a surface command."""
+        visible, label = CAPTURE_STATE_VIEW.get(
+            str(state or "").strip(), (False, "idle"))
+        return SurfaceCommand(visible, capture_state=label,
+                              x=x, y=y, width=width, height=height)
 
 
 def active_window(runner: Runner | None = None) -> dict[str, str]:
