@@ -1,0 +1,43 @@
+# Alive layer config — lives on the ALIVE HOST only (never the laptop,
+# never Drive). Generate keys with: python -m alive.provision init
+# Self-check with:                 python -m alive.provision doctor alive.toml
+#
+# HARD RULES THIS FILE CANNOT TALK YOU OUT OF (enforced in code):
+#   * ONE owner number. A second recipient is a start-up error.
+#   * Egress allowlist: the WhatsApp adapter may only open graph.facebook.com.
+#   * Utility templates are capped per day in code (max_templates_per_day).
+#   * S-0 only: there is no LLM config key, here or anywhere in the package.
+#   * fast_lane is refused by this build. Always awaiting_approval on the laptop.
+[alive]
+mac_key = "REPLACE_ME_64_HEX"          # openssl rand -hex 32; laptop gets the same value once
+from_hash_salt = "REPLACE_ME_32_HEX"   # provisioned together with mac_key
+owner_e164 = "+254700000000"           # the ONE number that is the owner
+tz = "Africa/Nairobi"
+state_dir = "./alive-state"            # mode 0700; the host's disk, never Drive
+
+# WhatsApp Cloud API (dedicated number registered FOR Elaria, Fork 4)
+wa_phone_number_id = ""
+wa_token = ""                          # System User token, scoped to the one WABA; mode 0600
+wa_app_secret = ""                     # for X-Hub-Signature-256 verification
+verify_token = ""                      # hub.challenge handshake token you invent
+
+# Front door — 0 = disclose nothing / 1 = day-level (recommended) / 2 = T1 slots only
+freebusy_level = 0
+content_free_secret_reminders = false  # owner decision; default OFF
+
+inbox_prefix = "inbox"                 # WRITER: this host. laptop reads.
+commitments_prefix = "commitments"     # WRITER: laptop. this host reads.
+reminder_log_prefix = "reminder_log"   # WRITER: this host. laptop reads.
+receipts_prefix = "receipts"           # WRITER: laptop. this host may read for pruning (future)
+heartbeat_prefix = "heartbeat"
+
+[alive.caps]
+max_templates_per_day = 10             # utility templates (~$0.0040 each in KE)
+owner_messages_per_day = 200
+stranger_turns_per_day_per_sender = 20
+stranger_messages_per_month = 800      # under the 1,000 free service messages
+late_grace_seconds = 1800
+stale_mirror_days = 30
+expiry_hours = 72                      # owner may raise to 168 (7 days)
+mute_after_never_list_hits = 3
+mute_window_hours = 24
