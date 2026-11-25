@@ -737,6 +737,24 @@ DEFAULTS: dict = {
         "surface_path": "~/Elaria/ui/quickshell/nus",
         "reduced_motion": False,
     },
+    # Phase-0 internet fetcher (BUILD-7, Agent REACH). Disabled by default.
+    "reach": {
+        "enabled": False,
+        "web_host_mode": "open-public",
+        "allowed_web_hosts": [],
+        "github_req_per_hr": 30,
+        "web_req_per_hr": 60,
+        "news_req_per_hr": 30,
+        "connect_timeout_s": 5.0,
+        "total_timeout_s": 20.0,
+        "max_redirects": 3,
+        "max_wire_bytes": 2 * 1024 * 1024,
+        "max_decoded_bytes": 8 * 1024 * 1024,
+        "max_extract_chars": 16_000,
+        "robots_cache_ttl_s": 86_400.0,
+        "user_agent_contact": "elaria-reach@local",
+        "offline": False,
+    },
 }
 
 
