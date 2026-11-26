@@ -839,6 +839,27 @@ def skill_file_window(
         record_format=obs.record_format, source=obs.source, trusted=False,
         next_cursor=window.next_cursor,
     )
+def _structured_schema_summary(
+    target: str, *, protected: list[str], never_send_roots: list[str],
+    cloud_bound: bool = False,
+) -> dict[str, Any]:
+    """One bounded record to label the shape of structured input.
+
+    Local, tool-free, authority-free: the sample is never journaled or fed
+    into a plan. ``complete`` is true only when the whole source parsed —
+    partial reads never masquerade as validated (I1).
+    """
+    from .streamread import read_batch
+
+    batch = read_batch(target, byte_budget=262_144, record_limit=1,
+                       protected=protected, never_send_roots=never_send_roots,
+                       cloud_bound=cloud_bound)
+    sample = type(batch.records[0]).__name__ if batch.records else "none"
+    return {"format": batch.format, "sample_type": sample,
+            "complete": batch.eof, "trusted": False,
+            "sha256_prefix": batch.sha256[:12]}
+
+
 def _decode_window(window: bytes, has_more: bool) -> tuple[str, bytes]:
     # Do not split a UTF-8 code point between byte windows. Invalid input is
     # refused rather than silently replacing bytes in an evidence span.
@@ -2288,14 +2309,15 @@ class ErrandRunner:
                             raise PermissionError("source outside authorized discovery roots")
                         # Structured records are data only. No decoded value is
                         # treated as a command or as byte-span verified evidence.
-                        from .structured_reader import read_batch
-                        target = str(step.args["target"])
-                        page = await asyncio.to_thread(
-                            read_batch, target, cursor=step.args.get("cursor"),
-                            max_records=100,
+                        from .streamread import read_batch
+                        batch = await asyncio.to_thread(
+                            read_batch, target, step.args.get("cursor"),
+                            byte_budget=max(256, min(budget.max_read_bytes, 2_000_000)),
+                            record_limit=100,
                             max_record_chars=max(256, min(budget.max_read_bytes, 2_000_000)),
                             protected=protected, never_send_roots=never_send_roots,
                             cloud_bound=bool(step.args.get("cloud_bound", False)))
+                        page = batch.as_dict()
                         if self.safety_journal is not None:
                             self.safety_journal.note_untrusted_input(
                                 target, actor="errand",
@@ -2418,25 +2440,22 @@ class ErrandRunner:
                             # The structural inspector is local, has no tools or
                             # authority, and its sample is not journaled or fed
                             # into a plan. Incomplete validation is explicit.
-                            from .structured_reader import inspect as inspect_structured
                             try:
-                                schema = await asyncio.to_thread(
-                                    inspect_structured, target, protected=protected,
-                                    never_send_roots=never_send_roots, cloud_bound=cloud_bound)
-                                step_summary["schema"] = {
-                                    "format": schema["format"], "sample_type": schema["sample_type"],
-                                    "complete": schema["complete"], "trusted": False,
-                                }
+                                step_summary["schema"] = await asyncio.to_thread(
+                                    _structured_schema_summary, target,
+                                    protected=protected,
+                                    never_send_roots=never_send_roots,
+                                    cloud_bound=cloud_bound)
                             except (OSError, ValueError, PermissionError) as exc:
                                 step_summary["schema"] = {"error": type(exc).__name__, "trusted": False}
                                 unanswered_notes.append({"path": obs.path,
                                     "reason": f"structured inspection failed: {type(exc).__name__}: {exc}"})
                         if (not structured and obs.eof and files_inspected[obs.path]["bytes_read"] == obs.total_size
                                 and obs.record_format in ("json", "jsonl", "csv", "tsv")):
-                            from .structured_reader import validate as validate_structured
+                            from .streamread import validate
                             try:
                                 validation = await asyncio.to_thread(
-                                    validate_structured, target, protected=protected,
+                                    validate, target, protected=protected,
                                     never_send_roots=never_send_roots, cloud_bound=cloud_bound,
                                     expected_sha256=obs.sha256)
                                 step_summary["validation"] = validation

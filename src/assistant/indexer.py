@@ -424,7 +424,7 @@ class Indexer:
             try:
                 data_hash = self._hash_large(path)
                 if path.suffix.lower() in (".json", ".jsonl", ".ndjson", ".csv", ".tsv"):
-                    from .structured_reader import validate
+                    from .streamread import validate
 
                     validate(str(path), protected=self.protected,
                              never_send_roots=self.never_send_roots)
