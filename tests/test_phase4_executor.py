@@ -12,11 +12,54 @@ from pathlib import Path
 import pytest
 
 from assistant.executor import Executor, parse_since
-from assistant.gemini_client import GeminiClient
 from assistant.organiser import OrganiserService
 from assistant.planner_llm import LlmPlanner, _parse_batch
+from assistant.provider_router import (
+    CallbackAdapter,
+    Capability,
+    ProviderResult,
+    ProviderRouter,
+)
 from assistant.safety import is_halted, set_halt
 from assistant.store import Store
+
+# BUILD-9S: the Tier 1/2 material path routes through ProviderRouter.material()
+# (diverted provider, disabled until the owner verifies [quota.providers.*]).
+# These fixtures stand in for an owner-verified free-tier provider.
+GROQ_ROW = {
+    "enabled": True, "verified": True, "verified_at": "2026-11-26",
+    "verified_source": "owner's account limits page (fixture evidence)",
+    "plan": "free", "no_card_required": True,
+    "terms_reviewed_at": "2026-11-26",
+    "data_use_policy": "owner-reviewed (fixture)",
+    "models": {"llama-test": {"rpm": 30, "rpd": 100, "tpm": 8000,
+                              "billing_unit": "requests_tokens"}},
+}
+
+
+def _material_router(config, store, tmp_path, fn):
+    config.raw.setdefault("organise", {})["material_provider"] = "groq"
+    config.raw["organise"]["material_model"] = "llama-test"
+    quota = config.raw.setdefault("quota", {})
+    quota["providers"] = {"groq": dict(GROQ_ROW)}
+    return ProviderRouter(
+        config, store,
+        adapters=[CallbackAdapter("groq", fn, (Capability.MATERIAL,))],
+        state_path=tmp_path / "router-state.json",
+        clock=lambda: 1000.0)
+
+
+def _json_material_fn(req):
+    entries = []
+    for line in str(req.contents).splitlines():
+        if line.startswith("- path: "):
+            path = line.split("- path: ")[1].strip()
+            entries.append({"path": path, "dest": "Finance",
+                            "new_name": Path(path).name, "confidence": 0.88,
+                            "reason": "looks financial"})
+    return ProviderResult(text=json.dumps(entries), model=req.model, provider=req.provider,
+                          usage={"tokens_in": 50, "tokens_out": 40},
+                          request_id="fixture-req")
 
 TAXONOMY = ["Finance", "Work", "Personal", "Photos", "_Unsorted", "_Conflicts"]
 OLD = time.time() - 86400 * 3  # well outside the 15-minute guard (§4.1)
@@ -181,35 +224,20 @@ def test_parse_since():
     assert parse_since("2h") < parse_since("30m") < parse_since("2999-01-01")
 
 
-# -- Tier 1/2 --------------------------------------------------------------------------
-class JsonTransport:
-    def __init__(self):
-        self.calls = []
-
-    def generate(self, model, contents, config):
-        self.calls.append(model)
-        assert isinstance(contents, str)
-        entries = []
-        for line in contents.splitlines():
-            if line.startswith("- path: "):
-                path = line.split("- path: ")[1].strip()
-                entries.append({"path": path, "dest": "Finance",
-                                "new_name": Path(path).name, "confidence": 0.88,
-                                "reason": "looks financial"})
-        return {"text": json.dumps(entries),
-                "usage": {"tokens_in": 50, "tokens_out": 40}}
+# -- Tier 1/2 (BUILD-9S: routed through ProviderRouter.material()) ----------------------
 
 
 def test_tier1_classifies_abstentions_within_taxonomy(config, tmp_path):
     store = Store(tmp_path / "t.db")
-    client = GeminiClient(config, store, transport=JsonTransport(),
-                          sleep=lambda _: None)
+    router = _material_router(config, store, tmp_path, _json_material_fn)
     items = [{"src": "/r/mystery-ledger-thing.dat", "dest": None, "new_name": None,
               "confidence": 0.0, "tier": 0, "rule": "abstain", "reason": "-",
               "decision": "abstain", "doc_id": None}]
-    LlmPlanner(config, store, client).classify_abstained(items, TAXONOMY)
+    LlmPlanner(config, store, router).classify_abstained(items, TAXONOMY)
     assert items[0]["dest"] == "Finance" and items[0]["tier"] in (1, 2)
     assert store.llm_summary()["calls"] >= 1  # ledgered like every call
+    providers = {row["provider"] for row in store.recent_llm_calls(5)}
+    assert "groq" in providers  # BUILD-9S: journaled with provider+purpose
 
 
 def test_tier_verifier_rejects_invented_folders():
@@ -227,8 +255,8 @@ def test_build_with_tiers_counts_api_calls(config, tmp_path):
     config.raw["organise"] = {**config.raw["organise"],
                               "roots": [{"path": str(root), "mode": "shadow",
                                          "taxonomy": TAXONOMY}]}
-    client = GeminiClient(config, store, transport=JsonTransport(), sleep=lambda _: None)
-    result = OrganiserService(config, store, client).build_plan(
+    router = _material_router(config, store, tmp_path, _json_material_fn)
+    result = OrganiserService(config, store, router=router).build_plan(
         config.organise_roots()[0], with_llm_tiers=True)
     assert result["stats"]["api_calls"] >= 1
     items = {Path(i["src"]).name: i for i in store.plan_items(result["plan_id"])}
@@ -307,26 +335,29 @@ def intent_for(kind):
 # -- build order 4: the planner consumes B's recall (read-only) ----------------
 
 class _PromptCapture:
-    """Transport that keeps every prompt; answers in the verifier's shape."""
+    """Material fn that keeps every prompt; answers in the verifier's shape."""
 
     def __init__(self):
         self.prompts = []
 
-    def generate(self, model, contents, config):
+    def __call__(self, req):
+        contents = str(req.contents)
         self.prompts.append(contents)
         entries = [{"path": line.split("- path: ")[1].strip(),
                     "dest": "Finance", "new_name": None, "confidence": 0.9,
                     "reason": "recalled precedent"}
                    for line in contents.splitlines()
                    if line.startswith("- path: ")]
-        return {"text": json.dumps(entries),
-                "usage": {"tokens_in": 10, "tokens_out": 10}}
+        return ProviderResult(text=json.dumps(entries), model=req.model,
+                              provider=req.provider,
+                              usage={"tokens_in": 10, "tokens_out": 10},
+                              request_id="fixture-req")
 
 
 def test_planner_feeds_memory_recall_into_the_prompt_as_data(config, tmp_path):
     store = Store(tmp_path / "t.db")
     capture = _PromptCapture()
-    client = GeminiClient(config, store, transport=capture, sleep=lambda _: None)
+    router = _material_router(config, store, tmp_path, capture)
     calls = []
 
     class Hit:
@@ -340,7 +371,7 @@ def test_planner_feeds_memory_recall_into_the_prompt_as_data(config, tmp_path):
     items = [{"src": "/r/mystery-ledger-thing.dat", "dest": None,
               "new_name": None, "confidence": 0.0, "tier": 0, "rule": "abstain",
               "reason": "-", "decision": "abstain", "doc_id": None}]
-    LlmPlanner(config, store, client, recall=recall).classify_abstained(
+    LlmPlanner(config, store, router, recall=recall).classify_abstained(
         items, TAXONOMY)
     assert calls, "recall was consulted"
     assert calls[0][1] <= 3, "bounded: a planner call never sweeps memory"
@@ -356,11 +387,11 @@ def test_planner_feeds_memory_recall_into_the_prompt_as_data(config, tmp_path):
 def test_planner_without_a_memory_is_exactly_as_before(config, tmp_path):
     store = Store(tmp_path / "t.db")
     capture = _PromptCapture()
-    client = GeminiClient(config, store, transport=capture, sleep=lambda _: None)
+    router = _material_router(config, store, tmp_path, capture)
     items = [{"src": "/r/mystery-ledger-thing.dat", "dest": None,
               "new_name": None, "confidence": 0.0, "tier": 0, "rule": "abstain",
               "reason": "-", "decision": "abstain", "doc_id": None}]
-    LlmPlanner(config, store, client).classify_abstained(items, TAXONOMY)
+    LlmPlanner(config, store, router).classify_abstained(items, TAXONOMY)
     assert capture.prompts and all("recalled" not in p for p in capture.prompts)
 
 

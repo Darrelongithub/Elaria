@@ -466,18 +466,34 @@ class Daemon:
         # Capture state, tracked for the console orb/mic (capture.state on the
         # wire). Transitions are emitted honestly: repeated emissions of the same
         # (state, reason) pair are suppressed.
-        from .nus_pointer import Pointer
+        from .nus_pointer import GroundingBudget, Pointer, RouterVlmGrounder
         from .nus_surface import NusDispatch
+        from .provider_router import ProviderRouter
 
         nus_path = config.section("nus_pointer").get("surface_path", "~/Elaria/ui/quickshell/nus")
         self._nus_surface = NusDispatch(Path(nus_path).expanduser())
         self._nus_state_lock = asyncio.Lock()
+        # BUILD-9S: the VLM grounding role routes through the provider router
+        # (never an ad-hoc client). Wired only when the owner enables
+        # [quota.grounding]; AT-SPI-only default keeps vlm_grounder=None.
+        # The router independently requires the owner-verified
+        # [quota.providers.<id>] row, so enabling grounding without verifying
+        # the provider yields a journaled refusal, never a call.
+        grounding_budget = GroundingBudget.from_config(config)
+        vlm_grounder = None
+        if grounding_budget.enabled and grounding_budget.rpd_cap > 0:
+            vlm_grounder = RouterVlmGrounder(
+                ProviderRouter(config, self.store),
+                purpose="nus_pointer.grounding",
+                mode=str(getattr(config, "gemini_mode", "mock")),
+            )
         self._nus_pointer = Pointer(
             self._nus_surface,
             config=config,
             store=self.store,
             safety_journal=self.safety_journal,
             is_offline=lambda: self.mode_manager.status().is_offline,
+            vlm_grounder=vlm_grounder,
         )
         self._capture_state_last: tuple | None = None
         # When the speech path is dead, capture.state says so (never a calm
@@ -1477,9 +1493,24 @@ class Daemon:
         # Bug 8: generated replies that never reached the user — the ledger
         # must show the discards too, or a working ledger hides them.
         today["reply_substitutions"] = self._reply_substitution_records(limit=10)
+        # BUILD-9S owner surface: today's spend per provider per purpose from
+        # the ledger, and the current degradation rung + reason. Ledger reads
+        # are local SQLite; the ladder reads the same caps/buckets that gate
+        # dispatch, so the CLI can never disagree with enforcement.
+        from .cost import provider_cost_report
+        from .provider_router import ProviderRouter
+
+        providers = provider_cost_report(self.store, day_start_iso())
+        try:
+            ladder = ProviderRouter(self.config, self.store).ladder_state()
+        except Exception as exc:  # an unreadable state file must not kill `cost`
+            ladder = {"level": "?", "reason": f"ladder unreadable: {type(exc).__name__}",
+                      "gemini_flash": False, "gemini_flash_lite": False,
+                      "material_diverted": False, "caps": {}, "buckets": {}}
         return {"month": month, "today": today,
                 "quota": self.config.section("quota"),
-                "tier": self.config.section("privacy").get("tier", "free")}
+                "tier": self.config.section("privacy").get("tier", "free"),
+                "providers": providers, "ladder": ladder}
 
     async def _ack(self, params: dict) -> dict:
         """§18: acknowledge first, think second. Pure local code — this
