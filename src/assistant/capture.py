@@ -20,6 +20,7 @@ import re
 import shutil
 import struct
 import subprocess
+import time
 import wave
 from array import array
 from collections import deque
@@ -250,6 +251,7 @@ def live_level_check(target: str | None = None, seconds: float = 1.2,
     """
     if not tool_available("pw-record"):
         return {"available": False, "target": target or "(default source)",
+                "argv": ["pw-record"],
                 "reason": "pw-record not found (pipewire-utils) — level check "
                           "runs on the Fedora target, absent in containers"}
     command = pw_record_pcm_stream_command(target, sample_rate=SAMPLE_RATE)
@@ -262,18 +264,24 @@ def live_level_check(target: str | None = None, seconds: float = 1.2,
         if proc.returncode not in (0, None) and not data:
             err = (proc.stderr or b"")[:200].decode("utf-8", "replace")
             return {"available": False, "target": target or "(default source)",
+                    "argv": list(command),
                     "reason": f"pw-record exited {proc.returncode}: {err}"}
     except subprocess.TimeoutExpired as exc:
         data = exc.stdout or b""
         detail = f"recorded {seconds:.1f}s"
     except Exception as exc:
         return {"available": False, "target": target or "(default source)",
+                "argv": list(command),
                 "reason": f"{type(exc).__name__}: {exc}"}
     peak = pcm_peak(data)
     split = split_peak(data, SAMPLE_RATE, skip_ms)
+    # BUG-HW1: the bytes-vs-label discriminator, for owners diagnosing a
+    # "the mic captures static" report without re-running anything. The
+    # wall window is the probe window (pw-record runs until the timeout).
     return {
         "available": True,
         "target": target or "(default source)",
+        "argv": list(command),
         "seconds": round(len(data) / BYTES_PER_SAMPLE / SAMPLE_RATE, 2),
         "bytes": len(data),
         # `peak` stays for every existing reader; the split is the honest pair.
@@ -282,6 +290,8 @@ def live_level_check(target: str | None = None, seconds: float = 1.2,
         "peak_steady": split["peak_steady"],
         "start_pop_ms": split["start_pop_ms"],
         "rms": round(frame_rms(data), 4),
+        "delivery_rate": classify_delivery_rate(len(data), float(seconds),
+                                                SAMPLE_RATE) if data else None,
         # Anything under the frame gate is digital silence / a dead node.
         "signal": bool(data) and peak >= 0.01,
         "detail": detail,
@@ -530,6 +540,99 @@ class AsyncFrameSource(Protocol):
     async def aclose(self) -> None: ...
 
 
+# --------------------------------------------------------------------------
+# BUG-HW1: the delivery-rate discriminator
+# --------------------------------------------------------------------------
+# pw-record never reports the format/rate the server actually negotiated on
+# stdout — the stream label is whatever was REQUESTED. The only in-band
+# signal of a misnegotiated stream is HOW FAST the bytes arrive: a stream
+# delivered as s32le at 16 kHz arrives at 64000 B/s, s16le at 48 kHz at
+# 96000 B/s, f32le at 48 kHz at 192000 B/s, and so on. The owner's hardware
+# A/B (bugs.md, PR #162) shows exactly this shape: the same argv to a WAV
+# file plays clean while the raw-stdout form explodes — the byte-rate of the
+# raw pipe is the discriminator that names the mislabel. Anything above or
+# below the expected rate means the pipe is delivering a format/rate other
+# than the label, and every consumer reading s16le bytes is reading garbage.
+_DELIVERY_RATE_CLASSES = (
+    (32_000, "s16le/16000/mono — as labelled"),
+    (64_000, "64000 B/s — s32le/16000/mono, or s16le/16000/stereo"),
+    (88_200, "88200 B/s — s16le/44100/mono"),
+    (96_000, "96000 B/s — s16le/48000/mono (rate tripled vs label)"),
+    (176_400, "176400 B/s — f32le/44100/mono"),
+    (192_000, "192000 B/s — f32le/48000/mono, s32le/48000/mono, or s16le/48000/stereo"),
+    (384_000, "384000 B/s — f32le/48000/stereo"),
+)
+#: A known class must land within ±5 % of its nominal rate to be named.
+_DELIVERY_CLASS_TOLERANCE = 0.05
+#: The labelled rate may wobble by at most ±10 % before it is a suspect.
+_DELIVERY_SUSPECT_BAND = (0.90, 1.10)
+#: Judging needs ≥ 1 s of expected audio AND ≥ 0.5 s of delivery window.
+_DELIVERY_MIN_BYTES = 32_000
+_DELIVERY_MIN_WINDOW_S = 0.5
+
+
+def delivery_rate_class(bytes_per_s: float) -> str | None:
+    """Best-effort name for a delivery rate, or None if no class is close."""
+    for nominal, label in _DELIVERY_RATE_CLASSES:
+        if abs(bytes_per_s - nominal) <= nominal * _DELIVERY_CLASS_TOLERANCE:
+            return label
+    return None
+
+
+def classify_delivery_rate(byte_count: int, wall_seconds: float | None,
+                           sample_rate: int = SAMPLE_RATE) -> dict:
+    """What the pipe's byte-rate says the delivered stream probably is.
+
+    `byte_count` is the number of bytes delivered for this session;
+    `wall_seconds` is the delivery WINDOW (first frame → last frame), not
+    the spawn-to-exit wall time — PipeWire power-up latency must not count
+    against the reading or every short take looks slow. A window of None or
+    zero (one burst) cannot be judged and says so, never guesses.
+
+    `mismatch_suspect` is True/False when there is enough evidence, else
+    None. It never changes what is captured — it names the mislabel so the
+    saved WAV and the journal stop pretending to be labelled audio.
+    """
+    expected = int(sample_rate) * BYTES_PER_SAMPLE
+    byte_count = int(byte_count)
+    result = {
+        "expected_bytes_per_s": expected,
+        "measured_bytes_per_s": None,
+        "delivery_ratio": None,
+        "class": None,
+        "mismatch_suspect": None,
+        "evidence": "",
+    }
+    if byte_count <= 0:
+        result["evidence"] = ("no bytes delivered — the pipe was silent "
+                              "(see stalled / first_frame_latency_ms)")
+        return result
+    window = float(wall_seconds) if wall_seconds and wall_seconds > 0 else None
+    if window is None:
+        result["class"] = delivery_rate_class(0.0) or "unjudged (single burst)"
+        result["evidence"] = ("delivery window is zero — bytes arrived in one "
+                              "burst; not judged")
+        return result
+    bps = byte_count / window
+    ratio = bps / expected
+    result["measured_bytes_per_s"] = round(bps, 1)
+    result["delivery_ratio"] = round(ratio, 3)
+    named = delivery_rate_class(bps)
+    result["class"] = named or (
+        f"unclassified ({bps:.0f} B/s) — too far from every known class")
+    if byte_count >= _DELIVERY_MIN_BYTES and window >= _DELIVERY_MIN_WINDOW_S:
+        low, high = _DELIVERY_SUSPECT_BAND
+        result["mismatch_suspect"] = not (low <= ratio <= high)
+        result["evidence"] = (f"{byte_count} bytes over {window:.2f}s of "
+                              f"delivery = {bps:.0f} B/s vs expected "
+                              f"{expected} B/s (ratio {ratio:.2f}x)")
+    else:
+        result["evidence"] = (f"insufficient evidence: {byte_count} bytes over "
+                              f"{window:.2f}s — need >= {_DELIVERY_MIN_BYTES} "
+                              f"bytes and >= {_DELIVERY_MIN_WINDOW_S}s to judge")
+    return result
+
+
 class PipeWireCapture:
     """One pw-record process per session (§3.4) — never per-chunk spawns.
 
@@ -539,25 +642,89 @@ class PipeWireCapture:
     now come with a stall deadline: pw-record emits samples continuously even
     in digital silence, so NO bytes within `stall_timeout_s` means the capture
     is dead, and the stream ends (`stalled = True`) instead of hanging.
+
+    BUG-HW1 (2026-11-26): on the owner's hardware the raw-stdout stream
+    does not deliver the s16le/rate/mono label `--format s16 --rate 16000
+    --channels 1` requests, and every consumer reads the bytes as s16le —
+    the "explosive static". pw-record never reports the negotiated format,
+    so this class measures what it CAN see: the exact argv spawned, the
+    delivery byte-rate vs the label (`stream_facts`, finalized when the
+    stream ends) and the bytes the child had already written into the pipe
+    when it died (`dropped_tail_bytes`, counted in `aclose`, never silently
+    discarded). It never changes the audio.
     """
 
     def __init__(self, target: str | None = None, *, sample_rate: int = SAMPLE_RATE,
-                 frame_ms: int = 30, stall_timeout_s: float = 8.0):
+                 frame_ms: int = 30, stall_timeout_s: float = 8.0, clock=None):
         if not tool_available("pw-record"):
             raise RuntimeError(
                 "pw-record not found (pipewire-utils) — live capture needs the "
                 "Fedora target. Headless/test runs use SimulatedCapture."
             )
         self.target = target            # node.name/object.serial, or None = default
+        self.sample_rate = int(sample_rate)
         self.stall_timeout_s = float(stall_timeout_s)
         self.stalled = False
         # J5: xrun/underrun sensor. A stalled stream or a short read is audio
         # the server did not deliver; counting it keeps "the take sounded
         # choppy" a measured fact instead of an impression.
         self.xruns = 0
+        self._clock = clock or time.monotonic
         self._command = pw_record_pcm_stream_command(target, sample_rate=sample_rate)
+        self.argv = list(self._command)  # public: journaled verbatim at spawn
         self._frame_bytes = sample_rate * frame_ms // 1000 * BYTES_PER_SAMPLE
         self._proc: asyncio.subprocess.Process | None = None
+        # BUG-HW1: delivery accounting. `stream_facts` is finalized once per
+        # frames() run; a second call never overwrites the first reading.
+        self.spawned_at: float | None = None
+        self.first_frame_at: float | None = None
+        self.last_frame_at: float | None = None
+        self.bytes_delivered = 0
+        self.dropped_tail_bytes = 0
+        self.stream_facts: dict | None = None
+        self._frames_done = False
+        self._read_in_flight = 0
+
+    def _note_delivery(self, count: int, now: float) -> None:
+        if self.first_frame_at is None:
+            self.first_frame_at = now
+        self.last_frame_at = now
+        self.bytes_delivered += int(count)
+
+    def _finalize_delivery(self) -> None:
+        if self.stream_facts is not None:
+            return
+        end = self._clock()
+        spawned = self.spawned_at if self.spawned_at is not None else end
+        latency = (self.first_frame_at - spawned
+                   if self.first_frame_at is not None else None)
+        if (self.first_frame_at is not None and self.last_frame_at is not None
+                and self.last_frame_at > self.first_frame_at):
+            window = self.last_frame_at - self.first_frame_at
+        else:
+            window = None
+        delivery = classify_delivery_rate(self.bytes_delivered, window,
+                                          self.sample_rate)
+        self.stream_facts = {
+            "argv": list(self.argv),
+            "expected": {
+                "format": "s16le",
+                "sample_rate": self.sample_rate,
+                "channels": 1,
+                "bytes_per_s": self.sample_rate * BYTES_PER_SAMPLE,
+            },
+            # pw-record never reports the negotiated format on stdout; these
+            # are the facts a hardware report needs to name the mislabel.
+            "bytes": self.bytes_delivered,
+            "wall_seconds_since_spawn": round(end - spawned, 3),
+            "first_frame_latency_ms": (round(latency * 1000, 1)
+                                       if latency is not None else None),
+            "delivery": delivery,
+            "dropped_tail_bytes": int(self.dropped_tail_bytes),
+            "note": ("pw-record does not report the negotiated format on "
+                     "stdout; the byte-rate vs the s16le label is the only "
+                     "in-band discriminator (BUG-HW1)"),
+        }
 
     async def frames(self) -> AsyncIterator[bytes]:
         # VB-10: `pw-record` must die with the daemon instead of keeping the
@@ -565,38 +732,102 @@ class PipeWireCapture:
         # (see assistant.proc). The graceful path below still terminates it.
         from .proc import child_kwargs
 
+        self.spawned_at = self._clock()
+        self._frames_done = False
         self._proc = await asyncio.create_subprocess_exec(
             *self._command, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             **child_kwargs(),
         )
         assert self._proc.stdout is not None
-        while True:
-            try:
-                chunk = await asyncio.wait_for(
-                    self._proc.stdout.readexactly(self._frame_bytes),
-                    timeout=self.stall_timeout_s)
-            except TimeoutError:
-                # Dead capture: report it, end the stream, let the session
-                # fail fast with "no speech captured" instead of hanging.
-                self.stalled = True
-                self.xruns += 1
-                return
-            except asyncio.IncompleteReadError as partial:
-                if partial.partial:
-                    self.xruns += 1      # short read: a dropped tail, counted
-                    yield partial.partial
-                return
-            yield chunk
+        try:
+            while True:
+                try:
+                    self._read_in_flight += 1
+                    try:
+                        chunk = await asyncio.wait_for(
+                            self._proc.stdout.readexactly(self._frame_bytes),
+                            timeout=self.stall_timeout_s)
+                    finally:
+                        self._read_in_flight -= 1
+                except TimeoutError:
+                    # Dead capture: report it, end the stream, let the session
+                    # fail fast with "no speech captured" instead of hanging.
+                    self.stalled = True
+                    self.xruns += 1
+                    return
+                except asyncio.IncompleteReadError as partial:
+                    if partial.partial:
+                        self._note_delivery(len(partial.partial), self._clock())
+                        self.xruns += 1      # short read: a dropped tail, counted
+                        yield partial.partial
+                    return
+                self._note_delivery(len(chunk), self._clock())
+                yield chunk
+        finally:
+            self._frames_done = True
+            self._finalize_delivery()
 
     # BH-K6: SIGTERM grace before SIGKILL escalation in aclose().
     TERMINATE_TIMEOUT_S = 2.0
+    #: How long the post-terminate pipe drain may take (BUG-HW1). The dictate
+    #: close path budgets 1.5 s for source.aclose(), so the drain must return
+    #: fast: EOF arrives as soon as the child dies, which is immediate for a
+    #: default SIGTERM. The remainder of the 2 s budget is the SIGKILL wait.
+    DRAIN_TIMEOUT_S = 0.8
+
+    async def _drain_tail(self, proc: asyncio.subprocess.Process) -> int:
+        """Bytes the child had written into the pipe and the session never saw.
+
+        After terminate() the bytes already in the kernel pipe stay readable
+        until the read end closes — they are audio the server delivered and
+        the take is missing them. They cannot be re-fed (the session has
+        moved on); counting them is the honest move. Never runs while a
+        readexactly is in flight on the same stream (that would steal its
+        bytes), and never errors the close.
+        """
+        if getattr(proc, "stdout", None) is None or getattr(self, "_read_in_flight", 0):
+            return 0
+        total = 0
+        deadline = self._clock() + self.DRAIN_TIMEOUT_S
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(proc.stdout.read(65536),
+                                                    timeout=0.25)
+                except TimeoutError:
+                    break  # child is wedged — do not hold the close hostage
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                total += len(chunk)
+                if self._clock() >= deadline:
+                    break
+        except asyncio.CancelledError:
+            # Never leak a live mic because the caller stopped waiting:
+            # the graceful-close contract still requires the kill.
+            try:
+                proc.kill()
+            except Exception as kill_exc:  # best effort — the kill still goes down
+                print(f"[assist] capture tail-drain kill failed: "
+                      f"{type(kill_exc).__name__}: {kill_exc}", flush=True)
+            raise
+        return total
 
     async def aclose(self) -> None:
         proc, self._proc = self._proc, None
         if proc is None or proc.returncode is not None:
             return
         proc.terminate()
+        # BUG-HW1: count the pipe tail the session is abandoning (the
+        # 0-byte-capture evidence: bytes in flight at a fast stop).
+        dropped = await self._drain_tail(proc)
+        if dropped:
+            self.dropped_tail_bytes = getattr(self, "dropped_tail_bytes", 0) + dropped
+            facts = getattr(self, "stream_facts", None)
+            if facts is not None:
+                facts["dropped_tail_bytes"] = int(self.dropped_tail_bytes)
         try:
             await asyncio.wait_for(proc.wait(), timeout=self.TERMINATE_TIMEOUT_S)
         except TimeoutError:
@@ -718,7 +949,14 @@ async def _next_or_silence(iterator, _silence):
 
 
 def pw_record_pcm_stream_command(target: str | None, *, sample_rate: int = 16000) -> list[str]:
-    """Raw s16le PCM to stdout — what assist-voice-test consumes live."""
+    """Raw s16le PCM to stdout — what assist-voice-test consumes live.
+
+    BUG-HW1: pw-record never reports the negotiated format on stdout, so a
+    stream delivered at any other width/rate/channel count than the label is
+    silently misread by every consumer as s16le. `PipeWireCapture` measures
+    and journals the delivery facts (`stream_facts`); this argv is pinned by
+    tests and must stay byte-identical to what production spawns.
+    """
     if target and str(target).isdigit() and len(str(target)) < 4:
         raise ValueError(
             f"'{target}' looks like an object.id. pw-record --target wants "
