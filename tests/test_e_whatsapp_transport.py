@@ -46,6 +46,7 @@ from alive.templates import (
     TEMPLATE_COMMITMENT_DUE,
     TEMPLATE_DEADLINE,
     TEMPLATE_MEETING,
+    TEMPLATE_MIRROR_STALE,
     TemplateSpec,
     TemplateSpecError,
     format_laptop_already_sent_knock,
@@ -148,6 +149,7 @@ def test_s0_template_pack_contains_exact_four_approved_shapes():
         TEMPLATE_DEADLINE,
         TEMPLATE_COMMITMENT_DUE,
         TEMPLATE_ALREADY_SENT_KNOCK,
+        TEMPLATE_MIRROR_STALE,
     }
     for spec in S0_TEMPLATE_PACK.values():
         validate_template_spec(spec)
@@ -603,7 +605,7 @@ def test_wrong_phone_number_id_or_non_messages_field_ignored(tmp_path):
 
 def test_default_paid_template_cap_is_small_and_s1_chatty_mode_refused(tmp_path):
     config, *_ = make_env(tmp_path)
-    assert config.max_templates_per_day == DEFAULT_MAX_TEMPLATES_PER_DAY == 5
+    assert config.max_templates_per_day == DEFAULT_MAX_TEMPLATES_PER_DAY == 3
     assert config.s1_chatty_mode is False
 
     with pytest.raises(AliveConfigError, match="s1_chatty_mode is refused"):
@@ -821,7 +823,7 @@ def test_provision_templates_cli_outputs_valid_json(capsys):
     rc = provision.main(["templates"])
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
-    assert len(parsed) == 4
+    assert len(parsed) == 5
     assert {item["name"] for item in parsed} == set(S0_TEMPLATE_PACK)
 
 

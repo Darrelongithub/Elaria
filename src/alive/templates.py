@@ -36,13 +36,18 @@ TEMPLATE_MEETING = "elaria_meeting_v1"
 TEMPLATE_DEADLINE = "elaria_deadline_v1"
 TEMPLATE_COMMITMENT_DUE = "elaria_commitment_due_v1"
 TEMPLATE_ALREADY_SENT_KNOCK = "elaria_already_sent_knock_v1"
+TEMPLATE_MIRROR_STALE = "mirror_stale_v1"
 
-# Legacy alias from BUILD-6 mapped to the canonical commitment-due template
+# Legacy / concise aliases mapped to the canonical S-0 template specs
 LEGACY_TEMPLATE_ALIASES: dict[str, str] = {
     "reminder_v1": TEMPLATE_COMMITMENT_DUE,
+    "meeting_reminder_v1": TEMPLATE_MEETING,
+    "deadline_reminder_v1": TEMPLATE_DEADLINE,
+    "commitment_due_v1": TEMPLATE_COMMITMENT_DUE,
+    "already_sent_knock_v1": TEMPLATE_ALREADY_SENT_KNOCK,
 }
 
-REMINDER_KINDS = ("meeting", "deadline", "commitment_due", "already_sent_knock")
+REMINDER_KINDS = ("meeting", "deadline", "commitment_due", "already_sent_knock", "mirror_stale")
 
 _NAME_RE = re.compile(r"^[a-z0-9_]{1,512}$")
 _VAR_RE = re.compile(r"\{\{(\d+)\}\}")
@@ -115,7 +120,13 @@ class TemplateSpec:
             "components": components,
         }
 
-    def graph_send_payload(self, to_e164: str, params: list[str] | tuple[str, ...]) -> dict:
+    def graph_send_payload(
+        self,
+        to_e164: str,
+        params: list[str] | tuple[str, ...],
+        *,
+        template_name_override: str | None = None,
+    ) -> dict:
         """Exact JSON body for ``POST /<PHONE_NUMBER_ID>/messages``."""
         validated = validate_params(self, params)
         return {
@@ -124,7 +135,7 @@ class TemplateSpec:
             "to": to_e164,
             "type": "template",
             "template": {
-                "name": self.name,
+                "name": template_name_override or self.name,
                 "language": {"code": self.language},
                 "components": [
                     {
@@ -195,10 +206,34 @@ S0_TEMPLATE_PACK: dict[str, TemplateSpec] = {
         sample_params=("meeting with Amina", "06:55 EAT"),
         description="Outside-24h knock update citing an earlier reminder send.",
     ),
+    TEMPLATE_MIRROR_STALE: TemplateSpec(
+        kind="mirror_stale",
+        name=TEMPLATE_MIRROR_STALE,
+        language=TEMPLATE_LANGUAGE,
+        category=TEMPLATE_CATEGORY,
+        body=(
+            "Your reminder list has not been refreshed since {{1}}. "
+            "Reminders are paused until your laptop syncs again."
+        ),
+        footer="Elaria reminder line (queued until laptop is on)",
+        param_names=("last_synced_date",),
+        sample_params=("2026-10-25",),
+        description="One-shot notice when the mirrored commitments list is stale.",
+    ),
 }
 
 S0_TEMPLATES_BY_KIND: dict[str, TemplateSpec] = {
     spec.kind: spec for spec in S0_TEMPLATE_PACK.values()
+}
+
+# Backwards-compatible map ``name -> (body, param_count)`` for callers inspecting
+# raw strings + slot counts directly.
+TEMPLATES: dict[str, tuple[str, int]] = {
+    **{spec.name: (spec.body, spec.param_count) for spec in S0_TEMPLATE_PACK.values()},
+    **{
+        alias: (S0_TEMPLATE_PACK[target].body, S0_TEMPLATE_PACK[target].param_count)
+        for alias, target in LEGACY_TEMPLATE_ALIASES.items()
+    },
 }
 
 # Spoken / console laptop-side short knock line (GATE VERDICT: short "already sent" form)

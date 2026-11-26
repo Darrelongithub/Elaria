@@ -2,6 +2,8 @@
 
 Append/update only; nothing here is authority. The database holds:
 
+* ``template_attempts`` — atomic cross-process reservation table for daily
+  paid-template budget (ambiguous failures consume budget cleanly);
 * ``seen`` — wamid dedup (7-day prune);
 * ``fired`` — write-ahead reminder table. A crash between the write-ahead
   row and the send leaves ``status='unknown'``; on restart it is NEVER
@@ -9,6 +11,8 @@ Append/update only; nothing here is authority. The database holds:
 * ``counters`` / ``month_counters`` — per-tier daily and monthly caps;
 * ``never_list_hits`` — stranger never-list attempts for the mute rule;
 * ``drafts`` — the S-0 concierge's per-sender collected turns (verbatim);
+* ``service_windows`` — 24h customer-service window timestamps per sender hash;
+* ``delivery_statuses`` — Meta ``statuses[]`` receipts (sent/delivered/read/failed);
 * ``kv`` — seq counter, platform_blocked, clock_suspect, mirror cache.
 
 One writer, single file, WAL, mode 0600. This file is never in Drive.
@@ -23,6 +27,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS template_attempts (
+  id INTEGER PRIMARY KEY, day TEXT NOT NULL, template TEXT NOT NULL,
+  status TEXT NOT NULL, wamid TEXT
+);
 CREATE TABLE IF NOT EXISTS seen (
   id TEXT PRIMARY KEY,
   seen_at TEXT NOT NULL
@@ -111,6 +119,40 @@ class AliveStore:
     def close(self):
         with self._lock:
             self._conn.close()
+
+    def reserve_template(self, template: str, cap: int, now: datetime) -> int | None:
+        """Reserve atomically across processes; ambiguous failures consume budget."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                count = self._conn.execute(
+                    "SELECT COUNT(*) FROM template_attempts WHERE day=?", (self._day(now),)
+                ).fetchone()[0]
+                if count >= cap:
+                    self._conn.rollback()
+                    return None
+                cur = self._conn.execute(
+                    "INSERT INTO template_attempts(day, template, status) VALUES (?, ?, 'pending')",
+                    (self._day(now), template))
+                self._conn.commit()
+                return cur.lastrowid
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def finish_template(self, attempt: int, status: str, wamid: str | None = None):
+        with self._lock:
+            self._conn.execute("UPDATE template_attempts SET status=?, wamid=? WHERE id=?",
+                               (status, wamid, attempt))
+            self._conn.commit()
+
+    def count_template_attempts_today(self, *, now: datetime | None = None) -> int:
+        now = now or _utcnow()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM template_attempts WHERE day=?",
+                (self._day(now),)).fetchone()
+            return int(row["n"]) if row else 0
 
     # -- seq -----------------------------------------------------------------
     def next_seq(self) -> int:
@@ -280,26 +322,63 @@ class AliveStore:
             self._conn.commit()
 
     # -- 24h customer service window tracking ----------------------------------
-    def record_inbound_window(self, sender_hash: str, inbound_at: datetime | str) -> None:
+    def record_inbound_window(
+        self,
+        sender_hash: str,
+        inbound_at: datetime | str | int,
+        now: datetime | None = None,
+    ) -> None:
         """Record the timestamp of a transport-authenticated user message.
 
-        Only move forward in time so an out-of-order webhook retry never shrinks
-        a fresher 24-hour customer service window.
+        Refuses negative or future-skewed timestamps (when ``now`` is supplied)
+        so a crafted/skewed timestamp cannot stretch the 24h window into the future,
+        and only moves forward monotonically.
         """
+        dt: datetime | None = None
+        epoch_sec: int | None = None
         if isinstance(inbound_at, datetime):
-            stamp = iso(inbound_at)
+            dt = inbound_at.astimezone(UTC) if inbound_at.tzinfo else inbound_at.replace(tzinfo=UTC)
+            epoch_sec = int(dt.timestamp())
+        elif isinstance(inbound_at, int):
+            if inbound_at < 0:
+                return
+            epoch_sec = inbound_at
+            dt = datetime.fromtimestamp(inbound_at, tz=UTC)
         else:
-            stamp = str(inbound_at)
+            raw = str(inbound_at).strip()
+            if raw.isdigit():
+                epoch_sec = int(raw)
+                dt = datetime.fromtimestamp(epoch_sec, tz=UTC)
+            else:
+                try:
+                    parsed = datetime.fromisoformat(raw)
+                except ValueError:
+                    return
+                dt = parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+                epoch_sec = int(dt.timestamp())
+
+        if now is not None:
+            now_utc = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
+            if dt > now_utc:
+                return
+
+        stamp = iso(dt)
+        key = "window:" + sender_hash
         with self._lock:
             row = self._conn.execute(
                 "SELECT last_inbound_at FROM service_windows WHERE sender_hash=?",
                 (sender_hash,)).fetchone()
-            if row and str(row["last_inbound_at"]) >= stamp:
-                return
+            if not (row and str(row["last_inbound_at"]) >= stamp):
+                self._conn.execute(
+                    "INSERT INTO service_windows(sender_hash, last_inbound_at) VALUES (?, ?) "
+                    "ON CONFLICT(sender_hash) DO UPDATE SET last_inbound_at=excluded.last_inbound_at",
+                    (sender_hash, stamp))
             self._conn.execute(
-                "INSERT INTO service_windows(sender_hash, last_inbound_at) VALUES (?, ?) "
-                "ON CONFLICT(sender_hash) DO UPDATE SET last_inbound_at=excluded.last_inbound_at",
-                (sender_hash, stamp))
+                "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET "
+                "value=CASE WHEN CAST(excluded.value AS INTEGER)>CAST(kv.value AS INTEGER) "
+                "THEN excluded.value ELSE kv.value END",
+                (key, str(epoch_sec)),
+            )
             self._conn.commit()
 
     def last_inbound_at(self, sender_hash: str) -> datetime | None:
@@ -307,25 +386,30 @@ class AliveStore:
             row = self._conn.execute(
                 "SELECT last_inbound_at FROM service_windows WHERE sender_hash=?",
                 (sender_hash,)).fetchone()
-        if not row:
+            if row:
+                try:
+                    dt = datetime.fromisoformat(str(row["last_inbound_at"]))
+                    return dt.astimezone(UTC) if dt.tzinfo else dt.replace(tzinfo=UTC)
+                except ValueError:
+                    pass
+            kv_row = self._conn.execute(
+                "SELECT value FROM kv WHERE key=?", ("window:" + sender_hash,)).fetchone()
+        if not kv_row:
             return None
         try:
-            dt = datetime.fromisoformat(str(row["last_inbound_at"]))
-        except ValueError:
+            return datetime.fromtimestamp(int(kv_row["value"]), tz=UTC)
+        except (TypeError, ValueError, OSError):
             return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
-        return dt
 
     def in_service_window(self, sender_hash: str, *, now: datetime | None = None,
                           window_seconds: int = 24 * 3600) -> bool:
-        """True iff the sender messaged us within ``window_seconds`` (strictly <= 24h, >= 0)."""
+        """True iff the sender messaged us within ``[0, window_seconds)`` (strictly < 24h)."""
         now = (now or _utcnow()).astimezone(UTC)
         last = self.last_inbound_at(sender_hash)
         if last is None:
             return False
         elapsed = (now - last.astimezone(UTC)).total_seconds()
-        return 0 <= elapsed <= window_seconds
+        return 0 <= elapsed < window_seconds
 
     # -- webhook delivery status receipts (statuses[]) -------------------------
     def record_delivery_status(self, wamid: str, status: str, *, ts: str,

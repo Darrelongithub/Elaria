@@ -19,7 +19,7 @@
 3. **Outside 24 hours = S-0 Utility Template or Nothing (`52 KES-cents`):**
    - If more than 24 hours pass without a message from you, Meta blocks free-form messages (`#131047`).
    - Elaria's transport (`src/alive/transport.py`) enforces this **before any network call**: a cold free-form send raises `OutsideServiceWindow` and sends zero packets.
-   - Outside 24 hours, Elaria can **only** knock using one of the 4 pre-approved **S-0 `UTILITY` templates** (`meeting`, `deadline`, `commitment-due`, `already-sent knock`), capped in code at **`5` templates/day** by default (`max_templates_per_day = 5`, ceiling `10`).
+   - Outside 24 hours, Elaria can **only** knock using one of the pre-approved **S-0 `UTILITY` templates** (`meeting`, `deadline`, `commitment-due`, `already-sent knock`, plus `mirror_stale`), capped atomically in code at **`3` templates/day** by default (`max_templates_per_day = 3`, ceiling `10`).
 4. **Laptop stays in charge:**
    - Nothing sent on WhatsApp executes on your laptop while it is asleep. Instructions wait in the HMAC-signed inbox and land in `awaiting_approval` when your laptop opens.
 
@@ -33,16 +33,16 @@ Cited against Meta's official WhatsApp Business Platform per-message pricing for
 | --- | --- | --- | --- | --- | --- |
 | **Inbound message from you** | You text Elaria's number | `$0.0000` | **`0 KES-cents`** | `KES 0.00` | Capped at `owner_messages_per_day = 200` |
 | **In-window session reply** (`send_service_reply`) | Elaria replies `< 24h` after your last message | `$0.0000` (first 1,000/mo) | **`0 KES-cents`** | `KES 0.00` | `stranger_messages_per_month = 800` keeps total well under 1,000 free/mo |
-| **Out-of-window S-0 Utility template** (`send_utility_template`) | Reminder/knock when `> 24h` silent | `$0.0040` | **`52 KES-cents`** | `KES 0.52` | Default `max_templates_per_day = 5` (hard ceiling `10`), journaled per send |
+| **Out-of-window S-0 Utility template** (`send_utility_template`) | Reminder/knock when `> 24h` silent | `$0.0040` | **`52 KES-cents`** | `KES 0.52` | Default `max_templates_per_day = 3` (hard ceiling `10`), atomic SQLite cap + journaled per send |
 | *(Hazard avoided)* Marketing template | Promotional / chatty copy | `$0.0248` | `322 KES-cents` | `KES 3.22` | **Blocked in code** (`TemplateSpecError` refuses non-`UTILITY` & promo words; S-1 OFF) |
 
 ### Monthly Budget Envelope (in KES-Cents & KES)
 
 - **Typical student week (~1–2 out-of-window reminder knocks/day = 45 templates/month):**
   - `45 × 52 KES-cents = 2,340 KES-cents` = **`KES 23.40 / month`** (`~$0.18 / month`).
-- **Default daily cap hit every single day (`max_templates_per_day = 5` × 30 days = 150 templates/month):**
-  - Daily ceiling: `5 × 52 KES-cents = 260 KES-cents / day` = **`KES 2.60 / day`**.
-  - 30-day ceiling: `150 × 52 KES-cents = 7,800 KES-cents / month` = **`KES 78.00 / month`** (`~$0.60 / month`).
+- **Default daily cap hit every single day (`max_templates_per_day = 3` × 30 days = 90 templates/month):**
+  - Daily ceiling: `3 × 52 KES-cents = 156 KES-cents / day` = **`KES 1.56 / day`**.
+  - 30-day ceiling: `90 × 52 KES-cents = 4,680 KES-cents / month` = **`KES 46.80 / month`** (`~$0.36 / month`).
 - **Absolute code ceiling (`max_templates_per_day = 10` × 30 days = 300 templates/month):**
   - `300 × 52 KES-cents = 15,600 KES-cents / month` = **`KES 156.00 / month`** (`~$1.20 / month`). Setting `max_templates_per_day > 10` in `alive.toml` raises `AliveConfigError` at startup.
 - **Spare SIM airtime keep-alive (Safaricom/Airtel Kenya):**
@@ -199,6 +199,7 @@ Now open **[https://business.facebook.com/latest/whatsapp_manager/message_templa
 | 2 | `elaria_deadline_v1` | `Elaria deadline reminder: {{1}} is due {{2}}. Reply here if you want an instruction queued for your laptop.` | `Distributed Systems lab report` | `Friday 17:00 EAT` |
 | 3 | `elaria_commitment_due_v1` | `Elaria reminder: you asked me to follow up on {{1}} at {{2}}. Reply here to queue an instruction until your laptop is on.` | `calling Dr. Kamau about lab results` | `08:30 EAT` |
 | 4 | `elaria_already_sent_knock_v1` | `Elaria knock update: {{1}} (already sent at {{2}}) is still waiting for your review. Reply here to queue a note for your laptop.` | `meeting with Amina` | `06:55 EAT` |
+| 5 | `mirror_stale_v1` | `Your reminder list has not been refreshed since {{1}}. Reminders are paused until your laptop syncs again.` | `2026-10-25` | *(1 slot)* |
 
 - Meta's automated review normally approves clean transactional `UTILITY` templates in **1–15 minutes**.
 - **Check category after approval:** Confirm all 4 show **`Utility — Approved`**. If Meta's April 2025/2026 recategoriser ever marks one `Marketing`, delete and resubmit with the exact samples above — `alive/templates.py` will never send a `MARKETING` template.
@@ -218,8 +219,8 @@ Confirm every line prints `ok`:
 - `ok   config loaded`
 - `ok   state dir writable`
 - `ok   sync round-trip passed`
-- `ok   template cap in code: 5/day`
-- `ok   S-0 template pack validated (4 utility templates)`
+- `ok   template cap in code: 3/day`
+- `ok   S-0 template pack validated (5 utility templates)`
 - `ok   S-1 chatty mode OFF (Meta policy guard)`
 - `ok   fast lane OFF (manager binding)`
 - `DOCTOR PASSED`
@@ -248,7 +249,7 @@ Run this two-part acceptance check once Steps 1–8 are green:
    - At `remind_at`, Elaria's cron tick calls `send_utility_template` and your phone receives the approved **S-0 template knock**, e.g.:
      > `Elaria meeting reminder: you asked to remember project sync with Amina scheduled for today at 19:00 EAT. Reply here to queue a note for when your laptop is on.`  
      > *(Footer: Elaria reminder line (queued until laptop is on))*
-   - Check `journal.jsonl` on the alive host: one `paid_template_journaled` event with `cost_kes_cents_est: 52`, `templates_sent_today: 1`, `cap_per_day: 5`.
+   - Check `journal.jsonl` on the alive host: one `paid_template_journaled` event with `cost_kes_cents_est: 52`, `templates_sent_today: 1`, `cap_per_day: 3`.
 3. **Open your laptop:**
    - `alive_sync.ingest(...)` drains the queued instruction from Part A into `cloud_jobs` with `status = "awaiting_approval"`.
    - `alive_sync.already_sent_knock_for_commitment(...)` reads `reminder_log/` so your laptop greets you with the short anti-duplicate line (`"Already sent to your phone at ..."`), instead of nagging you twice.

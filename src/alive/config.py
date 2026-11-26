@@ -33,15 +33,14 @@ from pathlib import Path
 EGRESS_ALLOWLIST = ("graph.facebook.com",)
 
 #: Graph API version pinned by the build. Bump deliberately, never at runtime.
-GRAPH_API_VERSION = "v21.0"
+GRAPH_API_VERSION = "v24.0"
 
 #: Default S-0 utility template name (canonical commitment-due template).
-#: All four S-0 templates live in ``alive.templates.S0_TEMPLATE_PACK``.
+#: All S-0 templates live in ``alive.templates.S0_TEMPLATE_PACK``.
 REMINDER_TEMPLATE = "elaria_commitment_due_v1"
 
-#: Default paid-template cap per UTC day — deliberately small (KES ~2.60/day at
-#: KES 0.52 = 52 KES-cents per delivered utility template in Kenya).
-DEFAULT_MAX_TEMPLATES_PER_DAY = 5
+#: Default paid-template cap per UTC day — deliberately small (3/day ≈ 156 KES-cents = KES 1.56/day).
+DEFAULT_MAX_TEMPLATES_PER_DAY = 3
 
 #: Hard upper ceiling on ``max_templates_per_day`` enforced by config + doctor.
 MAX_TEMPLATES_PER_DAY_CEILING = 10
@@ -96,10 +95,10 @@ class AliveConfig:
     verify_token: str = ""             # hub.challenge handshake
 
     # limits — all enforced in code, all overridable ONLY in this file
-    max_templates_per_day: int = DEFAULT_MAX_TEMPLATES_PER_DAY  # paid utility templates (default 5, ceiling 10)
+    max_templates_per_day: int = DEFAULT_MAX_TEMPLATES_PER_DAY  # paid utility templates (default 3, ceiling 10)
     owner_messages_per_day: int = 200  # owner instruction envelopes (B10)
     stranger_turns_per_day_per_sender: int = 20
-    stranger_messages_per_month: int = 800  # stays under the 1,000 free
+    stranger_messages_per_month: int = 800  # safety limit
     late_grace_seconds: int = 30 * 60  # reminder firing grace (§2.4.4)
     stale_mirror_days: int = 30        # B11: firing stops past this
     expiry_hours: int = 72             # instruction envelope expiry
@@ -124,6 +123,12 @@ class AliveConfig:
     s1_chatty_mode: bool = False       # binding OFF — Meta 15 Jan 2026 AI policy grey zone
 
     def __post_init__(self):
+        if not isinstance(self.max_templates_per_day, int) or self.max_templates_per_day < 0:
+            raise AliveConfigError("max_templates_per_day must be non-negative")
+        if self.max_templates_per_day > MAX_TEMPLATES_PER_DAY_CEILING:
+            raise AliveConfigError(
+                f"max_templates_per_day={self.max_templates_per_day} exceeds ceiling "
+                f"{MAX_TEMPLATES_PER_DAY_CEILING}; paid templates stay tightly bounded")
         if not self.mac_key or len(self.mac_key) < 16:
             raise AliveConfigError("mac_key missing or too short; provision with `python -m alive.provision`")
         if not self.from_hash_salt or len(self.from_hash_salt) < 8:
@@ -131,12 +136,6 @@ class AliveConfig:
         if not str(self.owner_e164).startswith("+") or not self.owner_e164[1:].isdigit():
             raise AliveConfigError("owner_e164 must be a single E.164 number, e.g. +2547...")
         normalise_e164(self.owner_e164)
-        if not isinstance(self.max_templates_per_day, int) or self.max_templates_per_day < 0:
-            raise AliveConfigError("max_templates_per_day must be a non-negative integer")
-        if self.max_templates_per_day > MAX_TEMPLATES_PER_DAY_CEILING:
-            raise AliveConfigError(
-                f"max_templates_per_day={self.max_templates_per_day} exceeds ceiling "
-                f"{MAX_TEMPLATES_PER_DAY_CEILING}; paid templates stay tightly bounded")
         for prefix in (self.inbox_prefix, self.commitments_prefix, self.reminder_log_prefix,
                        self.receipts_prefix, self.heartbeat_prefix):
             if "/" in prefix.strip("/") or not prefix.strip():

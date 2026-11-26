@@ -2,7 +2,7 @@
 
 This is the ONLY module in the package permitted to open an HTTP connection,
 and it may only ever open one to a host on ``EGRESS_ALLOWLIST`` — anything
-else raises before a packet leaves.
+else (including HTTP redirects) raises before a packet leaves.
 
 The two outbound operations (and NO others exist):
 
@@ -10,20 +10,21 @@ The two outbound operations (and NO others exist):
   customer service window that the user's own inbound message opened.
   **Hard rule enforced here in the transport:** a free-form cold send is
   IMPOSSIBLE. Before any HTTP call is constructed, ``send_service_reply``
-  verifies an open 24h window — either via an explicit ``inbound_at`` proof
-  within 24h of ``now`` OR via ``store.in_service_window(sender_hash, now=now)``.
-  With neither, or with an expired (>24h) window, ``OutsideServiceWindow``
-  is raised and ZERO HTTP packets leave.
+  verifies an open ``[0, 86400s)`` window — either via an explicit ``inbound_at``
+  proof within 24h of ``now`` OR via ``store.in_service_window(sender_hash, now=now)``.
+  With neither, or with an expired (>=24h) window, ``OutsideServiceWindow``
+  (subclass of ``EgressRefused``) is raised and ZERO HTTP packets leave.
 * ``send_utility_template`` — a business-initiated (or outside-24h) approved
   S-0 utility template from ``alive.templates.S0_TEMPLATE_PACK``.
   **Hard rules enforced here in the transport:**
   1. ONLY the single configured ``owner_e164`` is addressable;
-  2. ONLY templates registered in ``S0_TEMPLATE_PACK`` (plus legacy alias
-     ``reminder_v1``) are accepted — arbitrary template names or parameter
-     shapes raise ``TemplateSpecError``;
+  2. ONLY templates registered in ``S0_TEMPLATE_PACK`` (plus documented aliases)
+     are accepted — arbitrary template names or parameter shapes raise
+     ``TemplateSpecError`` (also a subclass of ``EgressRefused``);
   3. the per-day paid-template cap (``config.max_templates_per_day``) is
-     checked in code before the send, and EVERY send attempt + outcome is
-     journaled with KES-cents and USD cost estimates.
+     reserved atomically in SQLite (``store.reserve_template``) BEFORE HTTP,
+     so concurrent/ambiguous failures still consume budget cleanly, and EVERY
+     attempt + outcome is journaled with KES-cents and USD cost estimates.
 
 Meta policy posture: no LLM, no general-purpose assistant, S-1 chatty mode OFF,
 S-0 templates only for business-initiated sends. Error ``#131047`` from Meta
@@ -32,19 +33,6 @@ S-0 templates only for business-initiated sends. Error ``#131047`` from Meta
 free-form text). Account-level restrictions (``401``, ``403``, ``#10``,
 ``#190``, ``#368``, ``#130497``, ``#131031``) raise ``PlatformBlocked`` —
 TERMINAL: the layer stops sending, journals it, and waits for the owner.
-There is no retry through another number, no proxy, no evasion — ever.
-
-Cited Meta Cloud API documentation:
-* Messages endpoint & payload syntax:
-  ``https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages/``
-* Webhooks setup & payload structure:
-  ``https://developers.facebook.com/docs/whatsapp/cloud-api/guides/set-up-webhooks/``
-* Error codes (#131047 24h service window, #132000/#132001 template errors,
-  #131031/#368 account restriction):
-  ``https://developers.facebook.com/docs/whatsapp/cloud-api/support/error-codes/``
-
-Tests use ``FakeTransport`` or ``WhatsAppCloudTransport`` with an injected
-``http_client`` double — never live network calls in sandbox.
 """
 
 from __future__ import annotations
@@ -65,7 +53,8 @@ from .config import (
 )
 from .journal import log_event
 from .store import AliveStore
-from .templates import TemplateSpecError, resolve_template
+from .templates import TemplateSpecError as _BaseTemplateSpecError
+from .templates import resolve_template
 
 
 class TransportError(RuntimeError):
@@ -73,10 +62,11 @@ class TransportError(RuntimeError):
 
 
 class EgressRefused(TransportError):
-    """A non-allowlisted host or forbidden recipient was named. No packet leaves."""
+    """A non-allowlisted host, forbidden recipient, cold free-form send, or
+    unregistered template was attempted. No packet leaves."""
 
 
-class OutsideServiceWindow(TransportError):
+class OutsideServiceWindow(EgressRefused):
     """Attempted a free-form session message outside the 24-hour customer service window.
 
     Outside the 24h window: template or nothing. Free-form cold sends are
@@ -85,8 +75,16 @@ class OutsideServiceWindow(TransportError):
     """
 
 
-class TemplateCapExceeded(TransportError):
+class TemplateSpecError(EgressRefused, _BaseTemplateSpecError):
+    """Attempted to send an unregistered template or malformed parameters."""
+
+
+class TemplateCapReached(TransportError):
     """Per-day paid utility-template cap reached; send refused before HTTP."""
+
+
+# Alias so both spellings work seamlessly across callers and tests
+TemplateCapExceeded = TemplateCapReached
 
 
 class PlatformBlocked(TransportError):
@@ -98,8 +96,6 @@ class PlatformBlocked(TransportError):
 
 
 #: Meta Graph API error codes indicating account/token/policy restriction (terminal).
-#: Note: 131047 (24h window closed) and 131049 (per-user marketing pacing) are
-#: NOT account bans — 131047 maps to OutsideServiceWindow, 131049 to TransportError.
 PLATFORM_BLOCKED_CODES = frozenset({10, 190, 200, 368, 130497, 131031})
 OUTSIDE_WINDOW_CODE = 131047
 
@@ -133,12 +129,12 @@ def _check_24h_window(
     now: datetime,
     inbound_at: datetime | str | None,
 ) -> None:
-    """Hard gate: verify an open <=24h customer service window before free-form send."""
+    """Hard gate: verify an open ``[0, 24h)`` customer service window before free-form send."""
     now_utc = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
     explicit = _parse_utc(inbound_at)
     if explicit is not None:
         elapsed = (now_utc - explicit).total_seconds()
-        if 0 <= elapsed <= SERVICE_WINDOW_SECONDS:
+        if 0 <= elapsed < SERVICE_WINDOW_SECONDS:
             return
         raise OutsideServiceWindow(
             f"refusing free-form session send: inbound_at={explicit.isoformat()} is "
@@ -184,12 +180,9 @@ class WhatsAppCloudTransport:
     """Real WhatsApp Cloud API S-0 transport adapter.
 
     * Free-form session replies ONLY inside an active 24h customer service window;
-    * Approved S-0 utility templates ONLY to ``config.owner_e164``, capped per day
-      in code and journaled per send with KES-cents arithmetic.
-
-    ``http_client`` is an injectable callable ``(method, url, headers,
-    json_body) -> (status: int, json: dict)``. The default uses ``urllib.request``
-    with HTTPS and ``assert_egress_allowed``.
+    * Approved S-0 utility templates ONLY to ``config.owner_e164``, reserved
+      atomically against the daily cap in SQLite and journaled per send with
+      KES-cents arithmetic.
     """
 
     def __init__(
@@ -198,9 +191,11 @@ class WhatsAppCloudTransport:
         *,
         store: AliveStore | None = None,
         http_client=None,
+        clock=None,
     ):
         self.config = config
-        self.store = store
+        self.store = store if store is not None else AliveStore(config.state_dir)
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._http = http_client or self._default_http
 
     @property
@@ -222,8 +217,14 @@ class WhatsAppCloudTransport:
         assert_egress_allowed(url)  # hard gate, even for the default client
         data = _json.dumps(json_body, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                raise EgressRefused("HTTP redirect refused")
+
+        opener = urllib.request.build_opener(NoRedirect())
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with opener.open(req, timeout=15) as resp:
                 raw = resp.read().decode("utf-8") or "{}"
                 return resp.status, _json.loads(raw)
         except urllib.error.HTTPError as exc:
@@ -259,10 +260,13 @@ class WhatsAppCloudTransport:
         """Send an in-window free-form session text reply.
 
         Enforces the outside-24h-window rule in the transport: without a valid
-        <=24h window proof (``inbound_at`` or ``self.store``'s recorded window),
-        raises ``OutsideServiceWindow`` before touching HTTP.
+        ``[0, 24h)`` window proof (``inbound_at`` or ``self.store``'s recorded
+        window), raises ``OutsideServiceWindow`` before touching HTTP.
         """
-        now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+        if self.store is not None and self.store.platform_blocked():
+            raise PlatformBlocked("line is blocked; owner action required")
+
+        now_utc = (now if now is not None else self._clock()).astimezone(UTC)
         try:
             canonical_to = normalise_e164(to_e164)
         except AliveConfigError as exc:
@@ -296,7 +300,12 @@ class WhatsAppCloudTransport:
             "type": "text",
             "text": {"preview_url": False, "body": clean_text},
         }
-        response = self._send(body)
+        log_event(self.config.state_dir, "service_attempt")
+        try:
+            response = self._send(body)
+        except Exception:
+            log_event(self.config.state_dir, "service_unknown", level="warn")
+            raise
         wamid = _extract_wamid(response)
         log_event(
             self.config.state_dir,
@@ -320,11 +329,11 @@ class WhatsAppCloudTransport:
         Enforces:
         1. single-recipient owner lock (``EgressRefused`` otherwise);
         2. S-0 template pack registration & parameter validation (``TemplateSpecError``);
-        3. belt-and-braces per-day paid-template cap if ``self.store`` is attached
-           (``TemplateCapExceeded``);
+        3. atomic SQLite reservation against ``config.max_templates_per_day``
+           (``TemplateCapReached``);
         4. per-send journaling before and after the HTTP call with KES-cents cost.
         """
-        now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+        now_utc = (now if now is not None else self._clock()).astimezone(UTC)
         try:
             canonical_to = normalise_e164(to_e164)
         except AliveConfigError as exc:
@@ -335,43 +344,85 @@ class WhatsAppCloudTransport:
                 "utility templates may only be addressed to the single configured "
                 "owner number; refusing")
 
-        spec = resolve_template(template)
-        body = spec.graph_send_payload(canonical_to, params)
+        try:
+            spec = resolve_template(template)
+            body = spec.graph_send_payload(canonical_to, params)
+        except _BaseTemplateSpecError as exc:
+            raise TemplateSpecError(str(exc)) from exc
 
+        if self.store is not None and self.store.platform_blocked():
+            raise PlatformBlocked("line is blocked; owner action required")
+
+        attempt: int | None = None
         if self.store is not None:
-            sent_today = self.store.count_today("templates", tier="T0", now=now_utc)
-            if sent_today >= self.config.max_templates_per_day:
+            # Honour either atomic template_attempts OR legacy counters("templates")
+            sent_counter = self.store.count_today("templates", tier="T0", now=now_utc)
+            if sent_counter >= self.config.max_templates_per_day:
                 log_event(
                     self.config.state_dir,
-                    "wa_template_cap_blocked",
+                    "template_cap_reached",
                     level="warn",
                     template=spec.name,
-                    sent_today=sent_today,
+                    sent_today=sent_counter,
                     cap=self.config.max_templates_per_day,
                 )
-                raise TemplateCapExceeded(
-                    f"paid template cap reached ({sent_today}/{self.config.max_templates_per_day} today)")
+                raise TemplateCapReached(
+                    f"paid template cap reached ({sent_counter}/{self.config.max_templates_per_day} today)")
+            attempt = self.store.reserve_template(
+                spec.name, self.config.max_templates_per_day, now_utc)
+            if attempt is None:
+                log_event(
+                    self.config.state_dir,
+                    "template_cap_reached",
+                    level="warn",
+                    template=spec.name,
+                    cap=self.config.max_templates_per_day,
+                )
+                raise TemplateCapReached("daily template attempt cap reached")
 
         log_event(
             self.config.state_dir,
             "wa_template_attempt",
+            attempt=attempt,
             template=spec.name,
             kind=spec.kind,
             cost_usd_est=EST_TEMPLATE_COST_USD,
             cost_kes_cents_est=EST_TEMPLATE_COST_KES_CENTS,
         )
-        response = self._send(body)
-        wamid = _extract_wamid(response)
-        log_event(
-            self.config.state_dir,
-            "wa_template_sent",
-            template=spec.name,
-            kind=spec.kind,
-            wamid=wamid,
-            cost_usd_est=EST_TEMPLATE_COST_USD,
-            cost_kes_cents_est=EST_TEMPLATE_COST_KES_CENTS,
-        )
-        return response
+        try:
+            response = self._send(body)
+            wamid = _extract_wamid(response)
+            if not wamid:
+                raise TransportError("Meta response missing message id; outcome unknown")
+            if self.store is not None and attempt is not None:
+                self.store.finish_template(attempt, "accepted", wamid)
+            log_event(
+                self.config.state_dir,
+                "wa_template_sent",
+                attempt=attempt,
+                template=spec.name,
+                kind=spec.kind,
+                wamid=wamid,
+                cost_usd_est=EST_TEMPLATE_COST_USD,
+                cost_kes_cents_est=EST_TEMPLATE_COST_KES_CENTS,
+            )
+            return response
+        except Exception as exc:
+            if self.store is not None:
+                if attempt is not None:
+                    self.store.finish_template(attempt, "unknown")
+                if isinstance(exc, PlatformBlocked):
+                    self.store.kv_set("platform_blocked", "1")
+            log_event(
+                self.config.state_dir,
+                "template_unknown",
+                level="error",
+                attempt=attempt,
+                template=spec.name,
+            )
+            if isinstance(exc, TransportError):
+                raise
+            raise TransportError("template send outcome unknown") from exc
 
 
 def _extract_wamid(response: dict) -> str | None:
@@ -384,9 +435,6 @@ def _extract_wamid(response: dict) -> str | None:
 class FakeTransport:
     """Test double that enforces the EXACT same 24h-window, owner-only, and S-0
     template rules as ``WhatsAppCloudTransport`` so fake and real cannot drift.
-
-    ``fail_with`` may be ``PlatformBlocked``, ``OutsideServiceWindow``, or
-    ``TransportError``.
     """
 
     def __init__(
@@ -450,12 +498,15 @@ class FakeTransport:
         if self.config is not None and canonical_to != self.config.owner_e164:
             raise EgressRefused(
                 "utility templates may only be addressed to the single configured owner number")
-        spec = resolve_template(template)
-        validated = spec.graph_send_payload(canonical_to, params)
+        try:
+            spec = resolve_template(template)
+            validated = spec.graph_send_payload(canonical_to, params)
+        except _BaseTemplateSpecError as exc:
+            raise TemplateSpecError(str(exc)) from exc
         if self.store is not None and self.config is not None:
             sent_today = self.store.count_today("templates", tier="T0", now=now_utc)
             if sent_today >= self.config.max_templates_per_day:
-                raise TemplateCapExceeded(
+                raise TemplateCapReached(
                     f"paid template cap reached ({sent_today}/{self.config.max_templates_per_day} today)")
         self._maybe_fail()
         clean_params = [p["text"] for p in validated["template"]["components"][0]["parameters"]]
@@ -478,6 +529,7 @@ __all__ = [
     "OutsideServiceWindow",
     "PlatformBlocked",
     "TemplateCapExceeded",
+    "TemplateCapReached",
     "TemplateSpecError",
     "TransportError",
     "WhatsAppCloudTransport",

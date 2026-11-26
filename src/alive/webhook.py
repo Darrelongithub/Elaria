@@ -26,15 +26,6 @@ Inbound order of operations (design §2.4.1, binding):
 4. ack / concierge reply sent AFTER the durable write; an ack failure is
    journaled, never retried, never upgraded to a 5xx — an unsent ack is
    better than a double ack.
-
-Stranger turns and owner instructions are different envelope kinds with
-different laptop code paths. There is no code path from a stranger turn to
-the instruction queue; the only sink is ``proposals`` on the laptop.
-
-B3 note: the pre-stranger-door bug list said "stranger → no outbound
-message". That line is stale since the owner ruling added the public front
-door (§2.3b) and is NOT implemented; strangers get the S-0 deterministic
-reply as designed.
 """
 
 from __future__ import annotations
@@ -91,6 +82,20 @@ def _iso_from_meta_ts(value) -> str:
         return iso_now()
 
 
+def _valid_inbound_dt(meta_ts, now: datetime) -> datetime | None:
+    """Return UTC datetime iff ``meta_ts`` is a valid epoch integer in ``[0, now]``."""
+    try:
+        ts_int = int(meta_ts)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if ts_int < 0 or ts_int > now.timestamp():
+        return None
+    try:
+        return datetime.fromtimestamp(ts_int, tz=UTC)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def _check_clock_suspect(store: AliveStore, meta_ts, config: AliveConfig,
                          now: datetime) -> None:
     try:
@@ -138,14 +143,12 @@ def _push_one(config, backend, name: str, data: bytes) -> bool:
     try:
         marker.touch()
     except OSError:
-        pass  # a missing marker just means one redundant re-push next time
+        pass
     return True
 
 
 def push_backlog(config, backend) -> dict:
-    """Drain any spool files that never reached the sync folder (Drive was
-    down, host crashed mid-push). Called on every POST so the line heals
-    itself; also safe to call from a cron/timer."""
+    """Drain any spool files that never reached the sync folder."""
     spool = Path(config.state_dir) / "spool"
     pushed, failed = 0, 0
     if not spool.is_dir():
@@ -170,9 +173,7 @@ def push_backlog(config, backend) -> dict:
 def _make_and_store_envelope(*, config, store, backend, kind, id_, sender,
                              sent_at, body_text, now, suspected=False,
                              extra=None):
-    """Build, sign, write (SQLite + spool). Returns (envelope, name, data).
-
-    Raises on durable-write failure — callers turn that into a 503."""
+    """Build, sign, write (SQLite + spool). Returns (envelope, name, data)."""
     seq = store.next_seq()
     envelope = envelope_mod.make_envelope(
         kind=kind, id=id_, channel="whatsapp_cloud", from_=sender,
@@ -182,10 +183,6 @@ def _make_and_store_envelope(*, config, store, backend, kind, id_, sender,
         suspected_injection=suspected, extra=extra)
     data = envelope_mod.envelope_bytes(envelope)
     name = envelope_mod.envelope_name(now, seq, data)
-    # durable write: spool file (fsync) FIRST, then the SQLite row. The
-    # spool is the source the backlog pusher (push_backlog) drains into the
-    # sync folder — a crash anywhere leaves a recoverable artifact, never
-    # a silent loss.
     _spool_write(config, name, data)
     store.record_inbox(str(id_), kind, seq, now=now)
     _push_one(config, backend, name, data)
@@ -246,17 +243,7 @@ def _freebusy_for(config, store, backend, now) -> tuple[int, dict[int, int]]:
 
 
 def _extract_inbound_text(message: dict) -> tuple[str | None, str]:
-    """Extract text-like user reply content from Meta Cloud API ``messages[]`` objects.
-
-    Cited Meta webhook payload shapes:
-    * ``type=="text"`` -> ``text.body``
-    * ``type=="button"`` (quick-reply on a template) -> ``button.text`` / ``button.payload``
-    * ``type=="interactive"`` -> ``interactive.button_reply.title`` or ``list_reply.title``
-    * ``reaction`` -> ignored (returns ``(None, "")`` so an emoji reaction never
-      queues an empty instruction or triggers a spurious unsupported warning)
-    * ``audio`` / ``image`` / ``video`` / ``document`` / ``sticker`` / ``location``
-      / ``contacts`` / etc. -> ``("unsupported", "")`` (never downloaded).
-    """
+    """Extract text-like user reply content from Meta Cloud API ``messages[]`` objects."""
     msg_type = str(message.get("type") or "").strip().lower()
     if msg_type == "text":
         body = str((message.get("text") or {}).get("body", ""))[:4000]
@@ -281,11 +268,7 @@ def _extract_inbound_text(message: dict) -> tuple[str | None, str]:
 
 
 def _handle_status(*, status_obj: dict, config: AliveConfig, store: AliveStore) -> None:
-    """Process one item from ``value.statuses[]`` (sent/delivered/read/failed).
-
-    Never carries recipient numbers into the journal; records billable/category
-    telemetry and surfaces terminal restriction codes cleanly.
-    """
+    """Process one item from ``value.statuses[]`` (sent/delivered/read/failed)."""
     if not isinstance(status_obj, dict):
         return
     wamid = str(status_obj.get("id") or "").strip()
@@ -335,6 +318,8 @@ def _handle_message(*, message: dict, config, store, backend, transport,
                     now: datetime) -> dict:
     """One inbound message → one decision. Raises nothing the caller can't
     turn into a 5xx-or-200 policy outcome."""
+    if not isinstance(message, dict):
+        return {"outcome": "ignored_malformed"}
     raw_sender = str(message.get("from", "")).strip()
     message_id = str(message.get("id", "")).strip()
     if not raw_sender or not message_id:
@@ -348,18 +333,17 @@ def _handle_message(*, message: dict, config, store, backend, transport,
     if not store.first_time_seen(message_id, now=now):
         return {"outcome": "duplicate"}
 
+    sender_hash = envelope_mod.from_hash(sender, config.from_hash_salt)
+    valid_dt = _valid_inbound_dt(message.get("timestamp"), now)
+    if valid_dt is not None:
+        store.record_inbound_window(sender_hash, int(valid_dt.timestamp()), now)
     _check_clock_suspect(store, message.get("timestamp"), config, now)
     sent_at = _iso_from_meta_ts(message.get("timestamp"))
     msg_type = str(message.get("type") or "unknown")
     extracted_kind, text_body = _extract_inbound_text(message)
 
     t1_hashes = _cached_t1_hashes(config, store, backend, now)
-    sender_hash = envelope_mod.from_hash(sender, config.from_hash_salt)
     tier = config.tier_for(sender, sender_hash=sender_hash, t1_hashes=t1_hashes)
-
-    # Record the sender's 24-hour customer service window from the verified
-    # inbound timestamp (bounded to `now` if Meta's clock slightly leads).
-    store.record_inbound_window(sender_hash, sent_at)
 
     if extracted_kind is None:
         log_event(config.state_dir, "reaction_ignored", tier=tier, wamid=message_id)
@@ -375,7 +359,7 @@ def _handle_message(*, message: dict, config, store, backend, transport,
                 _safe_service_reply(transport, sender,
                                     "I'm not able to take more right now. "
                                     "I'll leave it with her.", config, store,
-                                    now=now, inbound_at=sent_at)
+                                    now=now)
             log_event(config.state_dir, "owner_cap_reached", level="warn")
             return {"outcome": "capped", "tier": tier}
         kind = "instruction" if extracted_kind == "text" else "unsupported"
@@ -387,12 +371,12 @@ def _handle_message(*, message: dict, config, store, backend, transport,
             suspected=suspected_injection(text_body) if text_body else False)
         if kind == "instruction":
             _safe_service_reply(transport, sender, _ack_text(envelope, config), config, store,
-                                now=now, inbound_at=sent_at)
+                                now=now)
         else:
             _safe_service_reply(transport, sender,
                                 "I can't take files, voice notes or locations on "
                                 "this line — text only.", config, store,
-                                now=now, inbound_at=sent_at)
+                                now=now)
         log_event(config.state_dir, "instruction_queued", tier=tier,
                   seq=envelope["seq"], suspected=envelope.get("suspected_injection"))
         return {"outcome": "queued", "tier": tier, "seq": envelope["seq"]}
@@ -404,7 +388,7 @@ def _handle_message(*, message: dict, config, store, backend, transport,
         store.increment("not_stored", tier="T2", now=now)
         _safe_service_reply(transport, sender,
                             "I'll leave this with her.", config, store,
-                            now=now, inbound_at=sent_at)
+                            now=now)
         log_event(config.state_dir, "stranger_cap_reached", sender_hash=sender_hash[:16])
         return {"outcome": "capped", "tier": tier}
 
@@ -414,7 +398,7 @@ def _handle_message(*, message: dict, config, store, backend, transport,
         _safe_service_reply(transport, sender,
                             "I'm not able to take more right now. "
                             "I'll leave it with her.", config, store,
-                            now=now, inbound_at=sent_at)
+                            now=now)
         return {"outcome": "capped", "tier": tier}
 
     concierge = S0Concierge(store, config)
@@ -449,27 +433,24 @@ def _handle_message(*, message: dict, config, store, backend, transport,
 
     reply = outcome.reply if outcome is not None else (
         "I can't take files, voice notes or locations on this line — text only.")
-    _safe_service_reply(transport, sender, reply, config, store,
-                        now=now, inbound_at=sent_at)
+    _safe_service_reply(transport, sender, reply, config, store, now=now)
     log_event(config.state_dir, "stranger_turn", tier=tier, seq=envelope["seq"],
               kind=kind, never_list=extra.get("never_list_category"))
     return {"outcome": kind, "tier": tier, "seq": envelope["seq"]}
 
 
 def _safe_service_reply(transport, to: str, text: str, config, store=None, *,
-                        now: datetime | None = None,
-                        inbound_at: str | None = None) -> None:
+                        now: datetime | None = None) -> None:
     """Acks/replies are best-effort and journaled; never fatal, never retried.
 
-    If a webhook was delayed by >24h before reaching us, ``OutsideServiceWindow``
-    fires cleanly: we keep the queued envelope and skip the expired free-form
-    ack rather than attempting a cold free-form send.
+    Relies on ``store``'s verified inbound window (which rejects future-skewed
+    or malformed timestamps), so a spoofed/future timestamp never triggers an
+    outbound session reply.
     """
     try:
         try:
-            transport.send_service_reply(to, text, now=now, inbound_at=inbound_at)
+            transport.send_service_reply(to, text, now=now)
         except TypeError:
-            # Backwards compatibility for minimal custom test stubs with 2-arg signature
             transport.send_service_reply(to, text)
     except OutsideServiceWindow as exc:
         log_event(config.state_dir, "reply_window_expired", level="warn", detail=str(exc))
@@ -550,13 +531,11 @@ def handle_request(method: str, headers: dict, raw_body: bytes, *,
             if not isinstance(change, dict) or change.get("field") != "messages":
                 continue
             value = change.get("value", {}) if isinstance(change.get("value"), dict) else {}
+            if value.get("messaging_product") != "whatsapp":
+                continue
             metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
-            incoming_phone_id = str(metadata.get("phone_number_id") or "").strip()
-            if (
-                config.wa_phone_number_id
-                and incoming_phone_id
-                and incoming_phone_id != config.wa_phone_number_id
-            ):
+            incoming_phone_id = str(metadata.get("phone_number_id") or "")
+            if incoming_phone_id != config.wa_phone_number_id:
                 log_event(
                     config.state_dir,
                     "ignored_wrong_phone_number_id",
@@ -592,9 +571,6 @@ def handle_request(method: str, headers: dict, raw_body: bytes, *,
                                               store=store, backend=backend,
                                               transport=transport, now=now)
                 except Exception as exc:
-                    # durable-write failure etc: Meta must retry → 503, no ack,
-                    # and the dedup insert is rolled back so the retry is
-                    # re-processed rather than dropped as a duplicate (I1).
                     store.unsee(str((message or {}).get("id", "")))
                     log_event(config.state_dir, "durable_write_failed",
                               level="error", error=str(exc))

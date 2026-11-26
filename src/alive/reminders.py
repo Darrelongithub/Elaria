@@ -12,14 +12,13 @@ Rules (design §2.4.4 + BUILD-10, binding):
 * nothing fires more than ``late_grace_seconds`` after ``remind_at``;
   a late one is logged ``missed``;
 * the paid utility-template cap (``config.max_templates_per_day``) is
-  enforced HERE in code and journaled per send with KES-cents arithmetic
-  (52 KES-cents ≈ KES 0.52 / $0.0040 per delivered utility template in Kenya);
+  enforced HERE in code and atomically in ``transport.py``, and journaled per
+  send with KES-cents arithmetic (52 KES-cents ≈ KES 0.52 / $0.0040 per
+  delivered utility template in Kenya);
 * if a second reminder time fires for a commitment that already had an earlier
-  ``sent`` reminder, the ``elaria_already_sent_knock_v1`` template is chosen
-  automatically so she cites the earlier send instead of repeating blindly;
+  ``sent`` reminder, ``elaria_already_sent_knock_v1`` is chosen automatically;
 * a snapshot older than ``stale_mirror_days`` stops firing (B11), and the
-  owner is told once — honestly, subject to the same daily template cap —
-  that the list is stale;
+  owner is told once via ``mirror_stale_v1`` (subject to the daily cap);
 * ``PLATFORM_BLOCKED`` is terminal: stop sending, journal, wait for the
   owner. No other path, no other number, no retry.
 """
@@ -32,14 +31,13 @@ from . import envelope as envelope_mod
 from .config import (
     EST_TEMPLATE_COST_KES_CENTS,
     EST_TEMPLATE_COST_USD,
-    REMINDER_TEMPLATE,
     AliveConfig,
 )
 from .journal import iso_now, log_event
 from .mirror import is_stale, load_mirror
 from .store import AliveStore
-from .templates import select_template_for_item
-from .transport import PlatformBlocked, TemplateCapExceeded, TransportError
+from .templates import TEMPLATE_MIRROR_STALE, select_template_for_item
+from .transport import PlatformBlocked, TemplateCapReached, TransportError
 
 
 def _parse_ts(value):
@@ -58,7 +56,10 @@ def send_reminder(*, backend, config: AliveConfig, store: AliveStore,
     commitment_id = int(item.id)
 
     # paid-template cap — enforced in code, every call, no exceptions
-    sent_today = store.count_today("templates", tier="T0", now=now)
+    sent_today = max(
+        store.count_today("templates", tier="T0", now=now),
+        store.count_template_attempts_today(now=now),
+    )
     if sent_today >= config.max_templates_per_day:
         store.record_fired(commitment_id, remind_at, "capped", now=now)
         log_event(config.state_dir, "template_cap_reached", level="warn",
@@ -67,8 +68,6 @@ def send_reminder(*, backend, config: AliveConfig, store: AliveStore,
         return "capped"
 
     if item.content_free and not config.content_free_secret_reminders:
-        # belt and braces: content-free secrets never fire unless the owner
-        # explicitly opted in — the laptop exporter is the primary filter.
         log_event(config.state_dir, "content_free_suppressed",
                   commitment_id=commitment_id)
         store.record_fired(commitment_id, remind_at, "missed", now=now)
@@ -106,7 +105,7 @@ def send_reminder(*, backend, config: AliveConfig, store: AliveStore,
         except TypeError:
             response = transport.send_utility_template(
                 config.owner_e164, spec.name, [topic, second_param])
-    except TemplateCapExceeded:
+    except TemplateCapReached:
         store.record_fired(commitment_id, remind_at, "capped", now=now)
         log_event(config.state_dir, "template_cap_reached", level="warn",
                   commitment_id=commitment_id, cap=config.max_templates_per_day)
@@ -168,7 +167,6 @@ def send_reminder(*, backend, config: AliveConfig, store: AliveStore,
     try:
         backend.put(config.reminder_log_prefix, name, data)
     except Exception as exc:
-        # The send happened; the log write failed. LOUD, not silent.
         log_event(config.state_dir, "reminder_log_write_failed", level="error",
                   commitment_id=commitment_id, error=str(exc))
     return "sent"
@@ -198,23 +196,23 @@ def tick(*, backend, config: AliveConfig, store: AliveStore,
     if is_stale(mirror, config.stale_mirror_days, now=now):
         result["stale"] = True
         if (store.kv_get("stale_notified", "0") or "0") != "1":
-            sent_today = store.count_today("templates", tier="T0", now=now)
-            if sent_today >= config.max_templates_per_day:
+            used = max(
+                store.count_today("templates", tier="T0", now=now),
+                store.count_template_attempts_today(now=now),
+            )
+            if used >= config.max_templates_per_day:
                 log_event(config.state_dir, "stale_notice_capped", level="warn",
                           cap=config.max_templates_per_day)
             else:
                 store.kv_set("stale_notified", "1")
                 try:
-                    stale_params = [
-                        f"reminder list not refreshed since {mirror.generated_at:%Y-%m-%d}",
-                        iso_now(),
-                    ]
+                    stale_params = [f"{mirror.generated_at:%Y-%m-%d}"]
                     try:
                         resp = transport.send_utility_template(
-                            config.owner_e164, REMINDER_TEMPLATE, stale_params, now=now)
+                            config.owner_e164, TEMPLATE_MIRROR_STALE, stale_params, now=now)
                     except TypeError:
                         resp = transport.send_utility_template(
-                            config.owner_e164, REMINDER_TEMPLATE, stale_params)
+                            config.owner_e164, TEMPLATE_MIRROR_STALE, stale_params)
                     paid_count = store.increment("templates", tier="T0", now=now)
                     kes_cents = store.increment(
                         "paid_template_kes_cents", tier="T0", now=now,
@@ -228,8 +226,8 @@ def tick(*, backend, config: AliveConfig, store: AliveStore,
                         config.state_dir,
                         "paid_template_journaled",
                         commitment_id=None,
-                        template=REMINDER_TEMPLATE,
-                        template_kind="stale_mirror_notice",
+                        template=TEMPLATE_MIRROR_STALE,
+                        template_kind="mirror_stale",
                         wamid=wamid,
                         templates_sent_today=paid_count,
                         cap_per_day=config.max_templates_per_day,
@@ -238,6 +236,8 @@ def tick(*, backend, config: AliveConfig, store: AliveStore,
                         spent_kes_cents_today_est=kes_cents,
                     )
                 except (PlatformBlocked, TransportError) as exc:
+                    if isinstance(exc, PlatformBlocked):
+                        store.kv_set("platform_blocked", "1")
                     log_event(config.state_dir, "stale_notice_failed", level="error",
                               error=str(exc))
                 log_event(config.state_dir, "mirror_stale_notices_owner",
@@ -257,7 +257,6 @@ def tick(*, backend, config: AliveConfig, store: AliveStore,
             row = store.fired_row(item.id, remind_at)
             if row is not None:
                 if row["status"] == "pending":
-                    # crash between write-ahead and send: honest uncertainty
                     store.record_fired(item.id, remind_at, "unknown", now=now)
                     log_event(config.state_dir, "reminder_unknown_after_crash",
                               level="warn", commitment_id=item.id,

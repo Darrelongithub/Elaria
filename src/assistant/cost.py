@@ -544,7 +544,7 @@ def provider_cost_report(store, since_iso: str | None = None) -> dict:
     params = (since_iso,) if since_iso else ()
     with store._lock:
         rows = store._conn.execute(
-            f"""SELECT provider, capability, model,
+            f"""SELECT provider, capability, model, purpose,
                        COUNT(*) AS calls,
                        COALESCE(SUM(tokens_in + tokens_out), 0) AS tokens,
                        COALESCE(SUM(cost_usd), 0) AS shadow_usd,
@@ -552,8 +552,8 @@ def provider_cost_report(store, since_iso: str | None = None) -> dict:
                        COALESCE(SUM(cost_known = 0), 0) AS unknown_cost,
                        COALESCE(SUM(error = ?), 0) AS pending
                 FROM llm_calls {where}
-                GROUP BY provider, capability, model
-                ORDER BY provider, capability, model""",
+                GROUP BY provider, capability, model, purpose
+                ORDER BY provider, capability, model, purpose""",
             (PENDING_MARK, *params)).fetchall()
     return {
         "since": since_iso,
@@ -574,7 +574,7 @@ def format_provider_report(report: dict) -> str:
             extra.append(f"{row['pending']} pending/unclosed")
         suffix = f" ({', '.join(extra)})" if extra else ""
         lines.append(
-            f"  {row['provider']} · {row['capability']} · {row['model']}: "
+            f"  {row['provider']} · {row['purpose']} · {row['capability']} · {row['model']}: "
             f"{row['calls']} call(s), {row['tokens']} tokens, "
             f"${row['shadow_usd']:.4f} shadow, {row['failures']} failure(s){suffix}")
     return "\n".join(lines)
