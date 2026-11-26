@@ -1914,6 +1914,194 @@ def _print_plan_summary(result: dict) -> None:
     print(f"Nothing moved. Read and judge: {result['shadow_log']}")
 
 
+def _local_discovery_policy(config, roots: list[str] | None):
+    """Daemon-free policy: same rails whether or not assistd is running."""
+    from .discovery import Policy
+
+    kwargs = (config.discovery_policy_kwargs()
+              if hasattr(config, "discovery_policy_kwargs") else {})
+    policy = Policy.from_config(
+        config,
+        include_archives=bool(kwargs.get("include_archives", True)),
+        max_entries=int(kwargs.get("max_entries", 50_000)),
+        max_depth=int(kwargs.get("max_depth", 32)),
+    )
+    if roots:
+        from dataclasses import replace
+
+        policy = replace(policy, roots=tuple(str(r) for r in roots))
+    return policy
+
+
+def _protected_and_never_send(config) -> tuple[list[str], list[str]]:
+    from pathlib import Path as _Path
+
+    protected = list(config.section("policy").get("protected") or [])
+    never_send = [
+        str(_Path(p).expanduser())
+        for p in (config.section("privacy").get("never_send_to_cloud") or [])
+    ]
+    return protected, never_send
+
+
+def _find_command(args, config) -> int:
+    """`assist find` — read-only metadata discovery (GAP-2). No content read."""
+    from .discovery import locate
+
+    policy = _local_discovery_policy(config, args.root)
+    if not policy.roots:
+        print("No discovery roots configured — add paths under [discovery] roots "
+              "in config.toml. Nothing is searched by default, and nothing under "
+              "a root is ever moved or altered.", file=sys.stderr)
+        return 1
+    result = locate(
+        policy,
+        args.terms or [],
+        exts=args.ext,
+        name_glob=args.name,
+        min_size=args.min_size,
+        max_size=args.max_size,
+        include_archive_members=not args.no_archive_members,
+        limit=args.limit,
+    )
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2))
+        return 0
+    for match in result.matches:
+        flag = "  [never_send]" if match.never_send else ""
+        kind = " (in archive)" if match.kind == "archive_member" else ""
+        print(f"{match.target}{kind}  {match.size}B{flag}")
+    if not result.matches:
+        print("(no matches)")
+    print(
+        f"{result.total_matched} match(es) from {result.scanned_files} entries "
+        f"across {result.scanned_roots} root(s); read-only, no content read.",
+        file=sys.stderr)
+    if result.skipped:
+        print(f"skipped: {result.skipped}", file=sys.stderr)
+    for error in result.errors[:5]:
+        print(f"  problem: {error}", file=sys.stderr)
+    return 0
+
+
+def _inspect_command(args, config) -> int:
+    from .streamread import StreamError, inspect
+
+    protected, never_send = _protected_and_never_send(config)
+    limits = config.stream_limits() if hasattr(config, "stream_limits") else {}
+    try:
+        result = inspect(
+            args.target, protected=protected, never_send_roots=never_send,
+            redact=bool(limits.get("redact_sensitive", True)))
+    except StreamError as exc:
+        print(f"inspect refused: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2))
+        return 0
+    payload = result.as_dict()
+    print(f"{payload['target']}")
+    print(f"  format={payload['format']} size={payload['size']}B "
+          f"digest={payload['digest'][:16]}… ({payload['digest_scope']})")
+    if payload["never_send"]:
+        print("  [never_send_to_cloud] content stays on this machine (§10.7)")
+    if payload["parse_error"]:
+        print(f"  PARSE ERROR: {payload['parse_error']}")
+    print(json.dumps(payload["skeleton"], indent=2)[:4000])
+    for note in payload["notes"]:
+        print(f"  note: {note}")
+    return 0
+
+
+def _read_command(args, config) -> int:
+    from .streamread import StreamError, read_window
+
+    protected, never_send = _protected_and_never_send(config)
+    limits = config.stream_limits() if hasattr(config, "stream_limits") else {}
+    budget = min(
+        int(args.bytes or limits.get("byte_budget", 65_536)),
+        int(limits.get("max_bytes_per_file", 8_388_608)),
+    )
+    cursor = None
+    if args.cursor:
+        try:
+            cursor = json.loads(args.cursor)
+        except json.JSONDecodeError as exc:
+            print(f"read refused: --cursor is not JSON ({exc})", file=sys.stderr)
+            return 2
+    spent = 0
+    windows = 0
+    while True:
+        try:
+            window = read_window(
+                args.target, cursor,
+                byte_budget=budget,
+                record_limit=int(args.records or limits.get("record_limit", 200)),
+                projection=args.project,
+                redact=bool(limits.get("redact_sensitive", True)),
+                protected=protected, never_send_roots=never_send)
+        except StreamError as exc:
+            print(f"read refused: {exc}", file=sys.stderr)
+            return 2
+        windows += 1
+        if args.json:
+            print(json.dumps(window.as_dict(), indent=2))
+        else:
+            if window.text:
+                print(window.text)
+            print(
+                f"[window {windows}: bytes {window.byte_start}..{window.byte_end} "
+                f"of {window.total_size} · records={window.records} · "
+                f"eof={window.eof} · cursor={json.dumps(window.next_cursor)}]",
+                file=sys.stderr)
+            for note in window.notes:
+                print(f"  note: {note}", file=sys.stderr)
+        spent += window.byte_end - window.byte_start
+        cursor = window.next_cursor
+        if not args.all or window.eof:
+            return 0
+        cap = int(limits.get("max_bytes_per_file", 8_388_608))
+        if spent >= cap:
+            print(f"stopped at the [stream] max_bytes_per_file cap ({cap}B) — "
+                  "continue with --cursor if this is intended", file=sys.stderr)
+            return 0
+
+
+def _stream_report_command(args, config) -> int:
+    """What the index really extracted (GAP-3): truncation and errors named."""
+    from .store import Store
+
+    store = Store(config.db_path)
+    try:
+        report = store.extraction_report()
+        truncated = store.search_document_metadata(truncated_only=True, limit=20)
+        errored = store.search_document_metadata(error_only=True, limit=20)
+    finally:
+        store.close()
+    if args.json:
+        print(json.dumps({"report": report, "truncated": truncated,
+                          "errors": errored}, indent=2))
+        return 0
+    totals = report["totals"] or {}
+    print(f"{totals.get('docs') or 0} document(s); "
+          f"{totals.get('truncated') or 0} truncated; "
+          f"{totals.get('errors') or 0} parse error(s); "
+          f"{totals.get('chars') or 0} chars extracted")
+    for row in report["by_extractor"]:
+        print(f"  {row['extractor']}: {row['docs']} doc(s), "
+              f"{row['truncated'] or 0} truncated, {row['errors'] or 0} error(s)")
+    if truncated:
+        print("\ntruncated (stored text is NOT the whole file):")
+        for row in truncated:
+            print(f"  {row['path']}  ({row['extracted_chars']} chars of "
+                  f"{row['size']}B)")
+    if errored:
+        print("\nparse errors:")
+        for row in errored:
+            print(f"  {row['path']}: {row['parse_error']}")
+    return 0
+
+
 def _errand_command(args, config) -> int:
     action = args.errand_cmd
     if action == "start":
@@ -2254,6 +2442,40 @@ def build_parser() -> argparse.ArgumentParser:
     suggest_p.add_argument("root")
     search_p = sub.add_parser("search", help="full-text search the local index (FTS5)")
     search_p.add_argument("query")
+    find_p = sub.add_parser(
+        "find",
+        help="find files by name/path/type/size/date across discovery roots (read-only)")
+    find_p.add_argument("terms", nargs="*", help="words to match in path or filename")
+    find_p.add_argument("--root", action="append", default=None,
+                        help="search this root only (repeatable); default = [discovery] roots")
+    find_p.add_argument("--ext", action="append", default=None,
+                        help="restrict to an extension, e.g. --ext .pdf (repeatable)")
+    find_p.add_argument("--name", default=None, help="filename glob, e.g. 'invoice*'")
+    find_p.add_argument("--min-size", type=int, default=None, help="bytes")
+    find_p.add_argument("--max-size", type=int, default=None, help="bytes")
+    find_p.add_argument("--limit", type=int, default=50)
+    find_p.add_argument("--json", action="store_true", help="machine-readable output")
+    find_p.add_argument("--no-archive-members", action="store_true",
+                        help="do not list files inside .zip/.tar bundles")
+    inspect_p = sub.add_parser(
+        "inspect", help="structural skeleton of a file or zip://archive#member (no tokens)")
+    inspect_p.add_argument("target")
+    inspect_p.add_argument("--json", action="store_true")
+    read_p = sub.add_parser(
+        "read", help="stream one bounded window of a file or archive member")
+    read_p.add_argument("target")
+    read_p.add_argument("--cursor", default=None,
+                        help="JSON cursor printed by a previous window")
+    read_p.add_argument("--bytes", type=int, default=None, help="byte budget for this window")
+    read_p.add_argument("--records", type=int, default=None, help="record limit")
+    read_p.add_argument("--project", action="append", default=None,
+                        help="keep only this top-level field (repeatable)")
+    read_p.add_argument("--all", action="store_true",
+                        help="page to the end (bounded by [stream] max_bytes_per_file)")
+    read_p.add_argument("--json", action="store_true")
+    stream_p = sub.add_parser(
+        "stream-report", help="what the index extracted, truncated or failed to parse")
+    stream_p.add_argument("--json", action="store_true")
     rem_p = sub.add_parser("remember", help="store a stated fact (§16)")
     rem_p.add_argument("text")
     rem_p.add_argument("--kind", default="profile",
@@ -2679,6 +2901,18 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"#   {s['folder']}: {s['files_below']} file(s) below"
                       + (f" — {s['note']}" if s.get("note") else ""))
             return 0
+
+        if args.command == "find":
+            return _find_command(args, config)
+
+        if args.command == "inspect":
+            return _inspect_command(args, config)
+
+        if args.command == "read":
+            return _read_command(args, config)
+
+        if args.command == "stream-report":
+            return _stream_report_command(args, config)
 
         if args.command == "search":
             try:

@@ -1,7 +1,8 @@
 """Bounded task planner & async read-errand runner (GAP-1).
 
 Composes read-only internal skills from one typed owner instruction:
-    fs.locate -> file.read (bounded streaming) -> content.analyze
+    fs.locate -> file.inspect (structural skeleton) -> file.read (bounded
+    record streaming) -> content.analyze
     -> memory.infer (probationary, verified evidence) -> owner.ask (pause/resume)
     -> errand.report
 
@@ -59,6 +60,7 @@ from .safety import expand, is_halted, is_protected
 # `point` is point-only screen guidance (BUILD-3): NO clicking, NO acting.
 READ_ONLY_SKILLS: frozenset[str] = frozenset({
     "fs.locate",
+    "file.inspect",
     "file.read",
     "content.analyze",
     "memory.infer",
@@ -122,6 +124,12 @@ READABLE_SUFFIXES: frozenset[str] = frozenset({
     ".org",
 })
 
+#: Formats `streamread` parses into whole records (vs. plain byte windows).
+_STREAMED_FORMATS: frozenset[str] = frozenset({
+    "json", "jsonl", "ndjson", "csv", "tsv", "html", "xml", "sqlite",
+    "docx", "xlsx", "pptx", "odt",
+})
+
 MAX_ZIP_MEMBERS = 128
 MAX_ZIP_COMPRESSION_RATIO = 100.0
 MAX_INFERRED_CONFIDENCE = 0.85
@@ -129,11 +137,15 @@ MAX_INFERRED_CONFIDENCE = 0.85
 # Purely grammatical stopwords for general query extraction (domain-agnostic).
 _QUERY_STOPWORDS: frozenset[str] = frozenset({
     "a", "about", "all", "an", "and", "any", "are", "as", "ask", "at", "be",
-    "by", "can", "check", "compare", "conflict", "conflicts", "disagreement",
-    "disagreements", "do", "does", "errand", "file", "files", "find", "folder",
+    "by", "can", "check", "compare", "conflict", "conflicts", "database",
+    "disagreement", "disagreements", "drive", "drives", "dump", "dumps", "export",
+    "exports", "everything", "index", "indexed", "known", "laptop", "located",
+    "locate", "machine", "matching", "named", "need", "only", "output", "please",
+    "records", "row", "rows", "see", "show", "stored", "summary", "table", "tables",
+    "do", "does", "errand", "file", "files", "find", "folder",
     "folders", "for", "from", "go", "have", "here", "i", "if", "in", "infer",
-    "inspect", "into", "is", "it", "laptop", "learn", "locate", "look", "me",
-    "my", "of", "on", "open", "or", "out", "over", "please", "read", "report",
+    "inspect", "into", "is", "it", "learn", "look", "me",
+    "my", "of", "on", "open", "or", "out", "over", "read", "report",
     "review", "scan", "search", "should", "summarize", "summarise", "that",
     "the", "their", "them", "there", "these", "this", "those", "through", "to",
     "up", "we", "what", "when", "where", "which", "whole", "will", "with",
@@ -292,6 +304,9 @@ class UntrustedObservation:
     record_format: str = "text"
     source: str = "local_file"
     trusted: bool = False
+    # GAP-3: opaque stream cursor (JSON) for resuming a structured read. It is
+    # a position, never content, so it costs nothing and stays IF-6 neutral.
+    next_cursor: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.trusted is not False:
@@ -554,6 +569,172 @@ def skill_fs_locate(
     }
 
 
+def skill_fs_discover(
+    *,
+    roots: list[str],
+    terms: list[str],
+    protected: list[str],
+    never_send_roots: list[str],
+    exts: list[str] | None = None,
+    name_glob: str | None = None,
+    limit: int = 32,
+    include_archives: bool = True,
+    max_entries: int = 50_000,
+    max_depth: int = 32,
+    match_terms: bool = False,
+) -> dict[str, Any]:
+    """GAP-2: metadata-first, read-only discovery (no content is read).
+
+    Backed by `assistant.discovery` so an errand, the daemon's `fs.locate` IPC
+    and `assist find` all obey the same protected rail, the same build/vendor
+    exclusions and the same archive-manifest caps — one policy, three callers.
+    """
+    from .discovery import Policy, locate
+
+    policy = Policy(
+        roots=tuple(str(expand(r)) for r in roots if str(r).strip()),
+        protected=tuple(protected),
+        never_send_roots=tuple(never_send_roots),
+        include_archives=bool(include_archives),
+        max_entries=max(1, int(max_entries)),
+        max_depth=max(1, int(max_depth)),
+    )
+    result = locate(
+        policy,
+        terms,
+        exts=exts,
+        name_glob=name_glob,
+        include_archive_members=bool(include_archives),
+        match_terms=bool(match_terms),
+        limit=max(1, int(limit)),
+    )
+    return {
+        "candidates": [entry.as_dict() for entry in result.matches
+                       if entry.ext not in (".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz")],
+        "total_discovered": result.total_matched,
+        "skipped": result.skipped,
+        "walk_errors": result.errors,
+        "scanned_files": result.scanned_files,
+    }
+
+
+def skill_file_inspect(
+    target: str,
+    *,
+    protected: list[str],
+    never_send_roots: list[str],
+    redact: bool = True,
+    skeleton_bytes: int = 4096,
+) -> dict[str, Any]:
+    """GAP-3: structural skeleton before a single record is streamed.
+
+    Never raises for an unreadable/corrupt target: the skeleton *is* the
+    honest answer (format, size, `parse_error`), so a planner can decide
+    whether to read, skip, or ask — instead of failing the whole errand.
+    """
+    from .streamread import StreamError, inspect
+
+    try:
+        return inspect(
+            target,
+            protected=protected,
+            never_send_roots=never_send_roots,
+            redact=redact,
+            skeleton_bytes=skeleton_bytes,
+        ).as_dict()
+    except StreamError as exc:
+        return {
+            "target": target,
+            "format": "unknown",
+            "size": 0,
+            "never_send": False,
+            "digest": "",
+            "digest_scope": "none",
+            "skeleton": {},
+            "parse_error": f"{exc.stage}: {exc.message}",
+            "notes": ["inspection failed; this target cannot be read"],
+            "trusted": False,
+        }
+
+
+def skill_file_window(
+    target: str,
+    *,
+    cursor: dict[str, Any] | None,
+    byte_budget: int,
+    record_limit: int,
+    protected: list[str],
+    never_send_roots: list[str],
+    redact: bool = True,
+    projection: list[str] | None = None,
+    safety_journal=None,
+    correlation_id: str | None = None,
+) -> UntrustedObservation:
+    """GAP-3: one bounded, record-aligned window of any readable target.
+
+    Replaces raw-byte reads for structured files: a 150 MB JSON export is read
+    as whole records, one bounded batch at a time, with an opaque cursor that
+    resumes exactly where the last batch stopped. The returned observation
+    keeps the errand's IF-6 envelope (`trusted=False`, `never_send` carried).
+    """
+    from .streamread import StreamError, read_window
+
+    try:
+        window = read_window(
+            target,
+            cursor,
+            byte_budget=byte_budget,
+            record_limit=record_limit,
+            projection=projection,
+            redact=redact,
+            protected=protected,
+            never_send_roots=never_send_roots,
+        )
+    except StreamError as exc:
+        raise ValueError(f"stream read failed: {exc}") from exc
+    obs = UntrustedObservation(
+        path=window.target,
+        sha256=window.digest,
+        byte_start=window.byte_start,
+        byte_end=window.byte_end,
+        total_size=window.total_size,
+        text=window.text,
+        eof=window.eof,
+        truncated=window.truncated,
+        never_send=window.never_send,
+        record_format=window.format,
+        source="archive_member" if window.target.startswith("zip://") else "local_file",
+        trusted=False,
+    )
+    if safety_journal is not None:
+        safety_journal.note_untrusted_input(
+            obs.path,
+            actor="errand",
+            correlation_id=correlation_id,
+            detail={
+                "sha256_prefix": obs.sha256[:12],
+                "byte_start": obs.byte_start,
+                "byte_end": obs.byte_end,
+                "bytes_read": obs.byte_end - obs.byte_start,
+                "records": window.records,
+                "total_size": obs.total_size,
+                "never_send": obs.never_send,
+                "format": window.format,
+                "cursor": window.next_cursor,
+                "trusted": False,
+            },
+        )
+    # The cursor rides on the observation so the runner resumes exactly where
+    # this batch stopped — a position, never content.
+    return UntrustedObservation(
+        path=obs.path, sha256=obs.sha256, byte_start=obs.byte_start,
+        byte_end=obs.byte_end, total_size=obs.total_size, text=obs.text,
+        eof=obs.eof, truncated=obs.truncated, never_send=obs.never_send,
+        record_format=obs.record_format, source=obs.source, trusted=False,
+        next_cursor=window.next_cursor,
+    )
+
+
 def skill_file_read(
     target: str,
     *,
@@ -564,6 +745,11 @@ def skill_file_read(
     cloud_bound: bool = False,
     safety_journal=None,
     correlation_id: str | None = None,
+    structured: bool = False,
+    cursor: dict[str, Any] | None = None,
+    record_limit: int = 200,
+    redact: bool = True,
+    projection: list[str] | None = None,
 ) -> UntrustedObservation:
     """GAP-3 minimum seam: bounded streaming reader wrapped in IF-6 envelope.
 
@@ -572,7 +758,27 @@ def skill_file_read(
     """
     if offset < 0:
         raise ValueError(f"offset must be >= 0, got {offset}")
+    if structured and offset:
+        raise ValueError(
+            "structured reads resume from `cursor`, not `offset`: pass the "
+            "previous batch's next_cursor (a byte offset would split a record)")
     max_bytes = _finite_positive_int("max_bytes", max_bytes, minimum=256)
+
+    # GAP-3: a structured file is streamed as whole records (bounded memory,
+    # resumable cursor, schema-aware) instead of as a raw byte window.
+    if structured:
+        return skill_file_window(
+            target,
+            cursor=cursor,
+            byte_budget=max_bytes,
+            record_limit=record_limit,
+            protected=protected,
+            never_send_roots=never_send_roots,
+            redact=redact,
+            projection=projection,
+            safety_journal=safety_journal,
+            correlation_id=correlation_id,
+        )
 
     zip_spec = _parse_zip_target(target)
     if zip_spec is not None:
@@ -725,6 +931,20 @@ def _extract_attributes_from_observation(
                 "quote_hash": hashlib.sha256(line.encode("utf-8")).hexdigest()[:12],
             })
 
+    # Record-rendered CSV windows carry explicit column names on each line.
+    if obs.record_format in ("csv", "tsv") and "=" in text.splitlines()[0]:
+        for line in text.splitlines():
+            fields = dict(part.partition("=")[::2] for part in line.split("; ") if "=" in part)
+            key_column = next((k for k in fields if k.lower() in
+                               ("key", "field", "setting", "attribute", "property", "name")), None)
+            val_column = next((k for k in fields if k.lower() in ("value", "val", "choice")), None)
+            if key_column and val_column:
+                _add(fields[key_column], fields[val_column], line)
+            else:
+                for key, value in fields.items():
+                    _add(key, value, line)
+        return records, injections
+
     if obs.record_format in ("csv", "tsv"):
         delimiter = "\t" if obs.record_format == "tsv" else ","
         lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -809,6 +1029,10 @@ def _deterministic_analyze(observations: list[UntrustedObservation]) -> dict[str
     all_injections: list[dict[str, Any]] = []
     for obs in observations:
         if obs.never_send:
+            continue
+        if obs.record_format in ("zip", "tar"):
+            # A container's byte window is not content: the members were
+            # discovered by manifest and read as their own targets.
             continue
         extracted, injections = _extract_attributes_from_observation(obs)
         all_injections.extend(injections)
@@ -1241,6 +1465,52 @@ class ErrandRunner:
         else:
             resolved = [r["path"] for r in self.config.discovery_roots()]
         return resolved
+
+    def _discovery_cfg(self) -> dict[str, Any]:
+        if self.config is None:
+            return {"include_archives": True, "max_entries": 50_000,
+                    "max_depth": 32}
+        getter = getattr(self.config, "discovery_policy_kwargs", None)
+        return getter() if callable(getter) else {
+            "include_archives": True, "max_entries": 50_000, "max_depth": 32}
+
+    def _stream_cfg(self) -> dict[str, Any]:
+        defaults = {
+            "byte_budget": 65_536,
+            "record_limit": 200,
+            "max_bytes_per_file": 8_388_608,
+            "redact_sensitive": True,
+        }
+        if self.config is None:
+            return defaults
+        getter = getattr(self.config, "stream_limits", None)
+        if not callable(getter):
+            return defaults
+        merged = dict(defaults)
+        merged.update(getter())
+        return merged
+
+    def _read_step_for(self, candidate: dict[str, Any],
+                       budget: ErrandBudget) -> PlannedStep:
+        """Plan the step that opens one discovered candidate.
+
+        Structured formats (JSON/JSONL/CSV/SQLite/OOXML and archive members)
+        get a structural skeleton first, then record streaming; plain prose
+        keeps the byte-window reader. The choice is made from the *file*, never
+        from the instruction, so a new domain needs no new code.
+        """
+        target = str(candidate["target"])
+        if candidate.get("structured") or candidate.get("kind") == "archive_member":
+            return PlannedStep(
+                "file.inspect",
+                {"target": target, "queue_read": True},
+            )
+        return PlannedStep("file.read", {
+            "target": target,
+            "offset": 0,
+            "max_bytes": budget.max_read_bytes,
+            "never_send": candidate.get("never_send", False),
+        })
 
     async def _emit(self, payload: dict[str, Any]) -> None:
         if self._broadcast is not None:
@@ -1683,6 +1953,8 @@ class ErrandRunner:
         confirmed_records: list[dict[str, Any]] = []
         unanswered_notes: list[dict[str, Any]] = []
         point_outcomes: list[dict[str, Any]] = []
+        inspections: dict[str, dict[str, Any]] = {}
+        streamed_bytes: dict[str, int] = {}
         analysis_result: dict[str, Any] = {}
         locate_result: dict[str, Any] = {}
         terms = extract_query_terms(instruction)
@@ -1772,18 +2044,27 @@ class ErrandRunner:
 
                 try:
                     if step.skill == "fs.locate":
+                        discovery_cfg = self._discovery_cfg()
                         locate_result = await asyncio.to_thread(
-                            skill_fs_locate,
-                            step.args.get("roots", roots),
+                            skill_fs_discover,
+                            roots=step.args.get("roots", roots),
                             terms=step.args.get("terms", terms),
                             protected=protected,
                             never_send_roots=never_send_roots,
-                            store=self.store,
+                            exts=step.args.get("exts"),
+                            name_glob=step.args.get("name_glob"),
+                            limit=int(step.args.get("limit", 32)),
+                            include_archives=bool(
+                                step.args.get("include_archives",
+                                              discovery_cfg["include_archives"])),
+                            max_entries=discovery_cfg["max_entries"],
+                            max_depth=discovery_cfg["max_depth"],
                         )
                         candidates = locate_result["candidates"]
                         step_summary = {
                             "discovered": locate_result["total_discovered"],
                             "selected": len(candidates),
+                            "scanned_files": locate_result["scanned_files"],
                             "skipped": locate_result["skipped"],
                             "walk_errors": locate_result["walk_errors"],
                         }
@@ -1801,22 +2082,32 @@ class ErrandRunner:
                                 reserve = 4
                                 read_slots = max(1, budget.max_steps - step_no - reserve)
                                 for cand in candidates[:min(len(candidates), read_slots)]:
-                                    queue.append(PlannedStep("file.read", {
-                                        "target": cand["target"],
-                                        "offset": 0,
-                                        "max_bytes": budget.max_read_bytes,
-                                        "never_send": cand.get("never_send", False),
-                                    }))
+                                    queue.append(self._read_step_for(cand, budget))
                                 queue.append(PlannedStep("content.analyze"))
 
-                    elif step.skill == "file.read":
+                    elif step.skill in ("file.read", "file.stream"):
                         target = str(step.args["target"])
-                        offset = int(step.args.get("offset", 0))
-                        max_b = min(
-                            int(step.args.get("max_bytes", budget.max_read_bytes)),
-                            budget.max_read_bytes,
-                        )
+                        structured = bool(step.args.get("structured", False))
+                        limits = self._stream_cfg()
                         cloud_bound = bool(step.args.get("cloud_bound", False))
+                        if structured:
+                            cursor = step.args.get("cursor")
+                            max_b = min(
+                                int(step.args.get("max_bytes", limits["byte_budget"])),
+                                limits["byte_budget"],
+                            )
+                            record_limit = int(step.args.get("record_limit",
+                                                             limits["record_limit"]))
+                            offset = 0
+                        else:
+                            cursor = None
+                            offset = int(step.args.get("offset", 0))
+                            max_b = min(
+                                int(step.args.get("max_bytes",
+                                                  budget.max_read_bytes)),
+                                budget.max_read_bytes,
+                            )
+                            record_limit = limits["record_limit"]
                         obs = await asyncio.to_thread(
                             skill_file_read,
                             target,
@@ -1827,28 +2118,39 @@ class ErrandRunner:
                             cloud_bound=cloud_bound,
                             safety_journal=self.safety_journal,
                             correlation_id=f"errand:{errand_id}:step:{step_no}",
+                            structured=structured,
+                            cursor=cursor,
+                            record_limit=record_limit,
+                            redact=limits["redact_sensitive"],
+                            projection=step.args.get("projection"),
                         )
                         observations.append(obs)
                         bytes_here = obs.byte_end - obs.byte_start
                         step_untrusted_bytes = bytes_here
-                        prev = files_inspected.get(obs.path)
+                        streamed_bytes[obs.path] = streamed_bytes.get(obs.path, 0) + bytes_here
+                        prev = files_inspected.get(obs.path) or {}
                         files_inspected[obs.path] = {
                             "path": obs.path,
                             "sha256": obs.sha256,
-                            "bytes_read": (prev["bytes_read"] if prev else 0) + bytes_here,
+                            "bytes_read": prev.get("bytes_read", 0) + bytes_here,
                             "total_size": obs.total_size,
                             "truncated": obs.truncated,
                             "eof": obs.eof,
                             "never_send": obs.never_send,
                             "format": obs.record_format,
+                            "structured": structured,
+                            "chunks": int(prev.get("chunks", 0)) + 1,
                         }
                         if obs.never_send:
                             unanswered_notes.append({
                                 "path": obs.path,
-                                "reason": "never_send_to_cloud (§10.7): withheld from cloud analysis",
+                                "reason": "never_send_to_cloud (§10.7): read locally, "
+                                          "withheld from cloud analysis",
                             })
                         step_summary = {
                             "path": obs.path,
+                            "format": obs.record_format,
+                            "structured": structured,
                             "sha256_prefix": obs.sha256[:12],
                             "byte_start": obs.byte_start,
                             "byte_end": obs.byte_end,
@@ -1856,34 +2158,94 @@ class ErrandRunner:
                             "eof": obs.eof,
                             "truncated": obs.truncated,
                             "never_send": obs.never_send,
+                            "cursor": obs.next_cursor,
                             "trusted": obs.trusted,
                         }
-                        # Bounded >200KB streaming continuation: if more bytes
-                        # remain and step budget has room (preserving space for
-                        # queued steps + infer/ask/report), queue the next chunk
-                        # right before content.analyze.
-                        if adaptive and not obs.eof and not obs.never_send:
+                        # Bounded continuation while bytes remain AND both the
+                        # step budget and the [stream] per-file cap allow it.
+                        per_file_cap = limits["max_bytes_per_file"]
+                        if (adaptive and not obs.eof and not obs.never_send
+                                and streamed_bytes.get(obs.path, 0) < per_file_cap):
                             if step_no + len(queue) + 4 <= budget.max_steps:
-                                next_step = PlannedStep("file.read", {
-                                    "target": target,
-                                    "offset": obs.byte_end,
-                                    "max_bytes": max_b,
-                                    "cloud_bound": cloud_bound,
-                                })
-                                # Insert before content.analyze so all chunks are read first.
+                                if structured:
+                                    next_step = PlannedStep("file.read", {
+                                        "target": target,
+                                        "structured": True,
+                                        "cursor": obs.next_cursor,
+                                        "max_bytes": max_b,
+                                        "record_limit": record_limit,
+                                    })
+                                else:
+                                    next_step = PlannedStep("file.read", {
+                                        "target": target,
+                                        "offset": obs.byte_end,
+                                        "max_bytes": max_b,
+                                        "cloud_bound": cloud_bound,
+                                    })
+                                # Read every chunk before analyse.
                                 insert_at = next(
-                                    (i for i, s in enumerate(queue) if s.skill != "file.read"),
-                                    len(queue),
-                                )
+                                    (i for i, q in enumerate(queue)
+                                     if q.skill != "file.read"), len(queue))
                                 queue.insert(insert_at, next_step)
                             else:
                                 unanswered_notes.append({
                                     "path": obs.path,
                                     "reason": (
-                                        f"stream paused at byte {obs.byte_end}/{obs.total_size} "
-                                        f"to stay within max_steps={budget.max_steps}"
-                                    ),
+                                        f"stream paused at byte {obs.byte_end}/"
+                                        f"{obs.total_size} to stay within "
+                                        f"max_steps={budget.max_steps}"),
                                 })
+                        elif adaptive and not obs.eof:
+                            unanswered_notes.append({
+                                "path": obs.path,
+                                "reason": (
+                                    f"stream stopped at the [stream] "
+                                    f"max_bytes_per_file cap ({per_file_cap}B) — "
+                                    f"{obs.byte_end}/{obs.total_size} bytes read"),
+                            })
+
+                    elif step.skill == "file.inspect":
+                        target = str(step.args["target"])
+                        limits = self._stream_cfg()
+                        skeleton = await asyncio.to_thread(
+                            skill_file_inspect,
+                            target,
+                            protected=protected,
+                            never_send_roots=never_send_roots,
+                            redact=limits["redact_sensitive"],
+                        )
+                        inspections[target] = skeleton
+                        step_summary = {
+                            "target": target,
+                            "format": skeleton.get("format"),
+                            "size": skeleton.get("size"),
+                            "never_send": skeleton.get("never_send"),
+                            "parse_error": skeleton.get("parse_error"),
+                            "container": (skeleton.get("skeleton") or {}).get("container"),
+                        }
+                        if skeleton.get("parse_error"):
+                            # Loud, named, counted — never a silent "no text".
+                            step_status = "refused"
+                            unanswered_notes.append({
+                                "path": target,
+                                "reason": f"inspection failed: {skeleton['parse_error']}",
+                            })
+                        queued = step.args.get("queue_read")
+                        if (adaptive and queued and not skeleton.get("parse_error")
+                                and skeleton.get("format") not in ("zip", "tar")):
+                            if skeleton.get("format") in _STREAMED_FORMATS:
+                                queue.insert(0, PlannedStep("file.read", {
+                                    "target": target,
+                                    "structured": True,
+                                    "cursor": None,
+                                }))
+                            else:
+                                queue.insert(0, PlannedStep("file.read", {
+                                    "target": target,
+                                    "offset": 0,
+                                    "max_bytes": budget.max_read_bytes,
+                                    "never_send": bool(skeleton.get("never_send")),
+                                }))
 
                     elif step.skill == "content.analyze":
                         cloud_safe_obs = [o for o in observations if not o.never_send]
@@ -2159,6 +2521,8 @@ class ErrandRunner:
 
                 except asyncio.CancelledError:
                     duration_ms = round((time.monotonic() - step_t0) * 1000.0, 2)
+                    active_elapsed_s = _active_now()
+                    active_segment_start = time.monotonic()
                     self.store.finish_errand_step(
                         step_id,
                         finished_ts=iso_now(),
@@ -2177,6 +2541,12 @@ class ErrandRunner:
                 except Exception as exc:
                     step_status = "refused" if isinstance(exc, PermissionError) else "failed"
                     duration_ms = round((time.monotonic() - step_t0) * 1000.0, 2)
+                    # A stream/inspect/text read step spends real active time
+                    # too (metadata-only discovery is cheap, reading is not).
+                    if step.skill in ("file.read", "file.stream", "file.inspect",
+                                      "content.analyze", "owner.ask"):
+                        active_elapsed_s = _active_now()
+                        active_segment_start = time.monotonic()
                     self.store.finish_errand_step(
                         step_id,
                         finished_ts=iso_now(),
@@ -2215,6 +2585,13 @@ class ErrandRunner:
                 total_tokens_in += step_tokens_in
                 total_tokens_out += step_tokens_out
                 total_shadow_cost += step_shadow_cost
+                # Charge active time for steps that touch the disk or a model;
+                # metadata-only discovery is cheap and must never starve a step
+                # budget (I3: the deadline is total, not per-step).
+                if step.skill in ("file.read", "file.stream", "file.inspect",
+                                  "content.analyze", "owner.ask"):
+                    active_elapsed_s = _active_now()
+                    active_segment_start = time.monotonic()
 
                 self.store.finish_errand_step(
                     step_id,
@@ -2271,6 +2648,7 @@ class ErrandRunner:
             unanswered_notes=unanswered_notes,
             injection_signals=analysis_result.get("injection_signals", []),
             point_outcomes=point_outcomes,
+            inspections=list(inspections.values()),
         )
         self.store.update_errand(
             errand_id,
@@ -2308,6 +2686,7 @@ class ErrandRunner:
         unanswered_notes: list[dict[str, Any]],
         injection_signals: list[dict[str, Any]] | None = None,
         point_outcomes: list[dict[str, Any]] | None = None,
+        inspections: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         steps = self.store.list_errand_steps(errand_id)
         questions = self.store.list_pending_questions(errand_id=errand_id)
@@ -2376,6 +2755,15 @@ class ErrandRunner:
             ],
         }
         point_list = list(point_outcomes or [])
+        inspected_list = list(inspections or [])
+        truncated_files = [
+            f["path"] for f in files_inspected
+            if isinstance(f, dict) and f.get("truncated")
+        ]
+        failed_inspections = [
+            {"path": i.get("target"), "parse_error": i.get("parse_error")}
+            for i in inspected_list if i.get("parse_error")
+        ]
         if point_list and not files_inspected:
             last_reply = str(point_list[-1].get("reply") or "").strip()
             summary = (
@@ -2389,12 +2777,21 @@ class ErrandRunner:
                 f"{len(confirmed)} confirmed, {len(answered_qs)} question(s) answered, "
                 f"{len(unanswered)} unanswered/remaining."
             )
+            if truncated_files:
+                summary += f" {len(truncated_files)} file(s) only partially read."
+            if failed_inspections:
+                summary += f" {len(failed_inspections)} file(s) could not be parsed."
         return {
             "errand_id": errand_id,
             "instruction": instruction,
             "status": status,
             "done": done_steps,
             "files_inspected": files_inspected,
+            # GAP-3 honesty: what was structurally inspected, which files were
+            # only PARTIALLY read, and which could not be parsed at all.
+            "inspections": inspected_list,
+            "partially_read": truncated_files,
+            "parse_failures": failed_inspections,
             "inferred": inferred,
             "confirmed": confirmed,
             "point_outcomes": point_list,

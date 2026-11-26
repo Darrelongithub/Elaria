@@ -137,6 +137,9 @@ def test_eye_check_domain1_composition_streaming_cost_and_resume(
     files = _build_domain1_greenhouse(workspace)
     config.raw["discovery"]["roots"] = [str(workspace)]
 
+    # Whole-record streaming needs nine record windows plus inspection steps.
+    config.raw["errand"]["max_steps"] = 32
+
     # One typed owner instruction via the normal `ask` turn surface.
     turn = call(
         config.socket_path,

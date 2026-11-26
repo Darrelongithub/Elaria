@@ -155,7 +155,14 @@ CREATE TABLE IF NOT EXISTS documents (
   ext TEXT,
   indexed_ts TEXT NOT NULL,
   never_send INTEGER NOT NULL DEFAULT 0,  -- §10.7: content stays off the cloud
-  status TEXT NOT NULL DEFAULT 'indexed'  -- indexed | changed | missing
+  status TEXT NOT NULL DEFAULT 'indexed', -- indexed | changed | missing | error
+  -- GAP-3 (I1/I9): what the extractor really produced, and whether the
+  -- stored text is the WHOLE file. Before these columns a >200 KB file was
+  -- silently cut and still recorded as `indexed`.
+  extractor TEXT,
+  extracted_chars INTEGER NOT NULL DEFAULT 0,
+  truncated INTEGER NOT NULL DEFAULT 0,
+  parse_error TEXT
 );
 
 CREATE TABLE IF NOT EXISTS doc_chunks (
@@ -366,6 +373,19 @@ class Store:
             columns = {r[1] for r in self._conn.execute("PRAGMA table_info(doc_chunks)")}
             if "embedding" not in columns:
                 self._conn.execute("ALTER TABLE doc_chunks ADD COLUMN embedding BLOB")
+            # GAP-3 migration: extraction provenance so truncation and parse
+            # failures are recorded facts instead of silent losses (I1/I9).
+            doc_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(documents)")}
+            for column, ddl in (
+                ("extractor", "ALTER TABLE documents ADD COLUMN extractor TEXT"),
+                ("extracted_chars",
+                 "ALTER TABLE documents ADD COLUMN extracted_chars INTEGER NOT NULL DEFAULT 0"),
+                ("truncated",
+                 "ALTER TABLE documents ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0"),
+                ("parse_error", "ALTER TABLE documents ADD COLUMN parse_error TEXT"),
+            ):
+                if column not in doc_cols:
+                    self._conn.execute(ddl)
             # BUG3 migration: purpose attribution for every live call
             llm_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(llm_calls)")}
             if "purpose" not in llm_cols:
@@ -704,18 +724,42 @@ class Store:
 
     # -- documents / chunks (indexer, §3.7-3.8) -------------------------------
     def upsert_document(self, *, path, root, sha256, size, mtime, mime, ext,
-                        indexed_ts, never_send, text_chunks: list[str]) -> int:
+                        indexed_ts, never_send, text_chunks: list[str],
+                        extractor: str | None = None,
+                        extracted_chars: int | None = None,
+                        truncated: bool = False,
+                        parse_error: str | None = None,
+                        status: str | None = None) -> int:
+        """Record one indexed document and its extraction provenance (GAP-3).
+
+        `truncated`/`parse_error` are stored, never inferred away: a reader can
+        always ask "is this the whole file?" and get an honest answer (I1).
+        `status` defaults to `indexed`, or `error` when a parse error is given.
+        """
+        resolved_chars = (
+            int(extracted_chars)
+            if extracted_chars is not None
+            else sum(len(chunk) for chunk in text_chunks)
+        )
+        resolved_status = status or ("error" if parse_error else "indexed")
         with self._lock:
             cur = self._conn.execute(
                 """INSERT INTO documents (path, root, sha256, size, mtime, mime, ext,
-                                          indexed_ts, never_send, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'indexed')
+                                          indexed_ts, never_send, status, extractor,
+                                          extracted_chars, truncated, parse_error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(path) DO UPDATE SET root=excluded.root,
                      sha256=excluded.sha256, size=excluded.size, mtime=excluded.mtime,
                      mime=excluded.mime, ext=excluded.ext, indexed_ts=excluded.indexed_ts,
-                     never_send=excluded.never_send, status='indexed'
+                     never_send=excluded.never_send, status=excluded.status,
+                     extractor=excluded.extractor,
+                     extracted_chars=excluded.extracted_chars,
+                     truncated=excluded.truncated,
+                     parse_error=excluded.parse_error
                    RETURNING id""",
-                (path, root, sha256, size, mtime, mime, ext, indexed_ts, never_send),
+                (path, root, sha256, size, mtime, mime, ext, indexed_ts, never_send,
+                 resolved_status, extractor, resolved_chars,
+                 1 if truncated else 0, parse_error),
             )
             doc_id = int(cur.fetchone()[0])
             self._conn.execute("DELETE FROM doc_chunks WHERE doc_id = ?", (doc_id,))
@@ -728,6 +772,135 @@ class Store:
                     "INSERT INTO doc_chunks_fts (doc_chunks_fts) VALUES ('rebuild')")
             self._conn.commit()
             return doc_id
+
+    def document_chunks(self, doc_id: int, *, offset: int = 0,
+                        limit: int = 20) -> list[dict]:
+        """Ordered chunk page for one document (GAP-3 pagination seam).
+
+        The reader used to expose only the first 600 chars of chunk 0
+        (`document_preview`), so prose longer than a preview could not be read
+        at all. This is the cursor the readers page.
+        """
+        offset = max(0, int(offset))
+        limit = max(1, int(limit))
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT chunk_no, text FROM doc_chunks WHERE doc_id = ?
+                   ORDER BY chunk_no LIMIT ? OFFSET ?""",
+                (int(doc_id), limit, offset)).fetchall()
+        return [dict(r) for r in rows]
+
+    def document_chunk_count(self, doc_id: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM doc_chunks WHERE doc_id = ?",
+                (int(doc_id),)).fetchone()
+        return int(row["n"]) if row else 0
+
+    def search_document_metadata(
+        self,
+        *,
+        terms: Iterable[str] | None = None,
+        exts: Iterable[str] | None = None,
+        min_size: int | None = None,
+        max_size: int | None = None,
+        modified_after: float | None = None,
+        modified_before: float | None = None,
+        structured_only: bool = False,
+        truncated_only: bool = False,
+        error_only: bool = False,
+        cloud_bound: bool = False,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Path/filename/extension/size/mtime search over `documents` (GAP-2).
+
+        `Store._search` only ever joined `doc_chunks`, so a file whose text was
+        never extracted (a `.zip`, a `.sqlite`, a binary) was invisible even
+        when its *filename* matched the owner's words. This query never looks
+        at chunk text at all, which is what makes it fast and total.
+
+        `cloud_bound=True` excludes `never_send=1` rows in SQL (§10.7), so a
+        cloud caller cannot receive a privacy-fenced path by forgetting a
+        filter.
+        """
+        where = ["status != 'missing'"]
+        if cloud_bound:
+            where.append("never_send = 0")
+        params: list = []
+        cleaned = _search_terms(" ".join(terms or []))
+        if cleaned:
+            patterns = _like_patterns(cleaned)
+            where.append(
+                "(" + " OR ".join(
+                    ["LOWER(path) LIKE ? ESCAPE '\\'"] * len(patterns)) + ")"
+            )
+            params.extend(patterns)
+        ext_list = [
+            (e if str(e).startswith(".") else f".{e}").lower()
+            for e in (exts or []) if str(e).strip()
+        ]
+        if ext_list:
+            where.append("LOWER(ext) IN (" + ", ".join("?" * len(ext_list)) + ")")
+            params.extend(ext_list)
+        if min_size is not None:
+            where.append("size >= ?")
+            params.append(int(min_size))
+        if max_size is not None:
+            where.append("size <= ?")
+            params.append(int(max_size))
+        if modified_after is not None:
+            where.append("mtime >= ?")
+            params.append(float(modified_after))
+        if modified_before is not None:
+            where.append("mtime <= ?")
+            params.append(float(modified_before))
+        if structured_only:
+            structured = (".json", ".jsonl", ".ndjson", ".csv", ".tsv", ".xml",
+                          ".sqlite", ".sqlite3", ".db", ".zip", ".tar",
+                          ".docx", ".xlsx", ".pptx", ".odt")
+            where.append("LOWER(ext) IN (" + ", ".join("?" * len(structured)) + ")")
+            params.extend(structured)
+        if truncated_only:
+            where.append("truncated = 1")
+        if error_only:
+            where.append("status = 'error'")
+        params.append(max(1, int(limit)))
+        sql = (
+            "SELECT id, path, root, sha256, size, mtime, mime, ext, never_send, "
+            "status, extractor, extracted_chars, truncated, parse_error "
+            f"FROM documents WHERE {' AND '.join(where)} "
+            "ORDER BY mtime DESC, path LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def extraction_report(self) -> dict:
+        """What the index knows, honestly: truncations and parse errors named.
+
+        The GAP-3 defect was not only lost bytes; it was lost *evidence* of the
+        loss. This is the surface a `doctor`/`assist` caller prints so a cut
+        file can never masquerade as a complete one (I1/I9).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT COALESCE(extractor, 'unknown') AS extractor,
+                          COUNT(*) AS docs,
+                          SUM(CASE WHEN truncated = 1 THEN 1 ELSE 0 END) AS truncated,
+                          SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors
+                   FROM documents WHERE status != 'missing'
+                   GROUP BY COALESCE(extractor, 'unknown')
+                   ORDER BY docs DESC""").fetchall()
+            totals = self._conn.execute(
+                """SELECT COUNT(*) AS docs,
+                          SUM(CASE WHEN truncated = 1 THEN 1 ELSE 0 END) AS truncated,
+                          SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
+                          SUM(extracted_chars) AS chars
+                   FROM documents WHERE status != 'missing'""").fetchone()
+        return {
+            "by_extractor": [dict(r) for r in rows],
+            "totals": dict(totals) if totals else {},
+        }
 
     def document_by_path(self, path: str) -> dict | None:
         with self._lock:

@@ -1212,6 +1212,9 @@ class Daemon:
             "errand.list": self._errand_list,
             "errand.cancel": self._errand_cancel,
             "errand.answer": self._errand_answer,
+            "fs.locate": self._fs_locate,
+            "file.inspect": self._file_inspect,
+            "file.read": self._file_read,
             "ask": self._ask,
             "nus.point": self._nus_point,
         }
@@ -4891,6 +4894,160 @@ class Daemon:
             answer_text=answer_text,
             owner_uid=principal.uid,
         )
+
+    # -- read-only discovery & bounded streaming (GAP-2 / GAP-3) -------------
+    def _discovery_policy(self):
+        from .discovery import Policy
+
+        kwargs = (
+            self.config.discovery_policy_kwargs()
+            if hasattr(self.config, "discovery_policy_kwargs") else {}
+        )
+        return Policy.from_config(
+            self.config,
+            include_archives=bool(kwargs.get("include_archives", True)),
+            max_entries=int(kwargs.get("max_entries", 50_000)),
+            max_depth=int(kwargs.get("max_depth", 32)),
+        )
+
+    def _stream_limits(self) -> dict:
+        return (
+            self.config.stream_limits()
+            if hasattr(self.config, "stream_limits") else {}
+        )
+
+    async def _fs_locate(self, params: dict) -> dict:
+        """Metadata-first read-only discovery (GAP-2). Reads zero file content."""
+        from .discovery import locate
+
+        terms = params.get("terms")
+        if isinstance(terms, str):
+            terms = [t for t in terms.replace(",", " ").split() if t]
+        if terms is not None and not isinstance(terms, list):
+            raise ValueError("fs.locate params.terms must be a string or list")
+        roots = params.get("roots")
+        if roots is not None and not isinstance(roots, list):
+            raise ValueError("fs.locate params.roots must be a list of paths")
+        policy = self._discovery_policy()
+        if roots:
+            from dataclasses import replace
+
+            policy = replace(policy, roots=tuple(str(r) for r in roots if str(r).strip()))
+        exts = params.get("exts")
+        if exts is not None and not isinstance(exts, list):
+            raise ValueError("fs.locate params.exts must be a list")
+        limit = params.get("limit", 50)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("fs.locate params.limit must be a positive integer")
+
+        def _optional_number(name: str):
+            value = params.get(name)
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"fs.locate params.{name} must be a number")
+            return value
+
+        result = await asyncio.to_thread(
+            locate, policy, terms or [],
+            exts=exts,
+            name_glob=params.get("name_glob"),
+            min_size=_optional_number("min_size"),
+            max_size=_optional_number("max_size"),
+            modified_after=_optional_number("modified_after"),
+            modified_before=_optional_number("modified_before"),
+            include_archive_members=params.get("include_archive_members", True) is not False,
+            limit=limit,
+        )
+        payload = result.as_dict()
+        payload["roots"] = list(policy.roots)
+        payload["note"] = (
+            "read-only discovery: no file content was read, nothing was "
+            "written, moved or extracted; protected paths were pruned")
+        return payload
+
+    async def _file_inspect(self, params: dict) -> dict:
+        """Structural skeleton of a file or archive member (GAP-3). Zero tokens."""
+        from .streamread import StreamError, inspect
+
+        target = params.get("target") or params.get("path")
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("file.inspect needs params.target")
+        limits = self._stream_limits()
+        try:
+            result = await asyncio.to_thread(
+                inspect,
+                target,
+                protected=list(self.config.section("policy").get("protected") or []),
+                never_send_roots=[
+                    str(Path(p).expanduser())
+                    for p in (self.config.section("privacy").get("never_send_to_cloud") or [])
+                ],
+                redact=bool(limits.get("redact_sensitive", True)),
+            )
+        except StreamError as exc:
+            raise ValueError(str(exc)) from exc
+        return result.as_dict()
+
+    async def _file_read(self, params: dict) -> dict:
+        """One bounded, record-aligned window of a file or archive member."""
+        from .streamread import StreamError, read_window
+
+        target = params.get("target") or params.get("path")
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("file.read needs params.target")
+        cursor = params.get("cursor")
+        if cursor is not None and not isinstance(cursor, dict):
+            raise ValueError("file.read params.cursor must be the previous next_cursor")
+        byte_budget = params.get("byte_budget")
+        if byte_budget is not None and (
+            isinstance(byte_budget, bool) or not isinstance(byte_budget, int)
+            or byte_budget < 256
+        ):
+            raise ValueError("file.read params.byte_budget must be an integer >= 256")
+        limits = self._stream_limits()
+        budget = min(
+            int(byte_budget or limits.get("byte_budget", 65_536)),
+            max(65_536, int(limits.get("max_bytes_per_file", 8_388_608))),
+        )
+        try:
+            window = await asyncio.to_thread(
+                read_window,
+                target,
+                cursor,
+                byte_budget=budget,
+                record_limit=int(limits.get("record_limit", 200)),
+                projection=params.get("projection"),
+                redact=(
+                    bool(limits.get("redact_sensitive", True))
+                    if params.get("redact") is None else bool(params.get("redact"))
+                ),
+                protected=list(self.config.section("policy").get("protected") or []),
+                never_send_roots=[
+                    str(Path(p).expanduser())
+                    for p in (self.config.section("privacy").get("never_send_to_cloud") or [])
+                ],
+            )
+        except StreamError as exc:
+            raise ValueError(str(exc)) from exc
+        # IF-6: journal that untrusted bytes were seen — provenance and length
+        # only, never the bytes themselves.
+        journal = getattr(self, "safety_journal", None)
+        if journal is not None:
+            journal.note_untrusted_input(
+                window.target,
+                actor="discovery",
+                correlation_id=f"file.read:{window.byte_start}",
+                detail={
+                    "digest_prefix": window.digest[:12],
+                    "byte_start": window.byte_start,
+                    "byte_end": window.byte_end,
+                    "records": window.records,
+                    "never_send": window.never_send,
+                    "trusted": False,
+                },
+            )
+        return window.as_dict()
 
     async def _run_intent(self, intent) -> tuple[str | None, str, dict | None]:
         """Execute a local intent.
