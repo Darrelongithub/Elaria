@@ -12,7 +12,8 @@ Module map:
 * ``envelope``    — signed immutable envelopes (the wire format, both sides)
 * ``config``      — single-recipient, egress allowlist, caps; refuses bad config
 * ``store``       — SQLite state (dedup, write-ahead fired, counters, mutes)
-* ``transport``   — the only HTTP in the package; S-0 sends; fake for tests
+* ``templates``   — S-0 utility template pack (meeting, deadline, commitment-due, already-sent knock)
+* ``transport``   — real WhatsApp Cloud API adapter + 24h-window gate + ``FakeTransport``
 * ``concierge``   — S-0 deterministic stranger responder (no LLM)
 * ``mirror``      — verified reader for the laptop's commitment mirror
 * ``reminders``   — write-ahead, capped reminder firing

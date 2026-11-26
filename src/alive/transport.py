@@ -1,51 +1,90 @@
-"""Messaging transports for the alive host.
+"""Messaging transports for the alive host — real WhatsApp Cloud API adapter + test double.
 
 This is the ONLY module in the package permitted to open an HTTP connection,
 and it may only ever open one to a host on ``EGRESS_ALLOWLIST`` — anything
-else raises before a packet leaves. The two sends that exist:
+else (including HTTP redirects) raises before a packet leaves.
 
-* ``send_service_reply`` — a free-form reply inside the 24 h window the
-  user's own message opened (stranger concierge replies, owner acks). The
-  only caller is the webhook handler, in the same request cycle as the
-  inbound message. Never used to initiate.
-* ``send_utility_template`` — a business-initiated approved utility
-  template (``reminder_v1``). The ONLY business-initiated send in the
-  system, and it is capped per day in code at the call site
-  (``max_templates_per_day``) and again here as a belt-and-braces check.
+The two outbound operations (and NO others exist):
 
-Meta policy posture: no LLM, no general-purpose assistant, S-0 templates
-only for business-initiated sends. A ``PLATFORM_BLOCKED``-class error is
+* ``send_service_reply`` — a free-form session reply INSIDE the 24-hour
+  customer service window that the user's own inbound message opened.
+  **Hard rule enforced here in the transport:** a free-form cold send is
+  IMPOSSIBLE. Before any HTTP call is constructed, ``send_service_reply``
+  verifies an open ``[0, 86400s)`` window — either via an explicit ``inbound_at``
+  proof within 24h of ``now`` OR via ``store.in_service_window(sender_hash, now=now)``.
+  With neither, or with an expired (>=24h) window, ``OutsideServiceWindow``
+  (subclass of ``EgressRefused``) is raised and ZERO HTTP packets leave.
+* ``send_utility_template`` — a business-initiated (or outside-24h) approved
+  S-0 utility template from ``alive.templates.S0_TEMPLATE_PACK``.
+  **Hard rules enforced here in the transport:**
+  1. ONLY the single configured ``owner_e164`` is addressable;
+  2. ONLY templates registered in ``S0_TEMPLATE_PACK`` (plus documented aliases)
+     are accepted — arbitrary template names or parameter shapes raise
+     ``TemplateSpecError`` (also a subclass of ``EgressRefused``);
+  3. the per-day paid-template cap (``config.max_templates_per_day``) is
+     reserved atomically in SQLite (``store.reserve_template``) BEFORE HTTP,
+     so concurrent/ambiguous failures still consume budget cleanly, and EVERY
+     attempt + outcome is journaled with KES-cents and USD cost estimates.
+
+Meta policy posture: no LLM, no general-purpose assistant, S-1 chatty mode OFF,
+S-0 templates only for business-initiated sends. Error ``#131047`` from Meta
+(re-engagement / 24h window closed) maps to ``OutsideServiceWindow`` (never
+``PlatformBlocked`` — it is not an account ban, and it is never retried as
+free-form text). Account-level restrictions (``401``, ``403``, ``#10``,
+``#190``, ``#368``, ``#130497``, ``#131031``) raise ``PlatformBlocked`` —
 TERMINAL: the layer stops sending, journals it, and waits for the owner.
-There is no retry through another number, no proxy, no evasion — ever.
-
-Tests use ``FakeTransport`` only. ``WhatsAppCloudTransport`` is exercised
-in the sandbox with an injected ``http_client`` double, never a network.
 """
 
 from __future__ import annotations
 
-from urllib.parse import urlparse
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 
+from . import envelope as envelope_mod
+from .config import (
+    EGRESS_ALLOWLIST,
+    EST_TEMPLATE_COST_KES_CENTS,
+    EST_TEMPLATE_COST_USD,
+    GRAPH_API_VERSION,
+    SERVICE_WINDOW_SECONDS,
+    AliveConfig,
+    AliveConfigError,
+    normalise_e164,
+)
 from .journal import log_event
-from .envelope import from_hash
 from .store import AliveStore
-from .templates import TEMPLATES
-
-from .config import EGRESS_ALLOWLIST, GRAPH_API_VERSION, AliveConfig
+from .templates import TemplateSpecError as _BaseTemplateSpecError
+from .templates import resolve_template
 
 
 class TransportError(RuntimeError):
-    pass
-
-
-class TemplateCapReached(TransportError):
-    pass
+    """Non-terminal WhatsApp Cloud API or transport error."""
 
 
 class EgressRefused(TransportError):
-    """A non-allowlisted host was named. This is a bug or an attack; no
-    packet leaves."""
+    """A non-allowlisted host, forbidden recipient, cold free-form send, or
+    unregistered template was attempted. No packet leaves."""
+
+
+class OutsideServiceWindow(EgressRefused):
+    """Attempted a free-form session message outside the 24-hour customer service window.
+
+    Outside the 24h window: template or nothing. Free-form cold sends are
+    impossible in code, and Meta's #131047 error also maps here if clock skew
+    ever caused the edge of a window to close on Meta's side first.
+    """
+
+
+class TemplateSpecError(EgressRefused, _BaseTemplateSpecError):
+    """Attempted to send an unregistered template or malformed parameters."""
+
+
+class TemplateCapReached(TransportError):
+    """Per-day paid utility-template cap reached; send refused before HTTP."""
+
+
+# Alias so both spellings work seamlessly across callers and tests
+TemplateCapExceeded = TemplateCapReached
 
 
 class PlatformBlocked(TransportError):
@@ -56,12 +95,60 @@ class PlatformBlocked(TransportError):
     """
 
 
+#: Meta Graph API error codes indicating account/token/policy restriction (terminal).
+PLATFORM_BLOCKED_CODES = frozenset({10, 190, 200, 368, 130497, 131031})
+OUTSIDE_WINDOW_CODE = 131047
+
+
 def assert_egress_allowed(url: str) -> str:
-    host = urlparse(url).hostname or ""
-    if host not in EGRESS_ALLOWLIST:
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if parsed.scheme != "https" or host not in EGRESS_ALLOWLIST:
         raise EgressRefused(
-            f"refusing to open HTTP to {host!r}: egress allowlist is {EGRESS_ALLOWLIST}")
+            f"refusing to open HTTP to {url!r}: HTTPS egress allowlist is {EGRESS_ALLOWLIST}")
     return host
+
+
+def _parse_utc(ts: datetime | str | None) -> datetime | None:
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        return ts.astimezone(UTC) if ts.tzinfo else ts.replace(tzinfo=UTC)
+    try:
+        dt = datetime.fromisoformat(str(ts))
+    except ValueError:
+        return None
+    return dt.astimezone(UTC) if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def _check_24h_window(
+    *,
+    to_canonical: str,
+    config: AliveConfig,
+    store: AliveStore | None,
+    now: datetime,
+    inbound_at: datetime | str | None,
+) -> None:
+    """Hard gate: verify an open ``[0, 24h)`` customer service window before free-form send."""
+    now_utc = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
+    explicit = _parse_utc(inbound_at)
+    if explicit is not None:
+        elapsed = (now_utc - explicit).total_seconds()
+        if 0 <= elapsed < SERVICE_WINDOW_SECONDS:
+            return
+        raise OutsideServiceWindow(
+            f"refusing free-form session send: inbound_at={explicit.isoformat()} is "
+            f"{int(elapsed)}s from now (outside the {SERVICE_WINDOW_SECONDS}s / 24h window); "
+            "use an S-0 template or nothing")
+
+    if store is not None:
+        s_hash = envelope_mod.from_hash(to_canonical, config.from_hash_salt)
+        if store.in_service_window(s_hash, now=now_utc, window_seconds=SERVICE_WINDOW_SECONDS):
+            return
+
+    raise OutsideServiceWindow(
+        "refusing free-form cold send: no open 24h customer service window for recipient "
+        "(template or nothing outside 24h)")
 
 
 def _raise_for_status(status: int, payload) -> None:
@@ -70,27 +157,44 @@ def _raise_for_status(status: int, payload) -> None:
     error = (payload or {}).get("error", {}) if isinstance(payload, dict) else {}
     code = error.get("code")
     subcode = error.get("error_subcode")
+    details = ((error.get("error_data") or {}).get("details", "")
+               if isinstance(error.get("error_data"), dict) else "")
     message = str(error.get("message", ""))
-    # Account-level restriction shapes: (#10) permission, (#190) token,
-    # (#131031) account restricted, or an explicit platform block. Treat
-    # anything 401/403 and the known restriction codes as terminal.
-    blocked_codes = {10, 190, 131031, 131047, 131049, 368}
-    if status in (401, 403) or code in blocked_codes or "block" in message.lower():
-        raise PlatformBlocked(f"Meta refused ({status}, code={code}, subcode={subcode}): {message}")
-    raise TransportError(f"WhatsApp API error ({status}, code={code}): {message}")
+    detail_suffix = f" ({details})" if details else ""
+
+    if code == OUTSIDE_WINDOW_CODE:
+        raise OutsideServiceWindow(
+            f"Meta refused free-form send (#131047, 24h window closed): {message}{detail_suffix}")
+
+    if status in (401, 403) or code in PLATFORM_BLOCKED_CODES or (
+        "account" in message.lower() and "restrict" in message.lower()
+    ):
+        raise PlatformBlocked(
+            f"Meta refused ({status}, code={code}, subcode={subcode}): {message}{detail_suffix}")
+
+    raise TransportError(
+        f"WhatsApp API error ({status}, code={code}, subcode={subcode}): {message}{detail_suffix}")
 
 
 class WhatsAppCloudTransport:
-    """S-0 transport: service replies in-window; utility templates outbound.
+    """Real WhatsApp Cloud API S-0 transport adapter.
 
-    ``http_client`` is an injectable callable ``(method, url, headers,
-    json_body) -> (status:int, json:dict)``. The default uses urllib and
-    is only ever invoked with an allowlisted URL.
+    * Free-form session replies ONLY inside an active 24h customer service window;
+    * Approved S-0 utility templates ONLY to ``config.owner_e164``, reserved
+      atomically against the daily cap in SQLite and journaled per send with
+      KES-cents arithmetic.
     """
 
-    def __init__(self, config: AliveConfig, *, store=None, http_client=None, clock=None):
+    def __init__(
+        self,
+        config: AliveConfig,
+        *,
+        store: AliveStore | None = None,
+        http_client=None,
+        clock=None,
+    ):
         self.config = config
-        self.store = store or AliveStore(config.state_dir)
+        self.store = store if store is not None else AliveStore(config.state_dir)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._http = http_client or self._default_http
 
@@ -99,116 +203,252 @@ class WhatsAppCloudTransport:
         return "whatsapp_cloud"
 
     def _base(self) -> str:
-        return f"https://graph.facebook.com/{GRAPH_API_VERSION}/{self.config.wa_phone_number_id}/messages"
+        phone_id = str(self.config.wa_phone_number_id or "").strip()
+        if not phone_id or not phone_id.isdigit():
+            raise TransportError(
+                f"wa_phone_number_id must be a numeric Meta Phone Number ID, got {phone_id!r}")
+        return f"https://graph.facebook.com/{GRAPH_API_VERSION}/{phone_id}/messages"
 
-    def _default_http(self, method, url, headers, json_body):
+    def _default_http(self, method: str, url: str, headers: dict, json_body: dict):
         import json as _json
+        import urllib.error
         import urllib.request
+
         assert_egress_allowed(url)  # hard gate, even for the default client
-        data = _json.dumps(json_body).encode("utf-8")
+        data = _json.dumps(json_body, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
+
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 raise EgressRefused("HTTP redirect refused")
-        try_opener = urllib.request.build_opener(NoRedirect())
+
+        opener = urllib.request.build_opener(NoRedirect())
         try:
-            with try_opener.open(req, timeout=15) as resp:
-                return resp.status, _json.loads(resp.read().decode("utf-8") or "{}")
+            with opener.open(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8") or "{}"
+                return resp.status, _json.loads(raw)
         except urllib.error.HTTPError as exc:
             try:
                 payload = _json.loads(exc.read().decode("utf-8") or "{}")
             except Exception:
                 payload = {}
             return exc.code, payload
+        except urllib.error.URLError as exc:
+            raise TransportError(f"WhatsApp network error: {exc.reason}") from exc
 
     def _send(self, body: dict) -> dict:
         url = self._base()
         assert_egress_allowed(url)
         if not self.config.wa_token:
             raise TransportError("wa_token not provisioned")
-        headers = {"Authorization": f"Bearer {self.config.wa_token}",
-                   "Content-Type": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {self.config.wa_token}",
+            "Content-Type": "application/json",
+        }
         status, payload = self._http("POST", url, headers, body)
         _raise_for_status(status, payload)
         return payload if isinstance(payload, dict) else {}
 
-    def send_service_reply(self, to_e164: str, text: str) -> dict:
-        """In-window reply. Caller MUST be answering an inbound message.
+    def send_service_reply(
+        self,
+        to_e164: str,
+        text: str,
+        *,
+        now: datetime | None = None,
+        inbound_at: datetime | str | None = None,
+    ) -> dict:
+        """Send an in-window free-form session text reply.
 
-        In-window replies are the counterpart of a conversation the other
-        party opened, so any counterpart may be addressed here — but this
-        verified inbound timestamp is recorded by the signed webhook and
-        checked at this boundary; no timestamp means no free-form send.
+        Enforces the outside-24h-window rule in the transport: without a valid
+        ``[0, 24h)`` window proof (``inbound_at`` or ``self.store``'s recorded
+        window), raises ``OutsideServiceWindow`` before touching HTTP.
         """
-        if self.store.platform_blocked():
+        if self.store is not None and self.store.platform_blocked():
             raise PlatformBlocked("line is blocked; owner action required")
+
+        now_utc = (now if now is not None else self._clock()).astimezone(UTC)
         try:
-            last = int(self.store.kv_get("window:" + from_hash(to_e164, self.config.from_hash_salt), ""))
-            age = self._clock().timestamp() - last
-        except (TypeError, ValueError):
-            age = -1
-        if not 0 <= age < 24 * 60 * 60:
-            raise EgressRefused("no verified inbound message within the 24-hour window")
-        body = {"messaging_product": "whatsapp", "to": to_e164,
-                "type": "text", "text": {"body": text[:4096]}}
+            canonical_to = normalise_e164(to_e164)
+        except AliveConfigError as exc:
+            raise EgressRefused(str(exc)) from exc
+
+        try:
+            _check_24h_window(
+                to_canonical=canonical_to,
+                config=self.config,
+                store=self.store,
+                now=now_utc,
+                inbound_at=inbound_at,
+            )
+        except OutsideServiceWindow as exc:
+            log_event(
+                self.config.state_dir,
+                "cold_freeform_refused",
+                level="error",
+                reason=str(exc),
+            )
+            raise
+
+        clean_text = str(text or "").strip()[:4096]
+        if not clean_text:
+            raise TransportError("refusing to send empty session reply")
+
+        body = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": canonical_to,
+            "type": "text",
+            "text": {"preview_url": False, "body": clean_text},
+        }
         log_event(self.config.state_dir, "service_attempt")
         try:
             response = self._send(body)
         except Exception:
             log_event(self.config.state_dir, "service_unknown", level="warn")
             raise
-        log_event(self.config.state_dir, "service_accepted")
+        wamid = _extract_wamid(response)
+        log_event(
+            self.config.state_dir,
+            "wa_session_reply_sent",
+            wamid=wamid,
+            in_24h_window=True,
+            cost_kes_cents_est=0,
+        )
         return response
 
-    def send_utility_template(self, to_e164: str, template: str, params: list[str]) -> dict:
-        """Business-initiated send. ONLY the owner's number is addressable."""
-        if to_e164 != self.config.owner_e164:
+    def send_utility_template(
+        self,
+        to_e164: str,
+        template: str,
+        params: list[str],
+        *,
+        now: datetime | None = None,
+    ) -> dict:
+        """Send an approved S-0 utility template to the single configured owner number.
+
+        Enforces:
+        1. single-recipient owner lock (``EgressRefused`` otherwise);
+        2. S-0 template pack registration & parameter validation (``TemplateSpecError``);
+        3. atomic SQLite reservation against ``config.max_templates_per_day``
+           (``TemplateCapReached``);
+        4. per-send journaling before and after the HTTP call with KES-cents cost.
+        """
+        now_utc = (now if now is not None else self._clock()).astimezone(UTC)
+        try:
+            canonical_to = normalise_e164(to_e164)
+        except AliveConfigError as exc:
+            raise EgressRefused(str(exc)) from exc
+
+        if canonical_to != self.config.owner_e164:
             raise EgressRefused(
                 "utility templates may only be addressed to the single configured "
                 "owner number; refusing")
-        if template not in TEMPLATES or len(params) != TEMPLATES[template][1]:
-            raise EgressRefused("unknown template or incorrect parameter count")
-        if self.store.platform_blocked():
+
+        try:
+            spec = resolve_template(template)
+            body = spec.graph_send_payload(canonical_to, params)
+        except _BaseTemplateSpecError as exc:
+            raise TemplateSpecError(str(exc)) from exc
+
+        if self.store is not None and self.store.platform_blocked():
             raise PlatformBlocked("line is blocked; owner action required")
-        attempt = self.store.reserve_template(template, self.config.max_templates_per_day,
-                                              self._clock())
-        if attempt is None:
-            log_event(self.config.state_dir, "template_cap_reached", template=template)
-            raise TemplateCapReached("daily template attempt cap reached")
-        log_event(self.config.state_dir, "template_attempt", attempt=attempt, template=template)
-        body = {"messaging_product": "whatsapp", "to": to_e164,
-                "type": "template",
-                "template": {"name": template, "language": {"code": "en"},
-                             "components": [{"type": "body", "parameters": [
-                                 {"type": "text", "text": str(p)[:200]} for p in params]}]}}
+
+        attempt: int | None = None
+        if self.store is not None:
+            # Honour either atomic template_attempts OR legacy counters("templates")
+            sent_counter = self.store.count_today("templates", tier="T0", now=now_utc)
+            if sent_counter >= self.config.max_templates_per_day:
+                log_event(
+                    self.config.state_dir,
+                    "template_cap_reached",
+                    level="warn",
+                    template=spec.name,
+                    sent_today=sent_counter,
+                    cap=self.config.max_templates_per_day,
+                )
+                raise TemplateCapReached(
+                    f"paid template cap reached ({sent_counter}/{self.config.max_templates_per_day} today)")
+            attempt = self.store.reserve_template(
+                spec.name, self.config.max_templates_per_day, now_utc)
+            if attempt is None:
+                log_event(
+                    self.config.state_dir,
+                    "template_cap_reached",
+                    level="warn",
+                    template=spec.name,
+                    cap=self.config.max_templates_per_day,
+                )
+                raise TemplateCapReached("daily template attempt cap reached")
+
+        log_event(
+            self.config.state_dir,
+            "wa_template_attempt",
+            attempt=attempt,
+            template=spec.name,
+            kind=spec.kind,
+            cost_usd_est=EST_TEMPLATE_COST_USD,
+            cost_kes_cents_est=EST_TEMPLATE_COST_KES_CENTS,
+        )
         try:
             response = self._send(body)
-            wamid = response.get("messages", [{}])[0].get("id")
+            wamid = _extract_wamid(response)
             if not wamid:
                 raise TransportError("Meta response missing message id; outcome unknown")
-            self.store.finish_template(attempt, "accepted", wamid)
-            log_event(self.config.state_dir, "template_accepted", attempt=attempt, wamid=wamid)
+            if self.store is not None and attempt is not None:
+                self.store.finish_template(attempt, "accepted", wamid)
+            log_event(
+                self.config.state_dir,
+                "wa_template_sent",
+                attempt=attempt,
+                template=spec.name,
+                kind=spec.kind,
+                wamid=wamid,
+                cost_usd_est=EST_TEMPLATE_COST_USD,
+                cost_kes_cents_est=EST_TEMPLATE_COST_KES_CENTS,
+            )
             return response
         except Exception as exc:
-            self.store.finish_template(attempt, "unknown")
-            if isinstance(exc, PlatformBlocked):
-                self.store.kv_set("platform_blocked", "1")
-            log_event(self.config.state_dir, "template_unknown", level="error", attempt=attempt)
+            if self.store is not None:
+                if attempt is not None:
+                    self.store.finish_template(attempt, "unknown")
+                if isinstance(exc, PlatformBlocked):
+                    self.store.kv_set("platform_blocked", "1")
+            log_event(
+                self.config.state_dir,
+                "template_unknown",
+                level="error",
+                attempt=attempt,
+                template=spec.name,
+            )
             if isinstance(exc, TransportError):
                 raise
             raise TransportError("template send outcome unknown") from exc
 
 
+def _extract_wamid(response: dict) -> str | None:
+    try:
+        return str(response["messages"][0]["id"])
+    except (KeyError, IndexError, TypeError):
+        return None
+
 
 class FakeTransport:
-    """Test double. Records every send; can be armed to fail.
-
-    ``fail_with`` may be ``PlatformBlocked`` or ``TransportError`` or a string.
+    """Test double that enforces the EXACT same 24h-window, owner-only, and S-0
+    template rules as ``WhatsAppCloudTransport`` so fake and real cannot drift.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        config: AliveConfig | None = None,
+        store: AliveStore | None = None,
+        enforce_window: bool = False,
+    ):
         self.sent: list[dict] = []
         self.fail_with: Exception | None = None
+        self.config = config
+        self.store = store
+        self.enforce_window = enforce_window
 
     @property
     def name(self) -> str:
@@ -218,13 +458,80 @@ class FakeTransport:
         if self.fail_with is not None:
             raise self.fail_with
 
-    def send_service_reply(self, to_e164: str, text: str) -> dict:
+    def send_service_reply(
+        self,
+        to_e164: str,
+        text: str,
+        *,
+        now: datetime | None = None,
+        inbound_at: datetime | str | None = None,
+    ) -> dict:
+        now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+        canonical_to = normalise_e164(to_e164)
+        if (self.enforce_window or inbound_at is not None or self.store is not None) and self.config is not None:
+            _check_24h_window(
+                to_canonical=canonical_to,
+                config=self.config,
+                store=self.store,
+                now=now_utc,
+                inbound_at=inbound_at,
+            )
         self._maybe_fail()
-        self.sent.append({"kind": "service_reply", "to": to_e164, "text": text})
+        self.sent.append({
+            "kind": "service_reply",
+            "to": canonical_to,
+            "text": text,
+            "in_24h_window": True,
+        })
         return {"messages": [{"id": f"wamid.fake{len(self.sent)}"}]}
 
-    def send_utility_template(self, to_e164: str, template: str, params: list[str]) -> dict:
+    def send_utility_template(
+        self,
+        to_e164: str,
+        template: str,
+        params: list[str],
+        *,
+        now: datetime | None = None,
+    ) -> dict:
+        now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+        canonical_to = normalise_e164(to_e164)
+        if self.config is not None and canonical_to != self.config.owner_e164:
+            raise EgressRefused(
+                "utility templates may only be addressed to the single configured owner number")
+        try:
+            spec = resolve_template(template)
+            validated = spec.graph_send_payload(canonical_to, params)
+        except _BaseTemplateSpecError as exc:
+            raise TemplateSpecError(str(exc)) from exc
+        if self.store is not None and self.config is not None:
+            sent_today = self.store.count_today("templates", tier="T0", now=now_utc)
+            if sent_today >= self.config.max_templates_per_day:
+                raise TemplateCapReached(
+                    f"paid template cap reached ({sent_today}/{self.config.max_templates_per_day} today)")
         self._maybe_fail()
-        self.sent.append({"kind": "template", "to": to_e164,
-                          "template": template, "params": list(params)})
+        clean_params = [p["text"] for p in validated["template"]["components"][0]["parameters"]]
+        self.sent.append({
+            "kind": "template",
+            "to": canonical_to,
+            "template": spec.name,
+            "template_kind": spec.kind,
+            "params": clean_params,
+            "rendered": spec.render_preview(clean_params),
+        })
         return {"messages": [{"id": f"wamid.fake{len(self.sent)}"}]}
+
+
+__all__ = [
+    "OUTSIDE_WINDOW_CODE",
+    "PLATFORM_BLOCKED_CODES",
+    "EgressRefused",
+    "FakeTransport",
+    "OutsideServiceWindow",
+    "PlatformBlocked",
+    "TemplateCapExceeded",
+    "TemplateCapReached",
+    "TemplateSpecError",
+    "TransportError",
+    "WhatsAppCloudTransport",
+    "assert_egress_allowed",
+]

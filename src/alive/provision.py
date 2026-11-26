@@ -20,7 +20,13 @@ import re
 import secrets
 from pathlib import Path
 
-from .config import AliveConfigError, load_config
+from .config import (
+    DEFAULT_MAX_TEMPLATES_PER_DAY,
+    MAX_TEMPLATES_PER_DAY_CEILING,
+    AliveConfigError,
+    load_config,
+)
+from .templates import S0_TEMPLATE_PACK, validate_template_spec
 
 #: Names that must NEVER appear under the alive install tree.
 FORBIDDEN_PATTERNS = (
@@ -44,8 +50,9 @@ def cmd_init() -> int:
           'tz = "Africa/Nairobi"\n'
           'state_dir = "./alive-state"\n'
           'freebusy_level = 0              # 0 none / 1 day-level (recommended) / 2 T1 slots\n'
+          'responder_mode = "S-0"          # S-1 chatty mode stays OFF on WhatsApp\n'
           "\n[alive.caps]\n"
-          "max_templates_per_day = 10\n"
+          f"max_templates_per_day = {DEFAULT_MAX_TEMPLATES_PER_DAY}       # paid S-0 templates (~52 KES-cents each)\n"
           "owner_messages_per_day = 200\n"
           "stranger_turns_per_day_per_sender = 20\n"
           "stranger_messages_per_month = 800\n")
@@ -87,10 +94,20 @@ def cmd_doctor(config_path: str) -> int:
     if cfg.stranger_messages_per_month > 1000:
         problems.append("stranger_messages_per_month exceeds the 1,000 free service "
                         "messages — the line could run up a bill")
-    if cfg.max_templates_per_day > 10:
-        problems.append("max_templates_per_day above the design ceiling (10)")
+    if cfg.max_templates_per_day > MAX_TEMPLATES_PER_DAY_CEILING:
+        problems.append(
+            f"max_templates_per_day above the ceiling ({MAX_TEMPLATES_PER_DAY_CEILING})")
     else:
         print(f"ok   template cap in code: {cfg.max_templates_per_day}/day")
+
+    for spec in S0_TEMPLATE_PACK.values():
+        validate_template_spec(spec)
+    print(f"ok   S-0 template pack validated ({len(S0_TEMPLATE_PACK)} utility templates)")
+
+    if cfg.s1_chatty_mode:
+        problems.append("s1_chatty_mode is set — S-1 stays OFF on WhatsApp")
+    else:
+        print("ok   S-1 chatty mode OFF (Meta policy guard)")
 
     if cfg.fast_lane:
         problems.append("fast_lane is set — this build refuses it")
@@ -111,9 +128,15 @@ def main(argv=None) -> int:
     sub.add_parser("init", help="generate keys and a config skeleton")
     doctor = sub.add_parser("doctor", help="run the self-check")
     doctor.add_argument("config", help="path to alive.toml")
+    sub.add_parser("templates", help="print Meta submission JSON for the S-0 template pack")
     args = parser.parse_args(argv)
     if args.command == "init":
         return cmd_init()
+    if args.command == "templates":
+        import json
+        payloads = [spec.meta_submission_payload() for spec in S0_TEMPLATE_PACK.values()]
+        print(json.dumps(payloads, indent=2, ensure_ascii=False))
+        return 0
     return cmd_doctor(args.config)
 
 

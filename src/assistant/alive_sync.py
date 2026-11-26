@@ -51,6 +51,7 @@ from pathlib import Path
 try:  # the alive package deploys with the laptop source tree, not the wheel
     from alive import envelope as envelope_mod
     from alive.sync import FixtureSyncBackend, RcloneSyncBackend  # noqa: F401  (re-export)
+    from alive.templates import format_laptop_already_sent_knock
 except ImportError as exc:  # pragma: no cover - deployment guard
     raise ImportError(
         "assistant.alive_sync needs the sibling 'alive' package on the path "
@@ -202,7 +203,7 @@ def _commitment_items(store, config: AliveSyncConfig) -> list[dict]:
         remind_at = hint.get("remind_at") or []
         if isinstance(remind_at, str):
             remind_at = [remind_at]
-        items.append({
+        item_dict = {
             "id": int(fact["id"]),
             "topic": topic[:300],
             "due": hint.get("due"),
@@ -210,7 +211,10 @@ def _commitment_items(store, config: AliveSyncConfig) -> list[dict]:
             "origin": origin,
             "knock_id": knock_by_commitment.get(int(fact["id"])),
             "content_free": False,
-        })
+        }
+        if hint.get("template_kind"):
+            item_dict["template_kind"] = str(hint["template_kind"])
+        items.append(item_dict)
     return items
 
 
@@ -507,10 +511,29 @@ def read_reminder_log(backend, config: AliveSyncConfig) -> list[dict]:
             "remind_at": envelope.get("remind_at"),
             "sent_at": envelope.get("sent_at"),
             "template": envelope.get("template"),
+            "template_kind": envelope.get("template_kind"),
             "wamid": envelope.get("wamid"),
             "status": envelope.get("status"),
+            "cost_usd_est": envelope.get("cost_usd_est"),
+            "cost_kes_cents_est": envelope.get("cost_kes_cents_est"),
         })
     return entries
+
+
+def already_sent_knock_for_commitment(
+    backend, config: AliveSyncConfig, *, commitment_id: int, topic: str
+) -> str | None:
+    """If the phone already got a reminder for ``commitment_id``, return the
+    short laptop knock line ('Already sent to your phone at ...'); else None."""
+    matches = [
+        e for e in read_reminder_log(backend, config)
+        if e.get("commitment_id") == int(commitment_id) and e.get("status") == "sent"
+    ]
+    if not matches:
+        return None
+    latest = matches[-1]
+    sent_at = str(latest.get("sent_at") or latest.get("remind_at") or "earlier")
+    return format_laptop_already_sent_knock(topic, sent_at)
 
 
 def line_status(backend, config: AliveSyncConfig, *, now: datetime | None = None,
