@@ -32,10 +32,10 @@ receipts_prefix = "receipts"           # WRITER: laptop. this host may read for 
 heartbeat_prefix = "heartbeat"
 
 [alive.caps]
-max_templates_per_day = 10             # utility templates (~$0.0040 each in KE)
+max_templates_per_day = 3              # all template attempts, UTC day
 owner_messages_per_day = 200
 stranger_turns_per_day_per_sender = 20
-stranger_messages_per_month = 800      # under the 1,000 free service messages
+stranger_messages_per_month = 800      # safety limit, not a pricing allowance
 late_grace_seconds = 1800
 stale_mirror_days = 30
 expiry_hours = 72                      # owner may raise to 168 (7 days)

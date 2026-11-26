@@ -61,6 +61,7 @@ def meta_payload(sender: str, message_id: str, body: str | None,
                        "changes": [{"field": "messages",
                                     "value": {
                                         "messaging_product": "whatsapp",
+                                        "metadata": {"phone_number_id": "1234567890"},
                                         "contacts": [{"wa_id": sender.lstrip("+"),
                                                       "profile": {"name": "Test Sender"}}],
                                         "messages": [message]}}]}]}
