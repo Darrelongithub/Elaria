@@ -19,6 +19,7 @@ vision happens only when asked and costs quota (§3.7), so not here.
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import io
 import mimetypes
@@ -32,6 +33,7 @@ import subprocess
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
+from xml.parsers import expat
 
 from .cost import iso_now
 from .safety import expand, is_protected, open_readonly_nofollow
@@ -111,6 +113,101 @@ def _pdf_text(path: Path, max_chars: int) -> str:
         if len(text) > max_chars:
             raise ValueError(f"extraction exceeds {max_chars} characters")
         return text
+
+
+def _stream_pdf(path: Path):
+    """Yield bounded decoded output; an error rolls back the indexing transaction."""
+    if not shutil.which("pdftotext"):
+        raise ValueError("pdftotext unavailable")
+    with open_readonly_nofollow(path) as source, subprocess.Popen(
+            ["pdftotext", "-layout", f"/proc/self/fd/{source.fileno()}", "-"],
+            pass_fds=(source.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
+        before = os.fstat(source.fileno())
+        deadline = time.monotonic() + 120
+        decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise ValueError("pdftotext timed out")
+                block = os.read(proc.stdout.fileno(), 65536)
+                if not block:
+                    break
+                text = decoder.decode(block)
+                for i in range(0, len(text), CHUNK_CHARS):
+                    yield text[i:i + CHUNK_CHARS]
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                yield tail
+            if proc.wait(timeout=max(0.01, deadline - time.monotonic())):
+                raise ValueError("pdftotext failed to parse PDF")
+            after = os.fstat(source.fileno())
+            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ValueError("PDF changed during extraction")
+        finally:
+            selector.close()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
+def _stream_ooxml(path: Path, patterns: tuple[str, ...]):
+    """Read selected XML members incrementally, never extract to disk."""
+    with open_readonly_nofollow(path) as raw, zipfile.ZipFile(raw) as archive:
+        before = os.fstat(raw.fileno())
+        matched = False
+        for info in archive.infolist():
+            if not any(re.fullmatch(pattern, info.filename) for pattern in patterns):
+                continue
+            matched = True
+            if info.file_size > 1_000_000_000 or info.file_size / max(1, info.compress_size) > 100:
+                raise ValueError("structured document member exceeds safety limit")
+            with archive.open(info) as member:
+                parser = expat.ParserCreate(namespace_separator="}")
+                stack = []
+                pieces = []
+                pending = 0
+                def start(name, _attrs):
+                    stack.append(name)
+                def end(name):
+                    nonlocal pending
+                    if (name.endswith("}t") or (info.filename.startswith("xl/worksheets/") and name.endswith("}v")) or (info.filename == "content.xml" and name.endswith("}p"))):
+                        pieces.append(" ")
+                        pending += 1
+                    stack.pop()
+                def data(text):
+                    nonlocal pending
+                    if stack and (stack[-1].endswith("}t") or
+                                  (info.filename.startswith("xl/worksheets/") and stack[-1].endswith("}v")) or
+                                  info.filename == "content.xml"):
+                        pending += len(text)
+                        if pending > 2_000_000:
+                            raise ValueError("XML expansion exceeds chunk limit")
+                        pieces.append(text)
+                def reject_doctype(*_args):
+                    raise ValueError("XML DTD is not supported")
+                parser.StartElementHandler = start
+                parser.EndElementHandler = end
+                parser.CharacterDataHandler = data
+                parser.StartDoctypeDeclHandler = reject_doctype
+                while True:
+                    block = member.read(65536)
+                    parser.Parse(block, not block)
+                    if pieces:
+                        text = "".join(pieces)
+                        pieces.clear()
+                        pending = 0
+                        for i in range(0, len(text), CHUNK_CHARS):
+                            yield text[i:i + CHUNK_CHARS]
+                    if not block:
+                        break
+        if not matched:
+            raise ValueError("structured document has no supported text member")
+        after = os.fstat(raw.fileno())
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("document changed during extraction")
 
 
 def extract_text(path: Path, max_chars: int = 200_000) -> tuple[str, str]:
@@ -283,6 +380,18 @@ class Indexer:
                             if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (before.st_size, before.st_mtime_ns, before.st_ctime_ns):
                                 raise OSError("file changed during indexing")
                     text_chunks = chunks()
+                elif path.suffix.lower() in (".docx", ".pptx", ".xlsx", ".odt"):
+                    patterns = {
+                        ".docx": (r"word/document\.xml",),
+                        ".pptx": (r"ppt/slides/slide\d+\.xml",),
+                        ".xlsx": (r"xl/sharedStrings\.xml", r"xl/worksheets/sheet\d+\.xml"),
+                        ".odt": (r"content\.xml",),
+                    }
+                    extractor = "ooxml-stream"
+                    text_chunks = _stream_ooxml(path, patterns[path.suffix.lower()])
+                elif path.suffix.lower() == ".pdf" and shutil.which("pdftotext"):
+                    extractor = "pdf-stream"
+                    text_chunks = _stream_pdf(path)
                 else:
                     text, extractor = extract_text(path, self.max_extract_chars)
                     if extractor.startswith("error:"):
@@ -296,7 +405,7 @@ class Indexer:
                     mime=mimetypes.guess_type(path.name)[0], ext=path.suffix.lower(),
                     indexed_ts=iso_now(), never_send=int(never_send),
                     text_chunks=text_chunks)
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, zipfile.BadZipFile, ElementTree.ParseError, expat.ExpatError, subprocess.SubprocessError) as exc:
                 self.store.mark_document_error(
                     str(path), f"{type(exc).__name__}: {exc}", root=str(root),
                     size=stat.st_size, mtime=stat.st_mtime, ext=path.suffix.lower(),

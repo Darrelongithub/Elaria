@@ -106,6 +106,23 @@ def is_protected(path: str | Path, protected: list[str]) -> bool:
     return False
 
 
+def open_directory_nofollow(path: str | Path) -> int:
+    """Open an absolute directory through no-follow directory descriptors."""
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise PermissionError("safe directory traversal is unavailable")
+    parts = Path(os.path.abspath(expand(path))).parts[1:]
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def open_readonly_nofollow(path: str | Path):
     """Open a regular file through directory FDs without following symlinks.
 

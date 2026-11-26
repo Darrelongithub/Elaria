@@ -10,6 +10,9 @@ import csv
 import hashlib
 import io
 import json
+import sqlite3
+import tempfile
+import os
 from html.parser import HTMLParser
 from contextlib import contextmanager
 from pathlib import Path
@@ -178,7 +181,58 @@ def _html_records(text, limit):
         parser.parts.clear()
 
 
+def _sqlite_records(binary, limit):
+    """Inspect an immutable private snapshot, never execute SQL from the database.
+
+    WAL-mode databases are refused: copying the main file alone is not a
+    reliable snapshot. The private temporary directory is removed on exit.
+    """
+    header = binary.read(100)
+    if len(header) < 100 or not header.startswith(b"SQLite format 3\x00"):
+        raise StructuredReadError("invalid SQLite header")
+    if header[18] != 1 or header[19] != 1:
+        raise StructuredReadError("SQLite WAL-mode snapshot refused; checkpoint and use a rollback-mode copy")
+    with tempfile.TemporaryDirectory(prefix="elaria-read-") as directory:
+        filename = Path(directory) / "snapshot.sqlite"
+        total = len(header)
+        with open(filename, "xb") as out:
+            os.chmod(filename, 0o600)
+            out.write(header)
+            for block in iter(lambda: binary.read(65536), b""):
+                total += len(block)
+                if total > 1_000_000_000:
+                    raise StructuredReadError("SQLite snapshot exceeds disk budget")
+                out.write(block)
+        uri = filename.as_uri() + "?mode=ro&immutable=1"
+        try:
+            connection = sqlite3.connect(uri, uri=True)
+            try:
+                connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, max(limit, 10000))
+                connection.execute("PRAGMA query_only=ON")
+                connection.execute("PRAGMA trusted_schema=OFF")
+                tables = connection.execute(
+                    "SELECT name, sql FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                )
+                for name, definition in tables:
+                    if not definition or definition.lstrip().upper().startswith("CREATE VIRTUAL TABLE"):
+                        raise StructuredReadError("SQLite virtual tables are not inspectable")
+                    identifier = '"' + name.replace('"', '""') + '"'
+                    rows = connection.execute("SELECT * FROM " + identifier)
+                    columns = [item[0] for item in rows.description]
+                    for row in rows:
+                        values = [({'blob_hex': item.hex()} if isinstance(item, bytes) else item)
+                                  for item in row]
+                        yield {'table': name, 'columns': columns, 'values': values}
+            finally:
+                connection.close()
+        except sqlite3.Error as exc:
+            raise StructuredReadError(f"SQLite inspection failed: {exc}") from exc
+
+
 def _records(binary, fmt, limit):
+    if fmt in ('.sqlite', '.sqlite3', '.db'):
+        yield from _sqlite_records(binary, limit)
+        return
     text = io.TextIOWrapper(binary, encoding='utf-8-sig', errors='strict', newline='')
     try:
         if fmt in ('.html', '.htm'):
@@ -211,6 +265,28 @@ def _records(binary, fmt, limit):
         text.detach()
 
 
+_DOCUMENT_PATTERNS = {
+    '.docx': (r'word/document\.xml',),
+    '.pptx': (r'ppt/slides/slide\d+\.xml',),
+    '.xlsx': (r'xl/sharedStrings\.xml', r'xl/worksheets/sheet\d+\.xml'),
+    '.odt': (r'content\.xml',),
+}
+
+
+def _target_records(target, stream, fmt, limit):
+    if fmt in _DOCUMENT_PATTERNS or fmt == '.pdf':
+        if _parse_zip_target(target) or _parse_tar_target(target):
+            raise StructuredReadError('nested document extraction is not supported')
+        from .indexer import _stream_ooxml, _stream_pdf
+        path = expand(target)
+        try:
+            yield from _stream_pdf(path) if fmt == '.pdf' else _stream_ooxml(path, _DOCUMENT_PATTERNS[fmt])
+        except (OSError, ValueError) as exc:
+            raise StructuredReadError(f'document extraction failed: {exc}') from exc
+    else:
+        yield from _records(stream, fmt, limit)
+
+
 def read_batch(target: str, *, cursor: dict | None = None, max_records: int = 100,
                max_record_chars: int = 1_000_000, protected: list[str],
                never_send_roots: list[str], cloud_bound: bool = False) -> dict:
@@ -229,7 +305,7 @@ def read_batch(target: str, *, cursor: dict | None = None, max_records: int = 10
     page_chars = 0
     eof = True
     with _source(target, protected, never_send_roots, cloud_bound) as stream:
-        for index, record in enumerate(_records(stream, fmt, max_record_chars)):
+        for index, record in enumerate(_target_records(target, stream, fmt, max_record_chars)):
             if index < offset:
                 continue
             record_chars = len(json.dumps(record, ensure_ascii=False))
@@ -267,7 +343,7 @@ def validate(target: str, *, protected: list[str], never_send_roots: list[str],
     fmt = Path(target.split('#')[-1]).suffix.lower()
     count = 0
     with _source(target, protected, never_send_roots, cloud_bound) as stream:
-        for _ in _records(stream, fmt, max_record_chars):
+        for _ in _target_records(target, stream, fmt, max_record_chars):
             count += 1
     if _hash(target, protected, never_send_roots, cloud_bound) != sha:
         raise StructuredReadError('source changed during validation')

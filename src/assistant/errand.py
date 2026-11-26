@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import contextlib
 from contextlib import contextmanager
 import hashlib
 import io
@@ -55,13 +56,14 @@ from .nus_pointer import (
     PointOutcome,
     parse_point_instruction,
 )
-from .safety import expand, is_halted, is_protected, open_readonly_nofollow
+from .safety import expand, is_halted, is_protected, open_readonly_nofollow, open_directory_nofollow
 
 # -- strict read-only skill allowlist (no writes, no moves, no sends) --------
 # `point` is point-only screen guidance (BUILD-3): NO clicking, NO acting.
 READ_ONLY_SKILLS: frozenset[str] = frozenset({
     "fs.locate",
     "file.read",
+    "file.read_batch",
     "content.analyze",
     "memory.infer",
     "owner.ask",
@@ -432,6 +434,18 @@ def _check_zip_ratio(info: zipfile.ZipInfo) -> None:
         )
 
 
+def _open_discovered_file(directory_fd: int, name: str, expected):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+    try:
+        found = os.fstat(fd)
+        if not stat_mod.S_ISREG(found.st_mode) or (found.st_dev, found.st_ino) != (expected.st_dev, expected.st_ino):
+            raise OSError("discovered file changed before opening")
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 # -- Read-only skill implementations ----------------------------------------
 def skill_fs_locate(
     roots: list[str],
@@ -463,134 +477,150 @@ def skill_fs_locate(
         def _on_error(exc: OSError) -> None:
             walk_errors.append(f"{type(exc).__name__}: {exc}")
 
-        for dirpath, dirnames, filenames in os.walk(root_path, onerror=_on_error):
-            directory = Path(dirpath)
-            if (directory / ".assistant-ignore").exists():
-                dirnames[:] = []
-                _bump_skip(".assistant-ignore")
-                continue
-            kept_dirs: list[str] = []
-            for dname in sorted(dirnames):
-                sub = directory / dname
-                if sub.is_symlink():
-                    _bump_skip("symlink")
+        try:
+            root_fd = open_directory_nofollow(root_path)
+        except OSError as exc:
+            walk_errors.append(f"{root_path}: {type(exc).__name__}: {exc}")
+            continue
+        with contextlib.ExitStack() as stack:
+            stack.callback(os.close, root_fd)
+            for dirpath, dirnames, filenames, directory_fd in os.fwalk(
+                    ".", topdown=True, onerror=_on_error, follow_symlinks=False, dir_fd=root_fd):
+                directory = root_path / dirpath
+                if ".assistant-ignore" in filenames or ".assistant-ignore" in dirnames:
+                    dirnames[:] = []
+                    _bump_skip(".assistant-ignore")
                     continue
-                if dname.startswith("."):
-                    _bump_skip("hidden")
-                    continue
-                if dname in EXCLUDED_DIRNAMES:
-                    _bump_skip(dname)
-                    continue
-                if is_protected(sub, protected):
-                    _bump_skip("protected")
-                    continue
-                kept_dirs.append(dname)
-            dirnames[:] = kept_dirs
-
-            for fname in sorted(filenames):
-                fpath = directory / fname
-                if fpath.is_symlink():
-                    _bump_skip("symlink")
-                    continue
-                if fname.startswith(".") or fname.endswith(TEMP_SUFFIXES):
-                    _bump_skip("temp/hidden")
-                    continue
-                if is_protected(fpath, protected):
-                    _bump_skip("protected")
-                    continue
-                try:
-                    st = fpath.lstat()
-                except OSError as exc:
-                    walk_errors.append(f"{fpath}: {type(exc).__name__}")
-                    continue
-                if not stat_mod.S_ISREG(st.st_mode):
-                    _bump_skip("special")
-                    continue
-                never_send = _is_never_send(fpath, never_send_roots)
-                suffix = fpath.suffix.lower()
-
-                if suffix == ".zip":
-                    # Read-only archive manifest scan — zero disk extraction.
+                kept_dirs: list[str] = []
+                for dname in sorted(dirnames):
+                    sub = directory / dname
                     try:
-                        with open_readonly_nofollow(fpath) as archive_file, zipfile.ZipFile(archive_file, "r") as zf:
-                            for idx, info in enumerate(zf.infolist()):
-                                if idx >= MAX_ZIP_MEMBERS:
-                                    _bump_skip("zip_member_cap")
-                                    break
-                                if info.is_dir():
-                                    continue
-                                if (info.filename.startswith("/") or ".." in Path(info.filename).parts
-                                        or "#" in info.filename):
-                                    _bump_skip("unsafe_zip_member")
-                                    continue
-                                member_suffix = Path(info.filename).suffix.lower()
-                                try:
-                                    _check_zip_ratio(info)
-                                except ValueError:
-                                    _bump_skip("zip_ratio_guard")
-                                    continue
-                                target = f"zip://{fpath}#{info.filename}"
-                                if target in seen_targets:
-                                    continue
-                                seen_targets.add(target)
-                                candidates.append({
-                                    "target": target,
-                                    "name": Path(info.filename).name,
-                                    "size": int(info.file_size),
-                                    "mtime": float(st.st_mtime),
-                                    "ext": member_suffix,
-                                    "never_send": never_send,
-                                    "archive": str(fpath),
-                                    "readable": member_suffix in READABLE_SUFFIXES,
-                                })
-                    except (zipfile.BadZipFile, OSError):
-                        _bump_skip("bad_zip")
-                    continue
+                        sub_stat = os.stat(dname, dir_fd=directory_fd, follow_symlinks=False)
+                    except OSError as exc:
+                        walk_errors.append(f"{sub}: {type(exc).__name__}: {exc}")
+                        continue
+                    if stat_mod.S_ISLNK(sub_stat.st_mode):
+                        _bump_skip("symlink")
+                        continue
+                    if dname.startswith("."):
+                        _bump_skip("hidden")
+                        continue
+                    if dname in EXCLUDED_DIRNAMES:
+                        _bump_skip(dname)
+                        continue
+                    if is_protected(sub, protected):
+                        _bump_skip("protected")
+                        continue
+                    kept_dirs.append(dname)
+                dirnames[:] = kept_dirs
 
-                if suffix in (".tar", ".tgz", ".gz", ".bz2", ".xz"):
+                for fname in sorted(filenames):
+                    fpath = directory / fname
+                    if fname.startswith(".") or fname.endswith(TEMP_SUFFIXES):
+                        _bump_skip("temp/hidden")
+                        continue
+                    if is_protected(fpath, protected):
+                        _bump_skip("protected")
+                        continue
                     try:
-                        with open_readonly_nofollow(fpath) as archive_file, tarfile.open(fileobj=archive_file, mode="r:*") as archive:
-                            total_expanded = 0
-                            for idx, info in enumerate(archive):
-                                if idx >= MAX_ZIP_MEMBERS:
-                                    _bump_skip("tar_member_cap")
-                                    break
-                                total_expanded += max(0, info.size)
-                                if total_expanded > 1_000_000_000 or total_expanded / max(1, st.st_size) > MAX_ZIP_COMPRESSION_RATIO:
-                                    _bump_skip("tar_expansion_guard")
-                                    break
-                                if not info.isfile():
-                                    continue
-                                if (info.name.startswith("/") or ".." in Path(info.name).parts
-                                        or "#" in info.name):
-                                    _bump_skip("unsafe_tar_member")
-                                    continue
-                                target = f"tar://{fpath}#{info.name}"
-                                if target in seen_targets:
-                                    continue
-                                seen_targets.add(target)
-                                candidates.append({"target": target, "name": Path(info.name).name,
-                                                   "size": info.size, "mtime": float(st.st_mtime),
-                                                   "ext": Path(info.name).suffix.lower(),
-                                                   "never_send": never_send, "archive": str(fpath),
-                                                   "readable": Path(info.name).suffix.lower() in READABLE_SUFFIXES})
-                    except (tarfile.TarError, OSError) as exc:
-                        walk_errors.append(f"{fpath}: {type(exc).__name__}: {exc}")
-                    continue
+                        st = os.stat(fname, dir_fd=directory_fd, follow_symlinks=False)
+                    except OSError as exc:
+                        walk_errors.append(f"{fpath}: {type(exc).__name__}")
+                        continue
+                    if stat_mod.S_ISLNK(st.st_mode):
+                        _bump_skip("symlink")
+                        continue
+                    if not stat_mod.S_ISREG(st.st_mode):
+                        _bump_skip("special")
+                        continue
+                    never_send = _is_never_send(fpath, never_send_roots)
+                    suffix = fpath.suffix.lower()
 
-                target = str(fpath)
-                if target in seen_targets:
-                    continue
-                seen_targets.add(target)
-                candidates.append({
-                    "target": target,
-                    "name": fname,
-                    "size": int(st.st_size),
-                    "mtime": float(st.st_mtime),
-                    "ext": suffix,
-                    "never_send": never_send,
-                    "readable": suffix in READABLE_SUFFIXES,
-                })
+                    if suffix == ".zip":
+                        # Read-only archive manifest scan — zero disk extraction.
+                        try:
+                            with _open_discovered_file(directory_fd, fname, st) as archive_file, zipfile.ZipFile(archive_file, "r") as zf:
+                                for idx, info in enumerate(zf.infolist()):
+                                    if idx >= MAX_ZIP_MEMBERS:
+                                        _bump_skip("zip_member_cap")
+                                        break
+                                    if info.is_dir():
+                                        continue
+                                    if (info.filename.startswith("/") or ".." in Path(info.filename).parts
+                                            or "#" in info.filename):
+                                        _bump_skip("unsafe_zip_member")
+                                        continue
+                                    member_suffix = Path(info.filename).suffix.lower()
+                                    try:
+                                        _check_zip_ratio(info)
+                                    except ValueError:
+                                        _bump_skip("zip_ratio_guard")
+                                        continue
+                                    target = f"zip://{fpath}#{info.filename}"
+                                    if target in seen_targets:
+                                        continue
+                                    seen_targets.add(target)
+                                    candidates.append({
+                                        "target": target,
+                                        "name": Path(info.filename).name,
+                                        "size": int(info.file_size),
+                                        "mtime": float(st.st_mtime),
+                                        "ext": member_suffix,
+                                        "never_send": never_send,
+                                        "archive": str(fpath),
+                                        "readable": member_suffix in READABLE_SUFFIXES or member_suffix in (".sqlite", ".sqlite3", ".db"),
+                                        "structured_only": member_suffix in (".sqlite", ".sqlite3", ".db"),
+                                    })
+                        except (zipfile.BadZipFile, OSError):
+                            _bump_skip("bad_zip")
+                        continue
+
+                    if suffix in (".tar", ".tgz", ".gz", ".bz2", ".xz"):
+                        try:
+                            with _open_discovered_file(directory_fd, fname, st) as archive_file, tarfile.open(fileobj=archive_file, mode="r:*") as archive:
+                                total_expanded = 0
+                                for idx, info in enumerate(archive):
+                                    if idx >= MAX_ZIP_MEMBERS:
+                                        _bump_skip("tar_member_cap")
+                                        break
+                                    total_expanded += max(0, info.size)
+                                    if total_expanded > 1_000_000_000 or total_expanded / max(1, st.st_size) > MAX_ZIP_COMPRESSION_RATIO:
+                                        _bump_skip("tar_expansion_guard")
+                                        break
+                                    if not info.isfile():
+                                        continue
+                                    if (info.name.startswith("/") or ".." in Path(info.name).parts
+                                            or "#" in info.name):
+                                        _bump_skip("unsafe_tar_member")
+                                        continue
+                                    target = f"tar://{fpath}#{info.name}"
+                                    if target in seen_targets:
+                                        continue
+                                    seen_targets.add(target)
+                                    candidates.append({"target": target, "name": Path(info.name).name,
+                                                       "size": info.size, "mtime": float(st.st_mtime),
+                                                       "ext": Path(info.name).suffix.lower(),
+                                                       "never_send": never_send, "archive": str(fpath),
+                                                       "readable": Path(info.name).suffix.lower() in READABLE_SUFFIXES or Path(info.name).suffix.lower() in (".sqlite", ".sqlite3", ".db"),
+                                                       "structured_only": Path(info.name).suffix.lower() in (".sqlite", ".sqlite3", ".db")})
+                        except (tarfile.TarError, OSError) as exc:
+                            walk_errors.append(f"{fpath}: {type(exc).__name__}: {exc}")
+                        continue
+
+                    target = str(fpath)
+                    if target in seen_targets:
+                        continue
+                    seen_targets.add(target)
+                    candidates.append({
+                        "target": target,
+                        "name": fname,
+                        "size": int(st.st_size),
+                        "mtime": float(st.st_mtime),
+                        "ext": suffix,
+                        "never_send": never_send,
+                        "readable": suffix in READABLE_SUFFIXES or suffix in (".sqlite", ".sqlite3", ".db", ".pdf", ".docx", ".pptx", ".xlsx", ".odt"),
+                        "structured_only": suffix in (".sqlite", ".sqlite3", ".db", ".pdf", ".docx", ".pptx", ".xlsx", ".odt"),
+                    })
 
     # Also include any indexed path hits from Store if roots were sparse.
     if store is not None and not candidates and terms:
@@ -1828,6 +1858,7 @@ class ErrandRunner:
         active_segment_start = time.monotonic()
 
         observations: list[UntrustedObservation] = []
+        structured_schema: dict[str, dict[str, int]] = {}
         files_inspected: dict[str, dict[str, Any]] = {}
         inferred_records: list[dict[str, Any]] = []
         confirmed_records: list[dict[str, Any]] = []
@@ -1922,6 +1953,9 @@ class ErrandRunner:
 
                 try:
                     if step.skill == "fs.locate":
+                        requested_roots = step.args.get("roots", roots)
+                        if any(not roots or not is_protected(expand(r), roots) for r in requested_roots):
+                            raise PermissionError("discovery root outside authorized scope")
                         locate_result = await asyncio.to_thread(
                             skill_fs_locate,
                             step.args.get("roots", roots),
@@ -1952,7 +1986,7 @@ class ErrandRunner:
                                 read_slots = max(1, budget.max_steps - step_no - reserve)
                                 readable_candidates = [c for c in candidates if c.get("readable", True)]
                                 for cand in readable_candidates[:min(len(readable_candidates), read_slots)]:
-                                    queue.append(PlannedStep("file.read", {
+                                    queue.append(PlannedStep("file.read_batch" if cand.get("structured_only") else "file.read", {
                                         "target": cand["target"],
                                         "offset": 0,
                                         "max_bytes": budget.max_read_bytes,
@@ -1960,8 +1994,62 @@ class ErrandRunner:
                                     }))
                                 queue.append(PlannedStep("content.analyze"))
 
+                    elif step.skill == "file.read_batch":
+                        target = str(step.args["target"])
+                        archive_spec = _parse_zip_target(target) or _parse_tar_target(target)
+                        scoped_path = archive_spec[0] if archive_spec else expand(target)
+                        if not roots or not is_protected(scoped_path, roots):
+                            raise PermissionError("source outside authorized discovery roots")
+                        # Structured records are data only. No decoded value is
+                        # treated as a command or as byte-span verified evidence.
+                        from .structured_reader import read_batch
+                        target = str(step.args["target"])
+                        page = await asyncio.to_thread(
+                            read_batch, target, cursor=step.args.get("cursor"),
+                            max_records=100,
+                            max_record_chars=max(256, min(budget.max_read_bytes, 2_000_000)),
+                            protected=protected, never_send_roots=never_send_roots,
+                            cloud_bound=bool(step.args.get("cloud_bound", False)))
+                        if self.safety_journal is not None:
+                            self.safety_journal.note_untrusted_input(
+                                target, actor="errand",
+                                correlation_id=f"errand:{errand_id}:step:{step_no}",
+                                detail={"sha256_prefix": page["sha256"][:12],
+                                        "record_count": len(page["records"]),
+                                        "eof": page["eof"], "trusted": False})
+                        schema_counts = structured_schema.setdefault(target, {})
+                        for record in page["records"]:
+                            name = type(record).__name__
+                            schema_counts[name] = schema_counts.get(name, 0) + 1
+                        files_inspected[target] = {
+                            "path": target, "sha256": page["sha256"],
+                            "format": page["format"], "eof": page["eof"],
+                            "truncated": not page["eof"], "trusted": False,
+                            "never_send": bool(step.args.get("never_send", False)),
+                            "records_read": (files_inspected.get(target, {}).get("records_read", 0)
+                                             + len(page["records"])),
+                        }
+                        step_summary = {"path": target, "format": page["format"],
+                            "sha256_prefix": page["sha256"][:12], "records": len(page["records"]),
+                            "eof": page["eof"], "trusted": False}
+                        if page["eof"]:
+                            unanswered_notes.append({"path": target,
+                                "reason": "structured records inspected locally; semantic analysis not performed"})
+                        if not page["eof"]:
+                            if adaptive and step_no + len(queue) + 4 <= budget.max_steps:
+                                queue.insert(0, PlannedStep("file.read_batch", {
+                                    "target": target, "cursor": page["next_cursor"],
+                                    "never_send": step.args.get("never_send", False)}))
+                            else:
+                                unanswered_notes.append({"path": target,
+                                    "reason": "structured stream paused at the step budget"})
+
                     elif step.skill == "file.read":
                         target = str(step.args["target"])
+                        archive_spec = _parse_zip_target(target) or _parse_tar_target(target)
+                        scoped_path = archive_spec[0] if archive_spec else expand(target)
+                        if not roots or not is_protected(scoped_path, roots):
+                            raise PermissionError("source outside authorized discovery roots")
                         offset = int(step.args.get("offset", 0))
                         max_b = min(
                             int(step.args.get("max_bytes", budget.max_read_bytes)),
@@ -2077,6 +2165,9 @@ class ErrandRunner:
                     elif step.skill == "content.analyze":
                         cloud_safe_obs = [o for o in observations if not o.never_send]
                         det = await asyncio.to_thread(_deterministic_analyze, cloud_safe_obs)
+                        # Structured page metadata is local, untrusted and does
+                        # not satisfy evidence verification or authorize actions.
+                        det["structured_schema"] = structured_schema
                         llm_parsed: dict[str, Any] | None = None
                         purpose = f"errand:{errand_id}:step:{step_no}:content.analyze"
                         can_call_llm = (
@@ -2168,6 +2259,7 @@ class ErrandRunner:
                         }
                         step_summary = {
                             "observations_analyzed": len(cloud_safe_obs),
+                            "structured_schemas": structured_schema,
                             "findings": len(analysis_result["findings"]),
                             "candidate_inferences": len(merged_inferences),
                             "clarifying_questions": len(merged_questions),
