@@ -411,11 +411,11 @@ def skill_fs_locate(
 
     for raw_root in roots:
         root_path = expand(raw_root)
+        if is_protected(root_path, protected) or _has_symlink_to_root(root_path):
+            _bump_skip("protected_or_symlink_root")
+            continue
         if not root_path.exists():
             walk_errors.append(f"root not found: {root_path}")
-            continue
-        if root_path.is_symlink() or is_protected(root_path, protected):
-            _bump_skip("protected_or_symlink_root")
             continue
 
         def _on_error(exc: OSError) -> None:
@@ -477,6 +477,10 @@ def skill_fs_locate(
                                     break
                                 if info.is_dir():
                                     continue
+                                if (info.filename.startswith("/") or ".." in Path(info.filename).parts
+                                        or "#" in info.filename):
+                                    _bump_skip("unsafe_zip_member")
+                                    continue
                                 member_suffix = Path(info.filename).suffix.lower()
                                 if member_suffix not in READABLE_SUFFIXES:
                                     continue
@@ -522,7 +526,8 @@ def skill_fs_locate(
     if store is not None and not candidates and terms:
         for row in store.search_document_paths(terms, cloud_bound=False, limit=max_candidates):
             p = expand(row["path"])
-            if p.exists() and not p.is_symlink() and not is_protected(p, protected):
+            if (p.exists() and not _has_symlink_to_root(p) and not is_protected(p, protected)
+                    and any(p == expand(r) or expand(r) in p.parents for r in roots)):
                 target = str(p)
                 if target not in seen_targets:
                     seen_targets.add(target)
@@ -552,6 +557,16 @@ def skill_fs_locate(
         "skipped": skipped,
         "walk_errors": walk_errors,
     }
+
+
+def _decode_window(window: bytes, has_more: bool) -> tuple[str, bytes]:
+    # Do not split a UTF-8 code point between byte windows. Invalid input is
+    # refused rather than silently replacing bytes in an evidence span.
+    import codecs
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    text = decoder.decode(window, final=not has_more)
+    pending, _ = decoder.getstate()
+    return text, window[:len(window) - len(pending)] if pending else window
 
 
 def skill_file_read(
@@ -607,7 +622,7 @@ def skill_file_read(
                     raw = stream.read(max_bytes + 1)
                 has_more = len(raw) > max_bytes
                 window = raw[:max_bytes]
-                text = window.decode("utf-8", errors="replace")
+                text, window = _decode_window(window, has_more)
                 obs = UntrustedObservation(
                     path=target, sha256=sha, byte_start=offset,
                     byte_end=offset + len(window), total_size=total_size,
@@ -638,7 +653,7 @@ def skill_file_read(
                 raw = handle.read(max_bytes + 1)
             has_more = len(raw) > max_bytes
             window = raw[:max_bytes]
-            text = window.decode("utf-8", errors="replace")
+            text, window = _decode_window(window, has_more)
             obs = UntrustedObservation(
                 path=str(path), sha256=sha, byte_start=offset,
                 byte_end=offset + len(window), total_size=total_size,
@@ -664,6 +679,44 @@ def skill_file_read(
             },
         )
     return obs
+
+
+def inspect_observation_schema(obs: UntrustedObservation) -> dict[str, Any]:
+    """Describe a first window only; values and schema are untrusted data.
+
+    A partial JSON window is not claimed to be a validated document. Callers
+    must continue reading to EOF and validate the complete structure separately.
+    """
+    result: dict[str, Any] = {"format": obs.record_format, "trusted": False,
+                              "complete": obs.eof and obs.byte_start == 0}
+    if obs.byte_start:
+        result["status"] = "not_first_window"
+        return result
+    if obs.record_format in ("csv", "tsv"):
+        if "\n" not in obs.text and not obs.eof:
+            result["status"] = "header_incomplete"
+            return result
+        try:
+            row = next(csv.reader(io.StringIO(obs.text), delimiter="\t" if obs.record_format == "tsv" else ",", strict=True), [])
+        except csv.Error as exc:
+            result.update(status="parse_error", error=str(exc))
+            return result
+        result.update(status="header_only", columns=row)
+    elif obs.record_format == "json":
+        if not result["complete"]:
+            result["status"] = "incomplete_not_validated"
+        else:
+            try:
+                value = json.loads(obs.text)
+            except (ValueError, RecursionError) as exc:
+                result.update(status="parse_error", error=str(exc))
+            else:
+                result.update(status="validated", top_level=type(value).__name__)
+                if isinstance(value, dict):
+                    result["keys"] = list(value.keys())
+    else:
+        result["status"] = "not_schema_inspected"
+    return result
 
 
 # -- Domain-agnostic structural extraction & IF-6 verification ---------------
@@ -1828,6 +1881,9 @@ class ErrandRunner:
                             safety_journal=self.safety_journal,
                             correlation_id=f"errand:{errand_id}:step:{step_no}",
                         )
+                        previous = files_inspected.get(obs.path)
+                        if previous and previous["sha256"] != obs.sha256:
+                            raise ValueError(f"file changed during streaming: {obs.path}")
                         observations.append(obs)
                         bytes_here = obs.byte_end - obs.byte_start
                         step_untrusted_bytes = bytes_here
@@ -1857,6 +1913,7 @@ class ErrandRunner:
                             "truncated": obs.truncated,
                             "never_send": obs.never_send,
                             "trusted": obs.trusted,
+                            "schema": inspect_observation_schema(obs),
                         }
                         # Bounded >200KB streaming continuation: if more bytes
                         # remain and step budget has room (preserving space for

@@ -65,8 +65,8 @@ def _ooxml_text(path: Path, member_patterns: tuple[str, ...]) -> str:
                     root = ElementTree.fromstring(archive.read(name))
                     parts.extend(node.text for node in root.iter()
                                  if node.text and node.tag.endswith("}t"))
-    except Exception:
-        return ""
+    except (OSError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        raise ValueError(f"invalid structured document: {exc}") from exc
     return " ".join(parts)
 
 
@@ -76,31 +76,52 @@ def extract_text(path: Path, max_chars: int = 200_000) -> tuple[str, str]:
     suffix = path.suffix.lower()
     try:
         if suffix in TEXT_EXTENSIONS:
-            return path.read_text(encoding="utf-8", errors="replace")[:max_chars], "text"
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                text = handle.read(max_chars + 1)
+            if len(text) > max_chars:
+                raise ValueError(f"extraction exceeds {max_chars} characters")
+            return text, "text"
         if suffix == ".pdf":
             if shutil.which("pdftotext"):
                 out = subprocess.run(["pdftotext", "-layout", str(path), "-"],
                                      capture_output=True, text=True, timeout=60,
                                      check=False)
                 if out.returncode == 0:
-                    return out.stdout[:max_chars], "pdftotext"
+                    if len(out.stdout) > max_chars:
+                        raise ValueError(f"extraction exceeds {max_chars} characters")
+                    return out.stdout, "pdftotext"
             try:  # pragma: no cover - optional dependency
                 import fitz
 
                 with fitz.open(path) as doc:
-                    return "\n".join(p.get_text() for p in doc)[:max_chars], "pymupdf"
+                    text = "\n".join(p.get_text() for p in doc)
+                    if len(text) > max_chars:
+                        raise ValueError(f"extraction exceeds {max_chars} characters")
+                    return text, "pymupdf"
             except ImportError:
                 return "", "no-text (install poppler-utils or pymupdf)"
         if suffix == ".docx":
-            return _ooxml_text(path, (r"word/document\.xml",))[:max_chars], "docx"
+            text = _ooxml_text(path, (r"word/document\.xml",))
+            if len(text) > max_chars:
+                raise ValueError(f"extraction exceeds {max_chars} characters")
+            return text, "docx"
         if suffix == ".pptx":
-            return _ooxml_text(path, (r"ppt/slides/slide\d+\.xml",))[:max_chars], "pptx"
+            text = _ooxml_text(path, (r"ppt/slides/slide\d+\.xml",))
+            if len(text) > max_chars:
+                raise ValueError(f"extraction exceeds {max_chars} characters")
+            return text, "pptx"
         if suffix == ".xlsx":
-            return _ooxml_text(path, (r"xl/sharedStrings\.xml",))[:max_chars], "xlsx"
+            text = _ooxml_text(path, (r"xl/sharedStrings\.xml",))
+            if len(text) > max_chars:
+                raise ValueError(f"extraction exceeds {max_chars} characters")
+            return text, "xlsx"
         if suffix == ".odt":
-            return _ooxml_text(path, (r"content\.xml",))[:max_chars], "odt"
+            text = _ooxml_text(path, (r"content\.xml",))
+            if len(text) > max_chars:
+                raise ValueError(f"extraction exceeds {max_chars} characters")
+            return text, "odt"
     except Exception as exc:
-        return "", f"error: {type(exc).__name__}"
+        return "", f"error: {type(exc).__name__}: {exc}"
     return "", "no-text"  # binaries/images: metadata only (vision is opt-in)
 
 
@@ -177,6 +198,9 @@ class Indexer:
         stats = {"root": str(root), "indexed": 0, "unchanged": 0, "changed": 0,
                  "missing_marked": 0, "skipped": {}, "no_text": 0,
                  "never_send": 0, "extractors": {}}
+        if is_protected(root, self.protected) or root.is_symlink():
+            stats["error"] = f"protected or symlink root refused: {root}"
+            return stats
         if not root.exists():
             stats["error"] = f"root does not exist: {root}"
             return stats
@@ -201,6 +225,7 @@ class Indexer:
             never_send = self._never_send(path)
             existing = self.store.document_by_path(str(path))
             if (existing and existing["status"] == "indexed"
+                    and not (path.suffix.lower() in TEXT_EXTENSIONS and stat.st_size > self.max_extract_chars)
                     and existing["size"] == stat.st_size
                     and abs(existing["mtime"] - stat.st_mtime) < 1e-6):
                 if int(existing["never_send"]) != int(never_send):
@@ -212,19 +237,39 @@ class Indexer:
                 stats["never_send"] += int(never_send)
                 stats["unchanged"] += 1
                 continue
-            data_hash = sha256_bytes(path.read_bytes()) if stat.st_size <= 64_000_000 \
-                else self._hash_large(path)
-            text, extractor = extract_text(path, self.max_extract_chars)
+            try:
+                data_hash = self._hash_large(path)
+                if path.suffix.lower() in TEXT_EXTENSIONS:
+                    extractor = "text-stream"
+                    def chunks():
+                        with path.open(encoding="utf-8", errors="replace") as handle:
+                            while True:
+                                block = handle.read(CHUNK_CHARS)
+                                if not block:
+                                    break
+                                yield block
+                        after = path.stat()
+                        if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
+                            raise OSError("file changed during indexing")
+                    text_chunks = chunks()
+                else:
+                    text, extractor = extract_text(path, self.max_extract_chars)
+                    if extractor.startswith("error:"):
+                        raise ValueError(extractor)
+                    if not text:
+                        stats["no_text"] += 1
+                    text_chunks = chunk_text(text)
+                self.store.upsert_document(
+                    path=str(path), root=str(root), sha256=data_hash,
+                    size=stat.st_size, mtime=stat.st_mtime,
+                    mime=mimetypes.guess_type(path.name)[0], ext=path.suffix.lower(),
+                    indexed_ts=iso_now(), never_send=int(never_send),
+                    text_chunks=text_chunks)
+            except (OSError, ValueError) as exc:
+                walk_errors.append((str(path), f"{path}: {type(exc).__name__}: {exc}"))
+                continue
             stats["extractors"][extractor] = stats["extractors"].get(extractor, 0) + 1
-            if not text:
-                stats["no_text"] += 1
             stats["never_send"] += int(never_send)
-            self.store.upsert_document(
-                path=str(path), root=str(root), sha256=data_hash,
-                size=stat.st_size, mtime=stat.st_mtime,
-                mime=mimetypes.guess_type(path.name)[0], ext=path.suffix.lower(),
-                indexed_ts=iso_now(), never_send=int(never_send),
-                text_chunks=chunk_text(text))
             stats["changed" if existing else "indexed"] += 1
         if walk_errors:
             stats["error"] = "; ".join(msg for _, msg in walk_errors)

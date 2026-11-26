@@ -719,10 +719,14 @@ class Store:
             )
             doc_id = int(cur.fetchone()[0])
             self._conn.execute("DELETE FROM doc_chunks WHERE doc_id = ?", (doc_id,))
-            self._conn.executemany(
-                "INSERT INTO doc_chunks (doc_id, chunk_no, text) VALUES (?, ?, ?)",
-                [(doc_id, i, chunk) for i, chunk in enumerate(text_chunks)],
-            )
+            try:
+                self._conn.executemany(
+                    "INSERT INTO doc_chunks (doc_id, chunk_no, text) VALUES (?, ?, ?)",
+                    ((doc_id, i, chunk) for i, chunk in enumerate(text_chunks)),
+                )
+            except Exception:
+                self._conn.rollback()
+                raise
             if self.fts5_available:
                 self._conn.execute(
                     "INSERT INTO doc_chunks_fts (doc_chunks_fts) VALUES ('rebuild')")
