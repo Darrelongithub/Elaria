@@ -72,7 +72,7 @@ def main(argv=None) -> int:
     else:
         from .sync import RcloneSyncBackend
         backend = RcloneSyncBackend(remote="elaria-sync", root_folder="elaria-sync")
-    transport = FakeTransport() if args.fake_transport else WhatsAppCloudTransport(config)
+    transport = FakeTransport() if args.fake_transport else WhatsAppCloudTransport(config, store=store)
 
     app = AliveWSGIApp(config, store, backend, transport)
     log_event(config.state_dir, "serve_started", host=args.host, port=args.port,

@@ -23,6 +23,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS template_attempts (
+  id INTEGER PRIMARY KEY, day TEXT NOT NULL, template TEXT NOT NULL,
+  status TEXT NOT NULL, wamid TEXT
+);
 CREATE TABLE IF NOT EXISTS seen (
   id TEXT PRIMARY KEY,
   seen_at TEXT NOT NULL
@@ -98,6 +102,43 @@ class AliveStore:
     def close(self):
         with self._lock:
             self._conn.close()
+
+    def reserve_template(self, template: str, cap: int, now: datetime) -> int | None:
+        """Reserve atomically across processes; ambiguous failures consume budget."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                count = self._conn.execute(
+                    "SELECT COUNT(*) FROM template_attempts WHERE day=?", (self._day(now),)
+                ).fetchone()[0]
+                if count >= cap:
+                    self._conn.rollback()
+                    return None
+                cur = self._conn.execute(
+                    "INSERT INTO template_attempts(day, template, status) VALUES (?, ?, 'pending')",
+                    (self._day(now), template))
+                self._conn.commit()
+                return cur.lastrowid
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def finish_template(self, attempt: int, status: str, wamid: str | None = None):
+        with self._lock:
+            self._conn.execute("UPDATE template_attempts SET status=?, wamid=? WHERE id=?",
+                               (status, wamid, attempt))
+            self._conn.commit()
+
+    def record_inbound_window(self, sender: str, timestamp: int, now: datetime):
+        if timestamp < 0 or timestamp > now.timestamp():
+            return
+        key = "window:" + sender
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET "
+                "value=CASE WHEN CAST(excluded.value AS INTEGER)>CAST(kv.value AS INTEGER) "
+                "THEN excluded.value ELSE kv.value END", (key, str(timestamp)))
+            self._conn.commit()
 
     # -- seq -----------------------------------------------------------------
     def next_seq(self) -> int:

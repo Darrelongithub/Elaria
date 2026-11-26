@@ -33,7 +33,7 @@ from pathlib import Path
 EGRESS_ALLOWLIST = ("graph.facebook.com",)
 
 #: Graph API version pinned by the build. Bump deliberately, never at runtime.
-GRAPH_API_VERSION = "v21.0"
+GRAPH_API_VERSION = "v24.0"
 
 #: Reminder template name the owner registers with Meta (utility template).
 REMINDER_TEMPLATE = "reminder_v1"
@@ -59,7 +59,7 @@ class AliveConfig:
     verify_token: str = ""             # hub.challenge handshake
 
     # limits — all enforced in code, all overridable ONLY in this file
-    max_templates_per_day: int = 10    # utility templates (B14)
+    max_templates_per_day: int = 3    # utility templates (B14)
     owner_messages_per_day: int = 200  # owner instruction envelopes (B10)
     stranger_turns_per_day_per_sender: int = 20
     stranger_messages_per_month: int = 800  # stays under the 1,000 free
@@ -86,6 +86,8 @@ class AliveConfig:
     fast_lane: bool = False            # owner decision, default OFF — never auto-approve
 
     def __post_init__(self):
+        if not isinstance(self.max_templates_per_day, int) or self.max_templates_per_day < 0:
+            raise AliveConfigError("max_templates_per_day must be non-negative")
         if not self.mac_key or len(self.mac_key) < 16:
             raise AliveConfigError("mac_key missing or too short; provision with `python -m alive.provision`")
         if not self.from_hash_salt or len(self.from_hash_salt) < 8:
@@ -152,7 +154,7 @@ def load_config(path: str | Path) -> AliveConfig:
         wa_token=str(section.get("wa_token", "")),
         wa_app_secret=str(section.get("wa_app_secret", "")),
         verify_token=str(section.get("verify_token", "")),
-        max_templates_per_day=cap("max_templates_per_day", 10),
+        max_templates_per_day=cap("max_templates_per_day", 3),
         owner_messages_per_day=cap("owner_messages_per_day", 200),
         stranger_turns_per_day_per_sender=cap("stranger_turns_per_day_per_sender", 20),
         stranger_messages_per_month=cap("stranger_messages_per_month", 800),

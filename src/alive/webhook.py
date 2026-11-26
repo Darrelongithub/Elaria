@@ -249,7 +249,13 @@ def _handle_message(*, message: dict, config, store, backend, transport,
                     now: datetime) -> dict:
     """One inbound message → one decision. Raises nothing the caller can't
     turn into a 5xx-or-200 policy outcome."""
+    if not isinstance(message, dict):
+        return {"outcome": "ignored_malformed"}
     sender = str(message.get("from", "")).strip()
+    if sender.isdigit():
+        sender = "+" + sender
+    if not sender.startswith("+") or not sender[1:].isdigit():
+        return {"outcome": "ignored_malformed"}
     message_id = str(message.get("id", "")).strip()
     if not sender or not message_id:
         return {"outcome": "ignored_malformed"}
@@ -257,6 +263,11 @@ def _handle_message(*, message: dict, config, store, backend, transport,
     if not store.first_time_seen(message_id, now=now):
         return {"outcome": "duplicate"}
 
+    try:
+        store.record_inbound_window(envelope_mod.from_hash(sender, config.from_hash_salt),
+                                    int(message.get("timestamp")), now)
+    except (TypeError, ValueError, OverflowError):
+        pass  # malformed timestamps never open a service window
     _check_clock_suspect(store, message.get("timestamp"), config, now)
     sent_at = _iso_from_meta_ts(message.get("timestamp"))
 
@@ -421,11 +432,17 @@ def handle_request(method: str, headers: dict, raw_body: bytes, *,
         log_event(config.state_dir, "unparseable_body", level="warn")
         return 400, b"bad request"
 
-    entries = payload.get("entry", []) if isinstance(payload, dict) else []
+    entries = (payload.get("entry", []) if isinstance(payload, dict)
+               and payload.get("object") == "whatsapp_business_account" else [])
     outcomes = []
     for entry in entries:
         for change in entry.get("changes", []):
             value = change.get("value", {}) if isinstance(change, dict) else {}
+            if change.get("field") != "messages" or value.get("messaging_product") != "whatsapp":
+                continue
+            metadata = value.get("metadata") or {}
+            if str(metadata.get("phone_number_id", "")) != config.wa_phone_number_id:
+                continue
             profile_name = ""
             for contact in value.get("contacts", []) or []:
                 if isinstance(contact, dict):

@@ -25,9 +25,9 @@ from .config import REMINDER_TEMPLATE, AliveConfig
 from .journal import iso_now, log_event
 from .mirror import is_stale, load_mirror
 from .store import AliveStore
-from .transport import PlatformBlocked, TransportError
+from .transport import PlatformBlocked, TransportError, TemplateCapReached
 
-_COST_USD_EST = 0.0040  # Kenya utility-template estimate, labelled as such
+
 
 
 def _parse_ts(value):
@@ -69,6 +69,9 @@ def send_reminder(*, backend, config: AliveConfig, store: AliveStore,
     try:
         response = transport.send_utility_template(
             config.owner_e164, REMINDER_TEMPLATE, [topic, remind_at])
+    except TemplateCapReached:
+        store.record_fired(commitment_id, remind_at, "capped", now=now)
+        return "capped"
     except PlatformBlocked as exc:
         store.record_fired(commitment_id, remind_at, "unknown", now=now)
         store.kv_set("platform_blocked", "1")
@@ -95,7 +98,7 @@ def send_reminder(*, backend, config: AliveConfig, store: AliveStore,
         "v": 1, "kind": "reminder_log",
         "commitment_id": commitment_id, "template": REMINDER_TEMPLATE,
         "wamid": wamid, "status": "sent",
-        "cost_usd_est": _COST_USD_EST,
+        "cost_note": "unknown; check Meta billing",
         "sent_at": iso_now(), "remind_at": remind_at,
     }
     seq = store.next_seq()
@@ -137,13 +140,16 @@ def tick(*, backend, config: AliveConfig, store: AliveStore,
         if (store.kv_get("stale_notified", "0") or "0") != "1":
             store.kv_set("stale_notified", "1")
             try:
+                if store.count_today("templates", tier="T0", now=now) >= config.max_templates_per_day:
+                    raise TemplateCapReached("daily cap reached")
                 transport.send_utility_template(
-                    config.owner_e164, REMINDER_TEMPLATE,
-                    [f"(reminder list not refreshed since {mirror.generated_at:%Y-%m-%d})",
-                     iso_now()])
+                    config.owner_e164, "mirror_stale_v1",
+                    [f"{mirror.generated_at:%Y-%m-%d}"])
                 store.increment("templates", tier="T0", now=now)
                 store.increment_month("service_messages", now=now)
             except (PlatformBlocked, TransportError) as exc:
+                if isinstance(exc, PlatformBlocked):
+                    store.kv_set("platform_blocked", "1")
                 log_event(config.state_dir, "stale_notice_failed", level="error",
                           error=str(exc))
             log_event(config.state_dir, "mirror_stale_notices_owner",

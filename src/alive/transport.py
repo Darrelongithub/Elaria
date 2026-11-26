@@ -25,11 +25,21 @@ in the sandbox with an injected ``http_client`` double, never a network.
 from __future__ import annotations
 
 from urllib.parse import urlparse
+from datetime import UTC, datetime
+
+from .journal import log_event
+from .envelope import from_hash
+from .store import AliveStore
+from .templates import TEMPLATES
 
 from .config import EGRESS_ALLOWLIST, GRAPH_API_VERSION, AliveConfig
 
 
 class TransportError(RuntimeError):
+    pass
+
+
+class TemplateCapReached(TransportError):
     pass
 
 
@@ -78,8 +88,10 @@ class WhatsAppCloudTransport:
     is only ever invoked with an allowlisted URL.
     """
 
-    def __init__(self, config: AliveConfig, *, http_client=None):
+    def __init__(self, config: AliveConfig, *, store=None, http_client=None, clock=None):
         self.config = config
+        self.store = store or AliveStore(config.state_dir)
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._http = http_client or self._default_http
 
     @property
@@ -95,8 +107,12 @@ class WhatsAppCloudTransport:
         assert_egress_allowed(url)  # hard gate, even for the default client
         data = _json.dumps(json_body).encode("utf-8")
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                raise EgressRefused("HTTP redirect refused")
+        try_opener = urllib.request.build_opener(NoRedirect())
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with try_opener.open(req, timeout=15) as resp:
                 return resp.status, _json.loads(resp.read().decode("utf-8") or "{}")
         except urllib.error.HTTPError as exc:
             try:
@@ -121,12 +137,28 @@ class WhatsAppCloudTransport:
 
         In-window replies are the counterpart of a conversation the other
         party opened, so any counterpart may be addressed here — but this
-        method can only be reached from the webhook's request cycle, and it
-        is never used to initiate contact.
+        verified inbound timestamp is recorded by the signed webhook and
+        checked at this boundary; no timestamp means no free-form send.
         """
+        if self.store.platform_blocked():
+            raise PlatformBlocked("line is blocked; owner action required")
+        try:
+            last = int(self.store.kv_get("window:" + from_hash(to_e164, self.config.from_hash_salt), ""))
+            age = self._clock().timestamp() - last
+        except (TypeError, ValueError):
+            age = -1
+        if not 0 <= age < 24 * 60 * 60:
+            raise EgressRefused("no verified inbound message within the 24-hour window")
         body = {"messaging_product": "whatsapp", "to": to_e164,
                 "type": "text", "text": {"body": text[:4096]}}
-        return self._send(body)
+        log_event(self.config.state_dir, "service_attempt")
+        try:
+            response = self._send(body)
+        except Exception:
+            log_event(self.config.state_dir, "service_unknown", level="warn")
+            raise
+        log_event(self.config.state_dir, "service_accepted")
+        return response
 
     def send_utility_template(self, to_e164: str, template: str, params: list[str]) -> dict:
         """Business-initiated send. ONLY the owner's number is addressable."""
@@ -134,14 +166,38 @@ class WhatsAppCloudTransport:
             raise EgressRefused(
                 "utility templates may only be addressed to the single configured "
                 "owner number; refusing")
+        if template not in TEMPLATES or len(params) != TEMPLATES[template][1]:
+            raise EgressRefused("unknown template or incorrect parameter count")
+        if self.store.platform_blocked():
+            raise PlatformBlocked("line is blocked; owner action required")
+        attempt = self.store.reserve_template(template, self.config.max_templates_per_day,
+                                              self._clock())
+        if attempt is None:
+            log_event(self.config.state_dir, "template_cap_reached", template=template)
+            raise TemplateCapReached("daily template attempt cap reached")
+        log_event(self.config.state_dir, "template_attempt", attempt=attempt, template=template)
         body = {"messaging_product": "whatsapp", "to": to_e164,
                 "type": "template",
-                "template": {"name": template,
-                             "language": {"code": "en"},
-                             "components": [{"type": "body",
-                                             "parameters": [{"type": "text", "text": str(p)[:200]}
-                                                             for p in params]}]}}
-        return self._send(body)
+                "template": {"name": template, "language": {"code": "en"},
+                             "components": [{"type": "body", "parameters": [
+                                 {"type": "text", "text": str(p)[:200]} for p in params]}]}}
+        try:
+            response = self._send(body)
+            wamid = response.get("messages", [{}])[0].get("id")
+            if not wamid:
+                raise TransportError("Meta response missing message id; outcome unknown")
+            self.store.finish_template(attempt, "accepted", wamid)
+            log_event(self.config.state_dir, "template_accepted", attempt=attempt, wamid=wamid)
+            return response
+        except Exception as exc:
+            self.store.finish_template(attempt, "unknown")
+            if isinstance(exc, PlatformBlocked):
+                self.store.kv_set("platform_blocked", "1")
+            log_event(self.config.state_dir, "template_unknown", level="error", attempt=attempt)
+            if isinstance(exc, TransportError):
+                raise
+            raise TransportError("template send outcome unknown") from exc
+
 
 
 class FakeTransport:
