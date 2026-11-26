@@ -80,6 +80,16 @@ class RecallHit:
     text: str
     score: float
     trusted: bool = False  # IF-6: data only, never drives a tool
+    fact_source: str | None = None
+    confidence: float | None = None
+    evidence: str | None = None
+    probationary: bool = False
+
+    def prompt_text(self) -> str:
+        if self.probationary:
+            return (f"[UNVERIFIED INFERENCE conf={self.confidence:.2f} "
+                    f"evidence={self.evidence}] {self.text}")
+        return self.text
 
 
 @dataclass
@@ -288,6 +298,29 @@ class Memory:
                                    source=source, confidence=confidence,
                                    evidence=evidence)
 
+    def propose_inferred(self, text: str, kind: str, *, confidence: float,
+                         evidence: str, doc_sha256: str) -> int | None:
+        """Persist a strictly probationary, provenance-bound candidate.
+
+        Caller supplies a content hash and a citable evidence span. The API
+        pins source in Python; callers cannot promote by choosing a source.
+        """
+        claim = str(text or "").strip()
+        citation = str(evidence or "").strip()
+        digest = str(doc_sha256 or "").strip().lower()
+        if not claim or not citation or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("inference requires text, evidence, and a SHA-256 document hash")
+        existing = self.store.list_facts(active_only=True)
+        normalized = set(_query_terms(claim))
+        for row in existing:
+            overlap = normalized & set(_query_terms(row["text"]))
+            if row["kind"] == kind and normalized and len(overlap) / len(normalized) >= .8:
+                return None
+        return self.store.add_fact(
+            ts=iso_now(), kind=kind, text=claim, source="inferred",
+            confidence=min(.85, max(0.0, float(confidence))),
+            evidence=f"sha256:{digest} span:{citation}")
+
     def forget(self, topic: str) -> int:
         return self.store.forget_facts(topic)
 
@@ -394,14 +427,39 @@ class Memory:
                      RecallHit("document", chunk["path"], chunk["text"][:200], 0.0),
                      1.0 / (60 + rank))
         lowered = query.lower()
-        for fact in self.store.list_facts():
+        facts = self.store.list_facts()
+        stated_by_kind = {}
+        for fact in facts:
+            if fact.get("source") == "stated":
+                stated_by_kind.setdefault(fact["kind"], []).append(
+                    set(_query_terms(fact["text"])))
+        now = datetime.now(UTC)
+        for fact in facts:
             fact_terms = set(_query_terms(fact["text"]))
             overlap = len(fact_terms & set(terms)) if terms else 0
-            if overlap or (lowered and lowered in fact["text"].lower()):
-                bump(f"fact:{fact['id']}",
-                     RecallHit("fact", f"#{fact['id']} ({fact['kind']}, {fact['source']})",
-                               fact["text"], 0.0),
-                     0.02 + 0.01 * overlap)
+            if not (overlap or (lowered and lowered in fact["text"].lower())):
+                continue
+            inferred = fact.get("source") == "inferred"
+            # An inference contradicted/covered by any stated fact in its kind
+            # is omitted; stated knowledge always wins over tentative material.
+            contradicted = inferred and any(
+                bool(fact_terms & stated_terms)
+                for stated_terms in stated_by_kind.get(fact["kind"], []))
+            if contradicted:
+                continue
+            confidence = min(.85, max(0.0, float(fact.get("confidence", 1.0))))
+            try:
+                age_days = max(0.0, (now - _parse_iso(fact["ts"])).total_seconds() / 86400)
+            except (ValueError, TypeError):
+                age_days = 0.0
+            decay = math.exp(-math.log(2) * age_days / 180.0) if inferred else 1.0
+            factor = confidence * .5 * decay if inferred else 1.0
+            hit = RecallHit("fact", f"#{fact['id']} ({fact['kind']}, {fact['source']})",
+                            fact["text"], 0.0, fact_source=fact.get("source"),
+                            confidence=confidence, evidence=fact.get("evidence"),
+                            probationary=inferred)
+            bump(f"fact:{fact['id']}", hit,
+                 (0.02 + 0.01 * overlap) * factor)
         if terms:
             term_set = set(terms)
             for hit in scores.values():
