@@ -2024,7 +2024,10 @@ def build_parser() -> argparse.ArgumentParser:
     status_p.add_argument("--waybar", action="store_true", help="Waybar custom-module JSON")
     status_p.add_argument("--follow", action="store_true",
                           help="with --waybar: stream a line per state change (no poll lag)")
-    sub.add_parser("cost", help="request/token spend from the ledger")
+    sub.add_parser(
+        "cost",
+        help="ledger spend: totals, today's per-provider/per-purpose rows, "
+             "degradation-ladder rung + reason")
     talk_p = sub.add_parser(
         "talk", help="her console: one conversation, voice + text (CLI parity)")
     talk_p.add_argument("text", nargs="?",
@@ -2448,12 +2451,23 @@ def main(argv: list[str] | None = None) -> int:
             except DaemonUnavailable:
                 # Ledger reads fine without the daemon — cost must always answer.
                 from .cost import day_start_iso, month_start_iso
+                from .provider_router import ProviderRouter
                 from .store import Store
                 store = Store(config.db_path)
                 data = {"month": store.llm_summary(month_start_iso()),
                         "today": store.llm_summary(day_start_iso()),
                         "quota": config.section("quota"),
                         "tier": config.section("privacy").get("tier", "free")}
+                from .cost import provider_cost_report
+                data["providers"] = provider_cost_report(store, day_start_iso())
+                try:
+                    data["ladder"] = ProviderRouter(config, store).ladder_state()
+                except Exception as exc:
+                    data["ladder"] = {"level": "?",
+                                      "reason": f"ladder unreadable: {type(exc).__name__}",
+                                      "gemini_flash": False, "gemini_flash_lite": False,
+                                      "material_diverted": False,
+                                      "caps": {}, "buckets": {}}
                 data["today"]["live_calls"] = store.calls_since(day_start_iso())
                 data["today"]["user_turn_calls"] = store.user_turn_calls_since(day_start_iso())
                 data["today"]["housekeeping_calls"] = store.housekeeping_calls_since(day_start_iso())
@@ -2473,8 +2487,20 @@ def main(argv: list[str] | None = None) -> int:
                     subs.append(detail)
                 data["today"]["reply_substitutions"] = subs
                 store.close()
-            from .cost import format_cost_report
+            from .cost import (
+                format_cost_report,
+                format_ladder_status,
+                format_provider_report,
+            )
             print(format_cost_report(data["month"], data["today"], data["quota"], data["tier"]))
+            providers = data.get("providers")
+            if providers:
+                print(format_provider_report(
+                    providers,
+                    title="Today by provider and purpose (ledger):"))
+            ladder = data.get("ladder")
+            if ladder:
+                print(format_ladder_status(ladder))
             return 0
 
         if args.command == "class":

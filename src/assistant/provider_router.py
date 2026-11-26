@@ -14,6 +14,12 @@ No HTTP client, key, account or provider endpoint is shipped here: code-known
 diverted providers are adapters that the owner registers only after account
 verification. The boundary, quota, ledger and refusal behaviour are testable
 with fixture adapters and zero provider calls.
+
+Cloudflare Workers AI bills in neurons, not requests: its adapter always
+reserves a declared `neurons_per_request` per call against the model's
+`neurons_per_day` allocation (never `rpd`, never a request count), and its
+ledger rows carry `billing_unit='neurons'` with `billing_amount` left unknown
+until the owner records the measured per-call neuron cost.
 """
 
 from __future__ import annotations
@@ -59,6 +65,8 @@ STATE_VERSION = 1
 STATE_FILE = "provider-router-state.json"
 MAX_MATERIAL_CHARS = 4000
 VERBATIM_WINDOW = 120
+MAX_ATTACHMENT_BYTES = 1_500_000  # decoded bytes; a frame larger than this never dispatches
+MAX_ATTACHMENTS = 1
 
 
 class Capability(str, Enum):
@@ -103,6 +111,28 @@ class AdapterFailure(ProviderRoutingError):
 
 
 @dataclass(frozen=True)
+class MaterialAttachment:
+    """In-memory payload part for MATERIAL calls (e.g. a screen frame).
+
+    Never written to disk, the ledger or the journal by the router; adapters
+    pass it to the provider inline and drop it. The owner-approved use is
+    vision grounding; everything else stays text.
+    """
+
+    media_type: str
+    data_b64: str
+
+    def decoded_size(self) -> int:
+        import base64
+
+        try:
+            raw = base64.b64decode(self.data_b64, validate=True)
+        except Exception as exc:
+            raise AdapterFailure(f"attachment is not valid base64: {exc}") from exc
+        return len(raw)
+
+
+@dataclass(frozen=True)
 class ProviderRequest:
     capability: Capability
     role: str
@@ -112,6 +142,7 @@ class ProviderRequest:
     contents: object
     correlation_id: str
     quota_bucket: str
+    attachments: tuple[MaterialAttachment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -219,6 +250,43 @@ class CallbackAdapter:
         return self._fn(req)
 
 
+def _validate_attachments(attachments) -> tuple[MaterialAttachment, ...]:
+    """Count/bytes checks before any reservation is consumed or bytes move."""
+    items = tuple(attachments or ())
+    if len(items) > MAX_ATTACHMENTS:
+        raise AdapterFailure(f"too many attachments ({len(items)} > {MAX_ATTACHMENTS})")
+    out = []
+    for item in items:
+        if not isinstance(item, MaterialAttachment):
+            raise AdapterFailure("attachment must be a MaterialAttachment")
+        media = str(item.media_type or "").lower().strip()
+        if media not in {"image/png", "image/jpeg", "image/webp"}:
+            raise AdapterFailure(f"attachment media_type {media!r} is not supported")
+        if item.decoded_size() > MAX_ATTACHMENT_BYTES:
+            raise AdapterFailure(
+                f"attachment exceeds the {MAX_ATTACHMENT_BYTES}-byte cap; "
+                "refusing to dispatch")
+        out.append(MaterialAttachment(media_type=media, data_b64=item.data_b64))
+    return tuple(out)
+
+
+def _message_content(req: ProviderRequest):
+    """Text-only, or OpenAI-style parts when attachments ride along.
+
+    Attachments stay in memory end to end; the ledger/journal never see them.
+    """
+    text = " ".join(str(req.contents).split())[:MAX_MATERIAL_CHARS]
+    if not req.attachments:
+        return text
+    parts = [{"type": "text", "text": text}]
+    for item in req.attachments:
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{item.media_type};base64,{item.data_b64}"},
+        })
+    return parts
+
+
 class HttpMaterialAdapter:
     """OpenAI-compatible MATERIAL adapter for two code-owned hosts only.
 
@@ -257,6 +325,7 @@ class HttpMaterialAdapter:
             capability=req.capability.value)
         if req.capability is not Capability.MATERIAL:
             raise RouteRefused("this adapter emits untrusted material only")
+        _validate_attachments(req.attachments)
         key = os.environ.get(self.KEY_ENV[self.provider_id], "").strip()
         if not key:
             raise ProviderDisabledError(
@@ -266,8 +335,7 @@ class HttpMaterialAdapter:
 
         body = {
             "model": req.model,
-            "messages": [{"role": "user", "content":
-                          " ".join(str(req.contents).split())[:MAX_MATERIAL_CHARS]}],
+            "messages": [{"role": "user", "content": _message_content(req)}],
             "max_tokens": 512,
         }
         try:
@@ -308,6 +376,100 @@ class HttpMaterialAdapter:
             usage={"tokens_in": int(usage.get("prompt_tokens") or 0),
                    "tokens_out": int(usage.get("completion_tokens") or 0)},
             billing_unit="requests_tokens")
+
+
+class CloudflareMaterialAdapter:
+    """Cloudflare Workers AI MATERIAL adapter (OpenAI-compatible endpoint).
+
+    Disabled in practice until BOTH the owner's `[quota.providers.cloudflare]`
+    row is verified/no-card with positive `neurons_per_day` and
+    `neurons_per_request` AND the owner's own credentials are in the process
+    environment:
+      ELARIA_CLOUDFLARE_ACCOUNT_ID  — the 32-hex account id (path segment)
+      ELARIA_CLOUDFLARE_API_TOKEN   — the API token (Authorization bearer)
+    No config URL, no redirects, no proxy env, no token in the ledger/journal,
+    no PERSONALITY capability. Billing is neuron-denominated at the quota
+    layer; this surface cannot report neurons, so rows land with
+    billing_unit='neurons' and billing_amount unknown (never guessed).
+    """
+
+    ENDPOINT = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1/chat/completions"
+    ACCOUNT_ENV = "ELARIA_CLOUDFLARE_ACCOUNT_ID"
+    TOKEN_ENV = "ELARIA_CLOUDFLARE_API_TOKEN"
+    _ACCOUNT_RE = re.compile(r"[0-9a-f]{32}", re.IGNORECASE)
+    MAX_RESPONSE_BYTES = 1 << 20
+
+    provider_id = "cloudflare"
+
+    def supports(self, capability: Capability) -> bool:
+        return capability is Capability.MATERIAL
+
+    def generate(self, req: ProviderRequest) -> ProviderResult:
+        assert_model_permitted(
+            req.model, provider=self.provider_id, role=req.role,
+            capability=req.capability.value)
+        if req.capability is not Capability.MATERIAL:
+            raise RouteRefused("this adapter emits untrusted material only")
+        _validate_attachments(req.attachments)
+        account = os.environ.get(self.ACCOUNT_ENV, "").strip()
+        if not account:
+            raise ProviderDisabledError(
+                f"no owner-provided account id in {self.ACCOUNT_ENV}; "
+                "refusing without account verification")
+        if not self._ACCOUNT_RE.fullmatch(account):
+            raise ProviderDisabledError(
+                f"{self.ACCOUNT_ENV} is not a 32-hex Cloudflare account id; "
+                "refusing to build the endpoint from it")
+        token = os.environ.get(self.TOKEN_ENV, "").strip()
+        if not token:
+            raise ProviderDisabledError(
+                f"no owner-provided token in {self.TOKEN_ENV}; "
+                "refusing without account verification")
+        import httpx
+
+        body = {
+            "model": req.model,
+            "messages": [{"role": "user", "content": _message_content(req)}],
+            "max_tokens": 512,
+        }
+        try:
+            with httpx.Client(timeout=httpx.Timeout(15.0), follow_redirects=False,
+                              trust_env=False) as client:
+                response = client.post(
+                    self.ENDPOINT.format(account=account.lower()),
+                    headers={"Authorization": f"Bearer {token}",
+                             "Content-Type": "application/json"},
+                    json=body)
+        except Exception as exc:
+            raise AdapterFailure(
+                f"cloudflare transport failed ({type(exc).__name__})") from exc
+        if len(response.content) > self.MAX_RESPONSE_BYTES:
+            raise AdapterFailure("diverted response exceeded the byte cap")
+        if response.status_code == 429:
+            retry_after = response.headers.get("retry-after", "")
+            try:
+                seconds = float(retry_after) if retry_after else 300.0
+            except ValueError:
+                seconds = 300.0
+            raise RateLimited("cloudflare rate-limited (429)", seconds)
+        if response.status_code != 200:
+            raise AdapterFailure(f"cloudflare returned HTTP {response.status_code}")
+        try:
+            payload = response.json()
+            text = payload["choices"][0]["message"]["content"]
+            if not isinstance(text, str):
+                raise TypeError("content is not text")
+            usage = payload.get("usage") or {}
+        except Exception as exc:
+            raise AdapterFailure(
+                "cloudflare response shape was not understood") from exc
+        return ProviderResult(
+            text=text, model=req.model, provider=self.provider_id,
+            request_id=str(payload.get("id") or "") or None,
+            usage={"tokens_in": int(usage.get("prompt_tokens") or 0),
+                   "tokens_out": int(usage.get("completion_tokens") or 0)},
+            billing_unit="neurons",
+            billing_amount=None)
 
 
 class AdapterRegistry:
@@ -367,11 +529,16 @@ class QuotaState:
                 raise ValueError("bad provider quota state shape")
             buckets = payload["buckets"]
             for key, value in buckets.items():
+                used = value.get("used") if isinstance(value, dict) else None
                 if (not isinstance(key, str) or not isinstance(value, dict)
-                        or not isinstance(value.get("used"), int)
-                        or value["used"] < 0
-                        or not isinstance(value.get("cooldown_until"), (int, float))):
+                        or not isinstance(used, (int, float))
+                        or isinstance(used, bool)
+                        or not math.isfinite(float(used)) or float(used) < 0
+                        or not isinstance(value.get("cooldown_until"), (int, float))
+                        or isinstance(value.get("cooldown_until"), bool)):
                     raise ValueError(f"bad bucket {key!r}")
+                buckets[key] = {"used": float(used),
+                                "cooldown_until": float(value["cooldown_until"])}
             self._buckets = buckets
         except Exception as exc:
             raise ProviderRoutingError(
@@ -401,25 +568,37 @@ class QuotaState:
         day = datetime.fromtimestamp(now, UTC).strftime("%Y-%m-%d")
         return f"{provider}:{model}:{day}"
 
-    def reserve(self, bucket: str, cap: float, now: float | None = None) -> None:
-        """One atomic reservation. `cap` must be positive; 0 is unavailable."""
+    def reserve(self, bucket: str, cap: float, now: float | None = None,
+                *, cost: float = 1.0) -> None:
+        """One atomic reservation of `cost` units against a positive cap.
+
+        `cost` must be a positive finite number. For neuron-billed providers
+        it is the declared per-call neuron estimate; for request-billed
+        providers it defaults to 1. Zero is NOT unlimited, ever.
+        """
         if not isinstance(cap, (int, float)) or isinstance(cap, bool) or cap <= 0:
             raise ProviderUnavailable(
                 f"bucket {bucket!r} has no positive cap; 0 is NOT unlimited")
+        if (not isinstance(cost, (int, float)) or isinstance(cost, bool)
+                or not math.isfinite(float(cost)) or cost <= 0):
+            raise ProviderUnavailable(
+                f"bucket {bucket!r} reservation cost must be a positive finite "
+                "number; zero-cost reservations would smuggle unlimited calls")
+        cost = float(cost)
         with self._lock:
             now = self.clock() if now is None else now
             if now + 1 < self._last_now:
                 raise ProviderRoutingError("clock moved backwards; refusing quota spend")
             self._last_now = now
-            entry = self._buckets.get(bucket, {"used": 0, "cooldown_until": 0.0})
+            entry = self._buckets.get(bucket, {"used": 0.0, "cooldown_until": 0.0})
             if entry["cooldown_until"] > now:
                 raise ProviderUnavailable(
                     f"bucket {bucket!r} is in cooldown until {entry['cooldown_until']:.0f}")
-            if entry["used"] >= cap:
+            if float(entry["used"]) + cost > float(cap):
                 raise ProviderUnavailable(
-                    f"bucket {bucket!r} exhausted ({int(entry['used'])}/{int(cap)})")
+                    f"bucket {bucket!r} exhausted ({entry['used']:.1f}/{float(cap):.1f})")
             previous = dict(entry)
-            entry["used"] = int(entry["used"]) + 1
+            entry["used"] = float(entry["used"]) + cost
             self._buckets[bucket] = entry
             try:
                 self._save()
@@ -427,32 +606,35 @@ class QuotaState:
                 self._buckets[bucket] = previous
                 raise
 
-    def release(self, bucket: str) -> None:
+    def release(self, bucket: str, *, cost: float = 1.0) -> None:
+        if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost <= 0:
+            raise ProviderRoutingError("release cost must be positive")
+        cost = float(cost)
         with self._lock:
             entry = self._buckets.get(bucket)
-            if entry is not None and entry["used"] > 0:
-                entry["used"] -= 1
+            if entry is not None and float(entry["used"]) > 0:
+                entry["used"] = max(0.0, float(entry["used"]) - cost)
                 self._save()
 
     def cooldown(self, bucket: str, seconds: float, now: float | None = None) -> None:
         now = self.clock() if now is None else now
         with self._lock:
             entry = self._buckets.setdefault(
-                bucket, {"used": 0, "cooldown_until": 0.0})
+                bucket, {"used": 0.0, "cooldown_until": 0.0})
             entry["cooldown_until"] = max(float(entry["cooldown_until"]), now + seconds)
             self._save()
 
     def snapshot(self, now: float | None = None) -> dict:
         now = self.clock() if now is None else now
         with self._lock:
-            return {key: {"used": int(value["used"]),
+            return {key: {"used": float(value["used"]),
                           "cooldown_until": float(value["cooldown_until"]),
                           "in_cooldown": value["cooldown_until"] > now}
                     for key, value in sorted(self._buckets.items())}
 
-    def used(self, bucket: str) -> int:
+    def used(self, bucket: str) -> float:
         with self._lock:
-            return int(self._buckets.get(bucket, {}).get("used", 0))
+            return float(self._buckets.get(bucket, {}).get("used", 0.0))
 
 
 _GEMINI_BUCKET_MODEL = {CHAT_INTENT: "flash-lite", ESCALATION: "flash"}
@@ -548,14 +730,36 @@ class ProviderRouter:
                 continue
             diverted = True
             break
+        flash_used = snapshot.get(
+            QuotaState.bucket(PERSONALITY_PROVIDER, ESCALATION, now), {}).get("used", 0.0)
+        lite_used = snapshot.get(
+            QuotaState.bucket(PERSONALITY_PROVIDER, CHAT_INTENT, now), {}).get("used", 0.0)
+        flash_cap_s = flash_cap if flash_cap is not None else "unverified"
+        lite_cap_s = lite_cap if lite_cap is not None else "unverified"
         if not flash and not lite:
-            level = "G3" if not diverted else "G2"
+            if diverted:
+                level = "G2"
+                reason = (f"pinned Gemini exhausted (flash {flash_used:.0f}/{flash_cap_s}, "
+                          f"flash-lite {lite_used:.0f}/{lite_cap_s} or in cooldown); a verified "
+                          "diverted material provider exists — her replies stay short and "
+                          "local-notice; material may still be routed")
+            else:
+                level = "G3"
+                reason = (f"pinned Gemini exhausted (flash {flash_used:.0f}/{flash_cap_s}, "
+                          f"flash-lite {lite_used:.0f}/{lite_cap_s} or in cooldown) and NO "
+                          "verified diverted provider is available — local-only: wake, "
+                          "lock, transcription, memory, reminders still work")
         elif not flash:
             level = "G1"
+            reason = (f"flash escalation exhausted or in cooldown "
+                      f"({flash_used:.0f}/{flash_cap_s}); flash-lite workhorse still available — "
+                      "escalation degraded, personality unchanged")
         else:
             level = "G0"
+            reason = "both pinned Gemini routes available"
         return {
             "level": level,
+            "reason": reason,
             "gemini_flash": flash, "gemini_flash_lite": lite,
             "material_diverted": bool(diverted),
             "caps": {"flash": flash_cap, "flash_lite": lite_cap},
@@ -668,34 +872,60 @@ class ProviderRouter:
     # -- MATERIAL ---------------------------------------------------------
     def material(self, provider: str, model: str, purpose: str,
                  contents: object, *, correlation_id: str | None = None,
-                 mode: str = "mock") -> MaterialEnvelope:
-        """Return untrusted raw material, or refuse. Never owner-facing text."""
+                 mode: str = "mock",
+                 attachments=None) -> MaterialEnvelope:
+        """Return untrusted raw material, or refuse. Never owner-facing text.
+
+        `attachments` are in-memory payload parts (e.g. one screen frame for
+        vision grounding). They ride the adapter call only; the ledger and
+        journal never see them. Budget: neuron-billed providers (cloudflare)
+        must declare positive `neurons_per_day` and `neurons_per_request`;
+        every other provider must declare a positive `rpd`. Zero/absent caps
+        are unavailable, never unlimited.
+        """
         name = str(provider)
         if name == PERSONALITY_PROVIDER:
             raise RouteRefused("use personality() for Gemini; material() is for "
                                "diverted providers only")
+        _validate_attachments(attachments)
         row = self.provider_rows.get(name)
         if row is None or not row.runnable:
             raise ProviderDisabledError(
                 f"provider {name!r} is not enabled with complete owner-account "
                 "verification in [quota.providers]; refusing")
         cap_row = row.cap_for(model)
-        if cap_row is None or cap_row.cap("rpd") is None:
+        if cap_row is None:
             raise ProviderUnavailable(
-                f"provider {name!r} model {model!r} has no positive RPD cap")
+                f"provider {name!r} model {model!r} is not configured with "
+                "caps in [quota.providers]; refusing")
+        if name == "cloudflare":
+            day_cap = cap_row.neuron_day_cap()
+            unit_cost = cap_row.neuron_cost()
+            if day_cap is None or unit_cost is None:
+                raise ProviderUnavailable(
+                    f"provider 'cloudflare' model {model!r} must declare positive "
+                    "neurons_per_day and neurons_per_request — neuron budgets are "
+                    "never interpreted as requests or unlimited")
+        else:
+            day_cap = cap_row.cap("rpd")
+            unit_cost = 1.0
+            if day_cap is None:
+                raise ProviderUnavailable(
+                    f"provider {name!r} model {model!r} has no positive RPD cap")
         adapter = self.adapters.get(name, Capability.MATERIAL)
         now = self.clock()
         bucket = QuotaState.bucket(name, model, now)
-        self.state.reserve(bucket, cap_row.cap("rpd"), now=now)
+        self.state.reserve(bucket, day_cap, now=now, cost=unit_cost)
         correlation_id = correlation_id or uuid.uuid4().hex[:12]
         req = ProviderRequest(
             capability=Capability.MATERIAL, role="material", provider=name,
             model=str(model), purpose=purpose, contents=contents,
-            correlation_id=correlation_id, quota_bucket=bucket)
+            correlation_id=correlation_id, quota_bucket=bucket,
+            attachments=tuple(attachments or ()))
         try:
             result = self._dispatch(req, adapter=adapter, mode=mode)
         except Exception:
-            self.state.release(bucket)
+            self.state.release(bucket, cost=unit_cost)
             raise
         return MaterialEnvelope(
             provider=name, model=str(model), purpose=purpose,
@@ -704,6 +934,9 @@ class ProviderRouter:
                 "provider": name, "model": str(model), "purpose": purpose,
                 "correlation_id": correlation_id, "request_id": result.request_id,
                 "quota_bucket": bucket, "ts": iso_stamp(),
+                "billing_unit": result.billing_unit,
+                "billing_amount": result.billing_amount,
+                "reserved_cost": unit_cost,
             }, untrusted=True)
 
     async def material_async(self, *args, **kwargs) -> MaterialEnvelope:
@@ -801,7 +1034,9 @@ __all__ = [
     "AdapterRegistry",
     "CallbackAdapter",
     "Capability",
+    "CloudflareMaterialAdapter",
     "HttpMaterialAdapter",
+    "MaterialAttachment",
     "MaterialEnvelope",
     "PersonalityResponse",
     "ProviderAdapter",
