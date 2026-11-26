@@ -39,6 +39,47 @@ still awaits the owner's explicit dispatch go-ahead.
 > the per-provider caps you ship as defaults. New `arena/*`
 > branch, PR, merge yourself. Never edit OWNERS.yaml.
 
+### BUILD-9 STATUS (manager, 2026-11-26): NOT LANDED — re-dispatched
+
+Agent I reported a partial execution (owner checklist drafted;
+planner/pointer-VLM/REACH routing, Cloudflare adapter, `assist
+cost` and ladder surfaces incomplete; tests not run). **No
+artefact reached this repo** — no file, commit, PR, or merge — so
+nothing is verified and BUILD-9 remains OPEN in full. The candour
+is noted and correct; the lane is re-issued below as BUILD-9R.
+Rule restated for all agents: a lane is done when its PR is
+merged, not when a summary exists. If your sandbox lacks a tool
+(e.g. pytest), install it (`pip install --break-system-packages
+pytest`) or say so in the PR — never end uncommitted.
+
+## BUILD-9R — Agent I (provider routing activation, complete)
+
+> You are Agent I. BUILD-9 was reported partial and NOTHING
+> landed (no PR) — this re-issue is the whole lane, to merged
+> completion. Start from BUILD-8 on main
+> (`src/assistant/provider_router.py`, personality pin in code).
+> (1) Owner checklist: one page in your report — per candidate
+> (Groq, OpenRouter `:free`, Cloudflare Workers AI) the exact
+> account-page facts the owner confirms (free tier active, NO
+> card on file, model limits, data terms). You create no accounts
+> and hold no credentials. (2) Route the REAL diverted workloads
+> through `ProviderRouter.material()`: planner
+> classification/extraction material path, REACH summarisation,
+> pointer VLM grounding role. Grep-prove no workload bypasses the
+> router; a bypass = failed lane. (3) Adapters for all three
+> candidates, disabled by default, enabled only via a verified
+> flag in `[quota.providers.*]` (zero/absent cap = unavailable).
+> (4) Owner surfaces: `assist cost` answers per-provider
+> per-purpose spend from the ledger; degradation-ladder state is
+> observable (current rung + why). (5) Tests, RUN and reported
+> with numbers: personality pinned under diverted 429/outage;
+> injected diverted text stays data, re-voiced or dropped, never
+> spoken raw; ladder degrades and recovers. Deliver on a new
+> `arena/*` branch as a MERGED PR — commit your work; an
+> uncommitted summary does not close this lane. If a step is
+> impossible in your sandbox, land the rest and file the blocker
+> IN THE PR, not in chat. Never edit OWNERS.yaml.
+
 ## BUILD-10 — Agent E (WhatsApp layer — the real transport)
 
 > You are Agent E. BUILD-6 built the alive layer against a FAKE
