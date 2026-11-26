@@ -2637,7 +2637,10 @@ class Daemon:
             self._ptt_log("ptt.start.capture_spawn", target=opened["target"],
                           simulated=simulated,
                           kind=type(self._capture_source).__name__,
-                          node_policy=opened["node_policy"])
+                          node_policy=opened["node_policy"],
+                          # BUG-HW1: the exact argv, journaled at capture
+                          # start so the next hardware report is self-diagnosing.
+                          argv=getattr(self._capture_source, "argv", None))
         except GatewayRefused as exc:
             if getattr(exc, "refusal", "device") == "policy":
                 # A policy refusal is an ANSWER, never a silent simulation.
