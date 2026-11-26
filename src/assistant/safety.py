@@ -106,6 +106,54 @@ def is_protected(path: str | Path, protected: list[str]) -> bool:
     return False
 
 
+def open_directory_nofollow(path: str | Path) -> int:
+    """Open an absolute directory through no-follow directory descriptors."""
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise PermissionError("safe directory traversal is unavailable")
+    parts = Path(os.path.abspath(expand(path))).parts[1:]
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def open_readonly_nofollow(path: str | Path):
+    """Open a regular file through directory FDs without following symlinks.
+
+    The returned binary file owns the descriptor. Linux-only safety primitive;
+    fail closed if no-follow descriptor traversal is unavailable.
+    """
+    import stat
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise PermissionError("safe no-follow open is unavailable")
+    absolute = Path(os.path.abspath(expand(path)))
+    parts = absolute.parts[1:]
+    if not parts:
+        raise PermissionError("not a regular file")
+    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = next_fd
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise PermissionError(f"not a regular file: {absolute}")
+            return os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+    finally:
+        os.close(directory)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
