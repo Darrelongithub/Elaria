@@ -4680,7 +4680,7 @@ class Daemon:
                           or speaker != "owner")
             kept = self.disclosure.filter_hits(
                 hits, guest=(speaker != "owner" or public_demo))
-            context = "\n".join(f"- [{h.source} {h.ref}] {h.text}" for h in kept)
+            context = "\n".join(f"- [{h.source} {h.ref}] {h.prompt_text()}" for h in kept)
             history_lines = ""
             if prior_turns:
                 safe_turns = [
