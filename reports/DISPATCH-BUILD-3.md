@@ -80,6 +80,37 @@ pytest`) or say so in the PR — never end uncommitted.
 > impossible in your sandbox, land the rest and file the blocker
 > IN THE PR, not in chat. Never edit OWNERS.yaml.
 
+### BUILD-9R STATUS (manager, 2026-11-26): PARTIAL, verified
+
+PR #136 landed the owner checklist + provider/purpose ledger
+grouping (manager re-ran: 50 passed across whatsapp/alive/routing
+slices). The core of the lane is still open and re-issued as
+BUILD-9S. BUILD-10 (WhatsApp) is verified PASS to the owner
+registration seam (PR #135; 24h-window + template-only cold sends
++ atomic paid-cap reservations tested).
+
+## BUILD-9S — Agent I (routing activation, the remaining core)
+
+> You are Agent I. BUILD-9R landed the checklist and ledger
+> grouping ONLY (PR #136); this is the rest, to merged completion.
+> Sync main first (`git fetch origin && git merge origin/main`).
+> (1) Route the three real diverted workloads through
+> `ProviderRouter.material()` — planner classification/extraction
+> material path, REACH summarisation, pointer VLM grounding role.
+> Grep-prove in the PR that no independent client path remains
+> for these workloads; a bypass = failed lane. (2) Cloudflare
+> Workers AI adapter behind the dispatcher (disabled by default;
+> neuron-based budget converted explicitly, never as requests).
+> (3) Owner surfaces: `assist cost` shows today's spend per
+> provider per purpose; ladder rung + reason observable (CLI or
+> console — pick one, document it). (4) Tests RUN with numbers:
+> personality pinned under diverted 429/outage; injected diverted
+> text stays data; ladder degrades/recovers; each routed workload
+> journaled with provider+purpose. Providers stay DISABLED until
+> the owner marks each `[quota.providers.*]` verified — your job
+> ends at enable-ready. Completion = merged PR. Never edit
+> OWNERS.yaml.
+
 ## BUILD-10 — Agent E (WhatsApp layer — the real transport)
 
 > You are Agent E. BUILD-6 built the alive layer against a FAKE
