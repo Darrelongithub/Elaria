@@ -1263,7 +1263,8 @@ class DictationService:
             # source close is wedged, status still reports the bytes/peak and
             # points at the WAV that contains the owner's speech.
             self._log("dictate.capture_diagnostics", session_id=session_id,
-                      frames_seen=frames_seen, bytes=captured_bytes)
+                      frames_seen=frames_seen, bytes=captured_bytes,
+                      stream_facts=getattr(source, "stream_facts", None))
             try:
                 stalled = bool(getattr(source, "stalled", False))
             except Exception:
@@ -1302,6 +1303,26 @@ class DictationService:
                 "processed_peak": round(limiter.processed_peak, 4),
                 "xruns": int(getattr(source, "xruns", 0) or 0),
             }
+            # BUG-HW1: what the pipe actually delivered, verbatim — the argv,
+            # the byte-rate vs the s16le label, and the tail abandoned at
+            # close. Present only on a real measurement (simulated sources
+            # carry none), and never alters what was captured.
+            stream_facts = getattr(source, "stream_facts", None)
+            if stream_facts:
+                capture_stats["stream_facts"] = stream_facts
+                if (stream_facts.get("delivery") or {}).get("mismatch_suspect"):
+                    delivery = stream_facts["delivery"]
+                    notes.append(
+                        "capture delivered "
+                        f"{delivery.get('measured_bytes_per_s')} B/s vs the "
+                        f"expected {delivery.get('expected_bytes_per_s')} B/s "
+                        f"(ratio {delivery.get('delivery_ratio')}x; "
+                        f"{delivery.get('class')}) — the pipe is not "
+                        "delivering the labelled stream; the saved WAV is the "
+                        "mislabel, not a failed mic (BUG-HW1)")
+            elif getattr(source, "dropped_tail_bytes", 0):
+                capture_stats["stream_facts"] = {
+                    "dropped_tail_bytes": int(source.dropped_tail_bytes)}
             if stalled:
                 notes.append("capture stalled — the capture process delivered no data")
             if no_speech:
