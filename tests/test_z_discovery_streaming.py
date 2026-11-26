@@ -115,3 +115,75 @@ def test_multiline_csv_preserves_logical_rows(tmp_path):
     assert sum(len(b.records) for b in batches) == 2
     assert batches[0].records[0]["fields"]["description"] == "first line\nsecond line"
     assert batches[-1].eof
+
+
+def test_indexer_persists_truncation_and_parse_failures(config, tmp_path):
+    from assistant.indexer import Indexer, extract_text
+    from assistant.store import Store
+
+    root = tmp_path / "indexed"
+    root.mkdir()
+    large = root / "large.txt"
+    large.write_text("measurement " * 30000)
+    broken = root / "broken.json"
+    broken.write_text('[{"n": 1}, BROKEN]')
+    config.raw["organise"]["max_extract_chars"] = 200000
+    store = Store(tmp_path / "index.db")
+    try:
+        stats = Indexer(config, store).index_root({"path": str(root)})
+        large_doc = store.document_by_path(str(large))
+        bad_doc = store.document_by_path(str(broken))
+        assert large_doc["truncated"] == 1
+        assert large_doc["extracted_chars"] == 200000
+        assert bad_doc["status"] == "error" and bad_doc["parse_error"]
+        assert stats["truncated"] == stats["parse_errors"] == 1
+        assert store.extraction_report()
+        assert "truncated" in extract_text(large)[1]
+        # Migration of pre-provenance indexed rows must not skip re-extraction.
+        with store._lock:
+            store._conn.execute("UPDATE documents SET extractor=NULL WHERE path=?", (str(large),))
+            store._conn.commit()
+        Indexer(config, store).index_root({"path": str(root)})
+        assert store.document_by_path(str(large))["truncated"] == 1
+    finally:
+        store.close()
+
+
+def test_index_metadata_hits_are_root_policy_filtered_and_deduplicated(tmp_path):
+    from assistant.store import Store
+
+    root = tmp_path / "allowed"
+    root.mkdir()
+    good = root / "invoice.dat"
+    good.write_bytes(b"binary")
+    private = root / "private"
+    private.mkdir()
+    secret = private / "invoice.dat"
+    secret.write_bytes(b"secret")
+    outside = tmp_path / "invoice.dat"
+    outside.write_bytes(b"outside")
+    store = Store(tmp_path / "metadata.db")
+    try:
+        for path in (good, secret, outside, root / "missing-invoice.dat"):
+            store.upsert_document(path=str(path), root=str(root), sha256="a" * 64,
+                                  size=6, mtime=0, mime=None, ext=".dat",
+                                  indexed_ts="2026-11-26", never_send=0, text_chunks=[])
+        policy = Policy((str(root),), (str(private),), ())
+        # No walk entries: this result can only originate in metadata SQL.
+        result = locate(policy, "invoice", store=store, entries=[])
+        assert [entry.target for entry in result.matches] == [str(good)]
+        # Combining live and cached entries does not double count.
+        result = locate(policy, "invoice", store=store)
+        assert result.total_matched == 1
+    finally:
+        store.close()
+
+
+def test_structured_index_cap_is_recorded(tmp_path):
+    from assistant.indexer import extract_with_provenance
+
+    path = tmp_path / "ledger.jsonl"
+    path.write_text('\n'.join(json.dumps({"n": n, "padding": "x" * 100}) for n in range(3000)))
+    result = extract_with_provenance(path, 200000)
+    assert result["truncated"] and not result["parse_error"]
+    assert result["extracted_chars"] <= 200000

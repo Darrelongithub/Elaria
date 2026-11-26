@@ -621,6 +621,7 @@ def locate(
     match_terms: bool = True,
     limit: int = 50,
     entries: Iterable[Entry] | None = None,
+    store=None,
 ) -> LocateResult:
     """Metadata-first locator: path/filename/extension/size/mtime search.
 
@@ -645,6 +646,7 @@ def locate(
     skips = SkipCount()
     errors: list[str] = []
     matched: list[Entry] = []
+    seen: set[str] = set()
 
     def _consider(entry: Entry) -> None:
         if entry.kind == "archive_member" and not include_archive_members:
@@ -659,7 +661,45 @@ def locate(
             haystack = entry.target.lower()
             if not any(t in haystack for t in wanted):
                 return
-        matched.append(entry)
+        if entry.target not in seen:
+            seen.add(entry.target)
+            matched.append(entry)
+
+    if store is not None:
+        # An index is an untrusted cache, never authority to widen roots or
+        # resurrect protected, ignored, symlinked or deleted files.
+        for row in store.search_document_metadata(terms=wanted, limit=policy.max_entries):
+            path = expand(row["path"])
+            if not path.is_absolute():
+                continue
+            root = next((expand(r) for r in policy.roots
+                         if path.is_relative_to(expand(r))), None)
+            if root is None or _has_symlink_component(path):
+                continue
+            chain = [path, *path.parents]
+            if any(is_protected(part, list(policy.protected)) for part in chain):
+                continue
+            relative = path.relative_to(root)
+            if len(relative.parts) > policy.max_depth + 1:
+                continue
+            if any(part.startswith(".") or part in policy.excluded_dirnames
+                   for part in relative.parts):
+                continue
+            if path.name.endswith(TEMP_SUFFIXES):
+                continue
+            parents = [path.parent, *path.parent.parents]
+            if any((parent / ".assistant-ignore").exists() for parent in parents):
+                continue
+            try:
+                st = path.lstat()
+            except OSError:
+                continue
+            if not stat_mod.S_ISREG(st.st_mode):
+                continue
+            _consider(Entry(str(path), path.name, path.suffix.lower(),
+                            int(st.st_size), float(st.st_mtime),
+                            never_send=is_never_send(path, policy.never_send_roots),
+                            structured=path.suffix.lower() in STRUCTURED_SUFFIXES))
 
     if entries is not None:
         for entry in entries:

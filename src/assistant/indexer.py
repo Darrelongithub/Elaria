@@ -70,7 +70,7 @@ def _ooxml_text(path: Path, member_patterns: tuple[str, ...]) -> str:
     return " ".join(parts)
 
 
-def extract_text(path: Path, max_chars: int = 200_000) -> tuple[str, str]:
+def _legacy_extract_text(path: Path, max_chars: int = 200_000) -> tuple[str, str]:
     """Return (text, extractor_name). Extractor name keeps coverage honest
     in index stats — 'no-text' is a fact to surface, not hide."""
     suffix = path.suffix.lower()
@@ -102,6 +102,74 @@ def extract_text(path: Path, max_chars: int = 200_000) -> tuple[str, str]:
     except Exception as exc:
         return "", f"error: {type(exc).__name__}"
     return "", "no-text"  # binaries/images: metadata only (vision is opt-in)
+
+
+def extract_with_provenance(path: Path, max_chars: int = 200_000) -> dict:
+    """Bound indexed text while recording every cap/error; full reads use streamread."""
+    from .streamread import StreamError, detect_format, iter_batches
+
+    cap = max(1, int(max_chars))
+    fmt = detect_format(str(path))
+    parts = []
+    count = 0
+    truncated = False
+    error = None
+    extractor = fmt
+    try:
+        if path.suffix.lower() in TEXT_EXTENSIONS and fmt not in (
+                "json", "jsonl", "csv", "tsv"):
+            # Read characters, not bytes: UTF-8 boundaries remain intact.
+            with path.open(encoding="utf-8", errors="strict") as stream:
+                text = stream.read(cap + 1)
+            truncated = len(text) > cap
+            parts = [text[:cap]]
+        elif fmt in ("json", "jsonl", "ndjson", "csv", "tsv", "sqlite",
+                     "docx", "xlsx", "pptx", "odt"):
+            for batch in iter_batches(path, byte_budget=65536, record_limit=200):
+                for record in batch.records:
+                    if record.get("parse_error"):
+                        raise StreamError("parse", record["parse_error"], target=str(path))
+                    if "fields" in record:
+                        rendered = str(record["fields"])
+                    elif "value" in record:
+                        import json
+
+                        value = ({record["key"]: record["value"]}
+                                 if record.get("kind") == "field" else record["value"])
+                        rendered = json.dumps(value, ensure_ascii=False)
+                    else:
+                        rendered = str(record.get("text", ""))
+                    remaining = cap - count
+                    piece = rendered[:remaining]
+                    parts.append(piece)
+                    count += len(piece) + 1
+                    if len(rendered) > remaining or count >= cap:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+        else:
+            text, extractor = _legacy_extract_text(path, cap + 1)
+            truncated = len(text) > cap
+            parts = [text[:cap]]
+            if extractor.startswith("error:"):
+                error = extractor
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    text = "\n".join(parts)[:cap]
+    return {"text": text, "extractor": extractor, "extracted_chars": len(text),
+            "truncated": truncated, "parse_error": error}
+
+
+def extract_text(path: Path, max_chars: int = 200_000) -> tuple[str, str]:
+    """Compatibility API: caps and failures are explicit in the extractor label."""
+    result = extract_with_provenance(path, max_chars)
+    label = result["extractor"]
+    if result["parse_error"]:
+        label = f"error: {result['parse_error']}"
+    elif result["truncated"]:
+        label += " (truncated)"
+    return result["text"], label
 
 
 class Indexer:
@@ -201,6 +269,7 @@ class Indexer:
             never_send = self._never_send(path)
             existing = self.store.document_by_path(str(path))
             if (existing and existing["status"] == "indexed"
+                    and existing.get("extractor") is not None
                     and existing["size"] == stat.st_size
                     and abs(existing["mtime"] - stat.st_mtime) < 1e-6):
                 if int(existing["never_send"]) != int(never_send):
@@ -214,7 +283,12 @@ class Indexer:
                 continue
             data_hash = sha256_bytes(path.read_bytes()) if stat.st_size <= 64_000_000 \
                 else self._hash_large(path)
-            text, extractor = extract_text(path, self.max_extract_chars)
+            extraction = extract_with_provenance(path, self.max_extract_chars)
+            text, extractor = extraction["text"], extraction["extractor"]
+            stats.setdefault("truncated", 0)
+            stats.setdefault("parse_errors", 0)
+            stats["truncated"] += int(extraction["truncated"])
+            stats["parse_errors"] += int(bool(extraction["parse_error"]))
             stats["extractors"][extractor] = stats["extractors"].get(extractor, 0) + 1
             if not text:
                 stats["no_text"] += 1
@@ -224,7 +298,9 @@ class Indexer:
                 size=stat.st_size, mtime=stat.st_mtime,
                 mime=mimetypes.guess_type(path.name)[0], ext=path.suffix.lower(),
                 indexed_ts=iso_now(), never_send=int(never_send),
-                text_chunks=chunk_text(text))
+                text_chunks=chunk_text(text), extractor=extractor,
+                extracted_chars=extraction["extracted_chars"],
+                truncated=extraction["truncated"], parse_error=extraction["parse_error"])
             stats["changed" if existing else "indexed"] += 1
         if walk_errors:
             stats["error"] = "; ".join(msg for _, msg in walk_errors)

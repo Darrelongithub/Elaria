@@ -1954,16 +1954,24 @@ def _find_command(args, config) -> int:
               "in config.toml. Nothing is searched by default, and nothing under "
               "a root is ever moved or altered.", file=sys.stderr)
         return 1
-    result = locate(
-        policy,
-        args.terms or [],
-        exts=args.ext,
-        name_glob=args.name,
-        min_size=args.min_size,
-        max_size=args.max_size,
-        include_archive_members=not args.no_archive_members,
-        limit=args.limit,
-    )
+    from .store import Store
+
+    store = Store(config.db_path) if config.discovery_policy_kwargs()["search_index"] else None
+    try:
+        result = locate(
+            policy,
+            args.terms or [],
+            store=store,
+            exts=args.ext,
+            name_glob=args.name,
+            min_size=args.min_size,
+            max_size=args.max_size,
+            include_archive_members=not args.no_archive_members,
+            limit=args.limit,
+        )
+    finally:
+        if store is not None:
+            store.close()
     if args.json:
         print(json.dumps(result.as_dict(), indent=2))
         return 0

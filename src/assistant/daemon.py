@@ -4950,6 +4950,7 @@ class Daemon:
 
         result = await asyncio.to_thread(
             locate, policy, terms or [],
+            store=(self.store if self.config.discovery_policy_kwargs()["search_index"] else None),
             exts=exts,
             name_glob=params.get("name_glob"),
             min_size=_optional_number("min_size"),
