@@ -14,12 +14,15 @@ keeps serial + name, and deliberately never uses the bare ID as a target.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
+import time
 import wave
 from array import array
 from collections import deque
@@ -28,6 +31,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import ensure_private_dir
+from .journal_log import log_event
 
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # s16le mono — what the Live API wants natively (§3.4)
@@ -140,6 +144,108 @@ def pcm_peak(pcm: bytes) -> float:
         return 0.0
     samples = struct.unpack(f"<{len(pcm) // 2}h", pcm[: len(pcm) - len(pcm) % 2])
     return max((abs(s) for s in samples), default=0) / 32768
+
+
+def detect_container_prefix(prefix: bytes) -> str | None:
+    """Container label when `prefix` is a file header instead of raw PCM.
+
+    BUG-HW1 tripwire: pw-record's `-` without `--raw` writes an AU container
+    (libsndfile stdio) whose bytes are NOT the s16le the caller labelled them.
+    Recognition is STRICT — a container is only declared on its full magic
+    plus sane header fields (for AU: magic `.snd`, a plausible data offset,
+    PCM encoding, sane rate and channel count) — so a real s16le capture that
+    merely starts with similar bytes is never misjudged. Returns `"au"`,
+    `"wav"`, or None.
+    """
+    if len(prefix) >= 24 and prefix[:4] == b".snd":
+        offset, _size, encoding, rate, channels = struct.unpack(
+            ">5I", prefix[4:24])
+        if (24 <= offset <= 4096 and 1 <= encoding <= 7
+                and 4000 <= rate <= 384000 and 1 <= channels <= 64):
+            return "au"
+        return None
+    if len(prefix) >= 12 and prefix[:4] == b"RIFF" and prefix[8:12] == b"WAVE":
+        return "wav"
+    return None
+
+
+def negotiated_stream_facts(runner=subprocess.run, *, attempts: int = 3,
+                            retry_delay_s: float = 0.05) -> dict:
+    """Best-effort PipeWire-side facts about the capture stream (`pw-dump`).
+
+    Journalled at capture start (BUG-HW1) so the next hardware report is
+    self-diagnosing: argv says what was ASKED for, these facts say what the
+    server NEGOTIATED. The stream node appears only after pw-record connects,
+    so the lookup retries briefly; a sandbox or a missing `pw-dump` gets the
+    house honest-unavailable shape (`available: False, reason: …`), never a
+    guess and never an exception into the capture path.
+    """
+    if not tool_available("pw-dump"):
+        return {"available": False,
+                "reason": "pw-dump not found (pipewire) — expected on the "
+                          "Fedora target, absent in containers"}
+    last_reason = "pw-dump produced no pw-record stream node"
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            time.sleep(retry_delay_s)
+        try:
+            out = runner(["pw-dump"], capture_output=True, text=True, timeout=10)
+            if getattr(out, "returncode", 0) != 0:
+                last_reason = (f"pw-dump exited {out.returncode}: "
+                               f"{(getattr(out, 'stderr', '') or '')[:120]}")
+                continue
+            nodes = json.loads(out.stdout or "[]")
+        except Exception as exc:
+            last_reason = f"{type(exc).__name__}: {exc}"
+            continue
+        found = _pw_record_stream_nodes(nodes)
+        if not found:
+            continue
+        node = found[-1]           # newest id: the stream this spawn created
+        facts = _format_facts(node)
+        return {"available": True, "node_id": node.get("id"),
+                "streams_visible": len(found), **facts}
+    return {"available": False, "reason": last_reason}
+
+
+def _pw_record_stream_nodes(nodes) -> list[dict]:
+    """pw-dump objects that are pw-record stream nodes (tolerant match)."""
+    found = []
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict):
+            continue
+        props = ((node.get("info") or {}).get("props") or {})
+        named = " ".join(str(props.get(key, "")) for key in
+                         ("node.name", "application.name",
+                          "application.process.binary"))
+        if "pw-record" in named:
+            found.append(node)
+    return found
+
+
+def _format_facts(node: dict) -> dict:
+    """First {format, rate, channels} triple in a node's params (tolerant)."""
+    def walk(obj):
+        if isinstance(obj, dict):
+            if ("format" in obj and "rate" in obj and "channels" in obj
+                    and isinstance(obj.get("rate"), int)):
+                return obj
+            for value in obj.values():
+                hit = walk(value)
+                if hit is not None:
+                    return hit
+        elif isinstance(obj, list):
+            for value in obj:
+                hit = walk(value)
+                if hit is not None:
+                    return hit
+        return None
+
+    fmt = walk((node.get("info") or {}).get("params") or {})
+    if fmt is None:
+        return {"format": "-", "rate": "-", "channels": "-"}
+    return {"format": fmt.get("format", "-"), "rate": fmt.get("rate", "-"),
+            "channels": fmt.get("channels", "-")}
 
 
 #: How long after stream open a sample can still be called a START transient
@@ -276,6 +382,9 @@ def live_level_check(target: str | None = None, seconds: float = 1.2,
         "target": target or "(default source)",
         "seconds": round(len(data) / BYTES_PER_SAMPLE / SAMPLE_RATE, 2),
         "bytes": len(data),
+        # BUG-HW1: a container header means the bytes are not the labelled
+        # raw s16le — flag it so the peak below is never read unexamined.
+        "container": detect_container_prefix(data) or "",
         # `peak` stays for every existing reader; the split is the honest pair.
         "peak": round(peak, 4),
         "peak_full": split["peak_full"],
@@ -539,6 +648,18 @@ class PipeWireCapture:
     now come with a stall deadline: pw-record emits samples continuously even
     in digital silence, so NO bytes within `stall_timeout_s` means the capture
     is dead, and the stream ends (`stalled = True`) instead of hanging.
+
+    BUG-HW1 (2026-11-26): the stream is journalled and VERIFIED at open.
+    `capture.stream_open` carries the exact argv plus the negotiated stream
+    facts (`pw-dump`), so a mislabelled stream names itself in the next
+    hardware report. The first bytes are checked against known container
+    headers (`detect_container_prefix`): a stream that opens as AU/WAV bytes
+    is NOT the labelled raw s16le, and feeding it downstream would recreate
+    the owner's explosive static — so the stream ends with
+    `capture.format_mismatch` (and `stream_mismatch` set) instead. A capture
+    that ends with zero bytes is journalled as `capture.starved` (the ~1.5 s
+    first-frame graph warmup starves fast stops), not left as a mystery
+    empty take.
     """
 
     def __init__(self, target: str | None = None, *, sample_rate: int = SAMPLE_RATE,
@@ -549,8 +670,12 @@ class PipeWireCapture:
                 "Fedora target. Headless/test runs use SimulatedCapture."
             )
         self.target = target            # node.name/object.serial, or None = default
+        self.sample_rate = int(sample_rate)
         self.stall_timeout_s = float(stall_timeout_s)
         self.stalled = False
+        # BUG-HW1: what the delivered stream turned out to be, when it is not
+        # what the label says (None = label held or not yet checked).
+        self.stream_mismatch: dict | None = None
         # J5: xrun/underrun sensor. A stalled stream or a short read is audio
         # the server did not deliver; counting it keeps "the take sounded
         # choppy" a measured fact instead of an impression.
@@ -558,6 +683,46 @@ class PipeWireCapture:
         self._command = pw_record_pcm_stream_command(target, sample_rate=sample_rate)
         self._frame_bytes = sample_rate * frame_ms // 1000 * BYTES_PER_SAMPLE
         self._proc: asyncio.subprocess.Process | None = None
+        self._opened = False
+        self._bytes_yielded = 0
+        self._starved_journaled = False
+
+    def _journal(self, event: str, *, level: str = "info", verdict: str = "",
+                 detail: str = "") -> None:
+        """§4.8 schema line; never raises (journal_log already guards)."""
+        log_event(event, level=level, verdict=verdict, detail=detail)
+
+    def _journal_starved_once(self) -> None:
+        # getattr defaults keep the K6 unit seam (object.__new__ without
+        # __init__) safe: a stripped object has nothing to report.
+        if (getattr(self, "_starved_journaled", True)
+                or not getattr(self, "_opened", False)
+                or getattr(self, "_bytes_yielded", 1) > 0):
+            return
+        self._starved_journaled = True
+        if self.stream_mismatch is not None:
+            return     # capture.format_mismatch already explains the zero bytes
+        self._journal(
+            "capture.starved", level="warn", verdict="starved",
+            detail=(f"0 bytes delivered argv={shlex.join(self._command)} "
+                    f"target={self.target or '(default)'} — stopped before "
+                    "the first frame (PipeWire graph warmup is ~1.5 s) or "
+                    "the stream never started"))
+
+    def _check_head(self, data: bytes) -> bool:
+        """First bytes: raw PCM, or a container wearing the s16le label?"""
+        label = detect_container_prefix(data)
+        if label is None:
+            return True
+        self.stream_mismatch = {"container": label,
+                                "command": list(self._command)}
+        self._journal(
+            "capture.format_mismatch", level="error", verdict="mismatch",
+            detail=(f"stream opens as a {label} container header, not the "
+                    f"labelled raw s16le/{self.sample_rate}hz/1ch — refusing "
+                    f"to record mislabelled bytes argv={shlex.join(self._command)} "
+                    f"target={self.target or '(default)'}"))
+        return False
 
     async def frames(self) -> AsyncIterator[bytes]:
         # VB-10: `pw-record` must die with the daemon instead of keeping the
@@ -571,28 +736,62 @@ class PipeWireCapture:
             **child_kwargs(),
         )
         assert self._proc.stdout is not None
-        while True:
-            try:
-                chunk = await asyncio.wait_for(
-                    self._proc.stdout.readexactly(self._frame_bytes),
-                    timeout=self.stall_timeout_s)
-            except TimeoutError:
-                # Dead capture: report it, end the stream, let the session
-                # fail fast with "no speech captured" instead of hanging.
-                self.stalled = True
-                self.xruns += 1
-                return
-            except asyncio.IncompleteReadError as partial:
-                if partial.partial:
-                    self.xruns += 1      # short read: a dropped tail, counted
-                    yield partial.partial
-                return
-            yield chunk
+        self._opened = True
+        # BUG-HW1: journal what was asked AND what the server negotiated,
+        # at capture start — the next hardware report reads facts, not vibes.
+        facts = await asyncio.to_thread(negotiated_stream_facts)
+        negotiated = ("not available: " + str(facts.get("reason", "?"))
+                      if not facts.get("available") else
+                      f"format={facts.get('format')} rate={facts.get('rate')} "
+                      f"channels={facts.get('channels')} "
+                      f"node_id={facts.get('node_id')} "
+                      f"streams_visible={facts.get('streams_visible')}")
+        self._journal(
+            "capture.stream_open", verdict="opened",
+            detail=(f"argv={shlex.join(self._command)} "
+                    f"target={self.target or '(default)'} "
+                    f"expected=format:s16le rate:{self.sample_rate} channels:1 "
+                    f"negotiated[{negotiated}]"))
+        head_checked = False
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        self._proc.stdout.readexactly(self._frame_bytes),
+                        timeout=self.stall_timeout_s)
+                except TimeoutError:
+                    # Dead capture: report it, end the stream, let the session
+                    # fail fast with "no speech captured" instead of hanging.
+                    self.stalled = True
+                    self.xruns += 1
+                    return
+                except asyncio.IncompleteReadError as partial:
+                    if partial.partial:
+                        self.xruns += 1      # short read: a dropped tail, counted
+                        if not head_checked:
+                            head_checked = True
+                            if not self._check_head(partial.partial):
+                                return
+                        self._bytes_yielded += len(partial.partial)
+                        yield partial.partial
+                    return
+                if not head_checked:
+                    head_checked = True
+                    if not self._check_head(chunk):
+                        return
+                self._bytes_yielded += len(chunk)
+                yield chunk
+        finally:
+            self._journal_starved_once()
 
     # BH-K6: SIGTERM grace before SIGKILL escalation in aclose().
     TERMINATE_TIMEOUT_S = 2.0
 
     async def aclose(self) -> None:
+        # BUG-HW1: a fast stop before the first frame is a STARVED capture —
+        # journaled here, because the frames() generator may never run again
+        # to say so itself.
+        self._journal_starved_once()
         proc, self._proc = self._proc, None
         if proc is None or proc.returncode is not None:
             return
@@ -718,7 +917,23 @@ async def _next_or_silence(iterator, _silence):
 
 
 def pw_record_pcm_stream_command(target: str | None, *, sample_rate: int = 16000) -> list[str]:
-    """Raw s16le PCM to stdout — what assist-voice-test consumes live."""
+    """Raw s16le PCM to stdout — what assist-voice-test consumes live.
+
+    BUG-HW1 (2026-11-26, owner hardware): `--raw` is load-bearing, not
+    decoration. Without it the filename `-` is NOT a raw pipe — pw-cat opens
+    it through libsndfile (`sf_open("-", …)` binds stdio), and
+    `format_from_filename()` maps `-` to the **AU container** (sunau):
+    a 24-byte `.snd` header followed by **big-endian** PCM. The daemon read
+    those bytes as s16le and got explosive static (every sample byte-swapped:
+    a ×256 gain with wraparound), a full-scale "start pop" from the header
+    (peak 0.9981 = the rate field misread as s16le), and an ASR-empty take —
+    while `pw-record … file.wav` from the same node was clean, because the
+    `.wav` extension selects the WAV container whose PCM16 is little-endian.
+    `--raw` forces pw-cat's raw path (`setup_pipe`/`setup_raw`): the stream's
+    own s16le bytes on stdout, no container, no header, no byteswap. A build
+    too old to know `--raw` exits with a usage error — fail-closed, never
+    silent static.
+    """
     if target and str(target).isdigit() and len(str(target)) < 4:
         raise ValueError(
             f"'{target}' looks like an object.id. pw-record --target wants "
@@ -726,7 +941,7 @@ def pw_record_pcm_stream_command(target: str | None, *, sample_rate: int = 16000
             "device instead of erroring (GETTING-STARTED Step 3)."
         )
     command = ["pw-record", "--rate", str(sample_rate), "--channels", "1",
-               "--format", "s16", "-"]
+               "--format", "s16", "--raw", "-"]
     if target:
         command.insert(1, f"--target={target}")
     return command
