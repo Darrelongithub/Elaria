@@ -414,6 +414,11 @@ def run_mouse_fixture(queue, errand, plan, *, capture, sink, owner_prompt,
             window, role, name, before, after = step.argv
             if not queue.claim_binds(errand, digest):
                 raise PermissionError('stale-claim')
+            # A plan superseded in `errands` while the batch was running (the
+            # owner may revise an errand at any moment) must not click again:
+            # re-checked per step, not only around the approval prompt.
+            if not queue.current(errand, digest):
+                raise PermissionError('stale-plan')
             frame = observe(window, before)
             matches = [e for e in frame.elements if (e.role, e.name) == (role, name)]
             if len(matches) != 1 or sum(e.id == matches[0].id for e in frame.elements) != 1:
@@ -446,5 +451,5 @@ def run_mouse_fixture(queue, errand, plan, *, capture, sink, owner_prompt,
         # Unknown adapter/observation failures never retry or resume the batch.
         reason = str(exc) if type(exc) is PermissionError and str(exc) in {
             'kill', 'unsafe-seat', 'unexpected-screen', 'ungrounded', 'click-loop',
-            'stale-frame', 'stale-claim'} else 'fixture-error'
+            'stale-frame', 'stale-claim', 'stale-plan'} else 'fixture-error'
         return record(f'halted/{reason}')
