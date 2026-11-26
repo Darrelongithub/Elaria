@@ -51,9 +51,19 @@ READ_VERBS = {
 # curl/wget-style content transfer flags. Long names are matched after
 # normalised flag parsing (``--name=value`` and abbreviated ``--name`` forms).
 UPLOAD_FLAG_NAMES = ("data", "data-raw", "data-ascii", "data-binary", "data-urlencode",
-                     "form", "form-string", "upload-file", "json", "proxy-upload-file")
+                     "form", "form-string", "upload-file", "json", "proxy-upload-file",
+                     # wget's body/POST family is the same exfiltration shape.
+                     "post-data", "post-file", "body-data", "body-file")
 UPLOAD_SHORTS = frozenset("dFT")
 _UPLOAD_TOKENS = frozenset({"-d", "--data", "-T", "--upload-file", "-F", "--form"})
+# Flags that load further options from a file or inline string. Their payload
+# is unbounded argv we never see, so they are never tier 2 by omission.
+OPTION_LOADING_FLAGS = ("config", "K", "-config", "configfile", "defaults", "netrc-file", "e")
+# Remote move/exec binaries: the same egress class as curl/wget whenever the
+# command names a destination that is not one of the owner's declared services.
+REMOTE_TRANSFER_BINARIES = frozenset({"scp", "sftp", "rsync", "ssh", "rsh", "nc", "ncat",
+                                      "netcat", "socat", "telnet", "ftp", "lftp", "mosh"})
+_TRANSFER_BINARIES = REMOTE_TRANSFER_BINARIES | {"curl", "wget"}
 _DURATION_OPERAND = re.compile(r"[0-9]+(?:[.][0-9]+)?(?:ns|us|ms|s|m|h|d)?")
 _TRUSTED_LAUNCHER = re.compile(r"/(?:usr/)?bin/[A-Za-z0-9._+-]+")
 
@@ -73,10 +83,67 @@ def _shell_like(name: str) -> bool:
             or name.startswith(INTERPRETERS))
 
 
+def _as_url(token: str):
+    """One argument as a URL, including a URI carried as another flag's value.
+
+    ``--url=file:///etc/passwd`` and ``-ofile:///etc/passwd`` hide the scheme
+    behind a flag prefix; normalised parsing must still see the operand.
+    """
+    if "://" not in token:
+        return None
+    if token.startswith("-"):
+        if "=" in token:
+            token = token.split("=", 1)[1]
+        elif token.startswith("--"):
+            return None
+        else:
+            match = re.match(r"-\w*(.*)", token)
+            token = match.group(1) if match else ""
+    if "://" not in token:
+        return None
+    return urlsplit(token)
+
+
+def _urls(args: tuple[str, ...]):
+    """Every URL operand, including URIs nested in flag values."""
+    return [url for url in (_as_url(a) for a in args) if url is not None]
+
+
+def _upload_value(arg: str) -> str:
+    """Value of an upload-shaped argument (possibly attached: -d@file, -sd@file)."""
+    if arg.startswith("--"):
+        return arg.split("=", 1)[1] if "=" in arg else ""
+    if arg.startswith("-") and len(arg) > 1:
+        match = re.search(r"[dFT]", arg[1:])
+        if match:
+            return arg[1 + match.end():].lstrip("=")
+    return ""
+
+
+def _option_loading(binary: str, args: tuple[str, ...]) -> bool:
+    """A flag that loads further options from a file/inline string (unbounded).
+
+    ``-e``/``--execute`` is only option-loading on the transfer binaries
+    (``wget -e robots=off``); on ``grep``/``sed`` it is an ordinary operand.
+    """
+    for arg in args:
+        allowed = OPTION_LOADING_FLAGS
+        if arg.startswith("--"):
+            name = arg[2:].split("=", 1)[0]
+            if name and name in allowed:
+                return True
+        elif arg.startswith("-") and len(arg) > 1:
+            short = arg[1]
+            if short in allowed and (short != "e" or binary in _TRANSFER_BINARIES):
+                return True
+    return False
+
+
 def _arg_value(arg: str) -> str:
     """Path-like value carried by one argument after normalised flag parsing."""
-    if "://" in arg:
-        parts = urlsplit(arg)
+    url = _as_url(arg)
+    if url is not None:
+        parts = url
         if parts.scheme != "file":
             return ""
         if parts.netloc in ("", "localhost"):
@@ -115,6 +182,76 @@ def _unwrap_chain(argv: tuple[str, ...]) -> tuple[str | None, tuple[str, ...], b
     return None, (), False
 
 
+_SCP_OPTION_OPERANDS = frozenset({"-o", "-O", "-c", "-F", "-i", "-l", "-P", "-S", "-e", "-L", "-D", "-J"})
+_SSH_OPTION_OPERANDS = frozenset({"-o", "-p", "-l", "-i", "-F", "-c", "-m", "-O", "-Q", "-R",
+                                  "-L", "-D", "-W", "-b", "-E", "-e", "-I", "-J", "-w", "-B"})
+_RSYNC_OPTION_OPERANDS = frozenset({"-e", "--rsh"})
+
+
+def _remote_host(token: str) -> str:
+    """Host named by a scp/ssh/rsync operand, or '' for a local path.
+
+    ``user@host:path``, ``host:path`` and ``ssh://user@host:22/path`` are all
+    remote; a bare local path (no colon, or a colon after a slash) is not.
+    """
+    if "://" in token:
+        try:
+            return urlsplit(token).hostname or ""
+        except ValueError:
+            return ""
+    if ":" not in token:
+        return ""
+    netloc = token.rsplit("@", 1)[-1]
+    if netloc.startswith("["):
+        # [2001:db8::1]:/path — the bracketed literal is the host
+        head = netloc.split("]", 1)[0] + "]"
+    else:
+        head = token.split(":", 1)[0]
+    if "/" in head:  # e.g. ./a:b or sub/file:b — a local name with a colon
+        return ""
+    if "@" in head:
+        head = head.rsplit("@", 1)[1]
+    if not head or head.startswith("-"):
+        return ""
+    return head
+
+
+_HOST_FIRST_BINARIES = frozenset({"ssh", "sftp", "telnet", "ftp", "lftp",
+                                  "mosh", "nc", "ncat", "netcat", "socat"})
+
+
+def _remote_egress(binary: str, args: tuple[str, ...], facts: SyntheticFacts) -> bool:
+    """A remote copy/exec naming a host the owner has not declared a service on.
+
+    These binaries are the same exfiltration class as curl/wget: their
+    destination semantics are resolved from the operand, never from an
+    allowlisted flag catalog. An unknown or undeclared host is tier 3.
+    """
+    if binary not in REMOTE_TRANSFER_BINARIES:
+        return False
+    operands = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg.startswith("-"):
+            if arg in _SCP_OPTION_OPERANDS | _SSH_OPTION_OPERANDS | _RSYNC_OPTION_OPERANDS:
+                skip = True
+            continue
+        operands.append(arg)
+    hosts = [h for h in (_remote_host(o) for o in operands) if h]
+    if not hosts and binary in _HOST_FIRST_BINARIES and operands:
+        # ssh/sftp/ftp name their host positionally, without a ":path" suffix.
+        head = operands[0]
+        hosts = [head.rsplit("@", 1)[-1]]
+    if not hosts:
+        # ssh with no host operand still runs nothing recognisable; rsync/scp
+        # between local paths is a local move.
+        return False
+    return any(h not in facts.owner_services for h in hosts)
+
+
 def _recursive_shape(args: tuple[str, ...]) -> bool:
     """Normalised flag parsing: ``--recursive=always`` and ``--r`` are ``--recursive``."""
     for arg in args:
@@ -134,8 +271,8 @@ def _upload_shape(args: tuple[str, ...]) -> bool:
             name = arg[2:].split("=", 1)[0]
             if name and any(flag.startswith(name) for flag in UPLOAD_FLAG_NAMES):
                 return True
-        elif arg.startswith("-") and len(arg) > 2 and arg[1] in UPLOAD_SHORTS:
-            return True  # attached short-option value: -d@file, -Tfile, -F@file
+        elif arg.startswith("-") and len(arg) > 2 and any(ch in UPLOAD_SHORTS for ch in arg[1:]):
+            return True  # attached short value, alone or bundled: -d@file, -sd@file
     return False
 
 
@@ -258,8 +395,9 @@ class GateChecker:
                 values.append(head)
         for arg in args:
             value = _arg_value(arg)
-            if value.startswith("@"):  # --data=@file, -d@file, @file payloads
-                value = value[1:]
+            if not value and step.tool == "exec":
+                value = _upload_value(arg)  # -o/etc/passwd, -sd@sub/note.txt
+            value = value.removeprefix("@")  # --data=@file, -d@file payloads
             if not value or value.startswith("-") or "://" in value:
                 continue
             values.append(value)
@@ -325,9 +463,13 @@ class GateChecker:
             return 3
         if binary == "rm" and _recursive_shape(args):
             return 3  # independently recognized bulk-delete shape; other rm is simulated T2
-        urls = [urlsplit(a) for a in args if "://" in a]
+        if _option_loading(binary, args):
+            return 3  # further options loaded from a file/string: unbounded argv
+        urls = _urls(args)
         if any(u.username or u.password for u in urls):
             return 3
+        if _remote_egress(binary, args, facts):
+            return 3  # remote copy/exec destination outside the owner's services
         upload = facts.sends_owner_content or any(a in _UPLOAD_TOKENS for a in args)
         if not upload and binary not in READ_BINARIES:
             upload = _upload_shape(args)  # normalised --data=/-d@file/T shapes

@@ -199,3 +199,50 @@ def test_bug_b2_parked_asks_get_enforced_ttl(queue, monkeypatch):
     assert q.decide(ask3['id'], plan3.digest, 'yes') == 'yes'
     at(4000.0 + ASK_TTL_S + 1)
     assert not q.claim('errand-3', plan3, 0, needs_yes=True)
+
+
+# --- residual: a plan superseded WHILE the batch is clicking
+
+def test_bug_b2_run_mouse_halts_when_plan_superseded_mid_batch(queue):
+    """queue.current() is re-checked per step, not only around owner_prompt.
+
+    The owner may revise an errand at any moment; a revised plan must not keep
+    clicking on the old one's authority. Before this check the batch ran to
+    'complete' with both clicks of the superseded plan.
+    """
+    space, q = queue
+    elements = (Element('one', 'First', 'button', (10, 10, 10, 10)),
+                Element('two', 'Second', 'button', (30, 10, 10, 10)))
+    base = Frame('frame', 'snapshot', 'pixels', 100, 100,
+                 Output('fixture', (0, 0, 100, 100), 1), 0, elements, 'app')
+    seats = [MouseSeat(replace(base, png_sha256=str(i)), 'window', True, True, True)
+             for i in range(4)]
+    hashes = list(map(mouse_screen, seats))
+    plan = Plan((Step(0, 3, 'click', ('window', 'button', 'First', hashes[0], hashes[1]),
+                      str(space.work)),
+                 Step(1, 3, 'click', ('window', 'button', 'Second', hashes[1], hashes[2]),
+                      str(space.work))))
+    revised = Plan((Step(0, 3, 'click', ('window', 'button', 'Second', hashes[0], hashes[1]),
+                         str(space.work)),))
+    q.register('errand', plan)
+    sink = FakeMouseInput()
+    order = [0, 0, 0, 1, 1, 1, 2]
+    n = [0]
+
+    def capture():
+        i = n[0]
+        n[0] += 1
+        seat = seats[order[min(i, 6)]]
+        return replace(seat, frame=replace(seat.frame, frame_id=f'fresh-{i}',
+                                          snapshot_id=f'snap-{i}', captured_at=float(i + 1)))
+
+    def during():
+        if len(sink.calls) == 1:
+            q.register('errand', revised)  # owner revised the errand mid-batch
+
+    sink.during = during
+    outcome = run_mouse_fixture(q, 'errand', plan, capture=capture, sink=sink,
+                                owner_prompt=lambda batch, token: token,
+                                principal='owner', clock=lambda: 0.0)
+    assert outcome == 'halted/stale-plan'
+    assert len(sink.calls) == 1  # the superseded plan's second click never fires
