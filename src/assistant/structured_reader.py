@@ -253,3 +253,23 @@ def inspect(target: str, **kwargs) -> dict:
     return {'format': batch['format'], 'sha256': batch['sha256'], 'trusted': False,
             'complete': batch['eof'], 'sample_type': type(sample).__name__,
             'sample': repr(sample)[:512] if sample is not None else None}
+
+
+def validate(target: str, *, protected: list[str], never_send_roots: list[str],
+             cloud_bound: bool = False, max_record_chars: int = 1_000_000,
+             expected_sha256: str | None = None) -> dict:
+    """Validate every record in one streaming pass, without collecting values."""
+    if not 256 <= max_record_chars <= 2_000_000:
+        raise ValueError('invalid record bound')
+    sha = _hash(target, protected, never_send_roots, cloud_bound)
+    if expected_sha256 and sha != expected_sha256:
+        raise StructuredReadError('source changed since read')
+    fmt = Path(target.split('#')[-1]).suffix.lower()
+    count = 0
+    with _source(target, protected, never_send_roots, cloud_bound) as stream:
+        for _ in _records(stream, fmt, max_record_chars):
+            count += 1
+    if _hash(target, protected, never_send_roots, cloud_bound) != sha:
+        raise StructuredReadError('source changed during validation')
+    return {'format': fmt.lstrip('.'), 'records': count, 'sha256': sha,
+            'complete': True, 'trusted': False}

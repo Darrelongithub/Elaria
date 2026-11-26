@@ -241,3 +241,13 @@ def test_index_chunk_pagination_and_cloud_fence(config, tmp_path):
     assert ''.join(chunks) == path.read_text()
     with pytest.raises(PermissionError):
         store.get_document_chunks(doc['id'], cloud_bound=True)
+
+
+def test_validate_stream_detects_corrupt_tail(tmp_path):
+    from assistant.structured_reader import validate, StructuredReadError
+    path = tmp_path / 'plants.json'
+    path.write_text('[' + ','.join('{"plant":"fern"}' for _ in range(5000)) + ',]')
+    with pytest.raises(StructuredReadError, match='trailing comma'):
+        validate(str(path), protected=[], never_send_roots=[])
+    path.write_text(path.read_text().replace(',]', ']'))
+    assert validate(str(path), protected=[], never_send_roots=[])['records'] == 5000

@@ -412,8 +412,12 @@ def _open_tar_member(path: Path, member: str):
         stream = archive.extractfile(info)
         if stream is None:
             raise ValueError("unable to read tar member")
+        before = os.fstat(raw.fileno())
         with stream:
             yield stream, info.size
+        after = os.fstat(raw.fileno())
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("archive changed during read")
 
 
 def _check_zip_ratio(info: zipfile.ZipInfo) -> None:
@@ -681,6 +685,7 @@ def skill_file_read(
             raise PermissionError(f"refused protected or symlink archive path: {archive_path}")
         never_send = _is_never_send(archive_path, never_send_roots)
         with open_readonly_nofollow(archive_path) as archive_handle, zipfile.ZipFile(archive_handle, "r") as zf:
+            before = os.fstat(archive_handle.fileno())
             info = zf.getinfo(member)
             _check_zip_ratio(info)
             total_size = int(info.file_size)
@@ -715,6 +720,9 @@ def skill_file_read(
                     never_send=never_send, record_format=_detect_format(target),
                     source="zip_member", trusted=False,
                 )
+            after = os.fstat(archive_handle.fileno())
+            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ValueError("archive changed during read")
     else:
         path = expand(target)
         if _has_symlink_to_root(path) or is_protected(path, protected):
@@ -2022,6 +2030,23 @@ class ErrandRunner:
                                 step_summary["schema"] = {"error": type(exc).__name__, "trusted": False}
                                 unanswered_notes.append({"path": obs.path,
                                     "reason": f"structured inspection failed: {type(exc).__name__}: {exc}"})
+                        if (obs.eof and files_inspected[obs.path]["bytes_read"] == obs.total_size
+                                and obs.record_format in ("json", "jsonl", "csv", "tsv")):
+                            from .structured_reader import validate as validate_structured
+                            try:
+                                validation = await asyncio.to_thread(
+                                    validate_structured, target, protected=protected,
+                                    never_send_roots=never_send_roots, cloud_bound=cloud_bound,
+                                    expected_sha256=obs.sha256)
+                                step_summary["validation"] = validation
+                                files_inspected[obs.path]["schema_validation"] = "complete"
+                            except (OSError, ValueError, PermissionError) as exc:
+                                step_summary["validation"] = {"error": type(exc).__name__, "trusted": False}
+                                files_inspected[obs.path]["schema_validation"] = "failed"
+                                unanswered_notes.append({"path": obs.path,
+                                    "reason": f"structured validation failed: {type(exc).__name__}: {exc}"})
+                                # Never analyze partial/corrupt structured input as complete.
+                                observations[:] = [item for item in observations if item.path != obs.path]
                         # Bounded >200KB streaming continuation: if more bytes
                         # remain and step budget has room (preserving space for
                         # queued steps + infer/ask/report), queue the next chunk
