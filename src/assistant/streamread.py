@@ -19,13 +19,21 @@ primitives that every reader in the tree can share:
   ``(records, next_cursor, bytes_read, eof)``. Memory stays proportional to
   one record, never to the file. A cursor is opaque JSON and round-trips
   through SQLite, so a read can pause and resume without re-reading prefix
-  bytes.
+  bytes. Every cursor binds the source's digest scope (``full`` for files
+  up to 1 MiB, else ``head:1MiB+size``); resuming against a changed source,
+  or a source that changes mid-read, fails loudly.
+* ``validate(target, …)`` — one full streaming pass that counts every record
+  without collecting values; returns the digest and a record count, or
+  raises. Anything less than a complete pass is an error, never a
+  best-effort "looks fine".
 * ``read_window(...)`` — the same stream rendered as human/LLM text, aligned
   to record boundaries so a window never ends mid-value or mid-CSV-row.
 
 Failure is loud (`StreamError`, naming the stage and byte offset). Nothing is
 silently truncated: a batch that stops early says so, and `eof` is only true
-when the stream really ended.
+when the stream really ended. SQLite is read through a private, bounded,
+read-only snapshot (WAL-mode files and virtual tables are refused), never
+through the live database.
 
 Everything here reads **untrusted data**. `trusted` is pinned `False` on every
 envelope, `[policy] protected` paths and symlinked paths are refused before a
@@ -47,10 +55,12 @@ import csv
 import hashlib
 import io
 import json
+import os
 import re
 import sqlite3
 import stat as stat_mod
 import tarfile
+import tempfile
 import zipfile
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
@@ -100,8 +110,13 @@ _SCRIPT_RE = re.compile(r"<(script|style)\b.*?</\1\s*>", re.IGNORECASE | re.DOTA
 _WS_RE = re.compile(r"[ \t\r\f\v]+")
 
 
-class StreamError(RuntimeError):
-    """A read failed at a named stage and byte offset. Never silent (I1)."""
+class StreamError(ValueError):
+    """A read failed at a named stage and byte offset. Never silent (I1).
+
+    Subclasses ``ValueError`` (like the retired ``StructuredReadError``) so
+    pre-existing ``except (OSError, ValueError, PermissionError)`` call
+    sites keep catching policy and parse failures.
+    """
 
     def __init__(self, stage: str, message: str, *, offset: int | None = None,
                  target: str | None = None):
@@ -151,20 +166,31 @@ class Target:
 
 
 def parse_target(raw: str | Path) -> Target:
-    """Parse `path` or `zip://archive#member` into a Target (validated)."""
+    """Parse `path`, `zip://archive#member` or `tar://archive#member` into a Target.
+
+    Both archive URI conventions name the same thing — a member streaming out
+    of a container — so ``tar://`` is accepted as an alias for a tar member
+    (the batch's label reports the detected container kind, not the spelling
+    the caller used). Archive contents are opened for reading only; nothing
+    is extracted (validated member names, no traversal).
+    """
     text = str(raw)
-    if text.startswith("zip://"):
-        rest = text[len("zip://"):]
+    for prefix, forced_kind in (("zip://", None), ("tar://", "tar")):
+        if not text.startswith(prefix):
+            continue
+        rest = text[len(prefix):]
         if "#" not in rest:
             raise StreamError(
-                "parse", "archive target must be zip://<archive>#<member>", target=text)
+                "parse", "archive target must be <kind>://<archive>#<member>",
+                target=text)
         archive, member = rest.split("#", 1)
         safe = _safe_member_name(member)
         if safe is None:
             raise StreamError(
                 "parse", f"refused unsafe archive member name {member!r}", target=text)
         path = expand(archive)
-        return Target(path=path, member=safe, archive_kind=archive_kind(path) or "zip")
+        return Target(path=path, member=safe,
+                      archive_kind=forced_kind or archive_kind(path) or "zip")
     return Target(path=expand(text))
 
 
@@ -236,6 +262,12 @@ def _check_policy(target: Target, protected: Iterable[str],
             if not found:
                 raise StreamError("policy", "member not found", target=target.label)
     return is_never_send(target.path, never_send_roots)
+
+
+def _check_cloud_bound(parsed: Target, never_send: bool, cloud_bound: bool) -> None:
+    """§10.7 fence: a never-send source is never opened for a cloud-bound call."""
+    if cloud_bound and never_send:
+        raise PermissionError("source is never_send_to_cloud (§10.7)")
 
 
 @contextlib.contextmanager
@@ -337,7 +369,7 @@ def target_digest(target: Target, *, protected: Iterable[str] = (),
 def detect_format(label: str | Path) -> str:
     """Map a name to a reader format. Pure string logic, no I/O."""
     text = str(label)
-    if text.startswith("zip://"):
+    if text.startswith(("zip://", "tar://")):
         text = text.split("#", 1)[-1]
     path = Path(text)
     suffix = path.suffix.lower()
@@ -476,14 +508,16 @@ class _JSONRecordStream:
 
     Supports the three shapes a real export takes: a top-level array of
     records, a top-level object of records, or one scalar value. Nested
-    structures are handed over whole (bounded by ``MAX_RECORD_CHARS``).
+    structures are handed over whole (bounded by ``max_record_chars``).
     """
 
     def __init__(self, stream, *, container: str | None = None,
-                 start_offset: int = 0, allow_leading_comma: bool = False):
+                 start_offset: int = 0, allow_leading_comma: bool = False,
+                 max_record_chars: int = MAX_RECORD_CHARS):
         self.feeder = _TextFeeder(stream)
         self.container = container
         self.allow_leading_comma = allow_leading_comma
+        self.max_record_chars = max(256, int(max_record_chars))
         self._index = 0
         self._opened = False
         if start_offset:
@@ -531,7 +565,14 @@ class _JSONRecordStream:
         decoder = json.JSONDecoder()
         while True:
             try:
-                return decoder.raw_decode(self.feeder.text, idx)
+                value, end = decoder.raw_decode(self.feeder.text, idx)
+                if end - idx > self.max_record_chars:
+                    raise StreamError(
+                        "parse",
+                        f"one JSON record exceeds the {self.max_record_chars}-char "
+                        "limit; split the file or raise the limit deliberately",
+                        offset=self.feeder.byte_pos(idx))
+                return value, end
             except json.JSONDecodeError as exc:
                 incomplete = exc.msg.startswith("Unterminated") or (
                     exc.pos >= len(self.feeder.text) - 2)
@@ -547,11 +588,11 @@ class _JSONRecordStream:
                         f"truncated JSON ({exc.msg}) at end of stream "
                         f"(offset {self.feeder.byte_pos(exc.pos)})",
                         offset=self.feeder.byte_pos(exc.pos)) from exc
-                if len(self.feeder.text) - idx > MAX_RECORD_CHARS:
+                if len(self.feeder.text) - idx > self.max_record_chars:
                     raise StreamError(
                         "parse",
-                        f"one JSON record exceeds the {MAX_RECORD_CHARS}-char "
-                        "cap; split the file or raise the cap deliberately",
+                        f"one JSON record exceeds the {self.max_record_chars}-char "
+                        "limit; split the file or raise the limit deliberately",
                         offset=self.feeder.byte_pos(idx)) from exc
                 if not self.feeder.fill_more():
                     raise StreamError(
@@ -910,34 +951,103 @@ def _skeleton_html(text: str) -> dict[str, Any]:
     }
 
 
-def _skeleton_sqlite(path: Path) -> dict[str, Any]:
-    uri = f"file:{path}?mode=ro&immutable=1"
-    tables: list[dict[str, Any]] = []
+_SQLITE_SNAPSHOT_BUDGET: int = 1_000_000_000  # max bytes copied to the private snapshot
+
+
+@contextlib.contextmanager
+def _sqlite_snapshot(target: Target, *, protected: Iterable[str] = (),
+                     never_send_roots: Iterable[str] = ()):
+    """Copy the SQLite source into a private, bounded, read-only snapshot.
+
+    Yields ``(snapshot_path, size)``. A WAL-mode database is refused: copying
+    the main file alone is not a reliable snapshot (it can miss committed
+    data still living in the WAL). The copy keeps the source file
+    unreachable for writes — nothing here opens the source for anything but
+    reading — enforces owner-only permissions on the copy and removes the
+    private directory on exit. An abrupt process termination can still leave
+    residue in the temp directory; that residue is never linked to the
+    source and contains only what a read-only copy contains.
+    """
+    with open_target(target, protected=protected,
+                     never_send_roots=never_send_roots) as stream:
+        header = stream.read(100)
+        if len(header) < 100 or not header.startswith(b"SQLite format 3\x00"):
+            raise StreamError("open", "invalid SQLite header", target=target.label)
+        if header[18] != 1 or header[19] != 1:
+            raise StreamError(
+                "preflight",
+                "SQLite WAL-mode snapshot refused; "
+                "checkpoint and use a rollback-mode copy", target=target.label)
+        with tempfile.TemporaryDirectory(prefix="elaria-read-") as directory:
+            filename = Path(directory) / "snapshot.sqlite"
+            total = len(header)
+            with open(filename, "xb") as out:
+                os.chmod(filename, 0o600)
+                out.write(header)
+                while True:
+                    block = stream.read(65536)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > _SQLITE_SNAPSHOT_BUDGET:
+                        raise StreamError(
+                            "open", "SQLite snapshot exceeds 1 GB disk budget",
+                            target=target.label)
+                    out.write(block)
+            yield filename, total
+
+
+def _inspectable_tables(conn: sqlite3.Connection,
+                        target: Target) -> list[tuple[str, str]]:
+    """``(name, definition)`` for each non-system table; virtual tables refused.
+
+    A virtual table's module code is part of the database file, not of this
+    reader, so such a table is never opened — refusing is the honest answer.
+    """
+    rows = conn.execute(
+        "SELECT name, sql FROM sqlite_schema WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
+    tables = []
+    for name, definition in rows:
+        if (not definition
+                or str(definition).lstrip().upper().startswith("CREATE VIRTUAL TABLE")):
+            raise StreamError("preflight",
+                              "SQLite virtual tables are not inspectable",
+                              target=target.label)
+        tables.append((str(name), str(definition)))
+    return tables
+
+
+def _skeleton_sqlite(target: Target, *, protected: Iterable[str] = (),
+                     never_send_roots: Iterable[str] = ()) -> dict[str, Any]:
+    """Table/column/row metadata from the private snapshot. Never raises."""
     try:
-        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
-    except sqlite3.Error as exc:
-        return {"format": "sqlite", "parse_error": f"{type(exc).__name__}: {exc}"}
-    try:
-        names = [
-            str(r[0]) for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 64")
-        ]
-        for name in names:
+        with _sqlite_snapshot(target, protected=protected,
+                              never_send_roots=never_send_roots) as (filename, _):
+            uri = filename.as_uri() + "?mode=ro&immutable=1"
+            conn = sqlite3.connect(uri, uri=True, timeout=2.0)
             try:
-                cols = [str(r[1]) for r in conn.execute(
-                    f'PRAGMA table_info("{name.replace(chr(34), "")}")')]
-                rows = int(conn.execute(
-                    f'SELECT COUNT(*) FROM "{name.replace(chr(34), "")}"'
-                ).fetchone()[0])
-            except sqlite3.Error:
-                cols, rows = [], -1
-            tables.append({"table": name, "columns": cols[:32], "rows": rows})
-    except sqlite3.Error as exc:
-        return {"format": "sqlite", "parse_error": f"{type(exc).__name__}: {exc}"}
-    finally:
-        conn.close()
-    return {"format": "sqlite", "tables": tables, "read_only": True}
+                conn.execute("PRAGMA query_only=ON")
+                conn.execute("PRAGMA trusted_schema=OFF")
+                tables = []
+                for name, _ in _inspectable_tables(conn, target)[:64]:
+                    safe = name.replace('"', '""')
+                    try:
+                        cols = [str(r[1]) for r in conn.execute(
+                            f'PRAGMA table_info("{safe}")')]
+                        rows = int(conn.execute(
+                            f'SELECT COUNT(*) FROM "{safe}"'
+                        ).fetchone()[0])
+                    except sqlite3.Error:
+                        cols, rows = [], -1
+                    tables.append({"table": name, "columns": cols[:32], "rows": rows})
+                return {"format": "sqlite", "tables": tables, "read_only": True}
+            finally:
+                conn.close()
+    except (StreamError, sqlite3.Error) as exc:
+        message = (exc.message if isinstance(exc, StreamError)
+                   else f"{type(exc).__name__}: {exc}")
+        return {"format": "sqlite", "parse_error": message}
 
 
 def _ooxml_member(target: Target) -> tuple[Path, str] | None:
@@ -1003,10 +1113,12 @@ class Inspection:
 def inspect(target: str | Path, *, protected: Iterable[str] = (),
             never_send_roots: Iterable[str] = (),
             redact: bool = True,
-            skeleton_bytes: int = MAX_SKELETON_BYTES) -> Inspection:
+            skeleton_bytes: int = MAX_SKELETON_BYTES,
+            cloud_bound: bool = False) -> Inspection:
     """Structural skeleton of any target in bounded memory. Zero tokens."""
     parsed = parse_target(target)
     never_send = _check_policy(parsed, protected, never_send_roots)
+    _check_cloud_bound(parsed, never_send, cloud_bound)
     fmt = detect_format(parsed.label)
     size = file_size(parsed)
     digest, scope = target_digest(parsed, protected=protected,
@@ -1048,8 +1160,11 @@ def inspect(target: str | Path, *, protected: Iterable[str] = (),
             result.parse_error = manifest.error
         return result
 
-    if fmt == "sqlite" and not parsed.is_member:
-        result.skeleton = _skeleton_sqlite(parsed.path)
+    if fmt == "sqlite":
+        # Members snapshot from the archive stream; direct files stream the
+        # file — either way the live database is never opened.
+        result.skeleton = _skeleton_sqlite(parsed, protected=protected,
+                                           never_send_roots=never_send_roots)
         result.parse_error = result.skeleton.get("parse_error")
         return result
 
@@ -1148,6 +1263,13 @@ class Batch:
     never_send: bool
     parse_error: str | None = None
     notes: list[str] = field(default_factory=list)
+    sha256: str = ""
+    digest_scope: str = "full"
+    trusted: bool = False
+
+    def __post_init__(self) -> None:
+        if self.trusted is not False:
+            raise ValueError("IF-6 violation: Batch.trusted must always be False")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1162,6 +1284,9 @@ class Batch:
             "never_send": self.never_send,
             "parse_error": self.parse_error,
             "notes": self.notes,
+            "sha256": self.sha256,
+            "digest_scope": self.digest_scope,
+            "trusted": False,
         }
 
 
@@ -1215,7 +1340,8 @@ def _window_line_trim(text: str, raw: bytes) -> tuple[str, int, bool]:
 
 def _read_text_style(target: Target, fmt: str, cursor: dict[str, Any], *,
                      byte_budget: int, record_limit: int, projection, redact: bool,
-                     protected, never_send_roots) -> Batch:
+                     protected, never_send_roots,
+                     max_record_chars: int = MAX_RECORD_CHARS) -> Batch:
     offset = int(cursor.get("offset", 0))
     header = cursor.get("header")
     with open_target(target, protected=protected,
@@ -1264,6 +1390,11 @@ def _read_text_style(target: Target, fmt: str, cursor: dict[str, Any], *,
             count = reader.line_num
             consumed += len("".join(lines[index:index + count]).encode("utf-8"))
             index += count
+            if sum(len(field) for field in row) > max_record_chars:
+                raise StreamError("parse",
+                                  f"CSV record exceeds the {max_record_chars}-char "
+                                  "limit", offset=offset + consumed,
+                                  target=target.label)
             return row
 
         if header is None and offset == 0:
@@ -1319,16 +1450,22 @@ def _read_text_style(target: Target, fmt: str, cursor: dict[str, Any], *,
             line = lines[index]
             consumed += len(line.encode("utf-8"))
             index += 1
+            if len(line) > max_record_chars:
+                raise StreamError("parse",
+                                  f"JSONL record exceeds the {max_record_chars}-char "
+                                  "limit", offset=offset + consumed,
+                                  target=target.label)
             stripped = line.strip()
             if not stripped:
                 continue
             try:
                 value = json.loads(stripped)
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, RecursionError) as exc:
                 bad += 1
+                reason = getattr(exc, "msg", None) or f"invalid JSON line ({type(exc).__name__})"
                 records.append({"kind": "line", "index": start_line + index - 1,
                                 "text": "[invalid JSON line withheld]" if redact else stripped,
-                                "parse_error": f"line {start_line + index - 1}: {exc.msg}"})
+                                "parse_error": f"line {start_line + index - 1}: {reason}"})
                 continue
             if redact:
                 value = _redact_value(value)
@@ -1477,47 +1614,62 @@ def _read_ooxml(target: Target, fmt: str, cursor: dict[str, Any], *,
 
 def _read_sqlite(target: Target, cursor: dict[str, Any], *,
                  byte_budget: int, record_limit: int, redact: bool,
-                 projection) -> Batch:
+                 projection, max_record_chars: int = MAX_RECORD_CHARS,
+                 protected: Iterable[str] = (),
+                 never_send_roots: Iterable[str] = ()) -> Batch:
     table_index = int(cursor.get("table_index", 0))
     offset = int(cursor.get("offset", 0))
     byte_start = int(cursor.get("rendered_bytes", 0))
-    conn = sqlite3.connect(target.path.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=2.0)
-    conn.row_factory = sqlite3.Row
     try:
-        tables = [str(r[0]) for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-        records = []
-        consumed = 0
-        while table_index < len(tables) and len(records) < record_limit:
-            table = tables[table_index]
-            safe = table.replace('"', '""')
-            row = conn.execute(f'SELECT * FROM "{safe}" LIMIT 1 OFFSET ?', (offset,)).fetchone()
-            if row is None:
-                table_index += 1
-                offset = 0
-                continue
-            mapping = dict(row)
-            if redact:
-                mapping = _redact_value(mapping)
-            mapping = _project_value(mapping, projection)
-            rendered = _record_text(mapping)
-            consumed += len(json.dumps(mapping, default=str).encode("utf-8"))
-            records.append({"kind": "row", "index": offset, "table": table,
-                            "value": mapping, "text": rendered})
-            offset += 1
-            if consumed >= byte_budget:
-                break
-        return Batch(records, {"table_index": table_index, "offset": offset,
-                               "rendered_bytes": byte_start + consumed},
-                     consumed, table_index >= len(tables), "sqlite", file_size(target),
-                     byte_start, byte_start + consumed, False,
-                     notes=[("SQLite byte ranges count rendered row bytes, not database pages; "
-                             "cursor spans all tables (read-only immutable URI)")])
+        with _sqlite_snapshot(target, protected=protected,
+                              never_send_roots=never_send_roots) as (filename, total_size):
+            uri = filename.as_uri() + "?mode=ro&immutable=1"
+            conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH,
+                              max(int(max_record_chars), 10000))
+                conn.execute("PRAGMA query_only=ON")
+                conn.execute("PRAGMA trusted_schema=OFF")
+                tables = [name for name, _ in _inspectable_tables(conn, target)]
+                records = []
+                consumed = 0
+                while table_index < len(tables) and len(records) < record_limit:
+                    table = tables[table_index]
+                    safe = table.replace('"', '""')
+                    row = conn.execute(
+                        f'SELECT * FROM "{safe}" LIMIT 1 OFFSET ?',
+                        (offset,)).fetchone()
+                    if row is None:
+                        table_index += 1
+                        offset = 0
+                        continue
+                    mapping = {}
+                    for key in row.keys():  # noqa: SIM118 -- Row iterates values, not keys
+                        value = row[key]
+                        mapping[key] = ({"blob_hex": value.hex()}
+                                        if isinstance(value, bytes) else value)
+                    if redact:
+                        mapping = _redact_value(mapping)
+                    mapping = _project_value(mapping, projection)
+                    rendered = _record_text(mapping)
+                    consumed += len(json.dumps(mapping, default=str).encode("utf-8"))
+                    records.append({"kind": "row", "index": offset, "table": table,
+                                    "value": mapping, "text": rendered})
+                    offset += 1
+                    if consumed >= byte_budget:
+                        break
+                return Batch(records, {"table_index": table_index, "offset": offset,
+                                       "rendered_bytes": byte_start + consumed},
+                             consumed, table_index >= len(tables), "sqlite",
+                             total_size, byte_start, byte_start + consumed, False,
+                             notes=[("SQLite byte ranges count rendered row bytes, "
+                                     "not database pages; cursor spans all tables "
+                                     "(private read-only snapshot)")])
+            finally:
+                conn.close()
     except sqlite3.Error as exc:
         raise StreamError("read", f"sqlite: {exc}", target=target.label) from exc
-    finally:
-        conn.close()
 
 
 def read_batch(target: str | Path, cursor: dict[str, Any] | None = None, *,
@@ -1526,41 +1678,58 @@ def read_batch(target: str | Path, cursor: dict[str, Any] | None = None, *,
                projection: Iterable[str] | None = None,
                redact: bool = True,
                protected: Iterable[str] = (),
-               never_send_roots: Iterable[str] = ()) -> Batch:
+               never_send_roots: Iterable[str] = (),
+               cloud_bound: bool = False,
+               max_record_chars: int = MAX_RECORD_CHARS) -> Batch:
     """Stream whole records within a bounded byte budget. Never loads the file.
 
     ``cursor`` is opaque and comes from a previous batch's ``next_cursor``;
-    ``None`` starts at the beginning. The returned ``eof`` is true only when
+    ``None`` starts at the beginning. The cursor binds the source's digest
+    scope: resuming against a changed source raises ``StreamError`` — it never
+    silently reads the wrong bytes. The returned ``eof`` is true only when
     the stream truly ended — a budget stop is `eof=False` with a cursor.
+
+    ``cloud_bound=True`` refuses any source inside `never_send_to_cloud`
+    (§10.7) instead of reading it for a cloud-bound consumer.
     """
     parsed = parse_target(target)
     never_send = _check_policy(parsed, protected, never_send_roots)
+    _check_cloud_bound(parsed, never_send, cloud_bound)
     fmt = detect_format(parsed.label)
     cur = _normalise_cursor(cursor)
     proj = list(projection or [])
     budget = max(256, int(byte_budget))
     limit = max(1, int(record_limit))
+    cap = max(256, min(int(max_record_chars), MAX_RECORD_CHARS))
 
-    if fmt == "zip":
+    if fmt in ("zip", "tar"):
         raise StreamError(
-            "read", "a zip container is not readable as records; pick a member "
-            "(discovery lists them as zip://archive#member)", target=parsed.label)
+            "read", "an archive container is not readable as records; pick a "
+            "member (discovery lists them as zip://archive#member)",
+            target=parsed.label)
     if fmt == "pdf":
         raise StreamError(
             "read", "PDF streaming is not built (page-aware extraction is a "
             "separate build); inspect() gives metadata only", target=parsed.label)
-    if fmt == "sqlite" and not parsed.is_member:
+    digest, digest_scope = target_digest(
+        parsed, protected=protected, never_send_roots=never_send_roots)
+    expected = cur.get("sha256")
+    if expected and expected != digest:
+        raise StreamError("cursor", "source changed since previous batch",
+                          target=parsed.label)
+    if fmt == "sqlite":
+        # Direct files and archive members both read from a private snapshot.
         batch = _read_sqlite(parsed, cur, byte_budget=budget,
-                             record_limit=limit, redact=redact, projection=proj)
+                             record_limit=limit, redact=redact, projection=proj,
+                             max_record_chars=cap,
+                             protected=protected,
+                             never_send_roots=never_send_roots)
         batch.never_send = never_send
-        return batch
-    if fmt in ("docx", "xlsx", "pptx", "odt"):
+    elif fmt in ("docx", "xlsx", "pptx", "odt"):
         batch = _read_ooxml(parsed, fmt, cur, byte_budget=budget,
                             record_limit=limit, redact=redact)
         batch.never_send = never_send
-        return batch
-
-    if fmt == "json":
+    elif fmt == "json":
         offset = int(cur.get("offset", 0))
         container = cur.get("container")
         if offset > 0 and not container:
@@ -1577,6 +1746,7 @@ def read_batch(target: str | Path, cursor: dict[str, Any] | None = None, *,
                 container=container if offset > 0 else None,
                 start_offset=offset,
                 allow_leading_comma=offset > 0,
+                max_record_chars=cap,
             )
             try:
                 records, next_offset, eof = reader.records(
@@ -1600,19 +1770,35 @@ def read_batch(target: str | Path, cursor: dict[str, Any] | None = None, *,
             if proj and record.get("kind") != "field":
                 record["value"] = _project_value(record.get("value"), proj)
                 record["text"] = _record_text(record["value"])
-        return Batch(records,
-                     {"offset": next_offset, "container": detected_container},
-                     max(0, next_offset - offset), eof, "json",
-                     file_size(parsed), offset, next_offset, never_send)
-
-    batch = _read_text_style(parsed, fmt, cur, byte_budget=budget,
-                             record_limit=limit, projection=proj, redact=redact,
-                             protected=protected,
-                             never_send_roots=never_send_roots)
+        batch = Batch(records,
+                      {"offset": next_offset, "container": detected_container},
+                      max(0, next_offset - offset), eof, "json",
+                      file_size(parsed), offset, next_offset, never_send)
+    else:
+        batch = _read_text_style(parsed, fmt, cur, byte_budget=budget,
+                                 record_limit=limit, projection=proj, redact=redact,
+                                 protected=protected,
+                                 never_send_roots=never_send_roots,
+                                 max_record_chars=cap)
+        batch.never_send = never_send
+        if not batch.eof and batch.byte_end <= batch.byte_start:
+            raise StreamError("read", "record exceeds byte budget; increase byte_budget",
+                              offset=batch.byte_start, target=parsed.label)
+    digest_after, _ = target_digest(parsed, protected=protected,
+                                    never_send_roots=never_send_roots)
+    if digest_after != digest:
+        raise StreamError("read", "source changed during read", target=parsed.label)
+    batch.sha256 = digest
+    batch.digest_scope = digest_scope
     batch.never_send = never_send
-    if not batch.eof and batch.byte_end <= batch.byte_start:
-        raise StreamError("read", "record exceeds byte budget; increase byte_budget",
-                          offset=batch.byte_start, target=parsed.label)
+    cursor_out = dict(batch.next_cursor)
+    cursor_out["sha256"] = digest
+    cursor_out["digest_scope"] = digest_scope
+    batch.next_cursor = cursor_out
+    if digest_scope != "full":
+        batch.notes = list(batch.notes) + [
+            (f"digest scope {digest_scope}: identity covers the leading bytes "
+             "and the file size, not every byte")]
     return batch
 
 
@@ -1685,16 +1871,16 @@ def read_window(target: str | Path, cursor: dict[str, Any] | None = None, *,
                 never_send_roots: Iterable[str] = (),
                 digest: str | None = None,
                 digest_scope: str | None = None,
-                record_chars: int | None = None) -> Window:
+                record_chars: int | None = None,
+                cloud_bound: bool = False) -> Window:
     """A bounded, record-aligned text window of any readable target."""
     batch = read_batch(target, cursor, byte_budget=byte_budget,
                        record_limit=record_limit, projection=projection,
                        redact=redact, protected=protected,
-                       never_send_roots=never_send_roots)
+                       never_send_roots=never_send_roots,
+                       cloud_bound=cloud_bound)
     if digest is None:
-        parsed = parse_target(target)
-        digest, digest_scope = target_digest(
-            parsed, protected=protected, never_send_roots=never_send_roots)
+        digest, digest_scope = batch.sha256, batch.digest_scope
     rendering_loss = any(
         str(r.get("text", "")).endswith("…") or
         len(str(r.get("text", ""))) >
@@ -1723,6 +1909,82 @@ def read_window(target: str | Path, cursor: dict[str, Any] | None = None, *,
 def batch_target_label(target: str | Path) -> str:
     parsed = parse_target(target)
     return parsed.label
+
+
+def _full_digest(target: Target, *, protected: Iterable[str] = (),
+                 never_send_roots: Iterable[str] = ()) -> str:
+    """Full-file sha256 over the readable stream (never the live database)."""
+    digest = hashlib.sha256()
+    with open_target(target, protected=protected,
+                     never_send_roots=never_send_roots) as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate(target: str | Path, *, protected: Iterable[str] = (),
+             never_send_roots: Iterable[str] = (),
+             cloud_bound: bool = False,
+             byte_budget: int = 65536,
+             record_limit: int = 200,
+             max_record_chars: int = MAX_RECORD_CHARS,
+             expected_sha256: str | None = None) -> dict[str, Any]:
+    """One full streaming pass over every record. Nothing is collected.
+
+    Returns the record count, a digest of the source, and ``complete=True``;
+    any parse failure, invalid record or change in the source is an
+    exception, never a best-effort "looks fine" (I1).
+
+    ``expected_sha256`` accepts either this module's digest for the source
+    (scoped: ``full`` up to 1 MiB, else ``head:1048576+size``) or a full-file
+    sha256 hex digest of the stream — a full-file comparison runs when the
+    scoped comparison does not match. Without ``expected_sha256`` the
+    returned digest is the scoped one, labelled via ``digest_scope``.
+    """
+    parsed = parse_target(target)
+    never_send = _check_policy(parsed, protected, never_send_roots)
+    _check_cloud_bound(parsed, never_send, cloud_bound)
+    fmt = detect_format(parsed.label)
+    digest, scope = target_digest(parsed, protected=protected,
+                                  never_send_roots=never_send_roots)
+    expected_matches_full = False
+    if expected_sha256 and expected_sha256 != digest:
+        expected_matches_full = _full_digest(
+            parsed, protected=protected,
+            never_send_roots=never_send_roots) == expected_sha256
+        if not expected_matches_full:
+            raise StreamError("validate", "source changed since read",
+                              target=parsed.label)
+    count = 0
+    for batch in iter_batches(target, byte_budget=byte_budget,
+                              record_limit=record_limit,
+                              max_record_chars=max_record_chars,
+                              protected=protected,
+                              never_send_roots=never_send_roots,
+                              cloud_bound=cloud_bound):
+        if batch.parse_error:
+            raise StreamError("validate",
+                              f"{fmt} contains invalid records: {batch.parse_error}",
+                              target=parsed.label)
+        count += len(batch.records)
+    if expected_sha256 and expected_matches_full:
+        after = _full_digest(parsed, protected=protected,
+                             never_send_roots=never_send_roots)
+        after_scope = "full"
+    else:
+        after, after_scope = target_digest(parsed, protected=protected,
+                                           never_send_roots=never_send_roots)
+    if expected_sha256:
+        if after != expected_sha256:
+            raise StreamError("validate", "source changed during validation",
+                              target=parsed.label)
+        return {"format": fmt, "records": count, "sha256": expected_sha256,
+                "digest_scope": after_scope, "complete": True, "trusted": False}
+    if after != digest:
+        raise StreamError("validate", "source changed during validation",
+                          target=parsed.label)
+    return {"format": fmt, "records": count, "sha256": digest,
+            "digest_scope": scope, "complete": True, "trusted": False}
 
 
 def iter_batches(target: str | Path, *, byte_budget: int = 65536,
@@ -1785,4 +2047,5 @@ __all__ = [
     "record_count",
     "render_records",
     "target_digest",
+    "validate",
 ]
