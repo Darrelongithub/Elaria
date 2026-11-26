@@ -50,6 +50,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .containment import (
+    narrow_roots,
+    require_within_roots,
+)
 from .cost import iso_now
 from .nus_pointer import (
     DISABLED_REFUSAL,
@@ -1512,6 +1516,7 @@ def skill_memory_infer(
         str(f.get("text") or "").strip().lower()
         for f in memory.beliefs()
     }
+    qualified_digest = re.compile(r"[0-9a-f]{64}")
     for cand in candidates:
         claim = str(cand.get("text") or "").strip()
         quote = str(cand.get("evidence_quote") or "").strip()
@@ -1533,30 +1538,116 @@ def skill_memory_infer(
         kind = str(cand.get("kind") or "preference")
         if kind not in ("profile", "preference", "commitment", "relationship"):
             kind = "preference"
+        digest = str(getattr(obs, "sha256", "") or "").strip().lower()
+        if not qualified_digest.fullmatch(digest):
+            rejected.append({"text": claim, "reason": "unverifiable_document_hash"})
+            continue
         evidence = (
             f"path={obs.path} sha256={obs.sha256[:12]} "
             f"bytes={obs.byte_start}..{obs.byte_end} quote={quote!r}"
         )
-        # Hardcoded source="inferred" in Python: never derived from data.
-        fact_id = memory.remember(
-            claim,
-            kind=kind,
-            source="inferred",
-            confidence=conf,
-            evidence=evidence,
-        )
+        # Route through Memory.propose_inferred() so owner tombstones
+        # (rejected_fact_hashes) and the 80% token-overlap deduplication are
+        # enforced here exactly as on every other inferred-write path.
+        propose = getattr(memory, "propose_inferred", None)
+        if callable(propose):
+            fact_id = propose(
+                claim,
+                kind,
+                confidence=conf,
+                evidence=evidence,
+                doc_sha256=digest,
+            )
+            if fact_id is None:
+                tombstoned = False
+                is_rejected = getattr(memory, "is_claim_rejected", None)
+                if callable(is_rejected):
+                    try:
+                        tombstoned = bool(is_rejected(kind, claim))
+                    except Exception:
+                        tombstoned = False
+                rejected.append({
+                    "text": claim,
+                    "reason": ("rejected_claim_tombstone" if tombstoned
+                               else "duplicate_active_fact"),
+                })
+                continue
+            stored_evidence = f"sha256:{digest} span:{evidence}"
+        else:
+            # Fallback for duck-typed memories without propose_inferred:
+            # still pin source in Python, never caller-controlled.
+            stored_evidence = evidence
+            fact_id = memory.remember(
+                claim,
+                kind=kind,
+                source="inferred",
+                confidence=conf,
+                evidence=stored_evidence,
+            )
         existing_texts.add(claim.lower())
         stored.append({
             "fact_id": int(fact_id),
             "kind": kind,
             "text": claim,
             "source": "inferred",
-            "confidence": conf,
-            "evidence": evidence,
+            "confidence": min(conf, MAX_INFERRED_CONFIDENCE),
+            "evidence": stored_evidence,
             "verified_evidence": True,
             "conflict_key": cand.get("conflict_key"),
         })
     return {"stored": stored, "rejected": rejected}
+
+
+# -- Owner answer classification (BUG-A1) ------------------------------------
+# A bare "yes" on a confirmation question means "the guess I named is correct";
+# it must never become a value. A bare "no" refuses the guess outright.
+# Only anything else is a concrete value the owner supplied.
+_AFFIRMATIVE_ANSWERS: frozenset[str] = frozenset({
+    "yes", "yeah", "yep", "yup", "ya", "y", "correct", "right", "exactly",
+    "sure", "confirmed", "confirm", "true", "ok", "okay", "agreed",
+    "that's right", "that's correct", "looks right", "looks correct",
+})
+_NEGATIVE_ANSWERS: frozenset[str] = frozenset({
+    "no", "nope", "nah", "n", "incorrect", "wrong", "false",
+    "that's wrong", "that's incorrect", "not right", "not correct",
+})
+
+
+def _normalise_owner_answer(text: str) -> str:
+    norm = str(text or "").strip().lower()
+    norm = norm.strip(" \t\r\n.!,;:\"'")
+    norm = re.sub(r"\s+", " ", norm)
+    return norm
+
+
+def _is_affirmative_answer(text: str) -> bool:
+    return _normalise_owner_answer(text) in _AFFIRMATIVE_ANSWERS
+
+
+def _is_negative_answer(text: str) -> bool:
+    return _normalise_owner_answer(text) in _NEGATIVE_ANSWERS
+
+
+def _choose_option_value(answer: str, options) -> str | None:
+    """Which of the question's options did the owner's answer name?
+
+    Longest boundary-safe match wins, so `dawn is current` selects `dawn`
+    on a dawn-vs-dusk question; anything else yields None (the caller then
+    uses the owner's raw words as the value).
+    """
+    norm = _normalise_owner_answer(answer)
+    if not norm:
+        return None
+    matches: list[str] = []
+    for opt in options or []:
+        text = str(opt).strip()
+        if not text:
+            continue
+        if re.search(rf"(?<!\w){re.escape(text.lower())}(?!\w)", norm):
+            matches.append(text)
+    if not matches:
+        return None
+    return max(matches, key=len)
 
 
 # -- Bounded Async Errand Runner ---------------------------------------------
@@ -1900,6 +1991,7 @@ class ErrandRunner:
                 "options": json.loads(q["options_json"] or "[]"),
                 "candidate_fact_ids": json.loads(q["candidate_fact_ids_json"] or "[]"),
                 "evidence_ref": q["evidence_ref"],
+                "attribute": q.get("attribute"),
                 "status": q["status"],
                 "answer_text": q["answer_text"],
                 "resolved_ts": q["resolved_ts"],
@@ -1999,14 +2091,66 @@ class ErrandRunner:
         amended_fact_id: int | None = None
         cleaned_answer = str(answer_text or "").strip()
 
+        def _supersede_linked_guesses() -> None:
+            """Retire linked *inferred* guesses the owner just superseded.
+
+            Stated facts are never touched here — they require an explicit
+            amendment. Already-inactive guesses are not re-counted.
+            """
+            if not candidate_ids:
+                return
+            rows = {int(r["id"]): r for r in self.store.list_facts(active_only=False)}
+            superseded = [
+                fid for fid in candidate_ids
+                if (rows.get(fid) or {}).get("source") == "inferred"
+                and int((rows.get(fid) or {}).get("active", 0) or 0) == 1
+            ]
+            if superseded:
+                self.store.deactivate_facts(superseded)
+                deactivated_ids.extend(superseded)
+
         if decision_norm == "confirm":
             note = f"confirmed_by_owner_uid={owner_uid}"
             if cleaned_answer:
                 note += f" answer={cleaned_answer!r}"
-            for fid in candidate_ids:
-                if self.store.confirm_fact(fid, evidence_note=note):
-                    promoted_ids.append(fid)
-            q_status = "confirmed"
+            attribute = str(question.get("attribute") or "").strip()
+            try:
+                q_options = json.loads(question.get("options_json") or "[]")
+            except ValueError:
+                q_options = []
+            owner_refused = _is_negative_answer(cleaned_answer)
+            owner_affirmed = (not cleaned_answer) or _is_affirmative_answer(cleaned_answer)
+            if owner_refused:
+                # A bare "no" refuses the guess outright: retire linked
+                # tentative inferences; promote nothing, invent nothing.
+                _supersede_linked_guesses()
+                q_status = "confirmed"
+            elif not owner_affirmed:
+                # The owner supplied a concrete value. Promotion must reflect
+                # the owner's chosen value — never the tentative
+                # "may be <a> (conflicting evidence with <b>)" text verbatim.
+                _supersede_linked_guesses()
+                value = _choose_option_value(cleaned_answer, q_options) or cleaned_answer
+                if attribute:
+                    fact_id = self.memory.remember(
+                        f"{attribute} is {value}",
+                        kind="preference",
+                        source="stated",
+                        confidence=1.0,
+                        evidence=(
+                            f"{note} attribute={attribute} "
+                            f"errand={errand_id} question={question['id']}"
+                        ),
+                    )
+                    promoted_ids.append(int(fact_id))
+                q_status = "confirmed"
+            else:
+                # Bare/affirmative confirm: a question may only ever promote
+                # the facts it names.
+                for fid in candidate_ids:
+                    if self.store.confirm_fact(fid, evidence_note=note):
+                        promoted_ids.append(fid)
+                q_status = "confirmed"
         elif decision_norm == "amend":
             if not cleaned_answer:
                 raise ValueError("amend requires non-empty answer_text")
@@ -2258,12 +2402,14 @@ class ErrandRunner:
                 try:
                     if step.skill == "fs.locate":
                         discovery_cfg = self._discovery_cfg()
-                        requested_roots = step.args.get("roots", roots)
-                        if any(not roots or not is_protected(expand(r), roots) for r in requested_roots):
-                            raise PermissionError("discovery root outside authorized scope")
+                        # Caller-supplied roots may narrow this errand's scope,
+                        # never widen it (BUG-A2).
+                        requested_roots = narrow_roots(
+                            step.args.get("roots", roots), roots,
+                            subject="discovery root")
                         locate_result = await asyncio.to_thread(
                             skill_fs_discover,
-                            roots=step.args.get("roots", roots),
+                            roots=requested_roots,
                             terms=step.args.get("terms", terms),
                             protected=protected,
                             never_send_roots=never_send_roots,
@@ -2303,10 +2449,7 @@ class ErrandRunner:
 
                     elif step.skill == "file.read_batch":
                         target = str(step.args["target"])
-                        archive_spec = _parse_zip_target(target) or _parse_tar_target(target)
-                        scoped_path = archive_spec[0] if archive_spec else expand(target)
-                        if not roots or not is_protected(scoped_path, roots):
-                            raise PermissionError("source outside authorized discovery roots")
+                        require_within_roots(target, roots)
                         # Structured records are data only. No decoded value is
                         # treated as a command or as byte-span verified evidence.
                         from .streamread import read_batch
@@ -2354,10 +2497,7 @@ class ErrandRunner:
 
                     elif step.skill in ("file.read", "file.stream"):
                         target = str(step.args["target"])
-                        archive_spec = _parse_zip_target(target) or _parse_tar_target(target)
-                        scoped_path = archive_spec[0] if archive_spec else expand(target)
-                        if not roots or not is_protected(scoped_path, roots):
-                            raise PermissionError("source outside authorized discovery roots")
+                        require_within_roots(target, roots)
                         structured = bool(step.args.get("structured", False))
                         limits = self._stream_cfg()
                         cloud_bound = bool(step.args.get("cloud_bound", False))
@@ -2512,6 +2652,7 @@ class ErrandRunner:
 
                     elif step.skill == "file.inspect":
                         target = str(step.args["target"])
+                        require_within_roots(target, roots)
                         limits = self._stream_cfg()
                         skeleton = await asyncio.to_thread(
                             skill_file_inspect,
@@ -2521,6 +2662,20 @@ class ErrandRunner:
                             redact=limits["redact_sensitive"],
                         )
                         inspections[target] = skeleton
+                        if self.safety_journal is not None:
+                            self.safety_journal.note_untrusted_input(
+                                target,
+                                actor="errand",
+                                correlation_id=f"errand:{errand_id}:step:{step_no}",
+                                detail={
+                                    "digest_prefix": str(skeleton.get("digest") or "")[:12],
+                                    "size": skeleton.get("size"),
+                                    "format": skeleton.get("format"),
+                                    "parse_error": skeleton.get("parse_error"),
+                                    "never_send": skeleton.get("never_send"),
+                                    "trusted": False,
+                                },
+                            )
                         step_summary = {
                             "target": target,
                             "format": skeleton.get("format"),
@@ -2706,14 +2861,15 @@ class ErrandRunner:
                         ev_ref = step.args.get("evidence_ref")
                         attr_key = step.args.get("attribute")
                         # Link candidate inferred fact IDs related to this question.
+                        # A question may ONLY ever promote facts it names: facts
+                        # whose conflict key matches the question's attribute, or
+                        # explicit candidate_fact_ids. Never an unrelated one.
                         linked_ids = [
                             int(r["fact_id"]) for r in inferred_records
                             if attr_key and r.get("conflict_key") == attr_key
                         ]
                         if not linked_ids and step.args.get("candidate_fact_ids"):
                             linked_ids = [int(i) for i in step.args["candidate_fact_ids"]]
-                        if not linked_ids and inferred_records:
-                            linked_ids = [int(inferred_records[-1]["fact_id"])]
 
                         q_id = self.store.create_pending_question(
                             errand_id=errand_id,
@@ -2723,6 +2879,7 @@ class ErrandRunner:
                             options_json=json.dumps(q_options),
                             candidate_fact_ids_json=json.dumps(linked_ids),
                             evidence_ref=ev_ref,
+                            attribute=(str(attr_key).strip() if attr_key else None),
                         )
                         self.store.add_holding(
                             ts=iso_now(),

@@ -38,6 +38,7 @@ from .asr import local_asr_status
 from .audio_gateway import AudioGateway, GatewayRefused
 from .config import DEFAULTS, Config, load_config, load_humour_profile
 from .console import ConsoleService, SessionService
+from .containment import configured_discovery_roots, narrow_roots, require_within_roots
 from .cost import day_start_iso, iso_now, month_start_iso
 from .disclosure import (
     DisclosureService,
@@ -4951,6 +4952,9 @@ class Daemon:
         """Metadata-first read-only discovery (GAP-2). Reads zero file content."""
         from .discovery import locate
 
+        self._require_ipc_owner()
+        if self.showoff.status().get("active"):
+            raise PermissionError("discovery is disabled during show-off mode")
         terms = params.get("terms")
         if isinstance(terms, str):
             terms = [t for t in terms.replace(",", " ").split() if t]
@@ -4959,11 +4963,14 @@ class Daemon:
         roots = params.get("roots")
         if roots is not None and not isinstance(roots, list):
             raise ValueError("fs.locate params.roots must be a list of paths")
+        # Configured [discovery] roots are the ceiling: caller-supplied roots
+        # may narrow them, never widen them (BUG-A2).
+        scope_roots = narrow_roots(roots, configured_discovery_roots(self.config))
         policy = self._discovery_policy()
-        if roots:
+        if roots is not None:
             from dataclasses import replace
 
-            policy = replace(policy, roots=tuple(str(r) for r in roots if str(r).strip()))
+            policy = replace(policy, roots=tuple(scope_roots))
         exts = params.get("exts")
         if exts is not None and not isinstance(exts, list):
             raise ValueError("fs.locate params.exts must be a list")
@@ -5002,9 +5009,14 @@ class Daemon:
         """Structural skeleton of a file or archive member (GAP-3). Zero tokens."""
         from .streamread import StreamError, inspect
 
+        self._require_ipc_owner()
+        if self.showoff.status().get("active"):
+            raise PermissionError("file reads are disabled during show-off mode")
         target = params.get("target") or params.get("path")
         if not isinstance(target, str) or not target.strip():
             raise ValueError("file.inspect needs params.target")
+        scope_roots = configured_discovery_roots(self.config)
+        require_within_roots(target, scope_roots)
         limits = self._stream_limits()
         try:
             result = await asyncio.to_thread(
@@ -5019,15 +5031,36 @@ class Daemon:
             )
         except StreamError as exc:
             raise ValueError(str(exc)) from exc
+        # IF-6: journal the skeleton's provenance — digests/sizes/shapes only.
+        journal = getattr(self, "safety_journal", None)
+        if journal is not None:
+            journal.note_untrusted_input(
+                target,
+                actor="discovery",
+                correlation_id=f"file.inspect:{str(result.digest or '')[:12]}",
+                detail={
+                    "digest_prefix": str(result.digest or "")[:12],
+                    "size": result.size,
+                    "format": result.format,
+                    "parse_error": result.parse_error,
+                    "never_send": result.never_send,
+                    "trusted": False,
+                },
+            )
         return result.as_dict()
 
     async def _file_read(self, params: dict) -> dict:
         """One bounded, record-aligned window of a file or archive member."""
         from .streamread import StreamError, read_window
 
+        self._require_ipc_owner()
+        if self.showoff.status().get("active"):
+            raise PermissionError("file reads are disabled during show-off mode")
         target = params.get("target") or params.get("path")
         if not isinstance(target, str) or not target.strip():
             raise ValueError("file.read needs params.target")
+        scope_roots = configured_discovery_roots(self.config)
+        require_within_roots(target, scope_roots)
         cursor = params.get("cursor")
         if cursor is not None and not isinstance(cursor, dict):
             raise ValueError("file.read params.cursor must be the previous next_cursor")
