@@ -31,13 +31,14 @@ def test_mouse_fixture(scenario, outcome, points):
                 Element('two', 'Second', 'button', (30, 10, 10, 10)))
     if scenario == 'ambiguous':
         elements += (replace(elements[0], id='third'),)
-    frame = Frame('frame', 'snapshot', 'pixels', 100, 100,
-                  Output('fixture', (0, 0, 100, 100), 1), 0, elements, 'app')
-    seats = [MouseSeat(replace(frame, png_sha256=str(i)), 'window', scenario != 'locked',
-                       scenario != 'absent', scenario != 'unsafe') for i in range(3)]
+    base = Frame('frame', 'snapshot', 'pixels', 100, 100,
+                 Output('fixture', (0, 0, 100, 100), 1), 0, elements, 'app')
+    states = [replace(base, png_sha256=str(i)) for i in range(3)]
+    seats = [MouseSeat(s, 'window', scenario != 'locked', scenario != 'absent',
+                       scenario != 'unsafe') for s in states]
+    hashes = list(map(mouse_screen, seats))
     with SyntheticSpace() as space:
         queue = ParkedQueue(space)
-        hashes = list(map(mouse_screen, seats))
         plan = Plan(tuple(Step(i, 3, 'click', ('window', 'button', name, *hashes[i:i+2]),
                                str(space.work)) for i, name in enumerate(
                                    ('10,20' if scenario == 'coordinate' else 'First', 'Second'))))
@@ -46,8 +47,6 @@ def test_mouse_fixture(scenario, outcome, points):
         def during():
             i = len(sink.calls)
             assert queue._db.execute('SELECT verdict FROM observations ORDER BY id DESC LIMIT 1').fetchone()[0] == f'click/{i-1}/before'
-            if scenario == 'changed':
-                seats[i] = replace(seats[i], frame=replace(frame, png_sha256='unexpected'))
             if scenario == 'external-stop':
                 halt_path(space.control).touch()
             if scenario == 'deadline':
@@ -58,7 +57,20 @@ def test_mouse_fixture(scenario, outcome, points):
             return 'yes' if scenario == 'unapproved' else token
         kwargs = dict(sink=sink, owner_prompt=prompt, principal='guest' if scenario == 'guest' else 'owner',
                       clock=lambda: now[0])
-        assert run_mouse_fixture(queue, 'errand', plan, capture=lambda: seats[len(sink.calls)], **kwargs) == outcome
+        # One fresh capture per observe: the screen state shown at capture j is
+        # S0 for the batch open and each step's pre/recheck, S1/S2 after clicks.
+        shown = [0, 0, 0, 1, 1, 1, 2]
+        n = [0]
+        def capture():
+            j = n[0]
+            n[0] += 1
+            seat = seats[shown[min(j, len(shown) - 1)]]
+            if scenario == 'changed' and j == 3:  # cached-stale buffer after click 0
+                seat = replace(seat, frame=replace(seat.frame, png_sha256='unexpected'))
+            return replace(seat, frame=replace(seat.frame, frame_id=f'fresh-{j}',
+                                              snapshot_id=f'snap-{j}', captured_at=float(j + 1)))
+        queue.register('errand', plan)
+        assert run_mouse_fixture(queue, 'errand', plan, capture=capture, **kwargs) == outcome
         assert sink.calls == points
         if scenario == 'approved':
             queue.close()

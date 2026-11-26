@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import math
 import re
 import secrets
 import time
@@ -333,7 +334,9 @@ def run_mouse_fixture(queue, errand, plan, *, capture, sink, owner_prompt,
 
     Each canonical click has argv (window, role, name, before, after), with
     exact screen fingerprints as expected states. ``owner_prompt`` represents
-    the trusted local seat in tests; it is not a daemon/model callback.
+    the trusted local seat in tests; it is not a daemon/model callback. The
+    batch runs only while the errand still holds this exact digest and the
+    burnt digest claim still binds that errand inside its expiry.
     """
     if type(queue) is not ParkedQueue or type(plan) is not Plan:
         raise TypeError("mouse fixture requires canonical plan and synthetic queue")
@@ -347,7 +350,11 @@ def run_mouse_fixture(queue, errand, plan, *, capture, sink, owner_prompt,
         if clock() >= deadline or is_halted(queue.path.parent) or queue.cancelled(errand):
             raise PermissionError('kill')
 
-    def observe(window, expected):
+    seen: set = set()
+    newest = [float('-inf')]
+    click_at = [None]
+
+    def observe(window, expected, *, verifying_click=False):
         check_stop()
         seat = capture()
         check_stop()
@@ -355,13 +362,25 @@ def run_mouse_fixture(queue, errand, plan, *, capture, sink, owner_prompt,
                 or seat.owner_present is not True or seat.safe_surface is not True
                 or seat.window != window or not seat.frame.focus):
             raise PermissionError('unsafe-seat')
+        frame = seat.frame
+        at = frame.captured_at
+        # Verification needs a fresh capture, taken after the click it verifies:
+        # a cached or regressed buffer can never prove the click landed.
+        if (type(frame.frame_id) is not str or not frame.frame_id or frame.frame_id in seen
+                or type(at) not in (int, float) or not math.isfinite(at) or at <= newest[0]
+                or (verifying_click and not at > click_at[0])):
+            raise PermissionError('stale-frame')
         if mouse_screen(seat) != expected:
             raise PermissionError('unexpected-screen')
-        return seat.frame
+        seen.add(frame.frame_id)
+        newest[0] = at
+        return frame
 
     try:
         if principal != 'owner' or type(sink) is not FakeMouseInput:
             return record('refused/no-authority')
+        if not queue.current(errand, digest):
+            return record('refused/stale-plan')
         steps = plan.steps
         if not 1 <= len(steps) <= 12:
             return record('refused/click-budget')
@@ -384,35 +403,48 @@ def run_mouse_fixture(queue, errand, plan, *, capture, sink, owner_prompt,
         if owner_prompt(plan.canonical.decode(), f'{digest} {nonce}') != f'{digest} {nonce}':
             return record('refused/unapproved')
         check_stop()
+        if not queue.current(errand, digest):
+            # superseded in errands while owner_prompt was waiting
+            return record('refused/stale-plan')
         if not queue.claim_mouse_digest(errand, digest, len(steps)):
             return record('refused/replay-or-budget')
         record(f'approved/{nonce}')
         recent = []
         for step in steps:
             window, role, name, before, after = step.argv
+            if not queue.claim_binds(errand, digest):
+                raise PermissionError('stale-claim')
             frame = observe(window, before)
             matches = [e for e in frame.elements if (e.role, e.name) == (role, name)]
             if len(matches) != 1 or sum(e.id == matches[0].id for e in frame.elements) != 1:
                 raise PermissionError('ungrounded')
             element = matches[0]
+            triple = (window, element.id, before)
+            if triple in recent:
+                raise PermissionError('click-loop')
+            recent.append(triple)
+            record(f'click/{step.i}/before')
+            # Recheck after the durable pre-action record; the click is grounded
+            # on this fresh capture, never on the discarded first one.
+            frame = observe(window, before)
+            matches = [e for e in frame.elements if (e.role, e.name) == (role, name)]
+            if (len(matches) != 1 or matches[0].id != element.id
+                    or sum(e.id == element.id for e in frame.elements) != 1):
+                raise PermissionError('ungrounded')
             resolution = ground(frame, dict(kind='element', id=element.id, confidence=1,
                                            frame_id=frame.frame_id, snapshot_id=frame.snapshot_id))
             if resolution is None:
                 raise PermissionError('ungrounded')
-            triple = (window, element.id, before)
-            if triple in recent[-3:]:
-                raise PermissionError('click-loop')
-            recent.append(triple)
-            record(f'click/{step.i}/before')
-            observe(window, before)  # recheck after the durable pre-action record
             if adjudicate(step.tier, 3, _mouse_key=_MOUSE_FIXTURE_KEY).verdict != "ok":
                 raise PermissionError("tier-3-refused")
+            click_at[0] = clock()
             sink.click(resolution.point)
-            observe(window, after)
+            observe(window, after, verifying_click=True)
             record(f'click/{step.i}/verified')
         return record('complete')
     except Exception as exc:
         # Unknown adapter/observation failures never retry or resume the batch.
         reason = str(exc) if type(exc) is PermissionError and str(exc) in {
-            'kill', 'unsafe-seat', 'unexpected-screen', 'ungrounded', 'click-loop'} else 'fixture-error'
+            'kill', 'unsafe-seat', 'unexpected-screen', 'ungrounded', 'click-loop',
+            'stale-frame', 'stale-claim'} else 'fixture-error'
         return record(f'halted/{reason}')
