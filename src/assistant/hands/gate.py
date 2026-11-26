@@ -6,9 +6,10 @@ must supply executable identity, dirty-repo/immutable and outward-effect facts.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from assistant.safety import assert_within_sandbox, check_operation, is_protected
 
@@ -17,6 +18,14 @@ from .plan import Step
 READ_BINARIES = frozenset(["cat", "ls", "stat", "du", "df", "grep", "find", "head", "tail", "wc", "file", "sha256sum", "systemctl", "rpm", "hyprctl", "pactl", "pw-dump", "journalctl"])
 SHELLS = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh"})
 EVAL_BINARIES = frozenset({"eval", "exec", "env", "xargs", "sudo", "su", "doas", "busybox"})
+# Launchers whose own effect semantics are unrecognised (privilege/namespace
+# escalation): forbidden outright, at any position of a launcher chain.
+PRIVILEGE_LAUNCHERS = frozenset({"pkexec", "systemd-run", "unshare", "nsenter", "capsh"})
+# Transparent wrappers that only schedule/attend their payload: unwrapped so
+# every shell/recursive/upload check below applies to the payload, not the wrapper.
+UNWRAP_LAUNCHERS = frozenset({"timeout", "nice", "nohup", "stdbuf", "setsid", "watch",
+                              "time", "flock", "chrt", "ionice", "taskset", "strace",
+                              "firejail", "bwrap", "bubblewrap"})
 # Script interpreters and loaders can evaluate a file/stdin, not just -c/-e.
 INTERPRETERS = ("python", "pypy", "perl", "ruby", "node", "lua", "php", "tclsh", "wish",
                 "gawk", "awk", "sed", "ld-linux")
@@ -38,6 +47,96 @@ READ_VERBS = {
     "hyprctl": {"version", "monitors", "clients", "activewindow", "layers", "devices"},
     "pactl": {"info", "list", "get-default-sink", "get-default-source", "get-sink-volume"},
 }
+
+# curl/wget-style content transfer flags. Long names are matched after
+# normalised flag parsing (``--name=value`` and abbreviated ``--name`` forms).
+UPLOAD_FLAG_NAMES = ("data", "data-raw", "data-ascii", "data-binary", "data-urlencode",
+                     "form", "form-string", "upload-file", "json", "proxy-upload-file")
+UPLOAD_SHORTS = frozenset("dFT")
+_UPLOAD_TOKENS = frozenset({"-d", "--data", "-T", "--upload-file", "-F", "--form"})
+_DURATION_OPERAND = re.compile(r"[0-9]+(?:[.][0-9]+)?(?:ns|us|ms|s|m|h|d)?")
+_TRUSTED_LAUNCHER = re.compile(r"/(?:usr/)?bin/[A-Za-z0-9._+-]+")
+
+
+def _trusted_launcher(token: str) -> bool:
+    """A canonicalised system binary path may name the executable without a
+    sandbox path check; every other argv[0] path is an ordinary candidate."""
+    try:
+        resolved = str(Path(token).resolve())
+    except (OSError, ValueError):
+        return False
+    return _TRUSTED_LAUNCHER.fullmatch(resolved) is not None
+
+
+def _shell_like(name: str) -> bool:
+    return (name in SHELLS | EVAL_BINARIES | PRIVILEGE_LAUNCHERS
+            or name.startswith(INTERPRETERS))
+
+
+def _arg_value(arg: str) -> str:
+    """Path-like value carried by one argument after normalised flag parsing."""
+    if "://" in arg:
+        parts = urlsplit(arg)
+        if parts.scheme != "file":
+            return ""
+        if parts.netloc in ("", "localhost"):
+            return unquote(parts.path)
+        return unquote("/" + parts.netloc + parts.path)
+    if not arg.startswith("-"):
+        return arg
+    if "=" in arg:
+        return arg.split("=", 1)[1]
+    if arg.startswith("--"):
+        return ""
+    match = re.match(r"-\w*(.*)", arg)
+    return match.group(1) if match else ""
+
+
+def _unwrap_chain(argv: tuple[str, ...]) -> tuple[str | None, tuple[str, ...], bool]:
+    """Split a launcher chain into (program, payload args, ok).
+
+    Only bare names and trusted system paths are transparent wrappers; a
+    lookalike under the fixture tree is a program of its own. A chain whose
+    payload cannot be resolved is unrecognised (ok=False), never tier 2 by
+    omission.
+    """
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        name = Path(token).name
+        if name not in UNWRAP_LAUNCHERS or ("/" in token and not _trusted_launcher(token)):
+            return token, tuple(argv[i + 1:]), True
+        i += 1
+        while i < len(argv) and ((argv[i].startswith("-") and len(argv[i]) > 1)
+                                 or _DURATION_OPERAND.fullmatch(argv[i])):
+            i += 1
+        if i >= len(argv):
+            return None, (), False
+    return None, (), False
+
+
+def _recursive_shape(args: tuple[str, ...]) -> bool:
+    """Normalised flag parsing: ``--recursive=always`` and ``--r`` are ``--recursive``."""
+    for arg in args:
+        if arg.startswith("--"):
+            name = arg[2:].split("=", 1)[0]
+            if name and "recursive".startswith(name):
+                return True
+        elif arg.startswith("-") and len(arg) > 1 and ("r" in arg or "R" in arg):
+            return True
+    return False
+
+
+def _upload_shape(args: tuple[str, ...]) -> bool:
+    """Normalised upload-flag detection: long names/prefixes and attached shorts."""
+    for arg in args:
+        if arg.startswith("--"):
+            name = arg[2:].split("=", 1)[0]
+            if name and any(flag.startswith(name) for flag in UPLOAD_FLAG_NAMES):
+                return True
+        elif arg.startswith("-") and len(arg) > 2 and arg[1] in UPLOAD_SHORTS:
+            return True  # attached short-option value: -d@file, -Tfile, -F@file
+    return False
 
 
 TYPE_TOOL = "type"  # text injection: exactly one printable string, nothing else
@@ -151,12 +250,36 @@ class GateChecker:
         args = step.argv if step.tool != "exec" else step.argv[1:]
         args = (*args, *(value for _, value in step.env_diff))
         values = []
+        if step.tool == "exec" and step.argv:
+            head = step.argv[0]
+            # argv[0] is a path like any other once it is a path form; only
+            # trusted system launchers are exempt from the sandbox path wall.
+            if ("/" in head or "://" in head) and not _trusted_launcher(head):
+                values.append(head)
         for arg in args:
-            value = arg.split("=", 1)[1] if arg.startswith("-") and "=" in arg else arg
+            value = _arg_value(arg)
+            if value.startswith("@"):  # --data=@file, -d@file, @file payloads
+                value = value[1:]
             if not value or value.startswith("-") or "://" in value:
                 continue
-            values.append(Path(value) if value.startswith("/") else cwd / value)
-        return (cwd, *values)
+            values.append(value)
+        return (cwd, *(Path(v) if v.startswith("/") else cwd / v for v in values))
+
+    def _shebang_entry(self, token: str, cwd: Path) -> bool:
+        """Kernel shebang dispatch on any canonicalised launcher path is tier 3."""
+        if "/" not in token:
+            return False
+        try:
+            candidate = Path(token)
+            if not candidate.is_absolute():
+                candidate = cwd / candidate
+            candidate = candidate.resolve()
+            if self.space.work.resolve() not in candidate.parents or not candidate.is_file():
+                return False
+            with candidate.open("rb") as handle:
+                return handle.read(2) == b"#!"
+        except (OSError, ValueError):
+            return True  # an unreadable launcher path is unrecognised, never tier 2
 
     def derive(self, step: Step, facts: SyntheticFacts) -> int | str:
         if facts.bulk_delete or facts.payments_or_identity:
@@ -184,40 +307,41 @@ class GateChecker:
             return 1
         if step.tool != "exec" or not facts.effects_complete:
             return "invalid"
-        binary = Path(step.argv[0]).name
+        # Classify the resolved launcher chain: transparent wrappers are
+        # unwrapped so no wrapper can shadow the payload's semantics.
+        program, args, chain_ok = _unwrap_chain(step.argv)
+        if not chain_ok:
+            return 3  # unrecognised launcher shape, never tier 2 by omission
+        binary = Path(program).name
         # Read identity only, never launch for introspection.
-        resolved = Path(step.argv[0]).resolve().name if "/" in step.argv[0] else binary
+        resolved = Path(program).resolve().name if "/" in program else binary
         for name in (binary, resolved):
-            if name in SHELLS | EVAL_BINARIES or name.startswith(INTERPRETERS):
+            if _shell_like(name):
                 return 3
-        candidate = Path(step.argv[0])
-        if candidate.is_absolute() and self.space.work in candidate.parents and candidate.is_file():
-            with candidate.open("rb") as handle:
-                if handle.read(2) == b"#!":
-                    return 3  # kernel shebang dispatch is an interpreter entry point too
+        if self._shebang_entry(program, Path(step.cwd)):
+            return 3  # kernel shebang dispatch is an interpreter entry point too
         if binary == "find" and any(a in {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint",
-                                          "-fprint0", "-fprintf"} for a in step.argv[1:]):
+                                          "-fprint0", "-fprintf"} for a in args):
             return 3
-        if binary == "rm" and any(a == "--recursive" or (a.startswith("-") and not a.startswith("--")
-                                                         and ("r" in a or "R" in a))
-                                  for a in step.argv[1:]):
+        if binary == "rm" and _recursive_shape(args):
             return 3  # independently recognized bulk-delete shape; other rm is simulated T2
-        urls = [urlsplit(a) for a in step.argv[1:] if "://" in a]
+        urls = [urlsplit(a) for a in args if "://" in a]
         if any(u.username or u.password for u in urls):
             return 3
-        upload = facts.sends_owner_content or any(a in {"-d", "--data", "-T", "--upload-file",
-                                                        "-F", "--form"} for a in step.argv[1:])
+        upload = facts.sends_owner_content or any(a in _UPLOAD_TOKENS for a in args)
+        if not upload and binary not in READ_BINARIES:
+            upload = _upload_shape(args)  # normalised --data=/-d@file/T shapes
         if upload and (not urls or any(u.hostname not in facts.owner_services for u in urls)):
             return 3
         if binary not in READ_BINARIES:
             return 2
-        if "/" in step.argv[0] and step.argv[0] not in {f"/usr/bin/{binary}", f"/bin/{binary}"}:
+        if "/" in program and program not in {f"/usr/bin/{binary}", f"/bin/{binary}"}:
             return 2  # a lookalike under the fixture tree is not a trusted T0 binary
-        options = [a for a in step.argv[1:] if a.startswith("-") and a != "--"]
+        options = [a for a in args if a.startswith("-") and a != "--"]
         if any(a not in READ_FLAGS[binary] for a in options):
             return 2
         if binary in READ_VERBS:
-            words = [a for a in step.argv[1:] if not a.startswith("-")]
+            words = [a for a in args if not a.startswith("-")]
             if not words or words[0] not in READ_VERBS[binary]:
                 return 2
         if binary == "rpm" and not any(a.startswith("-q") for a in options):
