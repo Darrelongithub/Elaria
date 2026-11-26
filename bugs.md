@@ -14,8 +14,8 @@ after the bug ID. Status: OPEN · FIX-IN-FLIGHT · FIXED (PR#).
 | BUG-B1 | `hands/gate.py` | Forbidden tier-3 commands (`curl --data=@…`, wrapper shells, relative shebangs, `rm --recursive=always`) classified tier 2 (askable) | FIX-IN-FLIGHT (Agent O, FIX-B1) |
 | BUG-B2 | `hands/queue.py`, `hands/runner.py` | Tier-3 mouse digest replays under a fresh errand ID; 12-click budget resets per errand; `bool` accepted as click count; no `queue.current` check | FIX-IN-FLIGHT (Agent O, FIX-B2) |
 | BUG-B3 | `hands/headless/worker.py` | Workers tracked only after exit: daemon death signals 0 live processes; `terminate_all` can hit recycled PIDs; masking tests | **FIXED** (PR #149, `test_bug_b3_*`) |
-| BUG-A1 | `errand.py`, `memory.py` | Unrelated/conflicting inferred facts promoted to `source='stated'` conf=1.0 by gap/conflict answers; `skill_memory_infer` bypasses tombstones — owner-rejected facts resurrect | OPEN → FIX-A1 |
-| BUG-A2 | `daemon.py`, `errand.py` | `fs.locate`/`file.inspect`/`file.read` IPC bypass `[discovery]` roots, `_require_ipc_owner()`, and showoff lockdown (private files readable during show-off) | OPEN → FIX-A2 |
+| BUG-A1 | `errand.py`, `memory.py` | Unrelated/conflicting inferred facts promoted to `source='stated'` conf=1.0 by gap/conflict answers; `skill_memory_infer` bypasses tombstones — owner-rejected facts resurrect | **FIXED** (PR #159, `test_bug_a1_*`) |
+| BUG-A2 | `daemon.py`, `errand.py` | `fs.locate`/`file.inspect`/`file.read` IPC bypass `[discovery]` roots, `_require_ipc_owner()`, and showoff lockdown (private files readable during show-off) | **FIXED** (PR #159, `test_bug_a2_*`) |
 
 ## P1 — wrong behaviour on a real path
 
