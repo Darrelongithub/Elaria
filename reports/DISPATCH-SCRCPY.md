@@ -1,5 +1,13 @@
 # DISPATCH-SCRCPY — scrcpy phone-surface blueprint (manager, 2026-11-26)
 
+> **OWNER UPDATE (2026-11-26, same day): PARKED.** Owner scrapped
+> the scrcpy idea for now — do NOT send Agent P on this lane.
+> Kept on record (licence verified Apache-2.0, design questions
+> below) in case the phone-mirror idea returns. Owner's phone
+> priority instead: **responding to texts** — see conversation
+> 2026-11-26; the only phone write verb remains `sms.send_sms`,
+> post-approval.
+
 Owner find: **scrcpy** for the phone integration layer.
 Find-first verification (manager, GitHub API, 2026-11-26):
 `Genymobile/scrcpy`, Apache-2.0, fork:false, 155,795★, pushed
