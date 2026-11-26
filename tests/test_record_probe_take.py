@@ -54,10 +54,12 @@ def _sine(seconds: float, amplitude: float, rate: int = 16000) -> bytes:
 def test_the_recorder_uses_productions_own_argv():
     assert rec.production_command(MIC1, 16000) == rec.prod.pw_record_pcm_stream_command(
         MIC1, sample_rate=16000)
-    # The production shape: --target=NAME, raw s16 to stdout.
+    # The production shape: --target=NAME, raw s16 to stdout. `--raw` is
+    # load-bearing (BUG-HW1): without it pw-cat's `-` is an AU container on
+    # stdio, not raw PCM. The pin moves with the fix so the fix cannot drift.
     assert rec.production_command(MIC1, 16000) == [
         "pw-record", f"--target={MIC1}", "--rate", "16000", "--channels", "1",
-        "--format", "s16", "-"]
+        "--format", "s16", "--raw", "-"]
 
 
 def test_the_failed_packet_line_is_still_reproducible_for_compare(tmp_path):

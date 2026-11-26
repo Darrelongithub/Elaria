@@ -193,11 +193,14 @@ def _split(pcm: bytes) -> dict:
 # --------------------------------------------------------------------------
 # 1. the argv under test — production's own command, no dialect to be wrong about
 # --------------------------------------------------------------------------
-def test_bug_hw1_production_argv_is_unchanged_and_journaled_verbatim(
+def test_bug_hw1_production_argv_is_pinned_and_journaled_verbatim(
         fake_pw_record, tmp_path):
     command = pw_record_pcm_stream_command("mic1-node", sample_rate=16000)
+    # `--raw` is load-bearing (FIX-HW1): without it pw-cat's `-` is the
+    # libsndfile/AU path (24-byte `.snd` header + big-endian PCM), not raw
+    # PCM. The pin moves with the fix so the fix cannot drift.
     assert command == ["pw-record", "--target=mic1-node", "--rate", "16000",
-                       "--channels", "1", "--format", "s16", "-"]
+                       "--channels", "1", "--format", "s16", "--raw", "-"]
     capture = PipeWireCapture("mic1-node", sample_rate=16000)
     assert capture.argv == command
     assert capture.argv is not command, "argv must be a defensive copy"
@@ -482,7 +485,7 @@ class _FactsSource:
 def _mislabelled_facts():
     return {
         "argv": ["pw-record", "--target=mic1-node", "--rate", "16000",
-                 "--channels", "1", "--format", "s16", "-"],
+                 "--channels", "1", "--format", "s16", "--raw", "-"],
         "expected": {"format": "s16le", "sample_rate": 16000,
                      "channels": 1, "bytes_per_s": 32_000},
         "bytes": 184_320,
