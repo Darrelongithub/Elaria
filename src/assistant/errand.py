@@ -2002,9 +2002,11 @@ class ErrandRunner:
             promoted_ids.append(int(amended_fact_id))
             q_status = "amended"
         elif decision_norm == "reject":
-            if candidate_ids:
-                self.store.deactivate_facts(candidate_ids)
-                deactivated_ids.extend(candidate_ids)
+            for fid in candidate_ids:
+                if self.memory.reject_inference(fid):
+                    deactivated_ids.append(fid)
+                # Rejection is meaningful only for tentative guesses; stated
+                # facts remain untouched and require an explicit amendment.
             q_status = "rejected"
         else:
             q_status = "answered"

@@ -200,6 +200,13 @@ CREATE TABLE IF NOT EXISTS plan_items (
   decision TEXT NOT NULL           -- auto | review | unsorted | abstain (§4.4)
 );
 
+CREATE TABLE IF NOT EXISTS rejected_fact_hashes (
+  fact_hash TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  rejected_ts TEXT NOT NULL,
+  evidence TEXT
+);
+
 CREATE TABLE IF NOT EXISTS facts (
   id INTEGER PRIMARY KEY,
   ts TEXT NOT NULL,
@@ -1117,6 +1124,20 @@ class Store:
         return [dict(r) for r in rows]
 
     # -- memory: facts & conversations (§16) ------------------------------------
+    def reject_fact_claim(self, *, fact_hash: str, kind: str, ts: str,
+                          evidence: str | None = None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO rejected_fact_hashes (fact_hash, kind, rejected_ts, evidence) VALUES (?, ?, ?, ?)",
+                (fact_hash, kind, ts, evidence))
+            self._conn.commit()
+
+    def is_fact_claim_rejected(self, fact_hash: str) -> bool:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM rejected_fact_hashes WHERE fact_hash = ?",
+                (fact_hash,)).fetchone() is not None
+
     def add_fact(self, *, ts, kind, text, source="stated", confidence=1.0,
                  evidence=None) -> int:
         with self._lock:

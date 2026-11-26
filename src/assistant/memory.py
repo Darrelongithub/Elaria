@@ -310,6 +310,9 @@ class Memory:
         digest = str(doc_sha256 or "").strip().lower()
         if not claim or not citation or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("inference requires text, evidence, and a SHA-256 document hash")
+        claim_hash = hashlib.sha256(f"{kind.lower()}:{' '.join(claim.lower().split())}".encode()).hexdigest()
+        if hasattr(self.store, "is_fact_claim_rejected") and self.store.is_fact_claim_rejected(claim_hash):
+            return None
         existing = self.store.list_facts(active_only=True)
         normalized = set(_query_terms(claim))
         for row in existing:
@@ -320,6 +323,20 @@ class Memory:
             ts=iso_now(), kind=kind, text=claim, source="inferred",
             confidence=min(.85, max(0.0, float(confidence))),
             evidence=f"sha256:{digest} span:{citation}")
+
+    def reject_inference(self, fact_id: int) -> bool:
+        rows = self.store.list_facts(active_only=False)
+        row = next((r for r in rows if int(r["id"]) == int(fact_id)), None)
+        if row is None or row.get("source") != "inferred":
+            return False
+        claim_hash = hashlib.sha256(
+            f"{row['kind'].lower()}:{' '.join(row['text'].lower().split())}".encode()
+        ).hexdigest()
+        if hasattr(self.store, "reject_fact_claim"):
+            self.store.reject_fact_claim(fact_hash=claim_hash, kind=row["kind"],
+                                         ts=iso_now(), evidence=row.get("evidence"))
+        self.store.deactivate_facts([int(fact_id)])
+        return True
 
     def forget(self, topic: str) -> int:
         return self.store.forget_facts(topic)
@@ -452,6 +469,8 @@ class Memory:
                 age_days = max(0.0, (now - _parse_iso(fact["ts"])).total_seconds() / 86400)
             except (ValueError, TypeError):
                 age_days = 0.0
+            if inferred and age_days >= 730:
+                continue  # stale tentative claims expire from recall
             decay = math.exp(-math.log(2) * age_days / 180.0) if inferred else 1.0
             factor = confidence * .5 * decay if inferred else 1.0
             hit = RecallHit("fact", f"#{fact['id']} ({fact['kind']}, {fact['source']})",

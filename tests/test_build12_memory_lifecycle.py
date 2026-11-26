@@ -8,6 +8,7 @@ from assistant.memory import Memory
 class Facts:
     def __init__(self):
         self.rows = []
+        self.rejected = set()
 
     def add_fact(self, **row):
         row["id"] = len(self.rows) + 1
@@ -21,6 +22,17 @@ class Facts:
 
     def forget_facts(self, _topic):
         return 0
+
+    def is_fact_claim_rejected(self, claim_hash):
+        return claim_hash in self.rejected
+
+    def reject_fact_claim(self, *, fact_hash, **_kwargs):
+        self.rejected.add(fact_hash)
+
+    def deactivate_facts(self, ids):
+        for row in self.rows:
+            if row["id"] in ids:
+                row["active"] = 0
 
     def search_documents_any(self, *_args, **_kwargs):
         return []
@@ -67,6 +79,20 @@ def test_inferred_recall_is_labelled_and_stated_wins():
     stated = memory.recall("concise reports")
     assert len(stated) == 1
     assert stated[0].fact_source == "stated" and not stated[0].probationary
+
+
+def test_owner_rejection_tombstones_an_inference():
+    facts = Facts()
+    memory = Memory(facts, Embedder())
+    digest = hashlib.sha256(b"source").hexdigest()
+    fid = memory.propose_inferred("Likes short summaries", "preference",
+                                  confidence=.5, evidence="line 9",
+                                  doc_sha256=digest)
+    assert memory.reject_inference(fid)
+    assert facts.rows[0]["active"] == 0
+    assert memory.propose_inferred("Likes short summaries", "preference",
+                                   confidence=.6, evidence="line 12",
+                                   doc_sha256=digest) is None
 
 
 def test_inference_requires_verifiable_source():
