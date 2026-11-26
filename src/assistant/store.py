@@ -863,7 +863,7 @@ class Store:
         if truncated_only:
             where.append("truncated = 1")
         if error_only:
-            where.append("status = 'error'")
+            where.append("(status = 'error' OR parse_error IS NOT NULL)")
         params.append(max(1, int(limit)))
         sql = (
             "SELECT id, path, root, sha256, size, mtime, mime, ext, never_send, "
@@ -887,14 +887,14 @@ class Store:
                 """SELECT COALESCE(extractor, 'unknown') AS extractor,
                           COUNT(*) AS docs,
                           SUM(CASE WHEN truncated = 1 THEN 1 ELSE 0 END) AS truncated,
-                          SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors
+                          SUM(CASE WHEN status = 'error' OR parse_error IS NOT NULL THEN 1 ELSE 0 END) AS errors
                    FROM documents WHERE status != 'missing'
                    GROUP BY COALESCE(extractor, 'unknown')
                    ORDER BY docs DESC""").fetchall()
             totals = self._conn.execute(
                 """SELECT COUNT(*) AS docs,
                           SUM(CASE WHEN truncated = 1 THEN 1 ELSE 0 END) AS truncated,
-                          SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
+                          SUM(CASE WHEN status = 'error' OR parse_error IS NOT NULL THEN 1 ELSE 0 END) AS errors,
                           SUM(extracted_chars) AS chars
                    FROM documents WHERE status != 'missing'""").fetchone()
         return {

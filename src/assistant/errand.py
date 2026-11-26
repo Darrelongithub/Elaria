@@ -692,6 +692,8 @@ def skill_file_window(
         )
     except StreamError as exc:
         raise ValueError(f"stream read failed: {exc}") from exc
+    if window.parse_error:
+        raise ValueError(f"stream parse failed for {target}: {window.parse_error}")
     obs = UntrustedObservation(
         path=window.target,
         sha256=window.digest,
@@ -720,7 +722,6 @@ def skill_file_window(
                 "total_size": obs.total_size,
                 "never_send": obs.never_send,
                 "format": window.format,
-                "cursor": window.next_cursor,
                 "trusted": False,
             },
         )
@@ -2539,6 +2540,10 @@ class ErrandRunner:
                     )
                     raise
                 except Exception as exc:
+                    if step.skill in ("file.read", "file.stream", "file.inspect"):
+                        failed_target = str(step.args.get("target", ""))
+                        inspections.setdefault(failed_target, {"target": failed_target})["parse_error"] = (
+                            f"{type(exc).__name__}: {exc}")
                     step_status = "refused" if isinstance(exc, PermissionError) else "failed"
                     duration_ms = round((time.monotonic() - step_t0) * 1000.0, 2)
                     # A stream/inspect/text read step spends real active time

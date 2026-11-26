@@ -179,7 +179,11 @@ class Indexer:
         organise = config.section("organise")
         policy = config.section("policy")
         self.protected = policy.get("protected") or []
-        self.max_extract_chars = int(organise.get("max_extract_chars", 200_000))
+        self.max_extract_chars = max(1, min(
+            int(organise.get("max_extract_chars", 200_000)),
+            getattr(config, "stream_limits", lambda: {"index_max_extract_chars": 200_000})()[
+                "index_max_extract_chars"],
+        ))
         self.never_send_roots = [
             str(expand(p)) for p in
             (config.section("privacy").get("never_send_to_cloud") or [])]
@@ -188,7 +192,11 @@ class Indexer:
         organise = self.config.section("organise")
         policy = self.config.section("policy")
         self.protected = policy.get("protected") or []
-        self.max_extract_chars = int(organise.get("max_extract_chars", 200_000))
+        self.max_extract_chars = max(1, min(
+            int(organise.get("max_extract_chars", 200_000)),
+            getattr(self.config, "stream_limits", lambda: {"index_max_extract_chars": 200_000})()[
+                "index_max_extract_chars"],
+        ))
         self.never_send_roots = [
             str(expand(p)) for p in
             (self.config.section("privacy").get("never_send_to_cloud") or [])]
@@ -300,7 +308,12 @@ class Indexer:
                 indexed_ts=iso_now(), never_send=int(never_send),
                 text_chunks=chunk_text(text), extractor=extractor,
                 extracted_chars=extraction["extracted_chars"],
-                truncated=extraction["truncated"], parse_error=extraction["parse_error"])
+                truncated=extraction["truncated"], parse_error=extraction["parse_error"],
+                # An undecodable .txt is still a freshly hashed binary file.
+                # Do not mark its identity stale: reversible organiser moves
+                # require indexed identity, not a successful text decoder.
+                status=("indexed" if str(extraction["parse_error"]).startswith(
+                    "UnicodeDecodeError:") else None))
             stats["changed" if existing else "indexed"] += 1
         if walk_errors:
             stats["error"] = "; ".join(msg for _, msg in walk_errors)

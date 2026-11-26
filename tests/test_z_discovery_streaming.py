@@ -187,3 +187,31 @@ def test_structured_index_cap_is_recorded(tmp_path):
     result = extract_with_provenance(path, 200000)
     assert result["truncated"] and not result["parse_error"]
     assert result["extracted_chars"] <= 200000
+
+
+def test_sqlite_all_tables_no_budget_skips_and_privacy(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "inventory.sqlite"
+    with sqlite3.connect(path) as conn:
+        for table in ("apples", "pears"):
+            conn.execute(f"CREATE TABLE {table} (n INTEGER, password TEXT)")
+            conn.executemany(f"INSERT INTO {table} VALUES (?, ?)", [(n, "SECRET" + "x" * 200) for n in range(10)])
+    batches = list(iter_batches(path, byte_budget=256, record_limit=7,
+                                never_send_roots=[str(tmp_path)], redact=False))
+    assert sum(len(b.records) for b in batches) == 20
+    assert all(b.never_send for b in batches)
+    assert {r["table"] for b in batches for r in b.records} == {"apples", "pears"}
+    assert all(a.byte_end == b.byte_start for a, b in pairwise(batches))
+
+
+def test_office_paragraph_cursor_does_not_drop_records(tmp_path):
+    path = tmp_path / "manual.docx"
+    xml = '<w:document xmlns:w="urn:test"><w:body>' + ''.join(
+        f'<w:p><w:r><w:t>paragraph {n}</w:t></w:r></w:p>' for n in range(20)) + '</w:body></w:document>'
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("word/document.xml", xml)
+    batches = list(iter_batches(path, record_limit=2, never_send_roots=[str(tmp_path)]))
+    assert sum(len(b.records) for b in batches) == 20
+    assert all(b.never_send for b in batches)
+    assert batches[-1].eof

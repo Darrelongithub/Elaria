@@ -1327,7 +1327,7 @@ def _read_text_style(target: Target, fmt: str, cursor: dict[str, Any], *,
             except json.JSONDecodeError as exc:
                 bad += 1
                 records.append({"kind": "line", "index": start_line + index - 1,
-                                "text": stripped,
+                                "text": "[invalid JSON line withheld]" if redact else stripped,
                                 "parse_error": f"line {start_line + index - 1}: {exc.msg}"})
                 continue
             if redact:
@@ -1341,6 +1341,7 @@ def _read_text_style(target: Target, fmt: str, cursor: dict[str, Any], *,
         return Batch(records, {"offset": offset + consumed,
                                "line": start_line + index}, consumed,
                      eof, fmt, total, offset, offset + consumed, False,
+                     parse_error=f"{bad} invalid JSON line(s)" if bad else None,
                      notes=notes)
 
     if fmt in ("html", "xml"):
@@ -1354,10 +1355,9 @@ def _read_text_style(target: Target, fmt: str, cursor: dict[str, Any], *,
         body = _SCRIPT_RE.sub(" ", kept_text)
         body = _TAG_RE.sub("\n", body)
         body = _WS_RE.sub(" ", body)
-        records = [
-            {"kind": "text", "index": i, "text": chunk.strip()}
-            for i, chunk in enumerate(body.splitlines()) if chunk.strip()
-        ][:max(1, record_limit)]
+        # This byte window is one rendered markup record: record_limit must
+        # never discard the tail after the cursor has already advanced.
+        records = [{"kind": "text", "index": offset, "text": body.strip()}] if body.strip() else []
         return Batch(records, {"offset": offset + kept_bytes}, kept_bytes,
                      eof_by_read, fmt, total, offset, offset + kept_bytes, False,
                      notes=notes)
@@ -1416,95 +1416,104 @@ def _strip_xml_runs(xml_text: str) -> str:
 
 def _read_ooxml(target: Target, fmt: str, cursor: dict[str, Any], *,
                 byte_budget: int, record_limit: int, redact: bool) -> Batch:
-    resolved = _ooxml_member(target)
-    if resolved is None:
-        raise StreamError("open", f"no primary XML member for {fmt}",
-                          target=target.label)
-    member_target = Target(path=resolved[0], member=resolved[1], archive_kind="zip")
-    offset = int(cursor.get("offset", 0))
-    with open_target(member_target) as stream:
+    from xml.etree import ElementTree
+
+    member_index = int(cursor.get("member_index", 0))
+    record_offset = int(cursor.get("record_offset", 0))
+    byte_start = int(cursor.get("rendered_bytes", 0))
+    records = []
+    consumed = 0
+    with zipfile.ZipFile(target.path) as archive:
+        names = sorted(name for name in archive.namelist() if (
+            (fmt == "docx" and name == "word/document.xml") or
+            (fmt == "odt" and name == "content.xml") or
+            (fmt == "pptx" and re.fullmatch(r"ppt/slides/slide\d+\.xml", name)) or
+            (fmt == "xlsx" and (name == "xl/sharedStrings.xml" or
+                                re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)))))
+    if not names:
+        raise StreamError("open", f"no primary XML members for {fmt}", target=target.label)
+    while member_index < len(names):
+        member = Target(path=target.path, member=names[member_index], archive_kind="zip")
+        index = 0
         try:
-            stream.seek(offset)  # type: ignore[attr-defined]
-        except (AttributeError, OSError, io.UnsupportedOperation):
-            remaining = offset
-            while remaining > 0:
-                block = stream.read(min(65536, remaining))
-                if not block:
-                    raise StreamError("seek", "stream ended before offset",
-                                      offset=offset, target=target.label)
-                remaining -= len(block)
-        # Read a bounded amount, then cut at the last paragraph boundary.
-        raw = stream.read(byte_budget * 2 + 1)
-        more = stream.read(1)
-    eof = not more
-    window = raw
-    if not eof:
-        cut = max(window.rfind(b"</w:p>"), window.rfind(b"</text:p>"),
-                  window.rfind(b"</a:p>"))
-        if cut >= 0:
-            window = window[:cut + 8]
-        else:
-            window = window[:byte_budget]
-    text = _strip_xml_runs(window.decode("utf-8", errors="replace"))
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    records = [
-        {"kind": "paragraph", "index": i, "text": ln}
-        for i, ln in enumerate(lines[:max(1, record_limit)])
-    ]
-    return Batch(records, {"offset": offset + len(window)}, len(window), eof,
-                 fmt, file_size(member_target), offset, offset + len(window),
-                 False)
+            with open_target(member) as stream:
+                # Reparse to an opaque record cursor, clearing consumed nodes.
+                # Memory stays bounded by the largest paragraph/row, not file size.
+                for _, elem in ElementTree.iterparse(stream, events=("end",)):
+                    tag = elem.tag.rsplit("}", 1)[-1]
+                    wanted = ("row", "si") if fmt == "xlsx" else ("p",)
+                    if tag not in wanted:
+                        continue
+                    if index < record_offset:
+                        index += 1
+                        elem.clear()
+                        continue
+                    text = " ".join(t.strip() for t in elem.itertext() if t.strip())
+                    index += 1
+                    elem.clear()
+                    if not text:
+                        continue
+                    if len(text) > MAX_RECORD_CHARS:
+                        raise StreamError("read", "office record exceeds size cap", target=target.label)
+                    consumed += len(text.encode("utf-8"))
+                    records.append({"kind": "paragraph", "index": index - 1,
+                                    "member": names[member_index], "text": text})
+                    if consumed >= byte_budget or len(records) >= record_limit:
+                        return Batch(records, {"member_index": member_index,
+                                               "record_offset": index,
+                                               "rendered_bytes": byte_start + consumed},
+                                     consumed, False, fmt, file_size(target), byte_start,
+                                     byte_start + consumed, False,
+                                     notes=["Office byte ranges count rendered text; cursor spans XML members"])
+        except ElementTree.ParseError as exc:
+            raise StreamError("parse", f"office XML: {exc}", target=target.label) from exc
+        member_index += 1
+        record_offset = 0
+    return Batch(records, {"member_index": member_index, "record_offset": 0,
+                           "rendered_bytes": byte_start + consumed}, consumed, True,
+                 fmt, file_size(target), byte_start, byte_start + consumed, False,
+                 notes=["Office byte ranges count rendered text, not ZIP bytes"])
 
 
 def _read_sqlite(target: Target, cursor: dict[str, Any], *,
                  byte_budget: int, record_limit: int, redact: bool,
                  projection) -> Batch:
-    table = cursor.get("table")
+    table_index = int(cursor.get("table_index", 0))
     offset = int(cursor.get("offset", 0))
-    uri = f"file:{target.path}?mode=ro&immutable=1"
-    conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+    byte_start = int(cursor.get("rendered_bytes", 0))
+    conn = sqlite3.connect(target.path.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=2.0)
     conn.row_factory = sqlite3.Row
     try:
-        if not table:
-            row = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 1").fetchone()
-            if row is None:
-                return Batch([], {}, 0, True, "sqlite", file_size(target),
-                             0, 0, False)
-            table = str(row["name"])
-        safe = str(table).replace('"', "")
-        records: list[dict[str, Any]] = []
+        tables = [str(r[0]) for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        records = []
         consumed = 0
-        eof = False
-        query = f'SELECT * FROM "{safe}" LIMIT ? OFFSET ?'
-        while len(records) < max(1, record_limit):
-            rows = conn.execute(query, (record_limit, offset)).fetchall()
-            if not rows:
-                eof = True
+        while table_index < len(tables) and len(records) < record_limit:
+            table = tables[table_index]
+            safe = table.replace('"', '""')
+            row = conn.execute(f'SELECT * FROM "{safe}" LIMIT 1 OFFSET ?', (offset,)).fetchone()
+            if row is None:
+                table_index += 1
+                offset = 0
+                continue
+            mapping = dict(row)
+            if redact:
+                mapping = _redact_value(mapping)
+            mapping = _project_value(mapping, projection)
+            rendered = _record_text(mapping)
+            consumed += len(json.dumps(mapping, default=str).encode("utf-8"))
+            records.append({"kind": "row", "index": offset, "table": table,
+                            "value": mapping, "text": rendered})
+            offset += 1
+            if consumed >= byte_budget:
                 break
-            for row in rows:
-                if len(records) >= max(1, record_limit):
-                    break
-                mapping = dict(row)
-                if redact:
-                    mapping = _redact_value(mapping)
-                mapping = _project_value(mapping, projection)
-                rendered = _record_text(mapping)
-                consumed += len(rendered.encode("utf-8"))
-                records.append({"kind": "row", "index": offset + len(records),
-                                "value": mapping, "text": rendered})
-                if consumed >= byte_budget:
-                    eof = False
-                    break
-            offset += len(rows)
-            if consumed >= byte_budget or len(rows) < record_limit:
-                if consumed < byte_budget and len(rows) < record_limit:
-                    eof = True
-                break
-        return Batch(records, {"table": safe, "offset": offset}, consumed, eof,
-                     "sqlite", file_size(target), 0, consumed, False,
-                     notes=[f"table={safe} (read-only immutable URI)"])
+        return Batch(records, {"table_index": table_index, "offset": offset,
+                               "rendered_bytes": byte_start + consumed},
+                     consumed, table_index >= len(tables), "sqlite", file_size(target),
+                     byte_start, byte_start + consumed, False,
+                     notes=[("SQLite byte ranges count rendered row bytes, not database pages; "
+                             "cursor spans all tables (read-only immutable URI)")])
     except sqlite3.Error as exc:
         raise StreamError("read", f"sqlite: {exc}", target=target.label) from exc
     finally:
@@ -1541,11 +1550,15 @@ def read_batch(target: str | Path, cursor: dict[str, Any] | None = None, *,
             "read", "PDF streaming is not built (page-aware extraction is a "
             "separate build); inspect() gives metadata only", target=parsed.label)
     if fmt == "sqlite" and not parsed.is_member:
-        return _read_sqlite(parsed, cur, byte_budget=budget,
-                            record_limit=limit, redact=redact, projection=proj)
+        batch = _read_sqlite(parsed, cur, byte_budget=budget,
+                             record_limit=limit, redact=redact, projection=proj)
+        batch.never_send = never_send
+        return batch
     if fmt in ("docx", "xlsx", "pptx", "odt"):
-        return _read_ooxml(parsed, fmt, cur, byte_budget=budget,
-                           record_limit=limit, redact=redact)
+        batch = _read_ooxml(parsed, fmt, cur, byte_budget=budget,
+                            record_limit=limit, redact=redact)
+        batch.never_send = never_send
+        return batch
 
     if fmt == "json":
         offset = int(cur.get("offset", 0))
