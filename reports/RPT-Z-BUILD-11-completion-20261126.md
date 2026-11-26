@@ -132,3 +132,11 @@ structured data cannot retain stale indexed content.
 Post-reconciliation targeted run: **121 passed**, including both lanes' BUILD-11
 fixtures, complete errand lifecycle, and byte-identical organiser apply/undo.
 Post-reconciliation full suite result follows when complete.
+
+Post-reconciliation full suite: **3417 passed, 32 skipped, 1 deselected in
+206.38 seconds**. The subsequent TAR URI bridge is covered by the focused suite.
+Main then advanced again to provider-routing merge `aa68f60`; integrated cleanly.
+Latest combined BUILD-11, routing, executor, organiser, CLI and store suite:
+**240 passed in 15.08 seconds**. Changed Python modules pass Ruff, and diff check
+against current main passes. Full suite was not repeated after that final clean
+provider-routing merge; its new tests and affected integration suites were run.
