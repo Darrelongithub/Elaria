@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+from contextlib import contextmanager
 import hashlib
 import io
 import json
@@ -40,6 +41,7 @@ import os
 import re
 import stat as stat_mod
 import time
+import tarfile
 import zipfile
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
@@ -53,7 +55,7 @@ from .nus_pointer import (
     PointOutcome,
     parse_point_instruction,
 )
-from .safety import expand, is_halted, is_protected
+from .safety import expand, is_halted, is_protected, open_readonly_nofollow
 
 # -- strict read-only skill allowlist (no writes, no moves, no sends) --------
 # `point` is point-only screen guidance (BUILD-3): NO clicking, NO acting.
@@ -345,7 +347,7 @@ def _is_never_send(path: Path, never_send_roots: list[str]) -> bool:
 
 def _stream_sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with open_readonly_nofollow(path) as handle:
         for block in iter(lambda: handle.read(65_536), b""):
             digest.update(block)
     return digest.hexdigest()
@@ -376,6 +378,42 @@ def _parse_zip_target(target: str) -> tuple[Path, str] | None:
     if not member or member.startswith("/") or ".." in Path(member).parts:
         raise PermissionError(f"unsafe zip member path refused: {member!r}")
     return expand(archive_str), member
+
+
+def _parse_tar_target(target: str) -> tuple[Path, str] | None:
+    if not target.startswith("tar://"):
+        return None
+    rest = target[len("tar://"):]
+    if "#" not in rest:
+        raise ValueError("malformed tar target")
+    archive, member = rest.split("#", 1)
+    if not member or member.startswith("/") or ".." in Path(member).parts:
+        raise PermissionError("unsafe tar member")
+    return expand(archive), member
+
+
+@contextmanager
+def _open_tar_member(path: Path, member: str):
+    with open_readonly_nofollow(path) as raw, tarfile.open(fileobj=raw, mode="r:*") as archive:
+        total = 0
+        info = None
+        for index, candidate in enumerate(archive):
+            if index >= MAX_ZIP_MEMBERS:
+                raise ValueError("tar member count limit exceeded")
+            total += max(0, candidate.size)
+            if total > 1_000_000_000 or total / max(1, os.fstat(raw.fileno()).st_size) > MAX_ZIP_COMPRESSION_RATIO:
+                raise ValueError("tar expansion limit exceeded")
+            if candidate.name == member:
+                if info is not None:
+                    raise ValueError("duplicate tar member name")
+                info = candidate
+        if info is None or not info.isfile():
+            raise ValueError("tar member missing or not a regular file")
+        stream = archive.extractfile(info)
+        if stream is None:
+            raise ValueError("unable to read tar member")
+        with stream:
+            yield stream, info.size
 
 
 def _check_zip_ratio(info: zipfile.ZipInfo) -> None:
@@ -470,7 +508,7 @@ def skill_fs_locate(
                 if suffix == ".zip":
                     # Read-only archive manifest scan — zero disk extraction.
                     try:
-                        with zipfile.ZipFile(fpath, "r") as zf:
+                        with open_readonly_nofollow(fpath) as archive_file, zipfile.ZipFile(archive_file, "r") as zf:
                             for idx, info in enumerate(zf.infolist()):
                                 if idx >= MAX_ZIP_MEMBERS:
                                     _bump_skip("zip_member_cap")
@@ -482,8 +520,6 @@ def skill_fs_locate(
                                     _bump_skip("unsafe_zip_member")
                                     continue
                                 member_suffix = Path(info.filename).suffix.lower()
-                                if member_suffix not in READABLE_SUFFIXES:
-                                    continue
                                 try:
                                     _check_zip_ratio(info)
                                 except ValueError:
@@ -501,14 +537,43 @@ def skill_fs_locate(
                                     "ext": member_suffix,
                                     "never_send": never_send,
                                     "archive": str(fpath),
+                                    "readable": member_suffix in READABLE_SUFFIXES,
                                 })
                     except (zipfile.BadZipFile, OSError):
                         _bump_skip("bad_zip")
                     continue
 
-                if suffix not in READABLE_SUFFIXES:
-                    _bump_skip("non_text")
+                if suffix in (".tar", ".tgz", ".gz", ".bz2", ".xz"):
+                    try:
+                        with open_readonly_nofollow(fpath) as archive_file, tarfile.open(fileobj=archive_file, mode="r:*") as archive:
+                            total_expanded = 0
+                            for idx, info in enumerate(archive):
+                                if idx >= MAX_ZIP_MEMBERS:
+                                    _bump_skip("tar_member_cap")
+                                    break
+                                total_expanded += max(0, info.size)
+                                if total_expanded > 1_000_000_000 or total_expanded / max(1, st.st_size) > MAX_ZIP_COMPRESSION_RATIO:
+                                    _bump_skip("tar_expansion_guard")
+                                    break
+                                if not info.isfile():
+                                    continue
+                                if (info.name.startswith("/") or ".." in Path(info.name).parts
+                                        or "#" in info.name):
+                                    _bump_skip("unsafe_tar_member")
+                                    continue
+                                target = f"tar://{fpath}#{info.name}"
+                                if target in seen_targets:
+                                    continue
+                                seen_targets.add(target)
+                                candidates.append({"target": target, "name": Path(info.name).name,
+                                                   "size": info.size, "mtime": float(st.st_mtime),
+                                                   "ext": Path(info.name).suffix.lower(),
+                                                   "never_send": never_send, "archive": str(fpath),
+                                                   "readable": Path(info.name).suffix.lower() in READABLE_SUFFIXES})
+                    except (tarfile.TarError, OSError) as exc:
+                        walk_errors.append(f"{fpath}: {type(exc).__name__}: {exc}")
                     continue
+
                 target = str(fpath)
                 if target in seen_targets:
                     continue
@@ -520,6 +585,7 @@ def skill_fs_locate(
                     "mtime": float(st.st_mtime),
                     "ext": suffix,
                     "never_send": never_send,
+                    "readable": suffix in READABLE_SUFFIXES,
                 })
 
     # Also include any indexed path hits from Store if roots were sparse.
@@ -589,13 +655,32 @@ def skill_file_read(
         raise ValueError(f"offset must be >= 0, got {offset}")
     max_bytes = _finite_positive_int("max_bytes", max_bytes, minimum=256)
 
+    tar_spec = _parse_tar_target(target)
     zip_spec = _parse_zip_target(target)
-    if zip_spec is not None:
+    if tar_spec is not None:
+        archive_path, member = tar_spec
+        if is_protected(archive_path, protected) or _has_symlink_to_root(archive_path):
+            raise PermissionError(f"refused protected or symlink archive path: {archive_path}")
+        never_send = _is_never_send(archive_path, never_send_roots)
+        with _open_tar_member(archive_path, member) as (stream, total_size):
+            digest = hashlib.sha256()
+            for block in iter(lambda: stream.read(65_536), b""):
+                digest.update(block)
+            sha = digest.hexdigest()
+            stream.seek(min(offset, total_size))
+            raw = b"" if cloud_bound and never_send else stream.read(max_bytes + 1)
+            has_more = len(raw) > max_bytes
+            text, window = _decode_window(raw[:max_bytes], has_more)
+            obs = UntrustedObservation(path=target, sha256=sha, byte_start=offset,
+                byte_end=offset + len(window), total_size=total_size, text=text,
+                eof=not has_more, truncated=has_more, never_send=never_send,
+                record_format=_detect_format(target), source="tar_member", trusted=False)
+    elif zip_spec is not None:
         archive_path, member = zip_spec
         if _has_symlink_to_root(archive_path) or is_protected(archive_path, protected):
             raise PermissionError(f"refused protected or symlink archive path: {archive_path}")
         never_send = _is_never_send(archive_path, never_send_roots)
-        with zipfile.ZipFile(archive_path, "r") as zf:
+        with open_readonly_nofollow(archive_path) as archive_handle, zipfile.ZipFile(archive_handle, "r") as zf:
             info = zf.getinfo(member)
             _check_zip_ratio(info)
             total_size = int(info.file_size)
@@ -634,33 +719,37 @@ def skill_file_read(
         path = expand(target)
         if _has_symlink_to_root(path) or is_protected(path, protected):
             raise PermissionError(f"refused protected or symlink path: {path}")
-        st = path.lstat()
-        if not stat_mod.S_ISREG(st.st_mode):
-            raise PermissionError(f"refused non-regular file: {path}")
-        total_size = int(st.st_size)
         never_send = _is_never_send(path, never_send_roots)
-        sha = _stream_sha256_file(path)
-        if cloud_bound and never_send:
-            obs = UntrustedObservation(
-                path=str(path), sha256=sha, byte_start=offset, byte_end=offset,
-                total_size=total_size, text="", eof=True, truncated=False,
-                never_send=True, record_format=_detect_format(str(path)),
-                source="local_file", trusted=False,
-            )
-        else:
-            with path.open("rb") as handle:
+        with open_readonly_nofollow(path) as handle:
+            st = os.fstat(handle.fileno())
+            total_size = int(st.st_size)
+            digest = hashlib.sha256()
+            for block in iter(lambda: handle.read(65_536), b""):
+                digest.update(block)
+            sha = digest.hexdigest()
+            if cloud_bound and never_send:
+                obs = UntrustedObservation(
+                    path=str(path), sha256=sha, byte_start=offset, byte_end=offset,
+                    total_size=total_size, text="", eof=True, truncated=False,
+                    never_send=True, record_format=_detect_format(str(path)),
+                    source="local_file", trusted=False,
+                )
+            else:
                 handle.seek(offset)
                 raw = handle.read(max_bytes + 1)
-            has_more = len(raw) > max_bytes
-            window = raw[:max_bytes]
-            text, window = _decode_window(window, has_more)
-            obs = UntrustedObservation(
-                path=str(path), sha256=sha, byte_start=offset,
-                byte_end=offset + len(window), total_size=total_size,
-                text=text, eof=not has_more, truncated=has_more,
-                never_send=never_send, record_format=_detect_format(str(path)),
-                source="local_file", trusted=False,
-            )
+                has_more = len(raw) > max_bytes
+                window = raw[:max_bytes]
+                text, window = _decode_window(window, has_more)
+                obs = UntrustedObservation(
+                    path=str(path), sha256=sha, byte_start=offset,
+                    byte_end=offset + len(window), total_size=total_size,
+                    text=text, eof=not has_more, truncated=has_more,
+                    never_send=never_send, record_format=_detect_format(str(path)),
+                    source="local_file", trusted=False,
+                )
+            after = os.fstat(handle.fileno())
+            if (st.st_size, st.st_mtime_ns, st.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ValueError(f"file changed during read: {path}")
 
     if safety_journal is not None:
         # IF-6: journal provenance + byte length ONLY, never raw content bytes.
@@ -1853,7 +1942,8 @@ class ErrandRunner:
                                 # Reserve budget for analyze + infer + ask + report.
                                 reserve = 4
                                 read_slots = max(1, budget.max_steps - step_no - reserve)
-                                for cand in candidates[:min(len(candidates), read_slots)]:
+                                readable_candidates = [c for c in candidates if c.get("readable", True)]
+                                for cand in readable_candidates[:min(len(readable_candidates), read_slots)]:
                                     queue.append(PlannedStep("file.read", {
                                         "target": cand["target"],
                                         "offset": 0,
@@ -1915,6 +2005,23 @@ class ErrandRunner:
                             "trusted": obs.trusted,
                             "schema": inspect_observation_schema(obs),
                         }
+                        if offset == 0 and obs.record_format in ("json", "jsonl", "csv", "tsv"):
+                            # The structural inspector is local, has no tools or
+                            # authority, and its sample is not journaled or fed
+                            # into a plan. Incomplete validation is explicit.
+                            from .structured_reader import inspect as inspect_structured
+                            try:
+                                schema = await asyncio.to_thread(
+                                    inspect_structured, target, protected=protected,
+                                    never_send_roots=never_send_roots, cloud_bound=cloud_bound)
+                                step_summary["schema"] = {
+                                    "format": schema["format"], "sample_type": schema["sample_type"],
+                                    "complete": schema["complete"], "trusted": False,
+                                }
+                            except (OSError, ValueError, PermissionError) as exc:
+                                step_summary["schema"] = {"error": type(exc).__name__, "trusted": False}
+                                unanswered_notes.append({"path": obs.path,
+                                    "reason": f"structured inspection failed: {type(exc).__name__}: {exc}"})
                         # Bounded >200KB streaming continuation: if more bytes
                         # remain and step budget has room (preserving space for
                         # queued steps + infer/ask/report), queue the next chunk
