@@ -386,6 +386,8 @@ class Store:
             ):
                 if column not in doc_cols:
                     self._conn.execute(ddl)
+            if "extraction_version" not in doc_cols:
+                self._conn.execute("ALTER TABLE documents ADD COLUMN extraction_version INTEGER NOT NULL DEFAULT 0")
             # BUG3 migration: purpose attribution for every live call
             llm_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(llm_calls)")}
             if "purpose" not in llm_cols:
@@ -739,7 +741,7 @@ class Store:
         resolved_chars = (
             int(extracted_chars)
             if extracted_chars is not None
-            else sum(len(chunk) for chunk in text_chunks)
+            else 0
         )
         resolved_status = status or ("error" if parse_error else "indexed")
         with self._lock:
@@ -762,11 +764,27 @@ class Store:
                  1 if truncated else 0, parse_error),
             )
             doc_id = int(cur.fetchone()[0])
+            self._conn.execute("UPDATE documents SET extraction_version=1 WHERE id=?", (doc_id,))
             self._conn.execute("DELETE FROM doc_chunks WHERE doc_id = ?", (doc_id,))
-            self._conn.executemany(
-                "INSERT INTO doc_chunks (doc_id, chunk_no, text) VALUES (?, ?, ?)",
-                [(doc_id, i, chunk) for i, chunk in enumerate(text_chunks)],
-            )
+            counted_chars = 0
+
+            def counted_chunks():
+                nonlocal counted_chars
+                for i, chunk in enumerate(text_chunks):
+                    counted_chars += len(chunk)
+                    yield doc_id, i, chunk
+
+            try:
+                self._conn.executemany(
+                    "INSERT INTO doc_chunks (doc_id, chunk_no, text) VALUES (?, ?, ?)",
+                    counted_chunks(),
+                )
+                if extracted_chars is None:
+                    self._conn.execute("UPDATE documents SET extracted_chars=? WHERE id=?",
+                                       (counted_chars, doc_id))
+            except Exception:
+                self._conn.rollback()
+                raise
             if self.fts5_available:
                 self._conn.execute(
                     "INSERT INTO doc_chunks_fts (doc_chunks_fts) VALUES ('rebuild')")
@@ -916,6 +934,18 @@ class Store:
             rows = self._conn.execute(query + " ORDER BY path", (root,)).fetchall()
         return [dict(r) for r in rows]
 
+    def mark_document_error(self, path: str, error: str, *, root: str, size: int,
+                            mtime: float, ext: str, never_send: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO documents (path, root, sha256, size, mtime, ext, never_send,
+                                          status, parse_error, indexed_ts)
+                   VALUES (?, ?, '', ?, ?, ?, ?, 'error', ?, datetime('now'))
+                   ON CONFLICT(path) DO UPDATE SET status='error', parse_error=excluded.parse_error,
+                     never_send=excluded.never_send""",
+                (path, root, size, mtime, ext, never_send, error))
+            self._conn.commit()
+
     def mark_missing(self, paths: list[str]) -> None:
         with self._lock:
             self._conn.executemany(
@@ -923,10 +953,29 @@ class Store:
                 [(p,) for p in paths])
             self._conn.commit()
 
+    def get_document_chunks(self, doc_id: int, *, offset: int = 0, limit: int = 100,
+                            cloud_bound: bool = False) -> dict:
+        """Page indexed text without treating a preview as a complete document."""
+        if offset < 0 or not 1 <= limit <= 1000:
+            raise ValueError("invalid chunk cursor or limit")
+        with self._lock:
+            doc = self._conn.execute("SELECT status, never_send FROM documents WHERE id=?", (doc_id,)).fetchone()
+            if doc is None or doc["status"] != "indexed":
+                raise ValueError("document missing or not indexed")
+            if cloud_bound and doc["never_send"]:
+                raise PermissionError("document is never_send_to_cloud")
+            rows = self._conn.execute(
+                "SELECT chunk_no, text FROM doc_chunks WHERE doc_id=? AND chunk_no>=? ORDER BY chunk_no LIMIT ?",
+                (doc_id, offset, limit + 1)).fetchall()
+        page = rows[:limit]
+        return {"chunks": [dict(r) for r in page], "trusted": False,
+                "next_cursor": page[-1]["chunk_no"] + 1 if len(rows) > limit else None,
+                "eof": len(rows) <= limit}
+
     def document_preview(self, doc_id: int, chars: int = 600) -> str:
         with self._lock:
             row = self._conn.execute(
-                "SELECT text FROM doc_chunks WHERE doc_id = ? ORDER BY chunk_no LIMIT 1",
+                "SELECT c.text FROM doc_chunks c JOIN documents d ON d.id=c.doc_id WHERE c.doc_id = ? AND d.status = 'indexed' ORDER BY c.chunk_no LIMIT 1",
                 (doc_id,)).fetchone()
         return row["text"][:chars] if row else ""
 
@@ -959,7 +1008,7 @@ class Store:
                                   snippet(doc_chunks_fts, 0, '[', ']', '…', 12) AS snip
                            FROM doc_chunks_fts f JOIN doc_chunks c ON c.id = f.rowid
                            JOIN documents d ON d.id = c.doc_id
-                           WHERE doc_chunks_fts MATCH ? AND d.status != 'missing'
+                           WHERE doc_chunks_fts MATCH ? AND d.status = 'indexed'
                            ORDER BY rank LIMIT ?""",
                         (_fts_match_expression(terms, joiner=joiner), limit)).fetchall()
                     return [dict(r) for r in rows]
@@ -973,7 +1022,7 @@ class Store:
             rows = self._conn.execute(
                 f"""SELECT d.path, substr(c.text, 1, 120) AS snip
                     FROM doc_chunks c JOIN documents d ON d.id = c.doc_id
-                    WHERE ({clause}) AND d.status != 'missing' LIMIT ?""",
+                    WHERE ({clause}) AND d.status = 'indexed' LIMIT ?""",
                 (*_like_patterns(terms), limit)).fetchall()
         return [dict(r) for r in rows]
 
@@ -1063,7 +1112,7 @@ class Store:
             rows = self._conn.execute(
                 """SELECT c.id, c.text, c.embedding, d.path
                    FROM doc_chunks c JOIN documents d ON d.id = c.doc_id
-                   WHERE c.embedding IS NOT NULL AND d.status != 'missing'"""
+                   WHERE c.embedding IS NOT NULL AND d.status = 'indexed'"""
             ).fetchall()
         return [dict(r) for r in rows]
 

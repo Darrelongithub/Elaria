@@ -18,14 +18,15 @@ before integrated testing. No ownership map or ownership guard changes.
   record readers are generic, not domain- or chat-shaped.
 - Indexer now persists extractor, extracted character count, truncation and
   parse failures, including re-extracting pre-provenance cached rows. Its
-  compatibility extraction API names caps/errors instead of silently presenting
-  a prefix as complete. Index text remains intentionally bounded; full file
-  consumption is provided by the resumable reader. Both organise and stream
-  index character limits apply (the smaller wins).
-- `stream-report` reports extraction errors even when metadata identity was
-  indexed successfully. Undecodable text files retain valid hashed identity for
-  reversible organiser moves, with a recorded decoder error and no invented
-  decoded content. Structured parse failures retain error status.
+  compatibility extraction API refuses oversized extractions instead of silently
+  presenting a prefix as complete. After reconciling concurrent PR #138, indexing
+  itself streams full text/office/PDF output into transactional chunks; the legacy
+  one-shot API remains bounded and fails loudly. Extraction provenance is counted
+  while consuming the chunk iterator, without materializing the full document.
+- `stream-report` reports extraction errors; structured parse failures retain
+  error status and stale chunks are removed. Upstream text-stream decoding and
+  hashed identity behavior are preserved so reversible organiser apply/undo
+  continues to work on arbitrary byte payloads.
 - Errands record partial reads and named parse failures. Read observations are
   always untrusted; only authenticated owner confirmation can promote facts.
 
@@ -109,3 +110,25 @@ Final full suite: **3362 passed, 32 skipped, 1 deselected in 199.92 seconds**.
 Command: `PYTHONPATH=src /tmp/venv/bin/python -m pytest -q`.
 The subsequent stream-index-limit compatibility adjustment was separately
 validated by the 39-test indexer/organiser/discovery suite above.
+
+
+## Concurrent-main reconciliation
+
+The first merge attempt was refused: PR #138 and #140 had just landed on main.
+Fetched `0f983d9` and resolved errand/indexer/store overlaps rather than overwriting
+upstream work. Preserved upstream no-follow file access, strict raw UTF-8 window
+boundaries, structured-reader validation and explicit `file.read_batch` support,
+full text/office/PDF index streaming and transactional rollback. Added provenance
+counting around the streaming iterator and preserved both schema migrations.
+SQLite errands retain upstream record-batch semantics; this lane's CLI/IPC
+record-window API remains available. Both archive URI conventions are supported.
+
+The old draft's bounded-index language no longer describes the final indexer:
+full indexed text is now streamed, and the tail remains searchable beyond 200 KiB.
+The bounded standalone extract helper still records truncation; the compatibility
+extract_text API refuses cap overflow. A regression test verifies invalid
+structured data cannot retain stale indexed content.
+
+Post-reconciliation targeted run: **121 passed**, including both lanes' BUILD-11
+fixtures, complete errand lifecycle, and byte-identical organiser apply/undo.
+Post-reconciliation full suite result follows when complete.

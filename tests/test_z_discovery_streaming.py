@@ -117,7 +117,7 @@ def test_multiline_csv_preserves_logical_rows(tmp_path):
     assert batches[-1].eof
 
 
-def test_indexer_persists_truncation_and_parse_failures(config, tmp_path):
+def test_indexer_persists_full_stream_and_parse_failures(config, tmp_path):
     from assistant.indexer import Indexer, extract_text
     from assistant.store import Store
 
@@ -133,18 +133,18 @@ def test_indexer_persists_truncation_and_parse_failures(config, tmp_path):
         stats = Indexer(config, store).index_root({"path": str(root)})
         large_doc = store.document_by_path(str(large))
         bad_doc = store.document_by_path(str(broken))
-        assert large_doc["truncated"] == 1
-        assert large_doc["extracted_chars"] == 200000
+        assert large_doc["truncated"] == 0
+        assert large_doc["extracted_chars"] == len(large.read_text())
         assert bad_doc["status"] == "error" and bad_doc["parse_error"]
-        assert stats["truncated"] == stats["parse_errors"] == 1
+        assert stats.get("error")
         assert store.extraction_report()
-        assert "truncated" in extract_text(large)[1]
+        assert extract_text(large)[1].startswith("error:")
         # Migration of pre-provenance indexed rows must not skip re-extraction.
         with store._lock:
             store._conn.execute("UPDATE documents SET extractor=NULL WHERE path=?", (str(large),))
             store._conn.commit()
         Indexer(config, store).index_root({"path": str(root)})
-        assert store.document_by_path(str(large))["truncated"] == 1
+        assert store.document_by_path(str(large))["extractor"] == "text-stream"
     finally:
         store.close()
 
@@ -215,3 +215,18 @@ def test_office_paragraph_cursor_does_not_drop_records(tmp_path):
     assert sum(len(b.records) for b in batches) == 20
     assert all(b.never_send for b in batches)
     assert batches[-1].eof
+
+
+def test_discovered_tar_prose_target_uses_compatible_reader(tmp_path):
+    from assistant.errand import skill_file_read
+
+    path = tmp_path / "field.tar"
+    payload = b"irrigation: morning\n"
+    with tarfile.open(path, "w") as archive:
+        info = tarfile.TarInfo("field/notes.txt")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    result = locate(Policy((str(tmp_path),), (), ()), "notes")
+    assert len(result.matches) == 1
+    obs = skill_file_read(result.matches[0].target, protected=[], never_send_roots=[])
+    assert obs.text == payload.decode() and obs.eof and not obs.trusted

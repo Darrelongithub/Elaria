@@ -28,6 +28,7 @@ class MirrorItem:
     origin: str
     knock_id: int | None
     content_free: bool
+    template_kind: str | None = None
 
 
 @dataclass
@@ -96,6 +97,8 @@ def load_mirror(backend, commitments_prefix: str, mac_key: str, *,
                 origin=str(raw.get("origin", "")),
                 knock_id=int(raw["knock_id"]) if raw.get("knock_id") is not None else None,
                 content_free=bool(raw.get("content_free", False)),
+                template_kind=(str(raw["template_kind"])
+                               if raw.get("template_kind") else None),
             ))
         except (KeyError, TypeError, ValueError):
             continue  # a malformed item is skipped, never trusted
@@ -158,4 +161,3 @@ def load_t1_hashes(backend, commitments_prefix: str, mac_key: str) -> set[str]:
     if not isinstance(hashes, list):
         return set()
     return {str(x) for x in hashes[:50]}
-    return None

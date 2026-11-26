@@ -26,15 +26,6 @@ Inbound order of operations (design §2.4.1, binding):
 4. ack / concierge reply sent AFTER the durable write; an ack failure is
    journaled, never retried, never upgraded to a 5xx — an unsent ack is
    better than a double ack.
-
-Stranger turns and owner instructions are different envelope kinds with
-different laptop code paths. There is no code path from a stranger turn to
-the instruction queue; the only sink is ``proposals`` on the laptop.
-
-B3 note: the pre-stranger-door bug list said "stranger → no outbound
-message". That line is stale since the owner ruling added the public front
-door (§2.3b) and is NOT implemented; strangers get the S-0 deterministic
-reply as designed.
 """
 
 from __future__ import annotations
@@ -49,11 +40,11 @@ from pathlib import Path
 
 from . import envelope as envelope_mod
 from .concierge import S0Concierge
-from .config import AliveConfig
+from .config import AliveConfig, AliveConfigError, normalise_e164
 from .journal import iso_now, log_event
 from .mirror import busy_days, load_mirror, load_public_card, load_t1_hashes
 from .store import AliveStore
-from .transport import PlatformBlocked
+from .transport import PLATFORM_BLOCKED_CODES, OutsideServiceWindow, PlatformBlocked
 
 GRAPH_SIGNATURE_HEADER = "X-Hub-Signature-256"
 
@@ -89,6 +80,20 @@ def _iso_from_meta_ts(value) -> str:
                 .isoformat(timespec="seconds").replace("+00:00", "Z"))
     except (TypeError, ValueError, OSError, OverflowError):
         return iso_now()
+
+
+def _valid_inbound_dt(meta_ts, now: datetime) -> datetime | None:
+    """Return UTC datetime iff ``meta_ts`` is a valid epoch integer in ``[0, now]``."""
+    try:
+        ts_int = int(meta_ts)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if ts_int < 0 or ts_int > now.timestamp():
+        return None
+    try:
+        return datetime.fromtimestamp(ts_int, tz=UTC)
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def _check_clock_suspect(store: AliveStore, meta_ts, config: AliveConfig,
@@ -138,14 +143,12 @@ def _push_one(config, backend, name: str, data: bytes) -> bool:
     try:
         marker.touch()
     except OSError:
-        pass  # a missing marker just means one redundant re-push next time
+        pass
     return True
 
 
 def push_backlog(config, backend) -> dict:
-    """Drain any spool files that never reached the sync folder (Drive was
-    down, host crashed mid-push). Called on every POST so the line heals
-    itself; also safe to call from a cron/timer."""
+    """Drain any spool files that never reached the sync folder."""
     spool = Path(config.state_dir) / "spool"
     pushed, failed = 0, 0
     if not spool.is_dir():
@@ -170,9 +173,7 @@ def push_backlog(config, backend) -> dict:
 def _make_and_store_envelope(*, config, store, backend, kind, id_, sender,
                              sent_at, body_text, now, suspected=False,
                              extra=None):
-    """Build, sign, write (SQLite + spool). Returns (envelope, name, data).
-
-    Raises on durable-write failure — callers turn that into a 503."""
+    """Build, sign, write (SQLite + spool). Returns (envelope, name, data)."""
     seq = store.next_seq()
     envelope = envelope_mod.make_envelope(
         kind=kind, id=id_, channel="whatsapp_cloud", from_=sender,
@@ -182,10 +183,6 @@ def _make_and_store_envelope(*, config, store, backend, kind, id_, sender,
         suspected_injection=suspected, extra=extra)
     data = envelope_mod.envelope_bytes(envelope)
     name = envelope_mod.envelope_name(now, seq, data)
-    # durable write: spool file (fsync) FIRST, then the SQLite row. The
-    # spool is the source the backlog pusher (push_backlog) drains into the
-    # sync folder — a crash anywhere leaves a recoverable artifact, never
-    # a silent loss.
     _spool_write(config, name, data)
     store.record_inbox(str(id_), kind, seq, now=now)
     _push_one(config, backend, name, data)
@@ -245,40 +242,112 @@ def _freebusy_for(config, store, backend, now) -> tuple[int, dict[int, int]]:
     return level, busy_days(mirror, now=now)
 
 
+def _extract_inbound_text(message: dict) -> tuple[str | None, str]:
+    """Extract text-like user reply content from Meta Cloud API ``messages[]`` objects."""
+    msg_type = str(message.get("type") or "").strip().lower()
+    if msg_type == "text":
+        body = str((message.get("text") or {}).get("body", ""))[:4000]
+        return ("text", body)
+    if msg_type == "button":
+        btn = message.get("button") if isinstance(message.get("button"), dict) else {}
+        body = str(btn.get("text") or btn.get("payload") or "")[:4000]
+        return ("text", body) if body else ("unsupported", "")
+    if msg_type == "interactive":
+        inter = message.get("interactive") if isinstance(message.get("interactive"), dict) else {}
+        sub = inter.get("type")
+        if sub == "button_reply" and isinstance(inter.get("button_reply"), dict):
+            body = str(inter["button_reply"].get("title") or inter["button_reply"].get("id") or "")[:4000]
+            return ("text", body) if body else ("unsupported", "")
+        if sub == "list_reply" and isinstance(inter.get("list_reply"), dict):
+            body = str(inter["list_reply"].get("title") or inter["list_reply"].get("id") or "")[:4000]
+            return ("text", body) if body else ("unsupported", "")
+        return ("unsupported", "")
+    if msg_type == "reaction":
+        return (None, "")
+    return ("unsupported", "")
+
+
+def _handle_status(*, status_obj: dict, config: AliveConfig, store: AliveStore) -> None:
+    """Process one item from ``value.statuses[]`` (sent/delivered/read/failed)."""
+    if not isinstance(status_obj, dict):
+        return
+    wamid = str(status_obj.get("id") or "").strip()
+    state = str(status_obj.get("status") or "").strip().lower()
+    if not wamid or not state:
+        return
+    ts_iso = _iso_from_meta_ts(status_obj.get("timestamp"))
+    pricing = status_obj.get("pricing") if isinstance(status_obj.get("pricing"), dict) else {}
+    billable = pricing.get("billable") if isinstance(pricing.get("billable"), bool) else None
+    category = str(pricing.get("category") or "") or None
+    errors = status_obj.get("errors") if isinstance(status_obj.get("errors"), list) else []
+    error_code = None
+    if errors and isinstance(errors[0], dict):
+        raw_code = errors[0].get("code")
+        if isinstance(raw_code, int):
+            error_code = raw_code
+    store.record_delivery_status(
+        wamid, state, ts=ts_iso, billable=billable, category=category, error_code=error_code)
+    if state == "failed":
+        log_event(
+            config.state_dir,
+            "wa_delivery_failed",
+            level="warn",
+            wamid=wamid,
+            error_code=error_code,
+        )
+        if error_code in PLATFORM_BLOCKED_CODES:
+            store.kv_set("platform_blocked", "1")
+            log_event(
+                config.state_dir,
+                "platform_blocked",
+                level="error",
+                detail=f"async status failed with code={error_code}",
+            )
+    else:
+        log_event(
+            config.state_dir,
+            "wa_delivery_status",
+            wamid=wamid,
+            status=state,
+            billable=billable,
+            category=category,
+        )
+
+
 def _handle_message(*, message: dict, config, store, backend, transport,
                     now: datetime) -> dict:
     """One inbound message → one decision. Raises nothing the caller can't
     turn into a 5xx-or-200 policy outcome."""
     if not isinstance(message, dict):
         return {"outcome": "ignored_malformed"}
-    sender = str(message.get("from", "")).strip()
-    if sender.isdigit():
-        sender = "+" + sender
-    if not sender.startswith("+") or not sender[1:].isdigit():
-        return {"outcome": "ignored_malformed"}
+    raw_sender = str(message.get("from", "")).strip()
     message_id = str(message.get("id", "")).strip()
-    if not sender or not message_id:
+    if not raw_sender or not message_id:
+        return {"outcome": "ignored_malformed"}
+    try:
+        sender = normalise_e164(raw_sender)
+    except AliveConfigError:
+        log_event(config.state_dir, "ignored_non_e164_sender", level="warn", wamid=message_id)
         return {"outcome": "ignored_malformed"}
 
     if not store.first_time_seen(message_id, now=now):
         return {"outcome": "duplicate"}
 
-    try:
-        store.record_inbound_window(envelope_mod.from_hash(sender, config.from_hash_salt),
-                                    int(message.get("timestamp")), now)
-    except (TypeError, ValueError, OverflowError):
-        pass  # malformed timestamps never open a service window
+    sender_hash = envelope_mod.from_hash(sender, config.from_hash_salt)
+    valid_dt = _valid_inbound_dt(message.get("timestamp"), now)
+    if valid_dt is not None:
+        store.record_inbound_window(sender_hash, int(valid_dt.timestamp()), now)
     _check_clock_suspect(store, message.get("timestamp"), config, now)
     sent_at = _iso_from_meta_ts(message.get("timestamp"))
-
-    msg_type = message.get("type")
-    text_body = ""
-    if msg_type == "text":
-        text_body = str((message.get("text") or {}).get("body", ""))[:4000]
+    msg_type = str(message.get("type") or "unknown")
+    extracted_kind, text_body = _extract_inbound_text(message)
 
     t1_hashes = _cached_t1_hashes(config, store, backend, now)
-    sender_hash = envelope_mod.from_hash(sender, config.from_hash_salt)
     tier = config.tier_for(sender, sender_hash=sender_hash, t1_hashes=t1_hashes)
+
+    if extracted_kind is None:
+        log_event(config.state_dir, "reaction_ignored", tier=tier, wamid=message_id)
+        return {"outcome": "ignored_reaction", "tier": tier}
 
     # --- owner: instruction path -------------------------------------------
     if tier == "T0":
@@ -289,10 +358,11 @@ def _handle_message(*, message: dict, config, store, backend, transport,
                 store.kv_set("inbox_full_acked", now.strftime("%Y-%m-%d"))
                 _safe_service_reply(transport, sender,
                                     "I'm not able to take more right now. "
-                                    "I'll leave it with her.", config, store)
+                                    "I'll leave it with her.", config, store,
+                                    now=now)
             log_event(config.state_dir, "owner_cap_reached", level="warn")
             return {"outcome": "capped", "tier": tier}
-        kind = "instruction" if msg_type == "text" else "unsupported"
+        kind = "instruction" if extracted_kind == "text" else "unsupported"
         body_text = text_body if kind == "instruction" else f"unsupported message type: {msg_type}"
         envelope, _name, _data = _make_and_store_envelope(
             config=config, store=store, backend=backend, kind=kind,
@@ -300,11 +370,13 @@ def _handle_message(*, message: dict, config, store, backend, transport,
             body_text=body_text, now=now,
             suspected=suspected_injection(text_body) if text_body else False)
         if kind == "instruction":
-            _safe_service_reply(transport, sender, _ack_text(envelope, config), config, store)
+            _safe_service_reply(transport, sender, _ack_text(envelope, config), config, store,
+                                now=now)
         else:
             _safe_service_reply(transport, sender,
                                 "I can't take files, voice notes or locations on "
-                                "this line — text only.", config, store)
+                                "this line — text only.", config, store,
+                                now=now)
         log_event(config.state_dir, "instruction_queued", tier=tier,
                   seq=envelope["seq"], suspected=envelope.get("suspected_injection"))
         return {"outcome": "queued", "tier": tier, "seq": envelope["seq"]}
@@ -315,7 +387,8 @@ def _handle_message(*, message: dict, config, store, backend, transport,
     if sender_day > config.stranger_turns_per_day_per_sender:
         store.increment("not_stored", tier="T2", now=now)
         _safe_service_reply(transport, sender,
-                            "I'll leave this with her.", config, store)
+                            "I'll leave this with her.", config, store,
+                            now=now)
         log_event(config.state_dir, "stranger_cap_reached", sender_hash=sender_hash[:16])
         return {"outcome": "capped", "tier": tier}
 
@@ -324,11 +397,12 @@ def _handle_message(*, message: dict, config, store, backend, transport,
         log_event(config.state_dir, "month_cap_reached", level="warn")
         _safe_service_reply(transport, sender,
                             "I'm not able to take more right now. "
-                            "I'll leave it with her.", config, store)
+                            "I'll leave it with her.", config, store,
+                            now=now)
         return {"outcome": "capped", "tier": tier}
 
     concierge = S0Concierge(store, config)
-    if msg_type != "text":
+    if extracted_kind != "text":
         kind = "unsupported"
         body_text = f"unsupported message type: {msg_type}"
         outcome = None
@@ -359,16 +433,27 @@ def _handle_message(*, message: dict, config, store, backend, transport,
 
     reply = outcome.reply if outcome is not None else (
         "I can't take files, voice notes or locations on this line — text only.")
-    _safe_service_reply(transport, sender, reply, config, store)
+    _safe_service_reply(transport, sender, reply, config, store, now=now)
     log_event(config.state_dir, "stranger_turn", tier=tier, seq=envelope["seq"],
               kind=kind, never_list=extra.get("never_list_category"))
     return {"outcome": kind, "tier": tier, "seq": envelope["seq"]}
 
 
-def _safe_service_reply(transport, to: str, text: str, config, store=None) -> None:
-    """Acks/replies are best-effort and journaled; never fatal, never retried."""
+def _safe_service_reply(transport, to: str, text: str, config, store=None, *,
+                        now: datetime | None = None) -> None:
+    """Acks/replies are best-effort and journaled; never fatal, never retried.
+
+    Relies on ``store``'s verified inbound window (which rejects future-skewed
+    or malformed timestamps), so a spoofed/future timestamp never triggers an
+    outbound session reply.
+    """
     try:
-        transport.send_service_reply(to, text)
+        try:
+            transport.send_service_reply(to, text, now=now)
+        except TypeError:
+            transport.send_service_reply(to, text)
+    except OutsideServiceWindow as exc:
+        log_event(config.state_dir, "reply_window_expired", level="warn", detail=str(exc))
     except PlatformBlocked as exc:
         log_event(config.state_dir, "platform_blocked", level="error", detail=str(exc))
         if store is not None:
@@ -432,33 +517,60 @@ def handle_request(method: str, headers: dict, raw_body: bytes, *,
         log_event(config.state_dir, "unparseable_body", level="warn")
         return 400, b"bad request"
 
-    entries = (payload.get("entry", []) if isinstance(payload, dict)
-               and payload.get("object") == "whatsapp_business_account" else [])
+    if not isinstance(payload, dict) or payload.get("object") != "whatsapp_business_account":
+        log_event(config.state_dir, "ignored_non_waba_object", level="warn")
+        return 200, b"EVENT_RECEIVED"
+
+    entries = payload.get("entry") if isinstance(payload.get("entry"), list) else []
     outcomes = []
     for entry in entries:
-        for change in entry.get("changes", []):
-            value = change.get("value", {}) if isinstance(change, dict) else {}
-            if change.get("field") != "messages" or value.get("messaging_product") != "whatsapp":
+        if not isinstance(entry, dict):
+            continue
+        changes = entry.get("changes") if isinstance(entry.get("changes"), list) else []
+        for change in changes:
+            if not isinstance(change, dict) or change.get("field") != "messages":
                 continue
-            metadata = value.get("metadata") or {}
-            if str(metadata.get("phone_number_id", "")) != config.wa_phone_number_id:
+            value = change.get("value", {}) if isinstance(change.get("value"), dict) else {}
+            if value.get("messaging_product") != "whatsapp":
                 continue
-            profile_name = ""
-            for contact in value.get("contacts", []) or []:
+            metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
+            incoming_phone_id = str(metadata.get("phone_number_id") or "")
+            if incoming_phone_id != config.wa_phone_number_id:
+                log_event(
+                    config.state_dir,
+                    "ignored_wrong_phone_number_id",
+                    level="warn",
+                    incoming_phone_number_id=incoming_phone_id,
+                )
+                continue
+
+            for status_obj in value.get("statuses") or []:
+                _handle_status(status_obj=status_obj, config=config, store=store)
+
+            # Map wa_id -> profile.name so multi-contact batches never mis-attribute names
+            profile_by_waid: dict[str, str] = {}
+            fallback_profile = ""
+            for contact in value.get("contacts") or []:
                 if isinstance(contact, dict):
-                    profile_name = str((contact.get("profile") or {}).get("name", ""))
-                    break
-            for message in value.get("messages", []):
-                if isinstance(message, dict) and profile_name:
-                    message = {**message, "_profile_name": profile_name}
+                    pname = str((contact.get("profile") or {}).get("name", ""))
+                    c_waid = str(contact.get("wa_id") or "").strip().lstrip("+")
+                    if c_waid and pname:
+                        profile_by_waid[c_waid] = pname
+                    if pname and not fallback_profile:
+                        fallback_profile = pname
+
+            for message in value.get("messages") or []:
+                if not isinstance(message, dict):
+                    continue
+                sender_digits = str(message.get("from") or "").strip().lstrip("+")
+                pname = profile_by_waid.get(sender_digits, fallback_profile)
+                if pname:
+                    message = {**message, "_profile_name": pname}
                 try:
                     outcome = _handle_message(message=message, config=config,
                                               store=store, backend=backend,
                                               transport=transport, now=now)
                 except Exception as exc:
-                    # durable-write failure etc: Meta must retry → 503, no ack,
-                    # and the dedup insert is rolled back so the retry is
-                    # re-processed rather than dropped as a duplicate (I1).
                     store.unsee(str((message or {}).get("id", "")))
                     log_event(config.state_dir, "durable_write_failed",
                               level="error", error=str(exc))

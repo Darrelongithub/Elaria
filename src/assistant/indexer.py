@@ -17,28 +17,34 @@ else no-text (counted, honest). Images contribute metadata only — OCR/
 vision happens only when asked and costs quota (§3.7), so not here.
 """
 
+# ruff: noqa: B023 -- XML callbacks and chunk generators are consumed synchronously in-loop.
 from __future__ import annotations
 
+import codecs
 import hashlib
+import io
 import mimetypes
 import os
 import re
+import selectors
 import shutil
 import stat as stat_mod
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
+from xml.parsers import expat
 
 from .cost import iso_now
-from .safety import expand, is_protected
+from .safety import expand, is_protected, open_readonly_nofollow
 
 TEMP_SUFFIXES = (".part", ".crdownload", ".tmp", ".swp", ".download")
 #: F33: rendered speech is regenerable output, never a document. If a data dir
 #: ever sits inside a whitelisted root, this name is still never tiered.
 EXCLUDED_DIRNAMES = ("voice-cache",)
 TEXT_EXTENSIONS = {
-    ".txt", ".md", ".rst", ".log", ".csv", ".tsv", ".json", ".toml", ".yaml",
+    ".txt", ".md", ".rst", ".log", ".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".toml", ".yaml",
     ".yml", ".ini", ".cfg", ".py", ".js", ".ts", ".rs", ".go", ".c", ".h",
     ".cpp", ".sh", ".html", ".xml", ".tex", ".org",
 }
@@ -59,48 +65,189 @@ def chunk_text(text: str, size: int = CHUNK_CHARS) -> list[str]:
 def _ooxml_text(path: Path, member_patterns: tuple[str, ...]) -> str:
     parts: list[str] = []
     try:
-        with zipfile.ZipFile(path) as archive:
+        with open_readonly_nofollow(path) as file_handle, zipfile.ZipFile(file_handle) as archive:
             for name in archive.namelist():
                 if any(re.search(pattern, name) for pattern in member_patterns):
-                    root = ElementTree.fromstring(archive.read(name))
+                    info = archive.getinfo(name)
+                    if info.file_size > 4_000_000 or info.file_size / max(1, info.compress_size) > 100:
+                        raise ValueError("structured document member exceeds safety limit")
+                    root = ElementTree.fromstring(archive.read(info))
                     parts.extend(node.text for node in root.iter()
                                  if node.text and node.tag.endswith("}t"))
-    except Exception:
-        return ""
+    except (OSError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        raise ValueError(f"invalid structured document: {exc}") from exc
     return " ".join(parts)
 
 
-def _legacy_extract_text(path: Path, max_chars: int = 200_000) -> tuple[str, str]:
+def _pdf_text(path: Path, max_chars: int) -> str:
+    """Capture bounded pdftotext output without holding its entire output in RAM."""
+    with open_readonly_nofollow(path) as source, subprocess.Popen(
+            ["pdftotext", "-layout", f"/proc/self/fd/{source.fileno()}", "-"],
+            pass_fds=(source.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
+        assert proc.stdout is not None
+        deadline = time.monotonic() + 60
+        data = bytearray()
+        # UTF-8 takes at most four bytes per character. An overflow is an error,
+        # not a partially indexed document.
+        cap = max_chars * 4 + 4
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise ValueError("pdftotext timed out")
+                block = os.read(proc.stdout.fileno(), min(65536, cap + 1 - len(data)))
+                if not block:
+                    break
+                data.extend(block)
+                if len(data) > cap:
+                    raise ValueError("PDF extraction exceeds output limit")
+            if proc.wait(timeout=max(0.01, deadline - time.monotonic())):
+                raise ValueError("pdftotext failed to parse PDF")
+        finally:
+            selector.close()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        text = data.decode("utf-8", errors="replace")
+        if len(text) > max_chars:
+            raise ValueError(f"extraction exceeds {max_chars} characters")
+        return text
+
+
+def _stream_pdf(path: Path):
+    """Yield bounded decoded output; an error rolls back the indexing transaction."""
+    if not shutil.which("pdftotext"):
+        raise ValueError("pdftotext unavailable")
+    with open_readonly_nofollow(path) as source, subprocess.Popen(
+            ["pdftotext", "-layout", f"/proc/self/fd/{source.fileno()}", "-"],
+            pass_fds=(source.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
+        before = os.fstat(source.fileno())
+        deadline = time.monotonic() + 120
+        decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise ValueError("pdftotext timed out")
+                block = os.read(proc.stdout.fileno(), 65536)
+                if not block:
+                    break
+                text = decoder.decode(block)
+                for i in range(0, len(text), CHUNK_CHARS):
+                    yield text[i:i + CHUNK_CHARS]
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                yield tail
+            if proc.wait(timeout=max(0.01, deadline - time.monotonic())):
+                raise ValueError("pdftotext failed to parse PDF")
+            after = os.fstat(source.fileno())
+            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ValueError("PDF changed during extraction")
+        finally:
+            selector.close()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
+def _stream_ooxml(path: Path, patterns: tuple[str, ...]):
+    """Read selected XML members incrementally, never extract to disk."""
+    with open_readonly_nofollow(path) as raw, zipfile.ZipFile(raw) as archive:
+        before = os.fstat(raw.fileno())
+        matched = False
+        for info in archive.infolist():
+            if not any(re.fullmatch(pattern, info.filename) for pattern in patterns):
+                continue
+            matched = True
+            if info.file_size > 1_000_000_000 or info.file_size / max(1, info.compress_size) > 100:
+                raise ValueError("structured document member exceeds safety limit")
+            with archive.open(info) as member:
+                parser = expat.ParserCreate(namespace_separator="}")
+                stack = []
+                pieces = []
+                pending = 0
+                def start(name, _attrs):
+                    stack.append(name)
+                def end(name):
+                    nonlocal pending
+                    if (name.endswith("}t") or (info.filename.startswith("xl/worksheets/") and name.endswith("}v")) or (info.filename == "content.xml" and name.endswith("}p"))):
+                        pieces.append(" ")
+                        pending += 1
+                    stack.pop()
+                def data(text):
+                    nonlocal pending
+                    if stack and (stack[-1].endswith("}t") or
+                                  (info.filename.startswith("xl/worksheets/") and stack[-1].endswith("}v")) or
+                                  info.filename == "content.xml"):
+                        pending += len(text)
+                        if pending > 2_000_000:
+                            raise ValueError("XML expansion exceeds chunk limit")
+                        pieces.append(text)
+                def reject_doctype(*_args):
+                    raise ValueError("XML DTD is not supported")
+                parser.StartElementHandler = start
+                parser.EndElementHandler = end
+                parser.CharacterDataHandler = data
+                parser.StartDoctypeDeclHandler = reject_doctype
+                while True:
+                    block = member.read(65536)
+                    parser.Parse(block, not block)
+                    if pieces:
+                        text = "".join(pieces)
+                        pieces.clear()
+                        pending = 0
+                        for i in range(0, len(text), CHUNK_CHARS):
+                            yield text[i:i + CHUNK_CHARS]
+                    if not block:
+                        break
+        if not matched:
+            raise ValueError("structured document has no supported text member")
+        after = os.fstat(raw.fileno())
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("document changed during extraction")
+
+
+def extract_text(path: Path, max_chars: int = 200_000) -> tuple[str, str]:
     """Return (text, extractor_name). Extractor name keeps coverage honest
     in index stats — 'no-text' is a fact to surface, not hide."""
     suffix = path.suffix.lower()
     try:
         if suffix in TEXT_EXTENSIONS:
-            return path.read_text(encoding="utf-8", errors="replace")[:max_chars], "text"
+            with open_readonly_nofollow(path) as raw, io.TextIOWrapper(raw, encoding="utf-8", errors="replace") as handle:
+                text = handle.read(max_chars + 1)
+            if len(text) > max_chars:
+                raise ValueError(f"extraction exceeds {max_chars} characters")
+            return text, "text"
         if suffix == ".pdf":
             if shutil.which("pdftotext"):
-                out = subprocess.run(["pdftotext", "-layout", str(path), "-"],
-                                     capture_output=True, text=True, timeout=60,
-                                     check=False)
-                if out.returncode == 0:
-                    return out.stdout[:max_chars], "pdftotext"
-            try:  # pragma: no cover - optional dependency
-                import fitz
-
-                with fitz.open(path) as doc:
-                    return "\n".join(p.get_text() for p in doc)[:max_chars], "pymupdf"
-            except ImportError:
-                return "", "no-text (install poppler-utils or pymupdf)"
+                return _pdf_text(path, max_chars), "pdftotext"
+            return "", "no-text (install poppler-utils)"
         if suffix == ".docx":
-            return _ooxml_text(path, (r"word/document\.xml",))[:max_chars], "docx"
+            text = _ooxml_text(path, (r"word/document\.xml",))
+            if len(text) > max_chars:
+                raise ValueError(f"extraction exceeds {max_chars} characters")
+            return text, "docx"
         if suffix == ".pptx":
-            return _ooxml_text(path, (r"ppt/slides/slide\d+\.xml",))[:max_chars], "pptx"
+            text = _ooxml_text(path, (r"ppt/slides/slide\d+\.xml",))
+            if len(text) > max_chars:
+                raise ValueError(f"extraction exceeds {max_chars} characters")
+            return text, "pptx"
         if suffix == ".xlsx":
-            return _ooxml_text(path, (r"xl/sharedStrings\.xml",))[:max_chars], "xlsx"
+            text = _ooxml_text(path, (r"xl/sharedStrings\.xml",))
+            if len(text) > max_chars:
+                raise ValueError(f"extraction exceeds {max_chars} characters")
+            return text, "xlsx"
         if suffix == ".odt":
-            return _ooxml_text(path, (r"content\.xml",))[:max_chars], "odt"
+            text = _ooxml_text(path, (r"content\.xml",))
+            if len(text) > max_chars:
+                raise ValueError(f"extraction exceeds {max_chars} characters")
+            return text, "odt"
     except Exception as exc:
-        return "", f"error: {type(exc).__name__}"
+        return "", f"error: {type(exc).__name__}: {exc}"
     return "", "no-text"  # binaries/images: metadata only (vision is opt-in)
 
 
@@ -149,7 +296,7 @@ def extract_with_provenance(path: Path, max_chars: int = 200_000) -> dict:
                 if truncated:
                     break
         else:
-            text, extractor = _legacy_extract_text(path, cap + 1)
+            text, extractor = extract_text(path, cap + 1)
             truncated = len(text) > cap
             parts = [text[:cap]]
             if extractor.startswith("error:"):
@@ -161,17 +308,6 @@ def extract_with_provenance(path: Path, max_chars: int = 200_000) -> dict:
             "truncated": truncated, "parse_error": error}
 
 
-def extract_text(path: Path, max_chars: int = 200_000) -> tuple[str, str]:
-    """Compatibility API: caps and failures are explicit in the extractor label."""
-    result = extract_with_provenance(path, max_chars)
-    label = result["extractor"]
-    if result["parse_error"]:
-        label = f"error: {result['parse_error']}"
-    elif result["truncated"]:
-        label += " (truncated)"
-    return result["text"], label
-
-
 class Indexer:
     def __init__(self, config, store):
         self.config = config
@@ -179,11 +315,7 @@ class Indexer:
         organise = config.section("organise")
         policy = config.section("policy")
         self.protected = policy.get("protected") or []
-        self.max_extract_chars = max(1, min(
-            int(organise.get("max_extract_chars", 200_000)),
-            getattr(config, "stream_limits", lambda: {"index_max_extract_chars": 200_000})()[
-                "index_max_extract_chars"],
-        ))
+        self.max_extract_chars = int(organise.get("max_extract_chars", 200_000))
         self.never_send_roots = [
             str(expand(p)) for p in
             (config.section("privacy").get("never_send_to_cloud") or [])]
@@ -192,11 +324,7 @@ class Indexer:
         organise = self.config.section("organise")
         policy = self.config.section("policy")
         self.protected = policy.get("protected") or []
-        self.max_extract_chars = max(1, min(
-            int(organise.get("max_extract_chars", 200_000)),
-            getattr(self.config, "stream_limits", lambda: {"index_max_extract_chars": 200_000})()[
-                "index_max_extract_chars"],
-        ))
+        self.max_extract_chars = int(organise.get("max_extract_chars", 200_000))
         self.never_send_roots = [
             str(expand(p)) for p in
             (self.config.section("privacy").get("never_send_to_cloud") or [])]
@@ -253,6 +381,9 @@ class Indexer:
         stats = {"root": str(root), "indexed": 0, "unchanged": 0, "changed": 0,
                  "missing_marked": 0, "skipped": {}, "no_text": 0,
                  "never_send": 0, "extractors": {}}
+        if is_protected(root, self.protected) or root.is_symlink():
+            stats["error"] = f"protected or symlink root refused: {root}"
+            return stats
         if not root.exists():
             stats["error"] = f"root does not exist: {root}"
             return stats
@@ -277,6 +408,7 @@ class Indexer:
             never_send = self._never_send(path)
             existing = self.store.document_by_path(str(path))
             if (existing and existing["status"] == "indexed"
+                    and existing.get("extraction_version", 0) == 1
                     and existing.get("extractor") is not None
                     and existing["size"] == stat.st_size
                     and abs(existing["mtime"] - stat.st_mtime) < 1e-6):
@@ -289,31 +421,63 @@ class Indexer:
                 stats["never_send"] += int(never_send)
                 stats["unchanged"] += 1
                 continue
-            data_hash = sha256_bytes(path.read_bytes()) if stat.st_size <= 64_000_000 \
-                else self._hash_large(path)
-            extraction = extract_with_provenance(path, self.max_extract_chars)
-            text, extractor = extraction["text"], extraction["extractor"]
-            stats.setdefault("truncated", 0)
-            stats.setdefault("parse_errors", 0)
-            stats["truncated"] += int(extraction["truncated"])
-            stats["parse_errors"] += int(bool(extraction["parse_error"]))
+            try:
+                data_hash = self._hash_large(path)
+                if path.suffix.lower() in (".json", ".jsonl", ".ndjson", ".csv", ".tsv"):
+                    from .structured_reader import validate
+
+                    validate(str(path), protected=self.protected,
+                             never_send_roots=self.never_send_roots)
+                if path.suffix.lower() in TEXT_EXTENSIONS:
+                    extractor = "text-stream"
+                    def chunks():
+                        with open_readonly_nofollow(path) as raw, io.TextIOWrapper(raw, encoding="utf-8", errors="replace") as handle:
+                            before = os.fstat(raw.fileno())
+                            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns):
+                                raise OSError("file changed before indexing")
+                            while True:
+                                block = handle.read(CHUNK_CHARS)
+                                if not block:
+                                    break
+                                yield block
+                            after = os.fstat(raw.fileno())
+                            if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (before.st_size, before.st_mtime_ns, before.st_ctime_ns):
+                                raise OSError("file changed during indexing")
+                    text_chunks = chunks()
+                elif path.suffix.lower() in (".docx", ".pptx", ".xlsx", ".odt"):
+                    patterns = {
+                        ".docx": (r"word/document\.xml",),
+                        ".pptx": (r"ppt/slides/slide\d+\.xml",),
+                        ".xlsx": (r"xl/sharedStrings\.xml", r"xl/worksheets/sheet\d+\.xml"),
+                        ".odt": (r"content\.xml",),
+                    }
+                    extractor = "ooxml-stream"
+                    text_chunks = _stream_ooxml(path, patterns[path.suffix.lower()])
+                elif path.suffix.lower() == ".pdf" and shutil.which("pdftotext"):
+                    extractor = "pdf-stream"
+                    text_chunks = _stream_pdf(path)
+                else:
+                    text, extractor = extract_text(path, self.max_extract_chars)
+                    if extractor.startswith("error:"):
+                        raise ValueError(extractor)
+                    if not text:
+                        stats["no_text"] += 1
+                    text_chunks = chunk_text(text)
+                self.store.upsert_document(
+                    path=str(path), root=str(root), sha256=data_hash,
+                    size=stat.st_size, mtime=stat.st_mtime,
+                    mime=mimetypes.guess_type(path.name)[0], ext=path.suffix.lower(),
+                    indexed_ts=iso_now(), never_send=int(never_send),
+                    text_chunks=text_chunks, extractor=extractor)
+            except (OSError, ValueError, zipfile.BadZipFile, ElementTree.ParseError, expat.ExpatError, subprocess.SubprocessError) as exc:
+                self.store.mark_document_error(
+                    str(path), f"{type(exc).__name__}: {exc}", root=str(root),
+                    size=stat.st_size, mtime=stat.st_mtime, ext=path.suffix.lower(),
+                    never_send=int(never_send))
+                walk_errors.append((str(path), f"{path}: {type(exc).__name__}: {exc}"))
+                continue
             stats["extractors"][extractor] = stats["extractors"].get(extractor, 0) + 1
-            if not text:
-                stats["no_text"] += 1
             stats["never_send"] += int(never_send)
-            self.store.upsert_document(
-                path=str(path), root=str(root), sha256=data_hash,
-                size=stat.st_size, mtime=stat.st_mtime,
-                mime=mimetypes.guess_type(path.name)[0], ext=path.suffix.lower(),
-                indexed_ts=iso_now(), never_send=int(never_send),
-                text_chunks=chunk_text(text), extractor=extractor,
-                extracted_chars=extraction["extracted_chars"],
-                truncated=extraction["truncated"], parse_error=extraction["parse_error"],
-                # An undecodable .txt is still a freshly hashed binary file.
-                # Do not mark its identity stale: reversible organiser moves
-                # require indexed identity, not a successful text decoder.
-                status=("indexed" if str(extraction["parse_error"]).startswith(
-                    "UnicodeDecodeError:") else None))
             stats["changed" if existing else "indexed"] += 1
         if walk_errors:
             stats["error"] = "; ".join(msg for _, msg in walk_errors)
@@ -335,7 +499,7 @@ class Indexer:
     @staticmethod
     def _hash_large(path: Path) -> str:
         digest = hashlib.sha256()
-        with path.open("rb") as handle:
+        with open_readonly_nofollow(path) as handle:
             for block in iter(lambda: handle.read(1 << 20), b""):
                 digest.update(block)
         return digest.hexdigest()
