@@ -1,7 +1,9 @@
 """A6/R5 private control-plane queue. All paths come from a SyntheticSpace.
 
-SQLite transactions serialize decisions/claims. No expiration, auto-approval,
-blind replay, or automatic resumption of an uncertain running step.
+SQLite transactions serialize decisions/claims. No auto-approval, blind
+replay, or automatic resumption of an uncertain running step. A parked ask
+is honoured (decided or claimed) only inside its TTL window; an expired ask
+goes stale and is never silently approved.
 """
 from __future__ import annotations
 
@@ -12,6 +14,11 @@ import time
 
 from .plan import Plan
 from .sandbox import SyntheticSpace
+
+# A parked ask (owner decision) is honoured only within this window.
+ASK_TTL_S = 900.0
+# A burnt mouse digest claim binds its errand for at most this long.
+MOUSE_CLAIM_TTL_S = 900.0
 
 
 class ParkedQueue:
@@ -94,6 +101,10 @@ class ParkedQueue:
                 row = self._db.execute("SELECT * FROM asks WHERE id=last_insert_rowid()").fetchone()
             return dict(row)
 
+    def _ask_expired(self, row) -> bool:
+        """A parked ask ages out of its TTL window; it is never honoured after."""
+        return time.time() - row["created"] > ASK_TTL_S
+
     def decide(self, ask_id: int, digest: str, decision: str) -> str:
         if decision not in {"yes", "no"}:
             raise ValueError("not a decision")
@@ -102,6 +113,11 @@ class ParkedQueue:
             row = self._db.execute("SELECT * FROM asks WHERE id=?", (ask_id,)).fetchone()
             if (row is None or row["plan_hash"] != digest or row["state"] != "pending"
                     or not self.current(row["errand"], digest)):
+                return "stale"
+            if self._ask_expired(row):
+                # Enforced TTL: the ask expires to 'stale' so a re-park mints a
+                # fresh one — an old approval is never replayed into a decision.
+                self._db.execute("UPDATE asks SET state='stale' WHERE id=?", (ask_id,))
                 return "stale"
             self._db.execute("UPDATE asks SET state=? WHERE id=?", (decision, ask_id))
             return decision
@@ -123,9 +139,15 @@ class ParkedQueue:
                     or self.step_state(errand, plan, step) is not None):
                 return False
             if needs_yes:
-                row = self._db.execute("SELECT state FROM asks WHERE errand=? AND plan_hash=? "
+                row = self._db.execute("SELECT id, state, created FROM asks WHERE errand=? AND plan_hash=? "
                     "AND step=? AND kind='execute' ORDER BY id DESC LIMIT 1", (errand, plan.digest, step)).fetchone()
                 if row is None or row["state"] != "yes":
+                    return False
+                if self._ask_expired(row):
+                    # Enforced TTL: an expired approval never dispatches; it goes
+                    # stale so a re-park can mint a fresh ask.
+                    self._db.execute("UPDATE asks SET state='stale' WHERE id=? AND state='yes'",
+                                     (row["id"],))
                     return False
             self._db.execute("INSERT INTO steps VALUES(?,?,?,'running')", (errand, plan.digest, step))
             return True
@@ -180,17 +202,40 @@ class ParkedQueue:
         self._db.close()
 
     def claim_mouse_digest(self, errand: str, digest: str, clicks: int) -> bool:
-        """Burn the entire approved batch before dispatch, even on interruption."""
+        """Burn the entire approved batch before dispatch, even on interruption.
+
+        The claim binds the digest to this errand and an expiry moment. A digest
+        is claimable exactly once, globally (not per-errand): re-submitting an
+        identical plan under a fresh errand string can never re-claim it or
+        reset the budget. The 12-click budget is per digest, and click counts
+        must be real ints (never bool).
+        """
+        if type(errand) is not str or not errand or type(digest) is not str or not digest:
+            raise ValueError("errand and digest are required")
+        if type(clicks) is not int:
+            raise ValueError("click count must be an int")
         with self._lock, self._db:
             self._db.execute("BEGIN IMMEDIATE")
             self._db.execute('''CREATE TABLE IF NOT EXISTS mouse_claims (
-                errand TEXT NOT NULL, digest TEXT NOT NULL, clicks INTEGER NOT NULL,
-                PRIMARY KEY (errand, digest))''')
+                digest TEXT PRIMARY KEY, errand TEXT NOT NULL, clicks INTEGER NOT NULL,
+                created REAL NOT NULL, expires REAL NOT NULL)''')
             used, = self._db.execute(
-                'SELECT COALESCE(SUM(clicks),0) FROM mouse_claims WHERE errand=?',
-                (errand,)).fetchone()
+                'SELECT COALESCE(SUM(clicks),0) FROM mouse_claims WHERE digest=?',
+                (digest,)).fetchone()
             if not 1 <= clicks <= 12 - used:
                 return False
+            now = time.time()
             return self._db.execute(
-                'INSERT OR IGNORE INTO mouse_claims VALUES (?,?,?)',
-                (errand, digest, clicks)).rowcount == 1
+                'INSERT OR IGNORE INTO mouse_claims VALUES (?,?,?,?,?)',
+                (digest, errand, clicks, now, now + MOUSE_CLAIM_TTL_S)).rowcount == 1
+
+    def mouse_claim(self, digest: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute('SELECT * FROM mouse_claims WHERE digest=?', (digest,)).fetchone()
+            return dict(row) if row else None
+
+    def claim_binds(self, errand: str, digest: str) -> bool:
+        """The burnt claim still binds this errand and is inside its expiry."""
+        row = self.mouse_claim(digest)
+        return (row is not None and row["errand"] == errand
+                and time.time() < row["expires"])
