@@ -35,12 +35,49 @@ EGRESS_ALLOWLIST = ("graph.facebook.com",)
 #: Graph API version pinned by the build. Bump deliberately, never at runtime.
 GRAPH_API_VERSION = "v21.0"
 
-#: Reminder template name the owner registers with Meta (utility template).
-REMINDER_TEMPLATE = "reminder_v1"
+#: Default S-0 utility template name (canonical commitment-due template).
+#: All four S-0 templates live in ``alive.templates.S0_TEMPLATE_PACK``.
+REMINDER_TEMPLATE = "elaria_commitment_due_v1"
+
+#: Default paid-template cap per UTC day — deliberately small (KES ~2.60/day at
+#: KES 0.52 = 52 KES-cents per delivered utility template in Kenya).
+DEFAULT_MAX_TEMPLATES_PER_DAY = 5
+
+#: Hard upper ceiling on ``max_templates_per_day`` enforced by config + doctor.
+MAX_TEMPLATES_PER_DAY_CEILING = 10
+
+#: Estimated cost per paid utility template in Kenya ($0.0040 ≈ KES 0.52 = 52 KES-cents).
+EST_TEMPLATE_COST_USD = 0.0040
+EST_TEMPLATE_COST_KES_CENTS = 52
+
+#: Meta 24-hour customer service window in seconds (86,400 s).
+SERVICE_WINDOW_SECONDS = 24 * 3600
 
 
 class AliveConfigError(RuntimeError):
     """Refused to (start|use) config that breaks a hard rule."""
+
+
+def normalise_e164(number: str) -> str:
+    """Canonicalise a phone number or Meta ``wa_id`` to ``+<digits>`` E.164.
+
+    Meta webhook payloads carry ``messages[].from``, ``contacts[].wa_id``, and
+    ``statuses[].recipient_id`` as digits WITHOUT a leading ``+`` (e.g.
+    ``"254711000111"``), whereas config and outbound Graph API calls use E.164
+    with a leading ``+`` (``"+254711000111"``). Normalising at the boundary
+    keeps ``from_hash``, ``tier_for``, and single-recipient checks exact.
+    Raises ``AliveConfigError`` if the input is not 7..15 international digits.
+    """
+    raw = str(number or "").strip()
+    if raw.startswith("+"):
+        digits = raw[1:]
+    else:
+        digits = raw
+    if not digits.isdigit() or not (7 <= len(digits) <= 15) or digits.startswith("0"):
+        raise AliveConfigError(
+            f"invalid E.164 / wa_id phone number {number!r}: expected +<country><subscriber> "
+            "or Meta wa_id digits (7..15 digits, nonzero country code)")
+    return f"+{digits}"
 
 
 @dataclass(frozen=True)
@@ -59,7 +96,7 @@ class AliveConfig:
     verify_token: str = ""             # hub.challenge handshake
 
     # limits — all enforced in code, all overridable ONLY in this file
-    max_templates_per_day: int = 10    # utility templates (B14)
+    max_templates_per_day: int = DEFAULT_MAX_TEMPLATES_PER_DAY  # paid utility templates (default 5, ceiling 10)
     owner_messages_per_day: int = 200  # owner instruction envelopes (B10)
     stranger_turns_per_day_per_sender: int = 20
     stranger_messages_per_month: int = 800  # stays under the 1,000 free
@@ -84,6 +121,7 @@ class AliveConfig:
     freebusy_level: int = 0            # overridden by the laptop's public card
     content_free_secret_reminders: bool = False  # owner decision, default OFF
     fast_lane: bool = False            # owner decision, default OFF — never auto-approve
+    s1_chatty_mode: bool = False       # binding OFF — Meta 15 Jan 2026 AI policy grey zone
 
     def __post_init__(self):
         if not self.mac_key or len(self.mac_key) < 16:
@@ -92,6 +130,13 @@ class AliveConfig:
             raise AliveConfigError("from_hash_salt missing; provision it together with mac_key")
         if not str(self.owner_e164).startswith("+") or not self.owner_e164[1:].isdigit():
             raise AliveConfigError("owner_e164 must be a single E.164 number, e.g. +2547...")
+        normalise_e164(self.owner_e164)
+        if not isinstance(self.max_templates_per_day, int) or self.max_templates_per_day < 0:
+            raise AliveConfigError("max_templates_per_day must be a non-negative integer")
+        if self.max_templates_per_day > MAX_TEMPLATES_PER_DAY_CEILING:
+            raise AliveConfigError(
+                f"max_templates_per_day={self.max_templates_per_day} exceeds ceiling "
+                f"{MAX_TEMPLATES_PER_DAY_CEILING}; paid templates stay tightly bounded")
         for prefix in (self.inbox_prefix, self.commitments_prefix, self.reminder_log_prefix,
                        self.receipts_prefix, self.heartbeat_prefix):
             if "/" in prefix.strip("/") or not prefix.strip():
@@ -105,6 +150,10 @@ class AliveConfig:
                 "fast_lane is refused by this build: alive_inbox jobs always land "
                 "awaiting_approval on the laptop. The owner decision to relax this "
                 "does not exist yet.")
+        if self.s1_chatty_mode:
+            raise AliveConfigError(
+                "s1_chatty_mode is refused by this build: S-0 deterministic templates "
+                "only on WhatsApp (Meta 15 Jan 2026 AI policy grey zone).")
 
     # -- tier resolution ---------------------------------------------------------
     def tier_for(self, sender_e164: str, *, sender_hash: str | None = None,
@@ -115,9 +164,13 @@ class AliveConfig:
         laptop."""
         from .envelope import from_hash  # local import: keep config import light
 
-        if str(sender_e164) == self.owner_e164:
+        try:
+            canonical = normalise_e164(sender_e164)
+        except AliveConfigError:
+            canonical = str(sender_e164)
+        if canonical == self.owner_e164:
             return "T0"
-        digest = sender_hash or from_hash(str(sender_e164), self.from_hash_salt)
+        digest = sender_hash or from_hash(canonical, self.from_hash_salt)
         if t1_hashes and digest in t1_hashes:
             return "T1"
         return "T2"
@@ -143,6 +196,10 @@ def load_config(path: str | Path) -> AliveConfig:
             raise AliveConfigError(f"caps.{name} must be a non-negative integer")
         return value
 
+    if section.get("responder_mode") not in (None, "S-0", "s-0"):
+        raise AliveConfigError(
+            "responder_mode must be 'S-0' (S-1 chatty mode stays OFF on WhatsApp)")
+
     state_dir = Path(section.get("state_dir", "./alive-state")).expanduser()
     cfg = AliveConfig(
         mac_key=str(section.get("mac_key", "")),
@@ -152,7 +209,7 @@ def load_config(path: str | Path) -> AliveConfig:
         wa_token=str(section.get("wa_token", "")),
         wa_app_secret=str(section.get("wa_app_secret", "")),
         verify_token=str(section.get("verify_token", "")),
-        max_templates_per_day=cap("max_templates_per_day", 10),
+        max_templates_per_day=cap("max_templates_per_day", DEFAULT_MAX_TEMPLATES_PER_DAY),
         owner_messages_per_day=cap("owner_messages_per_day", 200),
         stranger_turns_per_day_per_sender=cap("stranger_turns_per_day_per_sender", 20),
         stranger_messages_per_month=cap("stranger_messages_per_month", 800),
@@ -173,5 +230,6 @@ def load_config(path: str | Path) -> AliveConfig:
         freebusy_level=int(section.get("freebusy_level", 0)),
         content_free_secret_reminders=bool(section.get("content_free_secret_reminders", False)),
         fast_lane=bool(section.get("fast_lane", False)),
+        s1_chatty_mode=bool(section.get("s1_chatty_mode", False)),
     )
     return cfg

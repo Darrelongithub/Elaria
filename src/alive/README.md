@@ -25,8 +25,9 @@ the owner's laptop-side step, and are NOT claimed here.
 |---|---|
 | `envelope.py` | the signed wire format (shared with `assistant/alive_sync.py`) |
 | `config.py` | single-recipient, egress allowlist, caps — refuses bad config |
-| `store.py` | SQLite state: dedup, write-ahead reminder rows, counters, mutes |
-| `transport.py` | the only HTTP in the package; S-0 sends; `FakeTransport` for tests |
+| `store.py` | SQLite state: dedup, 24h service windows, delivery statuses, write-ahead reminder rows, counters, mutes |
+| `templates.py` | S-0 utility template pack (`elaria_meeting_v1`, `elaria_deadline_v1`, `elaria_commitment_due_v1`, `elaria_already_sent_knock_v1`) |
+| `transport.py` | real WhatsApp Cloud API adapter (24h window enforced; paid-template cap; KES-cents journaling); `FakeTransport` for tests |
 | `concierge.py` | S-0 deterministic stranger responder (no LLM, ever) |
 | `mirror.py` | verified reader for the laptop's commitments snapshot |
 | `reminders.py` | write-ahead, capped reminder firing (`tick()`) |
@@ -54,7 +55,10 @@ holds the owner's keys.
    shared read/write to the owner's account. The host's rclone remote
    uses Elaria's token pinned to that folder; the laptop's uses the
    owner's token pinned to the same folder (`root_folder_id`).
-4. Register the `reminder_v1` utility template (body params: item, time).
+4. Submit the four S-0 utility templates (`python -m alive.provision templates`)
+   in WhatsApp Manager (`elaria_meeting_v1`, `elaria_deadline_v1`,
+   `elaria_commitment_due_v1`, `elaria_already_sent_knock_v1`). Full step-by-step
+   registration runbook: `reports/RPT-E-whatsapp-runbook-20261126T083500Z.md`.
 5. On the host: copy `src/alive/` → install deps →
    `python -m alive.provision init` → fill `alive.toml` (mode 0600) →
    `python -m alive.provision doctor alive.toml` → **B16 acceptance

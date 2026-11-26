@@ -69,6 +69,19 @@ CREATE TABLE IF NOT EXISTS inbox (
   seq INTEGER NOT NULL,
   written_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS service_windows (
+  sender_hash TEXT PRIMARY KEY,
+  last_inbound_at TEXT NOT NULL      -- UTC ISO-8601 of last user-initiated message
+);
+CREATE TABLE IF NOT EXISTS delivery_statuses (
+  wamid TEXT NOT NULL,
+  status TEXT NOT NULL,              -- sent | delivered | read | failed
+  ts TEXT NOT NULL,
+  billable INTEGER,
+  category TEXT,
+  error_code INTEGER,
+  PRIMARY KEY (wamid, status)
+);
 """
 
 
@@ -265,6 +278,87 @@ class AliveStore:
                 "INSERT OR IGNORE INTO inbox(id, kind, seq, written_at) VALUES (?, ?, ?, ?)",
                 (str(envelope_id), kind, int(seq), iso(now)))
             self._conn.commit()
+
+    # -- 24h customer service window tracking ----------------------------------
+    def record_inbound_window(self, sender_hash: str, inbound_at: datetime | str) -> None:
+        """Record the timestamp of a transport-authenticated user message.
+
+        Only move forward in time so an out-of-order webhook retry never shrinks
+        a fresher 24-hour customer service window.
+        """
+        if isinstance(inbound_at, datetime):
+            stamp = iso(inbound_at)
+        else:
+            stamp = str(inbound_at)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_inbound_at FROM service_windows WHERE sender_hash=?",
+                (sender_hash,)).fetchone()
+            if row and str(row["last_inbound_at"]) >= stamp:
+                return
+            self._conn.execute(
+                "INSERT INTO service_windows(sender_hash, last_inbound_at) VALUES (?, ?) "
+                "ON CONFLICT(sender_hash) DO UPDATE SET last_inbound_at=excluded.last_inbound_at",
+                (sender_hash, stamp))
+            self._conn.commit()
+
+    def last_inbound_at(self, sender_hash: str) -> datetime | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_inbound_at FROM service_windows WHERE sender_hash=?",
+                (sender_hash,)).fetchone()
+        if not row:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(row["last_inbound_at"]))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+
+    def in_service_window(self, sender_hash: str, *, now: datetime | None = None,
+                          window_seconds: int = 24 * 3600) -> bool:
+        """True iff the sender messaged us within ``window_seconds`` (strictly <= 24h, >= 0)."""
+        now = (now or _utcnow()).astimezone(UTC)
+        last = self.last_inbound_at(sender_hash)
+        if last is None:
+            return False
+        elapsed = (now - last.astimezone(UTC)).total_seconds()
+        return 0 <= elapsed <= window_seconds
+
+    # -- webhook delivery status receipts (statuses[]) -------------------------
+    def record_delivery_status(self, wamid: str, status: str, *, ts: str,
+                               billable: bool | None = None,
+                               category: str | None = None,
+                               error_code: int | None = None) -> None:
+        billable_int = None if billable is None else (1 if billable else 0)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO delivery_statuses(wamid, status, ts, billable, category, error_code) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(wamid, status) DO UPDATE SET "
+                "ts=excluded.ts, billable=COALESCE(excluded.billable, delivery_statuses.billable), "
+                "category=COALESCE(excluded.category, delivery_statuses.category), "
+                "error_code=COALESCE(excluded.error_code, delivery_statuses.error_code)",
+                (str(wamid), str(status), str(ts), billable_int, category, error_code))
+            self._conn.commit()
+
+    def delivery_statuses_for(self, wamid: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM delivery_statuses WHERE wamid=? ORDER BY ts ASC",
+                (str(wamid),)).fetchall()
+            return [dict(r) for r in rows]
+
+    def first_fired_for_commitment(self, commitment_id: int) -> dict | None:
+        """Return the earliest ``sent`` reminder row for ``commitment_id``, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM fired WHERE commitment_id=? AND status='sent' "
+                "ORDER BY remind_at ASC LIMIT 1",
+                (int(commitment_id),)).fetchone()
+            return dict(row) if row else None
 
     # -- kv -------------------------------------------------------------------
     def kv_get(self, key: str, default=None):

@@ -29,6 +29,8 @@ def write_heartbeat(*, backend, config: AliveConfig, store: AliveStore,
         "platform_blocked": store.platform_blocked(),
         "clock_suspect": store.clock_suspect(),
         "templates_today": store.count_today("templates", tier="T0", now=now),
+        "paid_template_kes_cents_today": store.count_today(
+            "paid_template_kes_cents", tier="T0", now=now),
         "service_messages_month": store.count_month("service_messages", now=now),
         "not_stored": (store.count_today("not_stored", tier="T0", now=now)
                        + store.count_today("not_stored", tier="T2", now=now)),

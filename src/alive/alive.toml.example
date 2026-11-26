@@ -31,8 +31,10 @@ reminder_log_prefix = "reminder_log"   # WRITER: this host. laptop reads.
 receipts_prefix = "receipts"           # WRITER: laptop. this host may read for pruning (future)
 heartbeat_prefix = "heartbeat"
 
+responder_mode = "S-0"                 # S-1 chatty mode stays OFF (Meta grey zone)
+
 [alive.caps]
-max_templates_per_day = 10             # utility templates (~$0.0040 each in KE)
+max_templates_per_day = 5              # paid S-0 utility templates (~52 KES-cents / $0.0040 each in KE; ceiling 10)
 owner_messages_per_day = 200
 stranger_turns_per_day_per_sender = 20
 stranger_messages_per_month = 800      # under the 1,000 free service messages

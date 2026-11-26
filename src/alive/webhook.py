@@ -49,11 +49,11 @@ from pathlib import Path
 
 from . import envelope as envelope_mod
 from .concierge import S0Concierge
-from .config import AliveConfig
+from .config import AliveConfig, AliveConfigError, normalise_e164
 from .journal import iso_now, log_event
 from .mirror import busy_days, load_mirror, load_public_card, load_t1_hashes
 from .store import AliveStore
-from .transport import PlatformBlocked
+from .transport import PLATFORM_BLOCKED_CODES, OutsideServiceWindow, PlatformBlocked
 
 GRAPH_SIGNATURE_HEADER = "X-Hub-Signature-256"
 
@@ -245,13 +245,104 @@ def _freebusy_for(config, store, backend, now) -> tuple[int, dict[int, int]]:
     return level, busy_days(mirror, now=now)
 
 
+def _extract_inbound_text(message: dict) -> tuple[str | None, str]:
+    """Extract text-like user reply content from Meta Cloud API ``messages[]`` objects.
+
+    Cited Meta webhook payload shapes:
+    * ``type=="text"`` -> ``text.body``
+    * ``type=="button"`` (quick-reply on a template) -> ``button.text`` / ``button.payload``
+    * ``type=="interactive"`` -> ``interactive.button_reply.title`` or ``list_reply.title``
+    * ``reaction`` -> ignored (returns ``(None, "")`` so an emoji reaction never
+      queues an empty instruction or triggers a spurious unsupported warning)
+    * ``audio`` / ``image`` / ``video`` / ``document`` / ``sticker`` / ``location``
+      / ``contacts`` / etc. -> ``("unsupported", "")`` (never downloaded).
+    """
+    msg_type = str(message.get("type") or "").strip().lower()
+    if msg_type == "text":
+        body = str((message.get("text") or {}).get("body", ""))[:4000]
+        return ("text", body)
+    if msg_type == "button":
+        btn = message.get("button") if isinstance(message.get("button"), dict) else {}
+        body = str(btn.get("text") or btn.get("payload") or "")[:4000]
+        return ("text", body) if body else ("unsupported", "")
+    if msg_type == "interactive":
+        inter = message.get("interactive") if isinstance(message.get("interactive"), dict) else {}
+        sub = inter.get("type")
+        if sub == "button_reply" and isinstance(inter.get("button_reply"), dict):
+            body = str(inter["button_reply"].get("title") or inter["button_reply"].get("id") or "")[:4000]
+            return ("text", body) if body else ("unsupported", "")
+        if sub == "list_reply" and isinstance(inter.get("list_reply"), dict):
+            body = str(inter["list_reply"].get("title") or inter["list_reply"].get("id") or "")[:4000]
+            return ("text", body) if body else ("unsupported", "")
+        return ("unsupported", "")
+    if msg_type == "reaction":
+        return (None, "")
+    return ("unsupported", "")
+
+
+def _handle_status(*, status_obj: dict, config: AliveConfig, store: AliveStore) -> None:
+    """Process one item from ``value.statuses[]`` (sent/delivered/read/failed).
+
+    Never carries recipient numbers into the journal; records billable/category
+    telemetry and surfaces terminal restriction codes cleanly.
+    """
+    if not isinstance(status_obj, dict):
+        return
+    wamid = str(status_obj.get("id") or "").strip()
+    state = str(status_obj.get("status") or "").strip().lower()
+    if not wamid or not state:
+        return
+    ts_iso = _iso_from_meta_ts(status_obj.get("timestamp"))
+    pricing = status_obj.get("pricing") if isinstance(status_obj.get("pricing"), dict) else {}
+    billable = pricing.get("billable") if isinstance(pricing.get("billable"), bool) else None
+    category = str(pricing.get("category") or "") or None
+    errors = status_obj.get("errors") if isinstance(status_obj.get("errors"), list) else []
+    error_code = None
+    if errors and isinstance(errors[0], dict):
+        raw_code = errors[0].get("code")
+        if isinstance(raw_code, int):
+            error_code = raw_code
+    store.record_delivery_status(
+        wamid, state, ts=ts_iso, billable=billable, category=category, error_code=error_code)
+    if state == "failed":
+        log_event(
+            config.state_dir,
+            "wa_delivery_failed",
+            level="warn",
+            wamid=wamid,
+            error_code=error_code,
+        )
+        if error_code in PLATFORM_BLOCKED_CODES:
+            store.kv_set("platform_blocked", "1")
+            log_event(
+                config.state_dir,
+                "platform_blocked",
+                level="error",
+                detail=f"async status failed with code={error_code}",
+            )
+    else:
+        log_event(
+            config.state_dir,
+            "wa_delivery_status",
+            wamid=wamid,
+            status=state,
+            billable=billable,
+            category=category,
+        )
+
+
 def _handle_message(*, message: dict, config, store, backend, transport,
                     now: datetime) -> dict:
     """One inbound message → one decision. Raises nothing the caller can't
     turn into a 5xx-or-200 policy outcome."""
-    sender = str(message.get("from", "")).strip()
+    raw_sender = str(message.get("from", "")).strip()
     message_id = str(message.get("id", "")).strip()
-    if not sender or not message_id:
+    if not raw_sender or not message_id:
+        return {"outcome": "ignored_malformed"}
+    try:
+        sender = normalise_e164(raw_sender)
+    except AliveConfigError:
+        log_event(config.state_dir, "ignored_non_e164_sender", level="warn", wamid=message_id)
         return {"outcome": "ignored_malformed"}
 
     if not store.first_time_seen(message_id, now=now):
@@ -259,15 +350,20 @@ def _handle_message(*, message: dict, config, store, backend, transport,
 
     _check_clock_suspect(store, message.get("timestamp"), config, now)
     sent_at = _iso_from_meta_ts(message.get("timestamp"))
-
-    msg_type = message.get("type")
-    text_body = ""
-    if msg_type == "text":
-        text_body = str((message.get("text") or {}).get("body", ""))[:4000]
+    msg_type = str(message.get("type") or "unknown")
+    extracted_kind, text_body = _extract_inbound_text(message)
 
     t1_hashes = _cached_t1_hashes(config, store, backend, now)
     sender_hash = envelope_mod.from_hash(sender, config.from_hash_salt)
     tier = config.tier_for(sender, sender_hash=sender_hash, t1_hashes=t1_hashes)
+
+    # Record the sender's 24-hour customer service window from the verified
+    # inbound timestamp (bounded to `now` if Meta's clock slightly leads).
+    store.record_inbound_window(sender_hash, sent_at)
+
+    if extracted_kind is None:
+        log_event(config.state_dir, "reaction_ignored", tier=tier, wamid=message_id)
+        return {"outcome": "ignored_reaction", "tier": tier}
 
     # --- owner: instruction path -------------------------------------------
     if tier == "T0":
@@ -278,10 +374,11 @@ def _handle_message(*, message: dict, config, store, backend, transport,
                 store.kv_set("inbox_full_acked", now.strftime("%Y-%m-%d"))
                 _safe_service_reply(transport, sender,
                                     "I'm not able to take more right now. "
-                                    "I'll leave it with her.", config, store)
+                                    "I'll leave it with her.", config, store,
+                                    now=now, inbound_at=sent_at)
             log_event(config.state_dir, "owner_cap_reached", level="warn")
             return {"outcome": "capped", "tier": tier}
-        kind = "instruction" if msg_type == "text" else "unsupported"
+        kind = "instruction" if extracted_kind == "text" else "unsupported"
         body_text = text_body if kind == "instruction" else f"unsupported message type: {msg_type}"
         envelope, _name, _data = _make_and_store_envelope(
             config=config, store=store, backend=backend, kind=kind,
@@ -289,11 +386,13 @@ def _handle_message(*, message: dict, config, store, backend, transport,
             body_text=body_text, now=now,
             suspected=suspected_injection(text_body) if text_body else False)
         if kind == "instruction":
-            _safe_service_reply(transport, sender, _ack_text(envelope, config), config, store)
+            _safe_service_reply(transport, sender, _ack_text(envelope, config), config, store,
+                                now=now, inbound_at=sent_at)
         else:
             _safe_service_reply(transport, sender,
                                 "I can't take files, voice notes or locations on "
-                                "this line — text only.", config, store)
+                                "this line — text only.", config, store,
+                                now=now, inbound_at=sent_at)
         log_event(config.state_dir, "instruction_queued", tier=tier,
                   seq=envelope["seq"], suspected=envelope.get("suspected_injection"))
         return {"outcome": "queued", "tier": tier, "seq": envelope["seq"]}
@@ -304,7 +403,8 @@ def _handle_message(*, message: dict, config, store, backend, transport,
     if sender_day > config.stranger_turns_per_day_per_sender:
         store.increment("not_stored", tier="T2", now=now)
         _safe_service_reply(transport, sender,
-                            "I'll leave this with her.", config, store)
+                            "I'll leave this with her.", config, store,
+                            now=now, inbound_at=sent_at)
         log_event(config.state_dir, "stranger_cap_reached", sender_hash=sender_hash[:16])
         return {"outcome": "capped", "tier": tier}
 
@@ -313,11 +413,12 @@ def _handle_message(*, message: dict, config, store, backend, transport,
         log_event(config.state_dir, "month_cap_reached", level="warn")
         _safe_service_reply(transport, sender,
                             "I'm not able to take more right now. "
-                            "I'll leave it with her.", config, store)
+                            "I'll leave it with her.", config, store,
+                            now=now, inbound_at=sent_at)
         return {"outcome": "capped", "tier": tier}
 
     concierge = S0Concierge(store, config)
-    if msg_type != "text":
+    if extracted_kind != "text":
         kind = "unsupported"
         body_text = f"unsupported message type: {msg_type}"
         outcome = None
@@ -348,16 +449,30 @@ def _handle_message(*, message: dict, config, store, backend, transport,
 
     reply = outcome.reply if outcome is not None else (
         "I can't take files, voice notes or locations on this line — text only.")
-    _safe_service_reply(transport, sender, reply, config, store)
+    _safe_service_reply(transport, sender, reply, config, store,
+                        now=now, inbound_at=sent_at)
     log_event(config.state_dir, "stranger_turn", tier=tier, seq=envelope["seq"],
               kind=kind, never_list=extra.get("never_list_category"))
     return {"outcome": kind, "tier": tier, "seq": envelope["seq"]}
 
 
-def _safe_service_reply(transport, to: str, text: str, config, store=None) -> None:
-    """Acks/replies are best-effort and journaled; never fatal, never retried."""
+def _safe_service_reply(transport, to: str, text: str, config, store=None, *,
+                        now: datetime | None = None,
+                        inbound_at: str | None = None) -> None:
+    """Acks/replies are best-effort and journaled; never fatal, never retried.
+
+    If a webhook was delayed by >24h before reaching us, ``OutsideServiceWindow``
+    fires cleanly: we keep the queued envelope and skip the expired free-form
+    ack rather than attempting a cold free-form send.
+    """
     try:
-        transport.send_service_reply(to, text)
+        try:
+            transport.send_service_reply(to, text, now=now, inbound_at=inbound_at)
+        except TypeError:
+            # Backwards compatibility for minimal custom test stubs with 2-arg signature
+            transport.send_service_reply(to, text)
+    except OutsideServiceWindow as exc:
+        log_event(config.state_dir, "reply_window_expired", level="warn", detail=str(exc))
     except PlatformBlocked as exc:
         log_event(config.state_dir, "platform_blocked", level="error", detail=str(exc))
         if store is not None:
@@ -421,19 +536,57 @@ def handle_request(method: str, headers: dict, raw_body: bytes, *,
         log_event(config.state_dir, "unparseable_body", level="warn")
         return 400, b"bad request"
 
-    entries = payload.get("entry", []) if isinstance(payload, dict) else []
+    if not isinstance(payload, dict) or payload.get("object") != "whatsapp_business_account":
+        log_event(config.state_dir, "ignored_non_waba_object", level="warn")
+        return 200, b"EVENT_RECEIVED"
+
+    entries = payload.get("entry") if isinstance(payload.get("entry"), list) else []
     outcomes = []
     for entry in entries:
-        for change in entry.get("changes", []):
-            value = change.get("value", {}) if isinstance(change, dict) else {}
-            profile_name = ""
-            for contact in value.get("contacts", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        changes = entry.get("changes") if isinstance(entry.get("changes"), list) else []
+        for change in changes:
+            if not isinstance(change, dict) or change.get("field") != "messages":
+                continue
+            value = change.get("value", {}) if isinstance(change.get("value"), dict) else {}
+            metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
+            incoming_phone_id = str(metadata.get("phone_number_id") or "").strip()
+            if (
+                config.wa_phone_number_id
+                and incoming_phone_id
+                and incoming_phone_id != config.wa_phone_number_id
+            ):
+                log_event(
+                    config.state_dir,
+                    "ignored_wrong_phone_number_id",
+                    level="warn",
+                    incoming_phone_number_id=incoming_phone_id,
+                )
+                continue
+
+            for status_obj in value.get("statuses") or []:
+                _handle_status(status_obj=status_obj, config=config, store=store)
+
+            # Map wa_id -> profile.name so multi-contact batches never mis-attribute names
+            profile_by_waid: dict[str, str] = {}
+            fallback_profile = ""
+            for contact in value.get("contacts") or []:
                 if isinstance(contact, dict):
-                    profile_name = str((contact.get("profile") or {}).get("name", ""))
-                    break
-            for message in value.get("messages", []):
-                if isinstance(message, dict) and profile_name:
-                    message = {**message, "_profile_name": profile_name}
+                    pname = str((contact.get("profile") or {}).get("name", ""))
+                    c_waid = str(contact.get("wa_id") or "").strip().lstrip("+")
+                    if c_waid and pname:
+                        profile_by_waid[c_waid] = pname
+                    if pname and not fallback_profile:
+                        fallback_profile = pname
+
+            for message in value.get("messages") or []:
+                if not isinstance(message, dict):
+                    continue
+                sender_digits = str(message.get("from") or "").strip().lstrip("+")
+                pname = profile_by_waid.get(sender_digits, fallback_profile)
+                if pname:
+                    message = {**message, "_profile_name": pname}
                 try:
                     outcome = _handle_message(message=message, config=config,
                                               store=store, backend=backend,
