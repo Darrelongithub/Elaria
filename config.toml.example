@@ -499,7 +499,33 @@ drill_read_data_subset_mb = 500
 # Read-only discovery roots (decoupled from [[organise.roots]] folder moving).
 # Opt-in: empty by default. Protected paths stay untouchable either way.
 [discovery]
+# GAP-2: read-only discovery roots — where "find / locate" may look. Nothing
+# under a discovery root is ever moved, written or deleted by discovery.
+# Decoupled from [[organise.roots]] (folder-moving) on purpose. Protected
+# paths ([policy] protected) stay untouched even when they sit inside a root.
 roots = []
+# Inspect archives by manifest (central directory / tar headers) so files
+# inside .zip/.tar bundles are findable WITHOUT extracting anything.
+include_archives = true
+# Total walk caps: a broad root stops honestly instead of walking forever.
+max_entries = 50000
+max_depth = 32
+# Let a plain search also consult the local index (paths that were indexed).
+search_index = true
+
+[stream]
+# GAP-3: bounded streaming reads. byte_budget = most any single read may pull
+# into memory; the >200 KB silent truncation is gone — readers page whole
+# records and say when they stopped.
+byte_budget = 65536
+record_limit = 200
+max_bytes_per_file = 8388608
+# Credential-shaped fields (password/token/api_key/...) are masked in
+# structural previews and streamed records unless the owner opts out.
+redact_sensitive = true
+# Indexing still caps extraction, but now records truncated = 1 and the real
+# extractor name instead of silently reporting a cut file as complete.
+index_max_extract_chars = 200000
 
 # Bounded async read-errand runner (GAP-1). Cheapest-first under [quota].
 [errand]

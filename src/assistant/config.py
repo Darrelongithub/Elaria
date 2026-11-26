@@ -12,6 +12,7 @@ config.toml (Step 1). Only its presence and file permissions are reported.
 
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -734,7 +735,30 @@ DEFAULTS: dict = {
     # moving [[organise.roots]]). Default empty: nothing is walked until the
     # owner names a root. Protected paths (§4.1) stay untouchable either way.
     "discovery": {
+        # GAP-2: read-only roots. Nothing here is ever moved, written or
+        # deleted by discovery; it only decides where "find X" may look.
         "roots": [],
+        # Archives are inspected by manifest (member names/sizes), never
+        # extracted. Off = files inside bundles are not discoverable.
+        "include_archives": True,
+        # Total walk caps (I3): a broad root degrades honestly instead of
+        # walking forever.
+        "max_entries": 50_000,
+        "max_depth": 32,
+        # Where a plain `assist find` looks when no root is configured.
+        "search_index": True,
+    },
+    "stream": {
+        # GAP-3: bounded streaming reads. `byte_budget` is the most any one
+        # read may pull into memory; `max_bytes_per_file` caps a whole errand's
+        # spend on one file so a 5 GB export cannot eat the step budget.
+        "byte_budget": 65_536,
+        "record_limit": 200,
+        "max_bytes_per_file": 8_388_608,
+        "redact_sensitive": True,
+        # The indexing cliff that used to be silent: extraction now records
+        # `truncated=1` past this many characters instead of lying.
+        "index_max_extract_chars": 200_000,
     },
     # Bounded async read-errand runner (GAP-1). Every cap is total (I3),
     # cheapest-first under [quota] (flash-lite default; flash escalation off
@@ -910,6 +934,52 @@ class Config:
                 seen.add(expanded)
                 roots.append({"path": expanded, "source": "organise"})
         return roots
+
+    def discovery_policy_kwargs(self) -> dict:
+        """`[discovery]` as validated counts for `discovery.Policy` (GAP-2).
+
+        Hostile values (negative, non-numeric, bool, NaN/inf) fall back to the
+        shipped defaults instead of crashing a read-only walk (I3): a discovery
+        request must never fail because of a bad number in a TOML file.
+        """
+        section = self.section("discovery")
+
+        def _positive_int(key: str, default: int, *, minimum: int = 1) -> int:
+            value = section.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return default
+            if not math.isfinite(value):
+                return default
+            return max(minimum, int(value))
+
+        return {
+            "include_archives": section.get("include_archives", True) is not False,
+            "max_entries": _positive_int("max_entries", 50_000, minimum=1),
+            "max_depth": _positive_int("max_depth", 32, minimum=1),
+            "search_index": section.get("search_index", True) is not False,
+        }
+
+    def stream_limits(self) -> dict:
+        """`[stream]` as validated read limits (GAP-3, Invariant I3)."""
+        section = self.section("stream")
+
+        def _positive_int(key: str, default: int, *, minimum: int) -> int:
+            value = section.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return default
+            if not math.isfinite(value):
+                return default
+            return max(minimum, int(value))
+
+        return {
+            "byte_budget": _positive_int("byte_budget", 65_536, minimum=256),
+            "record_limit": _positive_int("record_limit", 200, minimum=1),
+            "max_bytes_per_file": _positive_int(
+                "max_bytes_per_file", 8_388_608, minimum=1024),
+            "redact_sensitive": section.get("redact_sensitive", True) is not False,
+            "index_max_extract_chars": _positive_int(
+                "index_max_extract_chars", 200_000, minimum=1024),
+        }
 
     # -- paths -------------------------------------------------------------
     @property

@@ -17,6 +17,7 @@ else no-text (counted, honest). Images contribute metadata only — OCR/
 vision happens only when asked and costs quota (§3.7), so not here.
 """
 
+# ruff: noqa: B023 -- XML callbacks and chunk generators are consumed synchronously in-loop.
 from __future__ import annotations
 
 import codecs
@@ -25,11 +26,11 @@ import io
 import mimetypes
 import os
 import re
-import shutil
 import selectors
-import time
+import shutil
 import stat as stat_mod
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
@@ -250,6 +251,63 @@ def extract_text(path: Path, max_chars: int = 200_000) -> tuple[str, str]:
     return "", "no-text"  # binaries/images: metadata only (vision is opt-in)
 
 
+def extract_with_provenance(path: Path, max_chars: int = 200_000) -> dict:
+    """Bound indexed text while recording every cap/error; full reads use streamread."""
+    from .streamread import StreamError, detect_format, iter_batches
+
+    cap = max(1, int(max_chars))
+    fmt = detect_format(str(path))
+    parts = []
+    count = 0
+    truncated = False
+    error = None
+    extractor = fmt
+    try:
+        if path.suffix.lower() in TEXT_EXTENSIONS and fmt not in (
+                "json", "jsonl", "csv", "tsv"):
+            # Read characters, not bytes: UTF-8 boundaries remain intact.
+            with path.open(encoding="utf-8", errors="strict") as stream:
+                text = stream.read(cap + 1)
+            truncated = len(text) > cap
+            parts = [text[:cap]]
+        elif fmt in ("json", "jsonl", "ndjson", "csv", "tsv", "sqlite",
+                     "docx", "xlsx", "pptx", "odt"):
+            for batch in iter_batches(path, byte_budget=65536, record_limit=200):
+                for record in batch.records:
+                    if record.get("parse_error"):
+                        raise StreamError("parse", record["parse_error"], target=str(path))
+                    if "fields" in record:
+                        rendered = str(record["fields"])
+                    elif "value" in record:
+                        import json
+
+                        value = ({record["key"]: record["value"]}
+                                 if record.get("kind") == "field" else record["value"])
+                        rendered = json.dumps(value, ensure_ascii=False)
+                    else:
+                        rendered = str(record.get("text", ""))
+                    remaining = cap - count
+                    piece = rendered[:remaining]
+                    parts.append(piece)
+                    count += len(piece) + 1
+                    if len(rendered) > remaining or count >= cap:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+        else:
+            text, extractor = extract_text(path, cap + 1)
+            truncated = len(text) > cap
+            parts = [text[:cap]]
+            if extractor.startswith("error:"):
+                error = extractor
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    text = "\n".join(parts)[:cap]
+    return {"text": text, "extractor": extractor, "extracted_chars": len(text),
+            "truncated": truncated, "parse_error": error}
+
+
 class Indexer:
     def __init__(self, config, store):
         self.config = config
@@ -351,6 +409,7 @@ class Indexer:
             existing = self.store.document_by_path(str(path))
             if (existing and existing["status"] == "indexed"
                     and existing.get("extraction_version", 0) == 1
+                    and existing.get("extractor") is not None
                     and existing["size"] == stat.st_size
                     and abs(existing["mtime"] - stat.st_mtime) < 1e-6):
                 if int(existing["never_send"]) != int(never_send):
@@ -364,6 +423,11 @@ class Indexer:
                 continue
             try:
                 data_hash = self._hash_large(path)
+                if path.suffix.lower() in (".json", ".jsonl", ".ndjson", ".csv", ".tsv"):
+                    from .structured_reader import validate
+
+                    validate(str(path), protected=self.protected,
+                             never_send_roots=self.never_send_roots)
                 if path.suffix.lower() in TEXT_EXTENSIONS:
                     extractor = "text-stream"
                     def chunks():
@@ -404,7 +468,7 @@ class Indexer:
                     size=stat.st_size, mtime=stat.st_mtime,
                     mime=mimetypes.guess_type(path.name)[0], ext=path.suffix.lower(),
                     indexed_ts=iso_now(), never_send=int(never_send),
-                    text_chunks=text_chunks)
+                    text_chunks=text_chunks, extractor=extractor)
             except (OSError, ValueError, zipfile.BadZipFile, ElementTree.ParseError, expat.ExpatError, subprocess.SubprocessError) as exc:
                 self.store.mark_document_error(
                     str(path), f"{type(exc).__name__}: {exc}", root=str(root),
