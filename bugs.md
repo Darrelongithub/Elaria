@@ -61,6 +61,12 @@ rebinding window (validation vs connect-time resolve) · S-C4
 alive receipt bookkeeping gap · S-C5 backup purge target when
 `trashed_as` missing. Rule on S-C1/S-C2 when fixing the C lane.
 
+## Hardware-found (owner laptop, 2026-11-26 — first real-hardware entries)
+
+| ID | Where | Failure | Status |
+|---|---|---|---|
+| BUG-HW1 | `capture.py` (`PipeWireCapture` / `pw_record_pcm_stream_command`) | Daemon-captured audio is explosive static on owner hardware while manual `pw-record` from the SAME node (`--rate 16000 --channels 1`, WAV) is clean. Daemon path: `pw-record --target=<node.name> --rate 16000 --channels 1 --format s16 -` raw PCM via stdout. Evidence (owner's machine, files kept): `~/.local/share/assistant/audio/20261126-165648-0f964a.wav` (raw_peak 1.0, 4.6% limited, ASR empty on all backends) and `20261126-171509-974193.wav` (owner: "mad explosion, static"); clean control: owner's `/tmp/same-node.wav`. Secondary symptom: repeated 0-byte captures (first-frame latency ~1.5s). Suspects: stream format/rate actually delivered vs assumed s16le-16k-mono, stdout pipe framing, target resolution, processing before WavSink. Thresholds are NOT suspects and stay frozen. | OPEN → FIX-HW1 |
+
 ## Hunt scoreboard
 
 30 reproduced bugs (5 P0 · 19 P1 · 6 P2… see tables) + 13
