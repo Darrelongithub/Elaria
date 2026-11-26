@@ -225,6 +225,26 @@ def _default_journal_fn() -> Callable[..., Any] | None:
 
 
 class Memory:
+    @staticmethod
+    def claim_hash(kind: str, text: str) -> str:
+        """Stable tombstone key for an inferred claim.
+
+        Shared by `propose_inferred` and `reject_inference` so a rejection is
+        written and read under exactly the same key — never recomputed ad hoc.
+        """
+        normalized = " ".join(str(text).lower().split())
+        return hashlib.sha256(f"{str(kind).lower()}:{normalized}".encode()).hexdigest()
+
+    def is_claim_rejected(self, kind: str, text: str) -> bool:
+        """True when the owner tombstoned this inferred claim (BUG-A1)."""
+        check = getattr(self.store, "is_fact_claim_rejected", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(check(self.claim_hash(kind, text)))
+        except Exception:
+            return False
+
     def __init__(
         self,
         store,
@@ -310,7 +330,7 @@ class Memory:
         digest = str(doc_sha256 or "").strip().lower()
         if not claim or not citation or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("inference requires text, evidence, and a SHA-256 document hash")
-        claim_hash = hashlib.sha256(f"{kind.lower()}:{' '.join(claim.lower().split())}".encode()).hexdigest()
+        claim_hash = self.claim_hash(kind, claim)
         if hasattr(self.store, "is_fact_claim_rejected") and self.store.is_fact_claim_rejected(claim_hash):
             return None
         existing = self.store.list_facts(active_only=True)
@@ -329,9 +349,7 @@ class Memory:
         row = next((r for r in rows if int(r["id"]) == int(fact_id)), None)
         if row is None or row.get("source") != "inferred":
             return False
-        claim_hash = hashlib.sha256(
-            f"{row['kind'].lower()}:{' '.join(row['text'].lower().split())}".encode()
-        ).hexdigest()
+        claim_hash = self.claim_hash(row["kind"], row["text"])
         if hasattr(self.store, "reject_fact_claim"):
             self.store.reject_fact_claim(fact_hash=claim_hash, kind=row["kind"],
                                          ts=iso_now(), evidence=row.get("evidence"))

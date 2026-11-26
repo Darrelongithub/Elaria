@@ -337,6 +337,7 @@ CREATE TABLE IF NOT EXISTS pending_questions (
   options_json TEXT NOT NULL DEFAULT '[]',
   candidate_fact_ids_json TEXT NOT NULL DEFAULT '[]',
   evidence_ref TEXT,
+  attribute TEXT,                            -- BUG-A1: gap/conflict attribute key, when known
   status TEXT NOT NULL DEFAULT 'pending',  -- pending|confirmed|amended|rejected|answered|cancelled
   answer_text TEXT,
   resolved_ts TEXT,
@@ -421,6 +422,14 @@ class Store:
                 self._conn.execute(
                     "ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL "
                     "DEFAULT 'voice'")
+            # BUG-A1 migration: gap/conflict questions remember their attribute
+            # key so an owner answer can create a fact for exactly that gap.
+            question_columns = {
+                r[1] for r in self._conn.execute("PRAGMA table_info(pending_questions)")
+            }
+            if "attribute" not in question_columns:
+                self._conn.execute(
+                    "ALTER TABLE pending_questions ADD COLUMN attribute TEXT")
             self.fts5_available = self._init_fts5()
             self._conn.commit()
 
@@ -1655,17 +1664,19 @@ class Store:
                                 question: str, kind: str = "clarify",
                                 options_json: str = "[]",
                                 candidate_fact_ids_json: str = "[]",
-                                evidence_ref: str | None = None) -> int:
+                                evidence_ref: str | None = None,
+                                attribute: str | None = None) -> int:
         if not str(question or "").strip():
             raise ValueError("pending question text must be non-empty")
         with self._lock:
             cur = self._conn.execute(
                 """INSERT INTO pending_questions
                    (errand_id, ts, kind, question, options_json,
-                    candidate_fact_ids_json, evidence_ref, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')""",
+                    candidate_fact_ids_json, evidence_ref, attribute, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
                 (int(errand_id), ts, kind, question.strip(), options_json,
-                 candidate_fact_ids_json, evidence_ref),
+                 candidate_fact_ids_json, evidence_ref,
+                 (str(attribute).strip() or None) if attribute is not None else None),
             )
             self._conn.commit()
             return int(cur.lastrowid)
