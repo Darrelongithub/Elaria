@@ -23,10 +23,14 @@ from .safety import check_blast_radius
 
 
 class OrganiserService:
-    def __init__(self, config, store, client=None, memory=None):
+    def __init__(self, config, store, client=None, memory=None, router=None):
         self.config = config
         self.store = store
-        self.client = client  # enables Tier 1/2 when asked (Phase 4)
+        # `client` is accepted for call-site compatibility and ignored for the
+        # LLM tiers (BUILD-9S: they route through ProviderRouter.material()).
+        self.client = client
+        # Optional injected router (tests); production builds one per plan run.
+        self.router = router
         # B's Memory (read-only consumer): Tier 1/2 hints come from the owner's
         # own prior placements when a memory is wired (build order 4). The
         # daemon passes it via HR-C-1; with memory=None the tiers run exactly
@@ -95,11 +99,12 @@ class OrganiserService:
                 items.append(proposal.as_item())
             api_calls_before = self.store.llm_summary()["calls"]
             if with_llm_tiers:
-                if self.client is None:
-                    raise ValueError("Tier 1/2 requested but no Gemini client wired")
                 from .planner_llm import LlmPlanner
+                from .provider_router import ProviderRouter
 
-                LlmPlanner(self.config, self.store, self.client,
+                router = self.router if self.router is not None else ProviderRouter(
+                    self.config, self.store)
+                LlmPlanner(self.config, self.store, router,
                            recall=getattr(self.memory, "recall", None)) \
                     .classify_abstained(items, taxonomy)
                 if progress:

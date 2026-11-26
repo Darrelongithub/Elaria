@@ -270,7 +270,15 @@ class LedgerWriteError(RuntimeError):
 
 @dataclass(frozen=True)
 class ProviderModelCap:
-    """Positive caps only. `None` means unknown/unavailable, never unlimited."""
+    """Positive caps only. `None` means unknown/unavailable, never unlimited.
+
+    Cloudflare Workers AI bills in *neurons*, not requests: a row for that
+    provider carries `neurons_per_day` (the account's free daily allocation
+    devoted to this model) and `neurons_per_request` (the per-call estimate
+    the router reserves atomically before dispatch). Those two keys are NEVER
+    interpreted as `rpd` — converting neuron budgets into request counts
+    silently would understate spend and overstate availability.
+    """
 
     rpm: int | None = None
     tpm: int | None = None
@@ -278,10 +286,20 @@ class ProviderModelCap:
     tpd: int | None = None
     billing_unit: str = ""
     reset_tz: str = "UTC"
+    neurons_per_day: int | float | None = None
+    neurons_per_request: int | float | None = None
 
     def cap(self, unit: str) -> int | None:
         value = getattr(self, unit, None)
         return value if isinstance(value, (int, float)) and value > 0 else None
+
+    def neuron_day_cap(self) -> float | None:
+        value = self.neurons_per_day
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else None
+
+    def neuron_cost(self) -> float | None:
+        value = self.neurons_per_request
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else None
 
 
 @dataclass(frozen=True)
@@ -325,7 +343,9 @@ class ProviderQuotaRow:
             "runnable": self.runnable,
             "models": {name: {"rpm": cap.rpm, "tpm": cap.tpm, "rpd": cap.rpd,
                               "tpd": cap.tpd, "billing_unit": cap.billing_unit,
-                              "reset_tz": cap.reset_tz}
+                              "reset_tz": cap.reset_tz,
+                              "neurons_per_day": cap.neurons_per_day,
+                              "neurons_per_request": cap.neurons_per_request}
                        for name, cap in self.models.items()},
         }
 
@@ -334,6 +354,7 @@ _BOOL_KEYS = ("enabled", "verified", "no_card_required")
 _TEXT_KEYS = ("verified_at", "verified_source", "plan", "terms_reviewed_at",
               "data_use_policy")
 _CAP_KEYS = ("rpm", "tpm", "rpd", "tpd")
+_NEURON_KEYS = ("neurons_per_day", "neurons_per_request")
 
 
 def _positive_cap(value, label: str, errors: list[str]) -> int | None:
@@ -403,18 +424,23 @@ def parse_provider_quota_rows(quota: dict) -> tuple[dict[str, ProviderQuotaRow],
             if not isinstance(model_raw, dict):
                 local_errors.append(f"{mlabel} must be a table")
                 continue
-            m_unknown = set(model_raw) - (set(_CAP_KEYS) | {"billing_unit", "reset_tz"})
+            m_unknown = set(model_raw) - (set(_CAP_KEYS) | set(_NEURON_KEYS)
+                                          | {"billing_unit", "reset_tz"})
             if m_unknown:
                 local_errors.append(f"{mlabel} unknown keys: {', '.join(sorted(m_unknown))}")
             caps = {key: _positive_cap(model_raw.get(key), f"{mlabel}.{key}", local_errors)
                     for key in _CAP_KEYS}
+            neurons = {key: _positive_cap(model_raw.get(key), f"{mlabel}.{key}", local_errors)
+                       for key in _NEURON_KEYS}
             billing_unit = model_raw.get("billing_unit", "")
             reset_tz = model_raw.get("reset_tz", "UTC")
             if not isinstance(billing_unit, str) or not isinstance(reset_tz, str):
                 local_errors.append(f"{mlabel} billing_unit/reset_tz must be strings")
                 billing_unit, reset_tz = "", "UTC"
             models[str(model_name)] = ProviderModelCap(
-                **caps, billing_unit=billing_unit.strip(), reset_tz=reset_tz.strip() or "UTC")
+                **caps, billing_unit=billing_unit.strip(), reset_tz=reset_tz.strip() or "UTC",
+                neurons_per_day=neurons["neurons_per_day"],
+                neurons_per_request=neurons["neurons_per_request"])
         errors.extend(local_errors)
         row = ProviderQuotaRow(
             provider=provider, enabled=flags["enabled"], verified=flags["verified"],
@@ -562,8 +588,8 @@ def provider_cost_report(store, since_iso: str | None = None) -> dict:
     }
 
 
-def format_provider_report(report: dict) -> str:
-    lines = ["Per-provider ledger (shadow USD, not billing):"]
+def format_provider_report(report: dict, title: str ="Per-provider ledger (shadow USD, not billing):") -> str:
+    lines = [title]
     if not report["rows"]:
         lines.append("  no provider calls recorded")
     for row in report["rows"]:
@@ -577,4 +603,32 @@ def format_provider_report(report: dict) -> str:
             f"  {row['provider']} · {row['purpose']} · {row['capability']} · {row['model']}: "
             f"{row['calls']} call(s), {row['tokens']} tokens, "
             f"${row['shadow_usd']:.4f} shadow, {row['failures']} failure(s){suffix}")
+    return "\n".join(lines)
+
+
+def format_ladder_status(ladder: dict) -> str:
+    """One honest owner-facing block: current degradation rung and why.
+
+    The ladder is `ProviderRouter.ladder_state()` output; this only renders
+    it — the rung is computed from the same caps/buckets that gate dispatch,
+    so the line can never disagree with what the router will actually do.
+    """
+    level = ladder.get("level", "?")
+    reason = ladder.get("reason", "no reason recorded")
+    flash = "available" if ladder.get("gemini_flash") else "exhausted/cooldown"
+    lite = "available" if ladder.get("gemini_flash_lite") else "exhausted/cooldown"
+    diverted = bool(ladder.get("material_diverted"))
+    caps = ladder.get("caps") or {}
+    lines = [
+        f"Degradation ladder: {level} — {reason}",
+        f"  pinned Gemini flash (escalation, cap {caps.get('flash')}): {flash}",
+        f"  pinned Gemini flash-lite (workhorse, cap {caps.get('flash_lite')}): {lite}",
+        "  diverted material providers (verified + enabled + adapter): "
+        + ("available" if diverted else "none — all diverted lanes disabled"),
+    ]
+    buckets = ladder.get("buckets") or {}
+    cooling = [f"{key} until {value.get('cooldown_until', 0):.0f}"
+               for key, value in buckets.items() if value.get("in_cooldown")]
+    if cooling:
+        lines.append("  cooldowns in force: " + ", ".join(sorted(cooling)))
     return "\n".join(lines)

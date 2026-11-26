@@ -12,24 +12,27 @@ from .contract import (
 )
 from .egress import RateLimiter, RobotsCache, fetch, plain_outcome_message
 from .observe import reconcile_outstanding
+from .summarise import ReachSummariser, summarisation_settings
 from .surface import InterestingnessGate
 
 __all__ = [
-    "AccountRegistry",
     "CHANNELS_V0",
-    "ChannelSpec",
-    "FetchedDoc",
-    "FetchResult",
-    "InterestingnessGate",
     "REACH_ALLOWED_ORIGINS",
+    "AccountRegistry",
+    "ChannelSpec",
+    "FetchResult",
+    "FetchedDoc",
+    "InterestingnessGate",
     "RateLimiter",
     "ReachAccount",
     "ReachConfig",
     "ReachError",
+    "ReachSummariser",
     "RobotsCache",
     "TerminalOutcome",
     "fetch",
     "plain_outcome_message",
     "reconcile_outstanding",
+    "summarisation_settings",
     "validate_url",
 ]
