@@ -307,6 +307,24 @@ DEFAULTS: dict = {
             "rpd_cap": 30,
             "timeout_s": 4.0,
         },
+        "providers": {
+            "groq": {
+                "enabled": False,
+                "verified": False,
+                "verified_at": "",
+                "verified_source": "",
+                "plan": "",
+                "no_card_required": False,
+                "terms_reviewed_at": "",
+                "data_use_policy": "",
+                "models": {
+                    "openai/gpt-oss-20b": {
+                        "rpm": 30, "tpm": 8000, "rpd": 100,
+                        "billing_unit": "requests_tokens",
+                    },
+                },
+            },
+        },
         # Flat aliases remain readable by older code/configs and by the client's
         # limiter. `0` means "not rate-limited" (Transcribe Live).
         "flash_rpm": 5,
@@ -648,6 +666,8 @@ DEFAULTS: dict = {
     },
     "organise": {
         "mode": "shadow",
+        "material_provider": "",
+        "material_model": "",
         "confidence_auto": 0.90,
         "confidence_review": 0.60,
         "tier0_min_confidence": 0.85,  # below: would escalate to LLM tiers (§3.7)
@@ -795,6 +815,9 @@ DEFAULTS: dict = {
         "robots_cache_ttl_s": 86_400.0,
         "user_agent_contact": "elaria-reach@local",
         "offline": False,
+        "summarise_provider": "",
+        "summarise_model": "",
+        "summarise_rpd_budget": 0,
     },
     # On-demand phone link via the pinned caelestia-connect sidecar (IF-3
     # owner amendment). Disabled by default. Connect per owner interaction,

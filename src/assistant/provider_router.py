@@ -319,6 +319,9 @@ class HttpMaterialAdapter:
     def supports(self, capability: Capability) -> bool:
         return capability is Capability.MATERIAL
 
+    def credentials_ready(self) -> bool:
+        return bool(os.environ.get(self.KEY_ENV[self.provider_id], "").strip())
+
     def generate(self, req: ProviderRequest) -> ProviderResult:
         assert_model_permitted(
             req.model, provider=self.provider_id, role=req.role,
@@ -403,6 +406,11 @@ class CloudflareMaterialAdapter:
 
     def supports(self, capability: Capability) -> bool:
         return capability is Capability.MATERIAL
+
+    def credentials_ready(self) -> bool:
+        account = os.environ.get(self.ACCOUNT_ENV, "").strip()
+        token = os.environ.get(self.TOKEN_ENV, "").strip()
+        return bool(account and self._ACCOUNT_RE.fullmatch(account) and token)
 
     def generate(self, req: ProviderRequest) -> ProviderResult:
         assert_model_permitted(
@@ -725,11 +733,30 @@ class ProviderRouter:
             if name == PERSONALITY_PROVIDER or not row.runnable:
                 continue
             try:
-                self.adapters.get(name, Capability.MATERIAL)
+                adapter = self.adapters.get(name, Capability.MATERIAL)
             except ProviderRoutingError:
                 continue
-            diverted = True
-            break
+            credential_check = getattr(adapter, "credentials_ready", None)
+            if callable(credential_check) and not credential_check():
+                continue
+            for model, model_cap in row.models.items():
+                if name == "cloudflare":
+                    daily_cap = model_cap.neuron_day_cap()
+                    unit_cost = model_cap.neuron_cost()
+                    if daily_cap is None or unit_cost is None:
+                        continue
+                else:
+                    daily_cap = model_cap.cap("rpd")
+                    unit_cost = 1.0
+                    if daily_cap is None:
+                        continue
+                bucket = QuotaState.bucket(name, model, now)
+                entry = snapshot.get(bucket, {"used": 0, "in_cooldown": False})
+                if not entry["in_cooldown"] and entry["used"] + unit_cost <= daily_cap:
+                    diverted = True
+                    break
+            if diverted:
+                break
         flash_used = snapshot.get(
             QuotaState.bucket(PERSONALITY_PROVIDER, ESCALATION, now), {}).get("used", 0.0)
         lite_used = snapshot.get(
@@ -936,6 +963,8 @@ class ProviderRouter:
                 "quota_bucket": bucket, "ts": iso_stamp(),
                 "billing_unit": result.billing_unit,
                 "billing_amount": result.billing_amount,
+                "tokens_in": int((result.usage or {}).get("tokens_in", 0)),
+                "tokens_out": int((result.usage or {}).get("tokens_out", 0)),
                 "reserved_cost": unit_cost,
             }, untrusted=True)
 
@@ -986,6 +1015,26 @@ class ProviderRouter:
         }
 
 
+def create_provider_router(config=None, store=None, *, adapters=(),
+                           state_path: str | os.PathLike | None = None,
+                           clock: Callable[[], float] | None = None) -> ProviderRouter:
+    """Build the production router with every code-owned material adapter.
+
+    Registration only makes a provider known to the ladder; dispatch remains
+    gated by the owner's verified quota row, positive model caps, and provider
+    credentials. Caller-supplied adapters are for separately code-owned roles
+    such as the pinned Gemini personality transport.
+    """
+    material_adapters = (
+        HttpMaterialAdapter("groq"),
+        HttpMaterialAdapter("openrouter"),
+        CloudflareMaterialAdapter(),
+    )
+    return ProviderRouter(
+        config, store, adapters=(*material_adapters, *tuple(adapters)),
+        state_path=state_path, clock=clock)
+
+
 def iso_stamp() -> str:
     from .cost import iso_now
 
@@ -1031,6 +1080,7 @@ def verbatim_overlap(material: str, answer: str) -> bool:
 __all__ = [
     "LOCAL_NOTICES",
     "PERSONALITY_PROVIDER",
+    "AdapterFailure",
     "AdapterRegistry",
     "CallbackAdapter",
     "Capability",
@@ -1051,6 +1101,7 @@ __all__ = [
     "QuotaState",
     "RateLimited",
     "RouteRefused",
+    "create_provider_router",
     "quiet",
     "speakable",
     "verbatim_overlap",

@@ -1673,11 +1673,17 @@ class ErrandRunner:
         pointer_provider: Callable[[], Any] | None = None,
         is_offline: Callable[[], bool] | None = None,
         web_fetch: Callable[..., Awaitable[Any]] | None = None,
+        router=None,
     ):
         self.config = config
         self.store = store
         self.memory = memory
         self.client = client
+        if router is None:
+            from .provider_router import create_provider_router
+
+            router = create_provider_router(config, store)
+        self.router = router
         self.safety_journal = safety_journal
         self._broadcast = broadcast
         self._pointer = pointer
@@ -2768,58 +2774,136 @@ class ErrandRunner:
                         det["structured_schema"] = structured_schema
                         llm_parsed: dict[str, Any] | None = None
                         purpose = f"errand:{errand_id}:step:{step_no}:content.analyze"
+                        organise = self.config.section("organise")
+                        material_provider = str(organise.get("material_provider") or "").strip()
+                        material_model = str(organise.get("material_model") or "").strip()
+                        has_material_route = bool(
+                            self.router is not None and material_provider and material_model)
                         can_call_llm = (
                             use_llm
-                            and self.client is not None
+                            and (self.client is not None or has_material_route)
                             and bool(cloud_safe_obs)
                             and budget.max_step_api_calls >= 1
                             and api_calls_used < budget.max_api_calls
                         )
                         if can_call_llm:
                             prompt = _fence_observations_for_prompt(instruction, cloud_safe_obs)
-                            max_att = (
-                                min(budget.max_step_api_calls, budget.max_api_calls - api_calls_used)
-                                if budget.allow_escalation
-                                else 1
-                            )
-                            # Cheapest-first under [quota]: role="organise" -> flash-lite.
-                            # With allow_escalation=False, max_attempts=1 guarantees 0 flash calls.
-                            try:
-                                if getattr(self.client, "supports_cancellable_async", False):
-                                    res = await self.client.generate_async(
-                                        "organise",
-                                        prompt,
-                                        purpose=purpose,
-                                        is_user_turn=False,
-                                        max_attempts=max_att,
-                                    )
-                                else:
-                                    res = await asyncio.to_thread(
-                                        self.client.generate,
-                                        "organise",
-                                        prompt,
-                                        purpose=purpose,
-                                        is_user_turn=False,
-                                        max_attempts=max_att,
-                                    )
-                                step_model = getattr(res, "model", None)
-                                llm_parsed = _parse_llm_analysis_json(
-                                    getattr(res, "text", ""), cloud_safe_obs
+                            if has_material_route:
+                                from .provider_router import (
+                                    AdapterFailure,
+                                    ProviderRoutingError,
+                                    RateLimited,
                                 )
-                            except Exception as llm_exc:
-                                unanswered_notes.append({
-                                    "reason": (
-                                        f"cloud analysis step degraded to local structural pass: "
-                                        f"{type(llm_exc).__name__}: {llm_exc}"
-                                    ),
-                                })
-                            usage = self.store.llm_usage_for_purpose(purpose)
-                            step_api_calls = usage["calls"]
-                            step_tokens_in = usage["tokens_in"]
-                            step_tokens_out = usage["tokens_out"]
-                            step_shadow_cost = usage["shadow_cost_usd"]
-                            step_model = usage["model"] or step_model
-                        elif use_llm and self.client is not None and cloud_safe_obs and (
+
+                                material_served = False
+                                try:
+                                    envelope = await self.router.material_async(
+                                        material_provider, material_model, purpose, prompt,
+                                        correlation_id=f"errand-{errand_id}-step-{step_no}",
+                                        mode=str(getattr(self.config, "gemini_mode", "mock")),
+                                    )
+                                    step_model = f"{envelope.provider}/{envelope.model}"
+                                    provenance = envelope.provenance or {}
+                                    step_tokens_in = int(provenance.get("tokens_in", 0) or 0)
+                                    step_tokens_out = int(provenance.get("tokens_out", 0) or 0)
+                                    step_api_calls = 1
+                                    llm_parsed = _parse_llm_analysis_json(
+                                        envelope.content, cloud_safe_obs)
+                                    material_served = True
+                                except ProviderRoutingError as route_exc:
+                                    # Owner ruling: material may fall back to the
+                                    # pinned Gemini flash-lite organiser role.
+                                    # The refusal is recorded with this step; no
+                                    # personality call is ever diverted.
+                                    unanswered_notes.append({
+                                        "reason": (
+                                            "material route unavailable: "
+                                            f"{type(route_exc).__name__}: "
+                                            f"{route_exc}"
+                                        ),
+                                    })
+                                    step_api_calls = 1 if isinstance(
+                                        route_exc, (RateLimited, AdapterFailure)) else 0
+                                if material_served:
+                                    pass
+                                elif (self.client is not None
+                                      and step_api_calls < budget.max_step_api_calls
+                                      and api_calls_used + step_api_calls < budget.max_api_calls):
+                                    max_att = 1  # fallback is pinned flash-lite only
+                                    try:
+                                        if getattr(self.client, "supports_cancellable_async", False):
+                                            res = await self.client.generate_async(
+                                                "organise", prompt, purpose=purpose,
+                                                is_user_turn=False, max_attempts=max_att)
+                                        else:
+                                            res = await asyncio.to_thread(
+                                                self.client.generate, "organise", prompt,
+                                                purpose=purpose, is_user_turn=False,
+                                                max_attempts=max_att)
+                                        from .model_registry import CHAT_INTENT
+                                        step_model = str(getattr(res, "model", None) or CHAT_INTENT)
+                                        llm_parsed = _parse_llm_analysis_json(
+                                            getattr(res, "text", ""), cloud_safe_obs)
+                                    except Exception as llm_exc:
+                                        unanswered_notes.append({
+                                            "reason": (
+                                                "Gemini flash-lite organise fallback failed: "
+                                                f"{type(llm_exc).__name__}: {llm_exc}"
+                                            ),
+                                        })
+                                    usage = self.store.llm_usage_for_purpose(purpose)
+                                    step_api_calls += usage["calls"]
+                                    step_tokens_in = usage["tokens_in"]
+                                    step_tokens_out = usage["tokens_out"]
+                                    step_shadow_cost = usage["shadow_cost_usd"]
+                                    # The Gemini fallback is deliberately pinned to
+                                    # the flash-lite organise role. A mixed-purpose
+                                    # ledger query may also contain the failed
+                                    # diverted leg, so never infer the serving model
+                                    # from MAX(model) in that aggregate.
+                                    from .model_registry import CHAT_INTENT
+                                    step_model = CHAT_INTENT
+                                else:
+                                    unanswered_notes.append({
+                                        "reason": (
+                                            "Gemini flash-lite organise fallback skipped: "
+                                            "errand API-call budget exhausted or no client"
+                                        ),
+                                    })
+                            else:
+                                max_att = (
+                                    min(budget.max_step_api_calls,
+                                        budget.max_api_calls - api_calls_used)
+                                    if budget.allow_escalation else 1
+                                )
+                                try:
+                                    if getattr(self.client, "supports_cancellable_async", False):
+                                        res = await self.client.generate_async(
+                                            "organise", prompt, purpose=purpose,
+                                            is_user_turn=False, max_attempts=max_att)
+                                    else:
+                                        res = await asyncio.to_thread(
+                                            self.client.generate, "organise", prompt,
+                                            purpose=purpose, is_user_turn=False,
+                                            max_attempts=max_att)
+                                    from .model_registry import CHAT_INTENT
+                                    step_model = str(getattr(res, "model", None) or CHAT_INTENT)
+                                    llm_parsed = _parse_llm_analysis_json(
+                                        getattr(res, "text", ""), cloud_safe_obs)
+                                except Exception as llm_exc:
+                                    unanswered_notes.append({
+                                        "reason": (
+                                            f"cloud analysis step degraded to local structural pass: "
+                                            f"{type(llm_exc).__name__}: {llm_exc}"
+                                        ),
+                                    })
+                                usage = self.store.llm_usage_for_purpose(purpose)
+                                step_api_calls = usage["calls"]
+                                step_tokens_in = usage["tokens_in"]
+                                step_tokens_out = usage["tokens_out"]
+                                step_shadow_cost = usage["shadow_cost_usd"]
+                                step_model = usage["model"] or step_model
+                        elif use_llm and (self.client is not None or has_material_route) and cloud_safe_obs and (
                             budget.max_step_api_calls < 1 or api_calls_used >= budget.max_api_calls
                         ):
                             unanswered_notes.append({

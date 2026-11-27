@@ -3093,7 +3093,7 @@ def main(argv: list[str] | None = None) -> int:
             except DaemonUnavailable:
                 # Ledger reads fine without the daemon — cost must always answer.
                 from .cost import day_start_iso, month_start_iso
-                from .provider_router import ProviderRouter
+                from .provider_router import create_provider_router
                 from .store import Store
                 store = Store(config.db_path)
                 data = {"month": store.llm_summary(month_start_iso()),
@@ -3103,7 +3103,7 @@ def main(argv: list[str] | None = None) -> int:
                 from .cost import provider_cost_report
                 data["providers"] = provider_cost_report(store, day_start_iso())
                 try:
-                    data["ladder"] = ProviderRouter(config, store).ladder_state()
+                    data["ladder"] = create_provider_router(config, store).ladder_state()
                 except Exception as exc:
                     data["ladder"] = {"level": "?",
                                       "reason": f"ladder unreadable: {type(exc).__name__}",

@@ -28,7 +28,7 @@ one envelope, journaled.
 from __future__ import annotations
 
 from ..cost import day_start_iso, provider_cost_report
-from ..provider_router import MaterialEnvelope, ProviderRouter
+from ..provider_router import MaterialEnvelope, create_provider_router
 from .contract import FetchedDoc
 
 REACH_SUMMARY_PURPOSE = "reach:summarise"
@@ -103,7 +103,7 @@ class ReachSummariser:
         contents = _SUMMARY_PROMPT.format(url=doc.final_url, title=doc.title.strip(), body=body)
         router = self.router
         if router is None:
-            router = ProviderRouter(self.config, self.store)
+            router = create_provider_router(self.config, self.store)
         mode = str(getattr(self.config, "gemini_mode", "mock"))
         return router.material(
             provider, model, REACH_SUMMARY_PURPOSE, contents,

@@ -100,6 +100,10 @@ class LlmPlanner:
         self.config = config
         self.store = store
         # BUILD-9S: the ONLY path to a model from here is ProviderRouter.material().
+        if router is None:
+            from .provider_router import create_provider_router
+
+            router = create_provider_router(config, store)
         self.router = router
         # Memory.recall (B's file) — consumed, never edited. None = no hints.
         self.recall = recall

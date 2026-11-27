@@ -96,6 +96,25 @@ rpd = 0
 [quota.models.transcribe-batch]
 rpd = 25
 
+# Diverted material providers are code-registered but inert until BOTH this
+# row is owner-verified/enabled and the matching key is present in the daemon
+# environment. Never put API keys in this file or the repository.
+[quota.providers.groq]
+enabled = false
+verified = false
+verified_at = ""
+verified_source = ""
+plan = ""
+no_card_required = false
+terms_reviewed_at = ""
+data_use_policy = ""
+
+[quota.providers.groq.models."openai/gpt-oss-20b"]
+rpm = 30
+tpm = 8000
+rpd = 100
+billing_unit = "requests_tokens"
+
 [quota.grounding]
 # Diverted-material VLM fallback for the NUS pointer (BUILD-3 /
 # SPEC-PROVIDER-ROUTING.md). Grounding is NEVER the personality tier
@@ -439,6 +458,8 @@ never_send_to_cloud = []
 
 [organise]
 mode = "shadow"                     # shadow | live, per-root override (§4.3)
+material_provider = ""              # optional verified material route (e.g. groq)
+material_model = ""                 # e.g. openai/gpt-oss-20b; inert until opted in
 confidence_auto = 0.90
 confidence_review = 0.60
 tier0_min_confidence = 0.85
@@ -560,6 +581,10 @@ max_extract_chars = 16000
 robots_cache_ttl_s = 86400.0
 user_agent_contact = "elaria-reach@local"
 offline = false
+# Optional remote summaries; zero budget keeps this path inert by default.
+summarise_provider = ""
+summarise_model = ""
+summarise_rpd_budget = 0
 
 [phone]
 # On-demand phone link via the pinned caelestia-connect sidecar (v1.1.1,
