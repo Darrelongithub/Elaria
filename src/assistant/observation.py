@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import journal_log
 from .disclosure import SECRET_PATTERNS
 
 NOT_FOUND = "I couldn't find it"
@@ -162,10 +163,13 @@ def _helper(mode):
 
 def _elements():
     window = json.loads(_run(['hyprctl', 'activewindow', '-j']))
-    rows = json.loads(_run([*_helper('atspi'), str(window['pid']),
+    result = json.loads(_run([*_helper('atspi'), str(window['pid']),
                            *map(str, window['at'] + window['size'])]))
+    if result['rejections']:
+        journal_log.log_event("observation.atspi.windows", level="warn", verdict="rejected",
+                              detail=json.dumps(result['rejections'], sort_keys=True))
     return tuple(Element(str(i), name, role, tuple(rect), sensitive)
-                 for i, (name, role, rect, sensitive) in enumerate(rows))
+                 for i, (name, role, rect, sensitive) in enumerate(result['rows']))
 
 
 def _screenshot(output: Output, monitor_count: int):
@@ -191,7 +195,9 @@ def capture(*, desktop=_desktop, screenshot=_screenshot, elements=_elements):
     focus, output, count = desktop()
     try:
         snapshot = elements()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        journal_log.log_event("observation.atspi.snapshot", level="warn", verdict="unavailable",
+                              detail=type(exc).__name__)
         snapshot = ()
     pixels = screenshot(output, count)
     if desktop() != (focus, output, count):
