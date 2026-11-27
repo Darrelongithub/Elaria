@@ -4,8 +4,8 @@
 
 Synced with `origin/main` before work; the fetch confirmed the assigned base
 `24e9ac7a3be1782897bf208fd93470926ea4fd0a` was current. Implemented FIX-HW2B
-on the assigned branch; **PR #174 is open and awaiting merge**. Owner hardware
-retest is still pending, so this report records sandbox evidence only.
+on the assigned branch; **PR #174 is merged**. Owner hardware retest is still
+pending, so this report records sandbox evidence only.
 
 ## Fix
 
