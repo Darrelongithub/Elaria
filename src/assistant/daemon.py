@@ -60,6 +60,7 @@ from .persona import (
     checkin_reply,
     timeout_fallback_reply,
 )
+from .phone_service import PhoneService
 from .presence import PresenceService
 from .safety import clear_halt, is_halted, set_halt
 from .showoff import ShowoffError, ShowoffService
@@ -504,6 +505,16 @@ class Daemon:
             safety_journal=self.safety_journal,
             is_offline=lambda: self.mode_manager.status().is_offline,
             vlm_grounder=vlm_grounder,
+        )
+        # Strictly on-demand phone lane (IF-3 owner amendment): idle by default,
+        # no persistent sidecar connection, no reconnect loop, no polling.
+        self.phone = PhoneService(
+            config,
+            self.store,
+            client=self.client,
+            safety_journal=self.safety_journal,
+            disclosure=self.disclosure,
+            governor=self.governor,
         )
         self._capture_state_last: tuple | None = None
         # When the speech path is dead, capture.state says so (never a calm
@@ -1230,6 +1241,7 @@ class Daemon:
             "showoff.exit": self._showoff_exit,
             "showoff.demo": self._showoff_demo,
             "console.say": self._console_say,
+            "console.command": self._console_command,
             "class.status": self._class_status,
             "class.set": self._class_set,
             "class.toggle": self._class_toggle,
@@ -1247,6 +1259,14 @@ class Daemon:
             "file.read": self._file_read,
             "ask": self._ask,
             "nus.point": self._nus_point,
+            "phone.status": self._phone_status,
+            "phone.inbox": self._phone_inbox,
+            "phone.notifications": self._phone_notifications,
+            "phone.draft": self._phone_draft,
+            "phone.drafts": self._phone_drafts,
+            "phone.approve": self._phone_approve,
+            "phone.reject": self._phone_reject,
+            "phone.revoke": self._phone_revoke,
         }
 
     def _require_ipc_owner(self) -> IpcPrincipal:
@@ -1271,22 +1291,34 @@ class Daemon:
             if method == "events.subscribe":
                 if writer is not None:
                     self._subscribers.add(writer)
-                return {"subscribed": True,
-                        "events": ["session.started", "transcript.interim",
-                                   "session.checkin", "session.offline",
-                                   "transcript.final", "session.ended",
-                                   "transcript.echo_suppressed",
-                                   "live.uplink_gated", "live.output_audio",
-                                   "live.output_transcript", "live.duplex",
-                                   "ptt.result",
-                                   "mode.changed", "offline.drained",
-                                   "speech.error", "conversation.message",
-                                   "class.changed", "knock.raised",
-                                   "knock.accepted", "knock.changed", "error",
-                                   "capture.levels", "capture.state",
-                                   "errand.started", "errand.step",
-                                   "errand.paused", "errand.question_resolved",
-                                   "errand.completed", "errand.cancelled"]}
+                events_list = [
+                    "session.started", "transcript.interim",
+                    "session.checkin", "session.offline",
+                    "transcript.final", "session.ended",
+                    "transcript.echo_suppressed",
+                    "live.uplink_gated", "live.output_audio",
+                    "live.output_transcript", "live.duplex",
+                    "ptt.result",
+                    "mode.changed", "offline.drained",
+                    "speech.error", "conversation.message",
+                    "class.changed", "knock.raised",
+                    "knock.accepted", "knock.changed", "error",
+                    "capture.levels", "capture.state",
+                    "errand.started", "errand.step",
+                    "errand.paused", "errand.question_resolved",
+                    "errand.completed", "errand.cancelled",
+                    "draft.pending", "draft.resolved",
+                ]
+                reply_payload: dict = {"subscribed": True, "events": events_list}
+                if bool(params.get("console_replay")):
+                    reply_payload["console_replay"] = True
+                    if writer is not None:
+                        replay_task = asyncio.create_task(
+                            self._replay_console_drafts(writer)
+                        )
+                        self._background_tasks.add(replay_task)
+                        replay_task.add_done_callback(self._background_tasks.discard)
+                return reply_payload
             handler = handlers.get(method)
             if handler is None:
                 raise ValueError(f"unknown method '{method}' — supported: "
@@ -1487,6 +1519,7 @@ class Daemon:
             },
             "offline_asr": local_asr_status(self.config),
             "cloud_queue": self.store.cloud_job_counts(),
+            "phone": self.phone.local_summary(),
         }
 
     async def _cost(self, params: dict) -> dict:
@@ -1707,6 +1740,193 @@ class Daemon:
         return {**result, "channel": "console",
                 "conversation": self.sessions.history(limit=int(
                     params.get("history_limit", 40)))}
+
+    async def _console_command(self, params: dict) -> dict:
+        """Owner-gated console draft decision command (console/CONSUMER-CONTRACT.md)."""
+        self._require_ipc_owner()
+        command = str(params.get("command") or "").strip()
+        draft_id = str(params.get("draft_id") or "").strip()
+        if command not in ("draft.approve", "draft.reject"):
+            raise ValueError(
+                "console.command requires command in ('draft.approve', 'draft.reject')"
+            )
+        if not draft_id:
+            raise ValueError("console.command requires a non-empty draft_id")
+        if command == "draft.approve":
+            result = await self._phone_approve({"draft_id": draft_id})
+            return {"accepted": True, "command": command, **result}
+        result = await self._phone_reject({"draft_id": draft_id})
+        return {"accepted": True, "command": command, **result}
+
+    # -- on-demand phone lane (IF-1 / IF-2 / IF-3 / IF-6, owner-gated) -------
+    async def _flush_phone_events(self) -> None:
+        for frame in self.phone.drain_events():
+            await self.broadcast(frame)
+
+    async def _replay_console_drafts(self, writer) -> None:
+        """Replay retained IF-2 draft frames to a console subscriber."""
+        frames = await asyncio.to_thread(self.phone.console_replay_frames)
+        for frame in frames:
+            if writer not in self._subscribers:
+                return
+            try:
+                writer.write((json.dumps(frame) + "\n").encode())
+                await asyncio.wait_for(writer.drain(), timeout=1.0)
+            except (ConnectionResetError, BrokenPipeError, RuntimeError, OSError):
+                self._subscribers.discard(writer)
+                return
+            except TimeoutError:
+                return
+
+    async def _phone_status(self, params: dict) -> dict:
+        self._require_ipc_owner()
+        try:
+            return await asyncio.to_thread(self.phone.status)
+        finally:
+            await self._flush_phone_events()
+
+    async def _phone_inbox(self, params: dict) -> dict:
+        self._require_ipc_owner()
+        thread_id = params.get("thread_id")
+        limit = params.get("limit")
+        if limit is not None:
+            limit = _int_param(params, "limit", minimum=1)
+        try:
+            result = await asyncio.to_thread(
+                self.phone.inbox,
+                thread_id=thread_id,
+                limit=limit,
+            )
+            if bool(params.get("draft")) and result.get("ok"):
+                chosen_thread = thread_id
+                chosen_recipient = None
+                chosen_body = None
+                if chosen_thread is not None and result.get("messages"):
+                    inbound = [
+                        m for m in result["messages"]
+                        if not m.get("outgoing") and str(m.get("body") or "").strip()
+                    ]
+                    if inbound:
+                        latest = inbound[-1]
+                        chosen_body = str(latest.get("body") or "")
+                        chosen_recipient = str(latest.get("sender") or "")
+                elif result.get("conversations"):
+                    first_conv = result["conversations"][0]
+                    chosen_thread = first_conv.get("threadId")
+                    addresses = first_conv.get("addresses") or []
+                    chosen_recipient = str(addresses[0]) if addresses else ""
+                    chosen_body = str(first_conv.get("snippet") or "")
+                if chosen_thread and chosen_recipient and chosen_body is not None:
+                    connectivity = await self._connectivity_snapshot()
+                    draft_res = await asyncio.to_thread(
+                        self.phone.draft_reply,
+                        thread_id=chosen_thread,
+                        recipient=chosen_recipient,
+                        inbound_body=chosen_body,
+                        is_offline=connectivity.is_offline,
+                    )
+                    result["draft"] = draft_res["draft"]
+                    result["draft_id"] = draft_res["draft_id"]
+                    result["suspected_injection"] = draft_res["suspected_injection"]
+            return result
+        finally:
+            await self._flush_phone_events()
+
+    async def _phone_notifications(self, params: dict) -> dict:
+        """On-demand notification read enforcing the 2026-11-27 privacy ruling."""
+        self._require_ipc_owner()
+        for forged in ("voiceprint_score", "voice_verified", "owner_verified"):
+            if forged in params:
+                raise ValueError(
+                    f"refused: phone.notifications does not accept caller-supplied {forged!r}; "
+                    "owner authority comes from kernel IPC/daemon verification only"
+                )
+        reveal = bool(params.get("reveal", False))
+        speaker = str(params.get("speaker") or "owner").strip().lower()
+        restricted = bool(
+            self.showoff.status().get("active")
+            or self.disclosure.company()
+            or speaker != "owner"
+        )
+        # Voice-initiated reveal fails closed unless backed by a live verified voice session.
+        voice_verified: bool | None = None
+        if bool(params.get("from_voice")):
+            voice_verified = False
+        try:
+            return await asyncio.to_thread(
+                self.phone.notifications,
+                reveal_body=reveal,
+                restricted=restricted,
+                owner_verified=True,
+                voice_verified=voice_verified,
+            )
+        finally:
+            await self._flush_phone_events()
+
+    async def _phone_draft(self, params: dict) -> dict:
+        self._require_ipc_owner()
+        connectivity = await self._connectivity_snapshot()
+        try:
+            return await asyncio.to_thread(
+                self.phone.draft_reply,
+                thread_id=params.get("thread_id"),
+                conversation_id=params.get("conversation_id"),
+                recipient=params.get("recipient"),
+                inbound_body=params.get("inbound_body"),
+                is_offline=connectivity.is_offline,
+                source=str(params.get("source") or "sms"),
+            )
+        finally:
+            await self._flush_phone_events()
+
+    async def _phone_drafts(self, params: dict) -> dict:
+        self._require_ipc_owner()
+        state = params.get("state", "pending")
+        try:
+            return await asyncio.to_thread(self.phone.list_drafts, state=state)
+        finally:
+            await self._flush_phone_events()
+
+    async def _phone_approve(self, params: dict) -> dict:
+        self._require_ipc_owner()
+        draft_id = str(params.get("draft_id") or "").strip()
+        body = params.get("body")
+        device = params.get("device")
+        halted = is_halted(self.config.socket_path.parent)
+        try:
+            return await asyncio.to_thread(
+                self.phone.approve_draft,
+                draft_id,
+                body=str(body) if body is not None else None,
+                device=str(device) if device is not None else None,
+                halted=halted,
+            )
+        finally:
+            await self._flush_phone_events()
+
+    async def _phone_reject(self, params: dict) -> dict:
+        self._require_ipc_owner()
+        draft_id = str(params.get("draft_id") or "").strip()
+        reason = params.get("reason")
+        try:
+            return await asyncio.to_thread(
+                self.phone.reject_draft,
+                draft_id,
+                reason=str(reason) if reason is not None else None,
+            )
+        finally:
+            await self._flush_phone_events()
+
+    async def _phone_revoke(self, params: dict) -> dict:
+        self._require_ipc_owner()
+        device_id = params.get("device_id")
+        try:
+            return await asyncio.to_thread(
+                self.phone.revoke_device,
+                device_id=str(device_id) if device_id is not None else None,
+            )
+        finally:
+            await self._flush_phone_events()
 
     # -- the knock (§19.2 as amended) ----------------------------------------
     def _knock_dict(self, knock: dict) -> dict:
@@ -5418,6 +5638,7 @@ class Daemon:
             await asyncio.gather(*tasks, return_exceptions=True)
         if meeting is not None:
             self.mode = self._meeting_mode()
+        self.phone.close()
         self.store.close()
         if capture_error is not None:
             print(f"[assistd] meeting capture cleanup failed: "

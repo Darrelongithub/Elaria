@@ -796,6 +796,23 @@ DEFAULTS: dict = {
         "user_agent_contact": "elaria-reach@local",
         "offline": False,
     },
+    # On-demand phone link via the pinned caelestia-connect sidecar (IF-3
+    # owner amendment). Disabled by default. Connect per owner interaction,
+    # disconnect after: no persistent connection, no reconnect loop, no
+    # background polling.
+    "phone": {
+        "enabled": False,
+        # "" -> $XDG_RUNTIME_DIR/caelestia-connect/ipc.sock (mode 0600).
+        "socket_path": "",
+        # Optional configured device binding (S-C2): explicit device overrides
+        # targeting any other device are refused and journaled locally.
+        "device_id": "",
+        "connect_timeout_s": 5.0,
+        "request_timeout_s": 10.0,
+        "draft_ttl_s": 900.0,
+        "max_inbox_threads": 20,
+        "max_thread_messages": 20,
+    },
 }
 
 
@@ -1006,6 +1023,26 @@ class Config:
     @property
     def socket_path(self) -> Path:
         return runtime_dir() / "assistant.sock"
+
+    def phone_socket_path(self) -> Path:
+        """Configured caelestia-connect AF_UNIX sidecar socket path (IF-3)."""
+        raw = str(self.section("phone").get("socket_path") or "").strip()
+        if raw:
+            return Path(raw).expanduser()
+        return runtime_dir() / "caelestia-connect" / "ipc.sock"
+
+    def phone_device_id(self) -> str | None:
+        """Optional configured device binding (S-C2)."""
+        raw = str(self.section("phone").get("device_id") or "").strip()
+        return raw or None
+
+    def phone_drafts_db_path(self) -> Path:
+        """Local durable IF-1 DraftStore SQLite path (mode 0600)."""
+        return self.data_dir / "phone_drafts.db"
+
+    def phone_pairs_path(self) -> Path:
+        """Local pairing/revocation registry path (mode 0600)."""
+        return self.data_dir / "phone_pairs.json"
 
     @property
     def fixtures_dir(self) -> Path:
@@ -1530,6 +1567,24 @@ def validate_config(config: Config) -> dict:
     _number_error(errors, "[errand] max_read_bytes", errand.get("max_read_bytes"),
                   minimum=256, integer=True)
     _bool_error(errors, "[errand] allow_escalation", errand.get("allow_escalation"))
+
+    # -- phone (on-demand caelestia-connect sidecar, IF-3 amendment) ---------
+    phone = raw.get("phone") if isinstance(raw.get("phone"), dict) else {}
+    _bool_error(errors, "[phone] enabled", phone.get("enabled"))
+    for key in ("socket_path", "device_id"):
+        val = phone.get(key)
+        if val is not None and not isinstance(val, str):
+            errors.append(f"[phone] {key}={val!r} must be a string")
+    _number_error(errors, "[phone] connect_timeout_s",
+                  phone.get("connect_timeout_s"), minimum=0.1)
+    _number_error(errors, "[phone] request_timeout_s",
+                  phone.get("request_timeout_s"), minimum=0.1)
+    _number_error(errors, "[phone] draft_ttl_s",
+                  phone.get("draft_ttl_s"), minimum=1.0)
+    _number_error(errors, "[phone] max_inbox_threads",
+                  phone.get("max_inbox_threads"), minimum=1, integer=True)
+    _number_error(errors, "[phone] max_thread_messages",
+                  phone.get("max_thread_messages"), minimum=1, integer=True)
 
     if errors:
         detail = "INVALID: " + "; ".join(errors + warnings)

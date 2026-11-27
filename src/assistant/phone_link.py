@@ -61,7 +61,7 @@ import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Self
 
 from assistant.drafts import APPROVED, DraftRecord
 
@@ -654,7 +654,11 @@ class PhoneLink:
         if socket_path is None or not str(socket_path).strip():
             raise PhoneLinkError("the phone link needs a configured sidecar socket")
         self.socket_path = Path(socket_path)
-        self.device_id = device_id
+        self.device_id = (
+            str(device_id).strip()
+            if device_id is not None and str(device_id).strip()
+            else None
+        )
         self._journal = journal
         self.request_timeout = float(request_timeout)
         self._registry = registry if registry is not None else PairingRegistry()
@@ -681,6 +685,12 @@ class PhoneLink:
         closer = getattr(self._transport, "close", None)
         if callable(closer):
             closer()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
 
     # -- the allowlisted surface --------------------------------------------
 
@@ -728,7 +738,30 @@ class PhoneLink:
                 f"refused to send draft {resolved.draft_id}: it is {resolved.state!r},"
                 " not 'approved'"
             )
-        target_id = device or self.device_id
+        # S-C2: when the adapter is bound to a configured device_id, an explicit
+        # device= argument targeting any other device (or an empty device id)
+        # must NEVER silently override that binding — refuse and journal locally
+        # before a single IPC packet leaves.
+        requested_id: str | None = None
+        if device is not None:
+            requested_id = str(device).strip()
+            if not requested_id:
+                self._refuse(
+                    "sms.send_sms",
+                    "explicit device argument was empty; refusing",
+                    device_id=str(device),
+                    configured_device_id=self.device_id,
+                )
+            if self.device_id is not None and requested_id != self.device_id:
+                self._refuse(
+                    "sms.send_sms",
+                    f"explicit device {requested_id!r} differs from configured"
+                    f" device binding {self.device_id!r}; refusing to override"
+                    " configured device",
+                    device_id=requested_id,
+                    configured_device_id=self.device_id,
+                )
+        target_id = self.device_id if self.device_id is not None else requested_id
         if target_id is not None:
             target_id = str(target_id)
             if self._registry.is_revoked(target_id) or self._registry.is_pending_unpair(
@@ -852,6 +885,55 @@ class PhoneLink:
         if self._registry.pending_unpairs():
             self.flush_pending_unpairs()
         state = self._read_state()
+        return self._sync_pairing_from_state(state)
+
+    def inspect_state(self) -> dict[str, Any]:
+        """Read sidecar state on demand and synchronize local pairing registry.
+
+        Uses only the existing sidecar ``state`` query (no extra verbs).
+        """
+        if self._registry.pending_unpairs():
+            self.flush_pending_unpairs()
+        state = self._read_state()
+        transitions = self._sync_pairing_from_state(state)
+        devices: list[dict[str, Any]] = []
+        configured_device: dict[str, Any] | None = None
+        for raw in state.get("devices") or []:
+            if not isinstance(raw, Mapping):
+                continue
+            did = str(raw.get("id") or "")
+            plugins = raw.get("state") if isinstance(raw.get("state"), Mapping) else {}
+            entry: dict[str, Any] = {
+                "id": did,
+                "name": str(raw.get("name") or did),
+                "type": str(raw.get("type") or ""),
+                "paired": bool(raw.get("paired")),
+                "reachable": bool(raw.get("reachable")),
+                "pair_state": str(raw.get("pairState") or raw.get("pair_state") or ""),
+                "revoked": self._registry.is_revoked(did),
+                "pending_unpair": self._registry.is_pending_unpair(did),
+            }
+            if "battery" in plugins:
+                entry["battery"] = plugins["battery"]
+            if "connectivity_report" in plugins:
+                entry["connectivity"] = plugins["connectivity_report"]
+            elif "connectivity" in plugins:
+                entry["connectivity"] = plugins["connectivity"]
+            devices.append(entry)
+            if self.device_id is not None and did == self.device_id:
+                configured_device = entry
+        return {
+            "sidecar_version": state.get("version"),
+            "devices": devices,
+            "configured_device_id": self.device_id,
+            "configured_device": configured_device,
+            "paired_devices": self._registry.paired_devices(),
+            "revoked_devices": self._registry.revoked_devices(),
+            "pending_unpairs": self._registry.pending_unpairs(),
+            "transitions": transitions,
+        }
+
+    def _sync_pairing_from_state(self, state: Mapping[str, Any]) -> dict[str, list[str]]:
         self._registry.mark_synced()
         devices = state.get("devices") or []
         paired_now = {
@@ -1128,7 +1210,27 @@ class PhoneLink:
     ) -> Any:
         if _is_forbidden(f"{plugin}.{action}"):
             self._refuse(f"{plugin}.{action}", "it is on the never-allowlist list")
-        device_id = device or str(self._select_device(self._read_state()).get("id"))
+        if device is not None:
+            requested = str(device).strip()
+            if not requested:
+                self._refuse(
+                    f"{plugin}.{action}",
+                    "explicit device argument was empty; refusing",
+                    device_id=str(device),
+                    configured_device_id=self.device_id,
+                )
+            if self.device_id is not None and requested != self.device_id:
+                self._refuse(
+                    f"{plugin}.{action}",
+                    f"explicit device {requested!r} differs from configured"
+                    f" device binding {self.device_id!r}; refusing to override"
+                    " configured device",
+                    device_id=requested,
+                    configured_device_id=self.device_id,
+                )
+            device_id = requested
+        else:
+            device_id = str(self._select_device(self._read_state()).get("id"))
         return self._transport.call(
             "device.call",
             {"device": device_id, "plugin": plugin, "action": action, "args": dict(args)},

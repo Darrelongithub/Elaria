@@ -2246,6 +2246,279 @@ def _errand_command(args, config) -> int:
     raise ValueError(f"unknown errand action: {action!r}")
 
 
+def _phone_command(args, config) -> int:
+    action = args.phone_cmd
+    if action == "status":
+        try:
+            result = call(config.socket_path, "phone.status", timeout=15.0)
+        except DaemonUnavailable:
+            from .drafts import DraftStore, SqliteDraftBackend
+            from .phone_link import PairingRegistry
+
+            registry = PairingRegistry(config.phone_pairs_path())
+            pending_count = 0
+            db_path = config.phone_drafts_db_path()
+            if db_path.exists():
+                backend = SqliteDraftBackend(db_path)
+                try:
+                    pending_count = len(DraftStore(backend).list_pending())
+                finally:
+                    backend.close()
+            result = {
+                "enabled": bool(config.section("phone").get("enabled", False)),
+                "lifecycle": "on-demand",
+                "daemon_running": False,
+                "sidecar_reachable": False,
+                "state": "daemon-down",
+                "socket_path": str(config.phone_socket_path()),
+                "configured_device_id": config.phone_device_id(),
+                "paired": bool(registry.paired_devices()),
+                "paired_devices": registry.paired_devices(),
+                "revoked_devices": registry.revoked_devices(),
+                "pending_unpairs": registry.pending_unpairs(),
+                "pending_drafts": pending_count,
+                "devices": [],
+                "error": "assistd is not running",
+            }
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                print(
+                    f"phone: {'enabled' if result['enabled'] else 'disabled'} "
+                    "(lifecycle: on-demand · daemon: down)"
+                )
+                print(f"  socket: {result['socket_path']}")
+                print(f"  device binding: {result['configured_device_id'] or 'auto'}")
+                print(f"  local paired: {', '.join(result['paired_devices']) or '(none)'}")
+                print(f"  pending drafts: {result['pending_drafts']}")
+            return 1
+
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            enabled_str = "enabled" if result.get("enabled") else "disabled"
+            print(
+                f"phone: {enabled_str} (lifecycle: {result.get('lifecycle', 'on-demand')})"
+            )
+            print(
+                f"  sidecar: {result.get('state', 'down')} "
+                f"({result.get('socket_path')})"
+            )
+            print(
+                f"  device binding: {result.get('configured_device_id') or 'auto'}"
+            )
+            print(
+                f"  paired: {'yes' if result.get('paired') else 'no'} · "
+                f"pending drafts: {result.get('pending_drafts', 0)}"
+            )
+            for dev in result.get("devices") or []:
+                status_bits = [
+                    "paired" if dev.get("paired") else "unpaired",
+                    "reachable" if dev.get("reachable") else "offline",
+                ]
+                if dev.get("revoked"):
+                    status_bits.append("revoked")
+                battery = dev.get("battery")
+                if isinstance(battery, dict) and battery.get("charge") is not None:
+                    status_bits.append(f"battery={battery['charge']}%")
+                print(
+                    f"  device: {dev.get('name')} [{dev.get('id')}] "
+                    f"({', '.join(status_bits)})"
+                )
+            if result.get("pending_unpairs"):
+                print(
+                    f"  pending unpairs: {', '.join(result['pending_unpairs'])}"
+                )
+            if result.get("error"):
+                print(f"  note: {result['error']}")
+        return 0 if (result.get("enabled") and result.get("sidecar_reachable")) else 1
+
+    if action == "inbox":
+        params: dict = {}
+        if args.thread is not None:
+            params["thread_id"] = args.thread
+        if args.limit is not None:
+            params["limit"] = args.limit
+        if args.draft:
+            params["draft"] = True
+        result = call(config.socket_path, "phone.inbox", params, timeout=60.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        elif not result.get("ok"):
+            print(
+                f"assist phone inbox: sidecar down ({result.get('error')})",
+                file=sys.stderr,
+            )
+            return 1
+        else:
+            if result.get("messages"):
+                print(f"Thread {result.get('thread_id')} (inbound messages are UNTRUSTED):")
+                for msg in result["messages"]:
+                    direction = "OUT" if msg.get("outgoing") else "IN [UNTRUSTED]"
+                    flag = " [INJECTION-FLAGGED]" if msg.get("suspected") else ""
+                    who = msg.get("senderName") or msg.get("sender") or ""
+                    print(f"  [{direction}{flag}] {who}: {msg.get('body', '')}")
+            else:
+                convs = result.get("conversations") or []
+                if not convs:
+                    print("(no SMS conversations)")
+                for conv in convs:
+                    flag = " [INJECTION-FLAGGED]" if conv.get("suspected") else ""
+                    addrs = ", ".join(str(a) for a in (conv.get("addresses") or []))
+                    print(
+                        f"thread={conv.get('threadId')} {conv.get('title') or addrs} "
+                        f"({addrs}) [UNTRUSTED{flag}]: {conv.get('snippet', '')}"
+                    )
+            if result.get("draft"):
+                d = result["draft"]
+                print(
+                    f"\nDraft {d['draft_id']} created [pending, NOT sent] "
+                    f"to {d['recipient']}: {d['body']}"
+                )
+        return 0 if result.get("ok") else 1
+
+    if action == "notifications":
+        params = {"reveal": bool(args.reveal)}
+        result = call(config.socket_path, "phone.notifications", params, timeout=15.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        elif not result.get("ok"):
+            print(
+                f"assist phone notifications: sidecar down ({result.get('error')})",
+                file=sys.stderr,
+            )
+            return 1
+        elif result.get("restricted"):
+            print(f"{result.get('count', 0)} notifications (restricted mode — details hidden)")
+        elif result.get("bodies_included"):
+            items = result.get("items") or []
+            if not items:
+                print("(no notifications)")
+            for item in items:
+                flag = " [INJECTION-FLAGGED]" if item.get("suspected") else ""
+                who = f" from {item['sender']}" if item.get("sender") else ""
+                print(
+                    f"[UNTRUSTED · SENSITIVE · LOCAL-ONLY{flag}] "
+                    f"{item.get('app')}{who}: {item.get('body', '')}"
+                )
+        else:
+            summary = result.get("summary") or []
+            if not summary:
+                print("(no notifications)")
+            for row in summary:
+                cnt = int(row.get("count") or 0)
+                noun = "notification" if cnt == 1 else "notifications"
+                who = f" from {row['sender']}" if row.get("sender") else ""
+                print(f"{cnt} {noun}{who} ({row.get('app')}) [bodies hidden]")
+        return 0 if result.get("ok") else 1
+
+    if action == "draft":
+        params = {}
+        if args.thread is not None:
+            params["thread_id"] = args.thread
+        result = call(config.socket_path, "phone.draft", params, timeout=60.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            d = result["draft"]
+            flag = " [INJECTION-FLAGGED INBOUND]" if result.get("suspected_injection") else ""
+            print(f"Draft {d['draft_id']} [{d['state']} · NOT sent]{flag}")
+            print(f"  thread: {d['conversation_id']} · recipient: {d['recipient']}")
+            print(f"  body: {d['body']}")
+            print(
+                f"  review: `assist phone approve {d['draft_id']}` or "
+                f"`assist phone reject {d['draft_id']}`"
+            )
+        return 0
+
+    if action == "drafts":
+        state = "all" if args.all else args.state
+        try:
+            result = call(config.socket_path, "phone.drafts", {"state": state}, timeout=10.0)
+        except DaemonUnavailable:
+            import time as _time
+
+            from .drafts import DraftStore, SqliteDraftBackend
+
+            db_path = config.phone_drafts_db_path()
+            drafts_rows: list[dict] = []
+            expired_swept: list[str] = []
+            pending_count = 0
+            if db_path.exists():
+                ttl = float(config.section("phone").get("draft_ttl_s") or 900.0)
+                backend = SqliteDraftBackend(db_path)
+                try:
+                    ds = DraftStore(backend, ttl_seconds=ttl)
+                    expired_swept = ds.expire_sweeper(_time.time())
+                    query_state = None if state in (None, "", "all") else state
+                    drafts_rows = [r.event_payload() for r in ds.list_records(query_state)]
+                    pending_count = len(ds.list_pending())
+                finally:
+                    backend.close()
+            result = {
+                "enabled": bool(config.section("phone").get("enabled", False)),
+                "drafts": drafts_rows,
+                "pending_count": pending_count,
+                "expired_swept": expired_swept,
+            }
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            drafts_list = result.get("drafts") or []
+            if not drafts_list:
+                print(f"(no {state} drafts)")
+            for d in drafts_list:
+                outcome = f" ({d['outcome']})" if d.get("outcome") else ""
+                print(
+                    f"{d['draft_id']} [{d['state']}{outcome}] "
+                    f"thread={d['conversation_id']} to={d['recipient']} "
+                    f"at={d['created_at']}"
+                )
+                print(f"  {d['body']}")
+        return 0
+
+    if action == "approve":
+        params = {"draft_id": args.draft_id}
+        if args.body is not None:
+            params["body"] = args.body
+        if args.device is not None:
+            params["device"] = args.device
+        result = call(config.socket_path, "phone.approve", params, timeout=30.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(
+                f"Sent draft {result['draft_id']} to {result['recipient']} "
+                f"via device {result['device_id']}."
+            )
+        return 0
+
+    if action == "reject":
+        params = {"draft_id": args.draft_id}
+        if args.reason is not None:
+            params["reason"] = args.reason
+        result = call(config.socket_path, "phone.reject", params, timeout=10.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"Rejected draft {result['draft_id']}. Nothing was sent.")
+        return 0
+
+    if action == "revoke":
+        params = {}
+        if args.device is not None:
+            params["device_id"] = args.device
+        result = call(config.socket_path, "phone.revoke", params, timeout=15.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            pending = " (pending sidecar unpair)" if result.get("pending_unpair") else ""
+            print(f"Revoked device {result['device_id']}{pending}.")
+        return 0
+
+    raise ValueError(f"unknown phone action: {action!r}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Every `assist` command surface, built in one place.
 
@@ -2666,6 +2939,73 @@ def build_parser() -> argparse.ArgumentParser:
                             default="confirm")
     err_answer.add_argument("--text", default="", help="owner answer or amended fact text")
     err_answer.add_argument("--json", action="store_true")
+
+    phone_p = sub.add_parser(
+        "phone",
+        help="on-demand phone SMS link via caelestia-connect sidecar (approve every reply)",
+    )
+    phone_sub = phone_p.add_subparsers(dest="phone_cmd", required=True)
+    ph_status = phone_sub.add_parser(
+        "status", help="check sidecar reachability, paired phone, and pending drafts"
+    )
+    ph_status.add_argument("--json", action="store_true")
+    ph_inbox = phone_sub.add_parser(
+        "inbox", help="pull recent SMS threads or one thread on demand (untrusted data)"
+    )
+    ph_inbox.add_argument("--thread", default=None, help="numeric KDE Connect thread id")
+    ph_inbox.add_argument("--limit", type=int, default=None, help="max threads/messages to show")
+    ph_inbox.add_argument(
+        "--draft", action="store_true",
+        help="also draft a pending reply via the personality path (sends nothing)",
+    )
+    ph_inbox.add_argument("--json", action="store_true")
+    ph_notifs = phone_sub.add_parser(
+        "notifications",
+        help="show phone notification existence counts (bodies hidden unless --reveal)",
+    )
+    ph_notifs.add_argument(
+        "--reveal", action="store_true",
+        help="explicit owner ask to reveal notification bodies locally (journaled, never cloud)",
+    )
+    ph_notifs.add_argument("--json", action="store_true")
+    ph_draft = phone_sub.add_parser(
+        "draft", help="draft a pending SMS reply in Elaria's voice (sends nothing)"
+    )
+    ph_draft.add_argument("--thread", default=None, help="numeric KDE Connect thread id")
+    ph_draft.add_argument("--json", action="store_true")
+    ph_drafts = phone_sub.add_parser(
+        "drafts", help="list local SMS reply drafts (works even when sidecar is down)"
+    )
+    ph_drafts.add_argument(
+        "--state", choices=("pending", "approved", "sent", "failed", "all"),
+        default="pending",
+    )
+    ph_drafts.add_argument("--all", action="store_true", help="show drafts in all states")
+    ph_drafts.add_argument("--json", action="store_true")
+    ph_approve = phone_sub.add_parser(
+        "approve", help="approve a pending draft and send exactly one SMS"
+    )
+    ph_approve.add_argument("draft_id", help="id of the pending draft to approve and send")
+    ph_approve.add_argument(
+        "--body", default=None,
+        help="optional owner-edited reply text (supersedes the draft, keeps locked recipient)",
+    )
+    ph_approve.add_argument(
+        "--device", default=None,
+        help="optional explicit device id (refused if it differs from [phone] device_id)",
+    )
+    ph_approve.add_argument("--json", action="store_true")
+    ph_reject = phone_sub.add_parser(
+        "reject", help="reject a pending draft locally (sends nothing)"
+    )
+    ph_reject.add_argument("draft_id", help="id of the draft to reject")
+    ph_reject.add_argument("--reason", default=None, help="optional reason for audit journal")
+    ph_reject.add_argument("--json", action="store_true")
+    ph_revoke = phone_sub.add_parser(
+        "revoke", help="revoke local pairing and unpair on sidecar (or queue pending-unpair)"
+    )
+    ph_revoke.add_argument("--device", default=None, help="device id to revoke")
+    ph_revoke.add_argument("--json", action="store_true")
     return parser
 
 
@@ -2820,6 +3160,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "queue":
             return _queue_command(args, config)
+
+        if args.command == "phone":
+            return _phone_command(args, config)
 
         if args.command == "backup":
             from .backup_cli import backup_command

@@ -55,11 +55,15 @@ after the bug ID. Status: OPEN · FIX-IN-FLIGHT · FIXED (PR#).
 ## SUSPECTS (static only — needs ruling or hardware repro; not asserted)
 
 S-A1..S-A4 (`BUGHUNT-A` §SUSPECTS) · S-B1..S-B4 (`BUGHUNT-B`) ·
-S-C1 unprovisioned WhatsApp verify-token sentinel · S-C2 phone
-`device=` override vs configured-device binding · S-C3 REACH DNS
-rebinding window (validation vs connect-time resolve) · S-C4
+S-C1 unprovisioned WhatsApp verify-token sentinel · ~~S-C2 phone
+`device=` override vs configured-device binding~~ (**FIXED** in
+PHONE-WIRE-2: `PhoneLink.send_approved` and `_call_plugin` refuse and
+journal `phone.refused` locally before any IPC packet when explicit
+`device=` differs from configured `self.device_id` or is empty; redone
+cleanly, regression tests in `tests/test_p_phone_wire.py`) · S-C3 REACH
+DNS rebinding window (validation vs connect-time resolve) · S-C4
 alive receipt bookkeeping gap · S-C5 backup purge target when
-`trashed_as` missing. Rule on S-C1/S-C2 when fixing the C lane.
+`trashed_as` missing. Rule on S-C1 when fixing the C lane.
 
 ## Hardware-found (owner laptop, 2026-11-26 — first real-hardware entries)
 
@@ -73,7 +77,7 @@ alive receipt bookkeeping gap · S-C5 backup purge target when
 
 | ID | Where | Failure | Status |
 |---|---|---|---|
-| GAP-HW3 | `phone_link.py` (module) vs `daemon.py`/`cli.py` (absent) | Phone lane is module-complete but UNWIRED (found at hardware pass, 2026-11-27): `PhoneLink` is instantiated only in tests; the daemon never imports/instantiates it, no `[phone]` config section, no `assist phone` surface — the owner's SMS approve-each ruling (2026-11-26) has no live path to execute on. Same species as the PR #89 nus unplugged seam. Needs a wiring build (daemon owner-gated IPC + CLI + sidecar supervision), not a patch. | OPEN → PHONE-WIRE |
+| GAP-HW3 | `phone_link.py` (module) vs `daemon.py`/`cli.py` (absent) | Phone lane is module-complete but UNWIRED (found at hardware pass, 2026-11-27): `PhoneLink` is instantiated only in tests; the daemon never imports/instantiates it, no `[phone]` config section, no `assist phone` surface — the owner's SMS approve-each ruling (2026-11-26) has no live path to execute on. Same species as the PR #89 nus unplugged seam. Needs a wiring build (daemon owner-gated IPC + CLI + on-demand sidecar lifecycle per `docs/contracts/IF-3-OWNER-AMENDMENT.md`). | **FIXED** (PHONE-WIRE-2: `phone_service.py`, `phone_link.py`, `daemon.py`, `cli.py`, `config.py`, `tests/test_p_phone_wire.py`; owner hardware pass script in `reports/RPT-P-phone-wire-2.md`) |
 
 | ID | Where | Failure | Status |
 |---|---|---|---|
