@@ -13,7 +13,26 @@ highest-volume material job — cannot divert today.
 ## PROVIDER-ENABLE-1 — Agent I (registry/router lane)
 
 > You are Agent I. Wire the errand material path through the
-> router and ship the owner enablement pack. Scope:
+> router and ship the owner enablement pack.
+>
+> **Scope extension (BUG-HW7, found during owner enablement
+> 2026-11-27):** the material adapters are never constructed
+> in production — every live `ProviderRouter(...)` is built
+> with `adapters=()`, so a verified Groq row + env key still
+> reports "diverted: none" and `material()` would refuse "no
+> code-registered adapter". First job is therefore a single
+> code-owned router factory used by daemon, organiser,
+> planner, reach, errand and the CLI ladder, registering the
+> three existing material adapters (groq, openrouter,
+> cloudflare). Registration is NOT enablement: dispatch stays
+> gated by the verified `[quota.providers.*]` row, positive
+> caps, and the env key, exactly as today. `assist cost`'s
+> ladder must then tell the truth about a runnable provider.
+> The owner's config + key are ALREADY in place on his laptop
+> (verified row, rpd cap 100, gpt-oss-20b allow-listed) — do
+> not ask him to change anything; make the code meet it.
+>
+> Scope:
 >
 > 1. **Errand diversion.** `content.analyze` (and any other
 >    LLM call the errand runner makes for organise/extraction)
