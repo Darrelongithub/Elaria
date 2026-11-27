@@ -87,6 +87,30 @@ def _intersects(a: Rect, b: Rect) -> bool:
     return x < X + W and X < x + w and y < Y + H and Y < y + h
 
 
+def _contains(outer: Rect, inner: Rect) -> bool:
+    """Whether the full inner rectangle lies within the outer rectangle."""
+    if not all(math.isfinite(value) for value in (*outer, *inner)):
+        return False
+    x, y, w, h = outer
+    X, Y, W, H = inner
+    return (w > 0 and h > 0 and W > 0 and H > 0
+            and x <= X and y <= Y and X + W <= x + w and Y + H <= y + h)
+
+
+_ACTIONABLE_ROLES = frozenset({
+    'button', 'push button', 'toggle button', 'menu button',
+    'menu item', 'check menu item', 'radio menu item', 'tearoff menu item',
+    'check box', 'checkbox', 'radio button', 'link', 'page tab', 'tab',
+    'combo box', 'list box', 'list item', 'tree item', 'option',
+    'entry', 'text', 'password text', 'spin button', 'slider', 'scroll bar', 'switch',
+})
+
+
+def _is_actionable(element: Element) -> bool:
+    role = ' '.join(element.role.casefold().replace('_', ' ').replace('-', ' ').split())
+    return role in _ACTIONABLE_ROLES
+
+
 def _sensitive(element: Element) -> bool:
     return element.sensitive or bool(SECRET.search(f'{element.name} {element.role}'))
 
@@ -132,11 +156,22 @@ def ground(frame: Frame, target: dict) -> Resolution | None:
 
 
 def semantic_target(frame: Frame, name: str) -> dict | None:
-    """Exact, unique accessible name; ambiguity is not evidence for a guess."""
+    """Resolve exact names, collapsing contained label duplicates into controls."""
     matches = [e for e in frame.elements if e.name.casefold().strip() == name.casefold().strip()]
-    if len(matches) != 1:
+    if not matches:
         return None
-    return {'kind': 'element', 'id': matches[0].id, 'confidence': 1,
+    if len(matches) == 1:
+        selected = matches[0]
+    else:
+        actionable = [
+            element for element in matches
+            if _is_actionable(element)
+            and all(_contains(element.bounds, match.bounds) for match in matches)
+        ]
+        if len(actionable) != 1:
+            return None
+        selected = actionable[0]
+    return {'kind': 'element', 'id': selected.id, 'confidence': 1,
             'frame_id': frame.frame_id, 'snapshot_id': frame.snapshot_id}
 
 

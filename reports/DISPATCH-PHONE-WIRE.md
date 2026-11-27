@@ -18,6 +18,27 @@ lifecycle below originally said "connect/reconnect with backoff"
 push, never a continuously running connection. Item (2) is
 amended accordingly in PHONE-WIRE-2.
 
+### OWNER PRIVACY RULING — notifications (2026-11-27)
+
+Owner paired the phone via KDE Connect and found every
+notification exposed on the desktop — messages included. His
+phone posture is "hide sensitive content"; Elaria must inherit
+it. Binding on PHONE-WIRE-2 and any notification surface:
+(1) notification BODIES are sensitive content — she may surface
+existence only (app + sender + count, e.g. "2 messages from
+Mum"), never body text on console/overlay/spoken output by
+default; (2) revealing a body requires the owner's explicit
+in-the-moment ask (voiceprint-gated like any owner authority),
+is journaled, and is never part of a proactive knock/summary;
+(3) notification content is untrusted data (IF-6) AND sensitive
+— both rails, always; it never enters long-term memory as
+`stated`, never leaves with diverted providers, and bodies are
+excluded from any cloud call (local handling only); (4) stranger/
+guest/showoff modes: not even existence metadata beyond a count.
+Owner-side interim hygiene (his settings, today): KDE Connect
+phone app → device → Notification sync plugin → allowlist only
+the apps that should mirror at all; banking/auth apps never.
+
 ## PHONE-WIRE-2 — Agent P (complete, on-demand)
 
 > You are Agent P. PHONE-WIRE round 1 landed nothing (S-C2 fix

@@ -102,10 +102,10 @@ def atspi():
                     or abs(r.width - width) > tolerance or abs(r.height - height) > tolerance):
                 reasons['size_mismatch'] += 1
             elif abs(r.x - x) <= tolerance and abs(r.y - y) <= tolerance:
-                candidates.append((window, 0, 0))
+                candidates.append((window, (r.x, r.y, r.width, r.height), 0, 0))
             elif abs(r.x) <= tolerance and abs(r.y) <= tolerance:
                 # Some Wayland toolkits return window-relative extents for SCREEN.
-                candidates.append((window, x, y))
+                candidates.append((window, (r.x, r.y, r.width, r.height), x, y))
             else:
                 reasons['origin_mismatch'] += 1
 
@@ -115,11 +115,15 @@ def atspi():
     elif not candidates and not reasons:
         reasons['no_pid_windows'] = 1
     if len(candidates) == 1:
-        window, dx, dy = candidates[0]
-        stack = [window]
+        window, screen_rect, dx, dy = candidates[0]
+        screen_x, screen_y, window_width, window_height = screen_rect
+        window_rect = (screen_x + dx, screen_y + dy, window_width, window_height)
+        window_x, window_y = window_rect[:2]
+        escaped = False
+        stack = [(window, True)]
         visited = 0
         while stack and visited < 1000:
-            node = stack.pop()
+            node, is_window = stack.pop()
             visited += 1
             if node is None:
                 continue
@@ -128,13 +132,35 @@ def atspi():
                 continue
             role = node.get_role_name()
             component = node.get_component_iface()
-            if component and len(rows) < 150:
-                r = component.get_extents(Atspi.CoordType.SCREEN)
-                if r.width > 0 and r.height > 0 and r.x != -2147483648 and r.y != -2147483648:
-                    rows.append([node.get_name()[:256], role, [r.x + dx, r.y + dy, r.width, r.height],
-                                 node.get_role() == Atspi.Role.PASSWORD_TEXT])
-            stack.extend(node.get_child_at_index(k)
+            if component:
+                # SCREEN is needed to validate and place the top-level window.
+                # GTK/Wayland can report every descendant at SCREEN origin, so
+                # obtain descendants in WINDOW coordinates and translate them
+                # from the accepted top-level window origin instead.
+                if is_window:
+                    rx, ry, rw, rh = screen_rect
+                else:
+                    r = component.get_extents(Atspi.CoordType.WINDOW)
+                    rx, ry, rw, rh = r.x, r.y, r.width, r.height
+                if rw > 0 and rh > 0 and rx != -2147483648 and ry != -2147483648:
+                    if is_window:
+                        rect = [rx + dx, ry + dy, rw, rh]
+                    else:
+                        rect = [window_x + rx, window_y + ry, rw, rh]
+                        if not (window_x <= rect[0] and window_y <= rect[1]
+                                and rect[0] + rect[2] <= window_x + window_width
+                                and rect[1] + rect[3] <= window_y + window_height):
+                            reasons['descendant_outside_window'] += 1
+                            escaped = True
+                            rect = None
+                    if rect is not None and len(rows) < 150:
+                        rows.append([node.get_name()[:256], role, rect,
+                                     node.get_role() == Atspi.Role.PASSWORD_TEXT])
+            stack.extend((node.get_child_at_index(k), False)
                          for k in reversed(range(min(150, node.get_child_count()))))
+        if escaped:
+            # A partial accessibility tree must not become a partial target map.
+            rows.clear()
     print(json.dumps({"rows": rows, "rejections": reasons}))
     return 0
 
