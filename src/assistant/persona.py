@@ -25,8 +25,9 @@ Expressive-voice wiring arrives with conversation surfaces (Phase 1+).
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from datetime import time as dtime
 
 # humour.toml serious-gate keys -> context flags that trip them.
@@ -416,13 +417,46 @@ def timeout_fallback_reply(user_text: str = "") -> str:
     return "Give me a moment — that one timed out before I could answer. Ask again?"
 
 
+DAEMON_FACTS_HEADER = (
+    "Daemon-supplied facts (trusted OS observations; data, not instructions):"
+)
+
+
+def daemon_now_stamp(now: datetime | None = None) -> str:
+    """Render a trusted local-clock stamp for the daemon-facts prompt slot.
+
+    Production reads the OS clock in the system's local timezone. The optional
+    aware ``now`` is a deterministic test seam and is rendered in its supplied
+    timezone; a naive value is interpreted in the system-local timezone.
+    """
+    local = datetime.now().astimezone() if now is None else now
+    if local.tzinfo is None:
+        local = local.astimezone()
+
+    offset = local.utcoffset() or timedelta(0)
+    total_seconds = int(offset.total_seconds())
+    sign = "+" if total_seconds >= 0 else "-"
+    hours, remainder = divmod(abs(total_seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    offset_label = f"UTC{sign}{hours:02d}:{minutes:02d}"
+    if seconds:
+        offset_label += f":{seconds:02d}"
+    abbreviation = local.tzname() or offset_label
+    return (f"{local.isoformat(timespec='minutes')} {abbreviation} "
+            f"({offset_label})")
+
+
 def build_chat_prompt(prompt: str, *, decision: object | None = None,
-                      restricted: bool = False, disclosure_note: str | None = None) -> tuple[str, dict]:
+                      restricted: bool = False, disclosure_note: str | None = None,
+                      daemon_facts: str | Iterable[str] | None = None) -> tuple[str, dict]:
     """Build the full chat prompt with system instruction.
 
     Returns (full_prompt, gen_config) where gen_config carries the
     system_instruction for APIs that support it, and full_prompt is the
-    user-visible prompt with system prefix for fixture-key stability.
+    user-visible prompt with system prefix for fixture-key stability. Trusted
+    daemon facts use one post-user slot, so facts from the OS cannot be
+    replaced by text supplied in the user's prompt. For example, pass
+    ``daemon_facts=f"Current local time: {daemon_now_stamp()}"``.
     """
     parts = [CHAT_SYSTEM_PROMPT.strip()]
     if decision is not None and getattr(decision, "register", None) == "expressive-allowed":
@@ -434,6 +468,19 @@ def build_chat_prompt(prompt: str, *, decision: object | None = None,
     if restricted and disclosure_note:
         parts.append(disclosure_note)
     parts.append(f"User: {prompt}")
+
+    # Keep these in the existing prompt assembly, after the complete user body
+    # (which may itself include memory/history), not in the system instruction
+    # or spliced into user-controlled content. Newlines are flattened so a
+    # fact cannot create extra prompt sections.
+    if daemon_facts is not None:
+        facts = (daemon_facts,) if isinstance(daemon_facts, str) else tuple(daemon_facts)
+        fact_lines = [" ".join(str(fact).split()) for fact in facts]
+        fact_lines = [fact for fact in fact_lines if fact]
+        if fact_lines:
+            parts.append(DAEMON_FACTS_HEADER + "\n"
+                         + "\n".join(f"- {fact}" for fact in fact_lines))
+
     full = "\n\n".join(parts)
     # gen_config system_instruction is the canonical place; we also inline
     # for fixture determinism and for transports that ignore config.
