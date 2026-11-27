@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 
 from .contract import FetchedDoc
+from .observe import journal_target
 
 
 class InterestingnessGate:
@@ -52,21 +53,22 @@ class InterestingnessGate:
 
         self._seen.add(key)
         svc = initiative or self.initiative
-        summary = doc.title.strip() or doc.excerpt[:120].strip() or doc.final_url
-        reason = f"Matches your stated interest {matched!r}: {summary} (source: {doc.final_url})"
+        # The match is a local observation, not a claim or a page-authored reason.
+        source = journal_target(doc.final_url) or "web"
+        reason = f"A fetched page matches your stated interest {matched!r} (source: {source})"
 
         if svc is None:
             return {
                 "kind": "finding",
                 "topic": f"reach:{matched}",
-                "referent": doc.final_url,
+                "referent": source,
                 "reason": reason,
-                "source_url": doc.final_url,
+                "source_url": source,
             }
 
         return svc.raise_knock(
             topic=f"reach:{matched}",
             reason=reason,
             kind="finding",
-            referent=doc.final_url,
+            referent=source,
         )

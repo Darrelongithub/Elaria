@@ -545,6 +545,7 @@ reduced_motion = false
 [reach]
 # Phase-0 internet fetcher (BUILD-7, Agent REACH). Disabled by default.
 enabled = false
+interests = []     # owner-stated topics; gate runs only on direct asks, never a feed
 web_host_mode = "open-public"     # open-public | named-hosts
 allowed_web_hosts = []
 github_req_per_hr = 30

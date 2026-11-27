@@ -2110,6 +2110,44 @@ def _stream_report_command(args, config) -> int:
     return 0
 
 
+def _print_reach_quote(summary: dict) -> None:
+    # Quote untrusted material (including terminal control characters), never
+    # let it print additional CLI lines or appear as the assistant's claims.
+    print("  Local extract (untrusted, not verified):")
+    if summary.get("quoted_title"):
+        print(f"    Title: {json.dumps(summary['quoted_title'])}")
+    print(f"    Excerpt: {json.dumps(summary['quoted_excerpt'])}")
+    for source in summary["sources"]:
+        print(f"    Source: {json.dumps(source)}")
+
+
+def _reach_command(args, config) -> int:
+    action = args.reach_cmd
+    params = {} if action == "status" else {"url": args.url}
+    timeout = 10.0 if action == "status" else float(
+        config.section("reach").get("total_timeout_s", 20.0)) + 10.0
+    result = call(config.socket_path, f"reach.{action}", params, timeout=timeout)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    elif action == "status":
+        print(f"REACH: {'enabled' if result['enabled'] else 'disabled'}"
+              f" · offline={result['offline']} · halted={result['halted']}")
+        print(f"Interestingness: {'on (direct asks only)' if result['interestingness_enabled'] else 'off'}")
+        print(f"Journal usage since {result['today_since']} (UTC):")
+        for name, row in result["channels"].items():
+            print(f"  {name}: {row['used_today']} used today; "
+                  f"{row['used_last_hour']}/{row['cap_per_hour']} in the last hour")
+            if last := row["last_terminal"]:
+                print(f"    Last terminal: {last['terminal']} at {last['at']} ({last['action_id']})")
+    else:
+        print(f"{result['terminal']}: {json.dumps(result['message'])}")
+        if result.get("action_id"):
+            print(f"  Journal action: {result['action_id']}")
+        if result.get("summary"):
+            _print_reach_quote(result["summary"])
+    return 0 if action == "status" or result["ok"] else 2
+
+
 def _errand_command(args, config) -> int:
     action = args.errand_cmd
     if action == "start":
@@ -2123,6 +2161,8 @@ def _errand_command(args, config) -> int:
         params: dict = {"instruction": args.instruction}
         if args.roots:
             params["roots"] = args.roots
+        if args.web_url:
+            params["plan"] = [{"skill": "web.fetch", "args": {"url": args.web_url}}]
         if budget:
             params["budget"] = budget
         result = call(config.socket_path, "errand.start", params, timeout=10.0)
@@ -2151,6 +2191,10 @@ def _errand_command(args, config) -> int:
                       f"model={step.get('model') or 'local'} "
                       f"calls={step['api_calls']} "
                       f"cost=${step['shadow_cost_usd']:.6f}")
+                if step["skill"] == "web.fetch" and (receipt := step.get("result")):
+                    print(f"    {receipt['terminal']}: {json.dumps(receipt['message'])}")
+                    if receipt.get("observation"):
+                        _print_reach_quote(receipt["observation"])
             for q in result["questions"]:
                 print(f"  question #{q['id']} [{q['status']}]: {q['question']}")
             if result.get("report"):
@@ -2579,6 +2623,19 @@ def build_parser() -> argparse.ArgumentParser:
     events_p.add_argument("--kind",
                           help="with --recent: only events of this kind "
                                "(e.g. ptt.lifecycle, capture.stats)")
+    reach_p = sub.add_parser("reach", help="owner-only, read-only internet fetches")
+    reach_sub = reach_p.add_subparsers(dest="reach_cmd", required=True)
+    for command, help_text in (
+        ("fetch", "fetch a public HTTPS page"),
+        ("news", "fetch a public RSS/Atom feed by HTTPS URL"),
+        ("github", "fetch a public api.github.com endpoint by HTTPS URL"),
+        ("status", "show channel caps, journal usage and terminal outcomes"),
+    ):
+        reach_cmd = reach_sub.add_parser(command, help=help_text)
+        if command != "status":
+            reach_cmd.add_argument("url")
+        reach_cmd.add_argument("--json", action="store_true")
+
     errand_p = sub.add_parser(
         "errand", help="bounded async read-only errands (GAP-1)")
     errand_sub = errand_p.add_subparsers(dest="errand_cmd", required=True)
@@ -2586,6 +2643,7 @@ def build_parser() -> argparse.ArgumentParser:
     err_start.add_argument("instruction", help="owner instruction to compose and execute")
     err_start.add_argument("--root", action="append", dest="roots",
                            help="override read-only root(s) to scan (repeatable)")
+    err_start.add_argument("--web-url", help="run only an explicit read-only web.fetch step")
     err_start.add_argument("--max-steps", type=int, default=None)
     err_start.add_argument("--max-seconds", type=float, default=None)
     err_start.add_argument("--max-api-calls", type=int, default=None)
@@ -2975,6 +3033,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "hotword":
             return _hotword_command(args, config)
+
+        if args.command == "reach":
+            return _reach_command(args, config)
 
         if args.command == "errand":
             return _errand_command(args, config)
