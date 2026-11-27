@@ -75,6 +75,10 @@ alive receipt bookkeeping gap · S-C5 backup purge target when
 |---|---|---|---|
 | GAP-HW3 | `phone_link.py` (module) vs `daemon.py`/`cli.py` (absent) | Phone lane is module-complete but UNWIRED (found at hardware pass, 2026-11-27): `PhoneLink` is instantiated only in tests; the daemon never imports/instantiates it, no `[phone]` config section, no `assist phone` surface — the owner's SMS approve-each ruling (2026-11-26) has no live path to execute on. Same species as the PR #89 nus unplugged seam. Needs a wiring build (daemon owner-gated IPC + CLI + sidecar supervision), not a patch. | OPEN → PHONE-WIRE |
 
+| ID | Where | Failure | Status |
+|---|---|---|---|
+| BUG-HW2B | `_observation_linux.py` (descendant extents) + `observation.py` (`semantic_target`) | Residuals of the HW2 fix, proven on owner hardware 2026-11-27 (elements dump in session): (1) descendant `get_extents(SCREEN)` on GTK/Wayland returns `(0,0,w,h)` for every node — after window-origin translation all elements sit at the window's top-left; ring would point at the dialog corner for any target. Must use WINDOW-relative extents for descendants. (2) `semantic_target` counts a button and its contained label child as two ambiguous matches (`Cancel` button + `Cancel` label → `None` → "couldn't find it"); contained same-name label duplicates of an actionable element must collapse to it, while genuinely distinct same-name elements must still refuse. | OPEN → FIX-HW2B |
+
 ## Hunt scoreboard
 
 30 reproduced bugs (5 P0 · 19 P1 · 6 P2… see tables) + 13
