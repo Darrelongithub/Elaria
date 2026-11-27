@@ -100,10 +100,10 @@ class OrganiserService:
             api_calls_before = self.store.llm_summary()["calls"]
             if with_llm_tiers:
                 from .planner_llm import LlmPlanner
-                from .provider_router import ProviderRouter
+                from .provider_router import create_provider_router
 
-                router = self.router if self.router is not None else ProviderRouter(
-                    self.config, self.store)
+                router = (self.router if self.router is not None
+                          else create_provider_router(self.config, self.store))
                 LlmPlanner(self.config, self.store, router,
                            recall=getattr(self.memory, "recall", None)) \
                     .classify_abstained(items, taxonomy)

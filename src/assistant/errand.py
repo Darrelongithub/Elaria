@@ -1673,6 +1673,7 @@ class ErrandRunner:
         pointer_provider: Callable[[], Any] | None = None,
         is_offline: Callable[[], bool] | None = None,
         web_fetch: Callable[..., Awaitable[Any]] | None = None,
+        router=None,
     ):
         self.config = config
         self.store = store
@@ -1684,6 +1685,7 @@ class ErrandRunner:
         self._pointer_provider = pointer_provider
         self._is_offline = is_offline
         self._web_fetch = web_fetch
+        self.router = router
         self._tasks: dict[int, asyncio.Task] = {}
         self._cancel_events: dict[int, asyncio.Event] = {}
         self._resume_events: dict[int, asyncio.Event] = {}
@@ -1693,6 +1695,20 @@ class ErrandRunner:
         if self._pointer_provider is not None:
             return self._pointer_provider()
         return self._pointer
+
+    def _material_router(self):
+        """Return the errand material router, with only code-owned adapters.
+
+        The selected route comes from [organise], but configuration cannot
+        provide an endpoint or adapter. Groq/OpenRouter use the fixed HTTP
+        adapter implementation; unsupported or disabled routes fail closed
+        and the caller falls back to Gemini flash-lite.
+        """
+        if self.router is None:
+            from .provider_router import create_provider_router
+
+            self.router = create_provider_router(self.config, self.store)
+        return self.router
 
     def _pointer_permitted(self) -> bool:
         sec = self.config.section("nus_pointer") if self.config is not None else {}
@@ -2768,6 +2784,7 @@ class ErrandRunner:
                         det["structured_schema"] = structured_schema
                         llm_parsed: dict[str, Any] | None = None
                         purpose = f"errand:{errand_id}:step:{step_no}:content.analyze"
+                        route_trace = None
                         can_call_llm = (
                             use_llm
                             and self.client is not None
@@ -2777,48 +2794,98 @@ class ErrandRunner:
                         )
                         if can_call_llm:
                             prompt = _fence_observations_for_prompt(instruction, cloud_safe_obs)
-                            max_att = (
-                                min(budget.max_step_api_calls, budget.max_api_calls - api_calls_used)
-                                if budget.allow_escalation
-                                else 1
+                            call_limit = min(
+                                budget.max_step_api_calls,
+                                budget.max_api_calls - api_calls_used,
                             )
-                            # Cheapest-first under [quota]: role="organise" -> flash-lite.
-                            # With allow_escalation=False, max_attempts=1 guarantees 0 flash calls.
-                            try:
-                                if getattr(self.client, "supports_cancellable_async", False):
-                                    res = await self.client.generate_async(
-                                        "organise",
+                            max_att = call_limit if budget.allow_escalation else 1
+                            organise = self.config.section("organise")
+                            material_provider = str(
+                                organise.get("material_provider") or ""
+                            ).strip()
+                            material_model = str(
+                                organise.get("material_model") or ""
+                            ).strip()
+                            # Reserve one call for the owner-ruled Gemini fallback.
+                            # If only one call remains, use Gemini directly rather
+                            # than start a diverted call that could not fall back.
+                            try_diversion = bool(
+                                material_provider and material_model and call_limit >= 2
+                            )
+                            route_trace = {
+                                "attempted": False,
+                                "configured_provider": material_provider or None,
+                                "configured_model": material_model or None,
+                                "served_by": None,
+                            }
+                            if try_diversion:
+                                route_trace["attempted"] = True
+                                try:
+                                    envelope = await asyncio.to_thread(
+                                        self._material_router().material,
+                                        material_provider,
+                                        material_model,
+                                        purpose,
                                         prompt,
-                                        purpose=purpose,
-                                        is_user_turn=False,
-                                        max_attempts=max_att,
+                                        mode=str(getattr(self.config, "gemini_mode", "mock")),
                                     )
-                                else:
-                                    res = await asyncio.to_thread(
-                                        self.client.generate,
-                                        "organise",
-                                        prompt,
-                                        purpose=purpose,
-                                        is_user_turn=False,
-                                        max_attempts=max_att,
+                                    step_model = f"{envelope.provider}/{envelope.model}"
+                                    route_trace["served_by"] = step_model
+                                    llm_parsed = _parse_llm_analysis_json(
+                                        envelope.content, cloud_safe_obs
                                     )
-                                step_model = getattr(res, "model", None)
-                                llm_parsed = _parse_llm_analysis_json(
-                                    getattr(res, "text", ""), cloud_safe_obs
-                                )
-                            except Exception as llm_exc:
-                                unanswered_notes.append({
-                                    "reason": (
-                                        f"cloud analysis step degraded to local structural pass: "
-                                        f"{type(llm_exc).__name__}: {llm_exc}"
-                                    ),
-                                })
+                                except Exception as material_exc:
+                                    # ProviderRouter journals dispatched errors;
+                                    # this step receipt makes the fallback leg
+                                    # explicit without exposing provider payloads.
+                                    route_trace["fallback_reason"] = type(material_exc).__name__
+
+                            # A diverted response is data only. It is locally
+                            # verified and can influence inference/question
+                            # records, never speech or an owner-facing reply.
+                            if route_trace["served_by"] is None:
+                                try:
+                                    gemini_attempts = 1 if try_diversion else max_att
+                                    if getattr(self.client, "supports_cancellable_async", False):
+                                        res = await self.client.generate_async(
+                                            "organise",
+                                            prompt,
+                                            purpose=purpose,
+                                            is_user_turn=False,
+                                            max_attempts=gemini_attempts,
+                                        )
+                                    else:
+                                        res = await asyncio.to_thread(
+                                            self.client.generate,
+                                            "organise",
+                                            prompt,
+                                            purpose=purpose,
+                                            is_user_turn=False,
+                                            max_attempts=gemini_attempts,
+                                        )
+                                    step_model = getattr(res, "model", None)
+                                    route_trace["served_by"] = (
+                                        f"gemini/{step_model}" if step_model else "gemini"
+                                    )
+                                    llm_parsed = _parse_llm_analysis_json(
+                                        getattr(res, "text", ""), cloud_safe_obs
+                                    )
+                                except Exception as llm_exc:
+                                    route_trace["fallback_error"] = type(llm_exc).__name__
+                                    unanswered_notes.append({
+                                        "reason": (
+                                            "cloud analysis step degraded to local structural pass: "
+                                            f"{type(llm_exc).__name__}: {llm_exc}"
+                                        ),
+                                    })
+                            # Both ProviderRouter and Gemini record in llm_calls;
+                            # purpose-scoped usage already includes each attempted
+                            # leg exactly once (including a journaled 429).
                             usage = self.store.llm_usage_for_purpose(purpose)
                             step_api_calls = usage["calls"]
                             step_tokens_in = usage["tokens_in"]
                             step_tokens_out = usage["tokens_out"]
                             step_shadow_cost = usage["shadow_cost_usd"]
-                            step_model = usage["model"] or step_model
                         elif use_llm and self.client is not None and cloud_safe_obs and (
                             budget.max_step_api_calls < 1 or api_calls_used >= budget.max_api_calls
                         ):
@@ -2830,10 +2897,19 @@ class ErrandRunner:
                                 ),
                             })
 
-                        # Merge verified LLM output + deterministic structural analysis.
+                        # Diverted material is not re-voiced on the success path
+                        # (that keeps this a single Groq call). It therefore may
+                        # inform no owner-facing sink: only local deterministic
+                        # observations can produce inferences/questions from this
+                        # step. Gemini fallback output follows the existing path.
+                        diverted_served = bool(
+                            route_trace and route_trace.get("served_by")
+                            and not str(route_trace["served_by"]).startswith("gemini/")
+                        )
+                        merge_model_output = bool(llm_parsed) and not diverted_served
                         merged_inferences = list(det["candidate_inferences"])
                         seen_claims = {c["text"].lower() for c in merged_inferences}
-                        if llm_parsed:
+                        if merge_model_output:
                             for inf in llm_parsed["candidate_inferences"]:
                                 if inf["text"].lower() not in seen_claims:
                                     seen_claims.add(inf["text"].lower())
@@ -2841,15 +2917,18 @@ class ErrandRunner:
 
                         merged_questions = list(det["clarifying_questions"])
                         seen_qs = {q["question"].lower() for q in merged_questions}
-                        if llm_parsed:
+                        if merge_model_output:
                             for q in llm_parsed["clarifying_questions"]:
                                 if q["question"].lower() not in seen_qs:
                                     seen_qs.add(q["question"].lower())
                                     merged_questions.append(q)
 
                         analysis_result = {
-                            "findings": (llm_parsed["findings"] if llm_parsed and llm_parsed["findings"]
-                                         else det["findings"]),
+                            "findings": (
+                                llm_parsed["findings"]
+                                if merge_model_output and llm_parsed["findings"]
+                                else det["findings"]
+                            ),
                             "candidate_inferences": merged_inferences,
                             "clarifying_questions": merged_questions,
                             "injection_signals": det["injection_signals"],
@@ -2863,6 +2942,7 @@ class ErrandRunner:
                             "clarifying_questions": len(merged_questions),
                             "injection_signals": len(det["injection_signals"]),
                             "model": step_model,
+                            "provider_route": route_trace,
                         }
                         if adaptive:
                             if merged_inferences:

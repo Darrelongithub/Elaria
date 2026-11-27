@@ -322,6 +322,24 @@ DEFAULTS: dict = {
         "flash_lite_rpd_cap": 400,   # §4.1 chat/intent config cap (under the 500 free)
         "max_requests_per_day": 1200,
         "max_requests_per_minute": 12,
+        "providers": {
+            "groq": {
+                "enabled": False,
+                "verified": False,
+                "verified_at": "",
+                "verified_source": "",
+                "plan": "",
+                "no_card_required": False,
+                "terms_reviewed_at": "",
+                "data_use_policy": "",
+                "models": {
+                    "openai/gpt-oss-20b": {
+                        "rpm": 30, "tpm": 8000, "rpd": 100,
+                        "billing_unit": "requests_tokens",
+                    },
+                },
+            },
+        },
     },
     "asr": {
         "primary": "gemini_live",
@@ -663,6 +681,8 @@ DEFAULTS: dict = {
         "watch": False,
         "watch_interval_s": 60,
         "max_extract_chars": 200_000,
+        "material_provider": "",
+        "material_model": "",
     },
     "policy": {
         "protected": ["~/.ssh", "~/.gnupg", "~/.config", "~/.local/share/assistant"],
@@ -795,6 +815,9 @@ DEFAULTS: dict = {
         "robots_cache_ttl_s": 86_400.0,
         "user_agent_contact": "elaria-reach@local",
         "offline": False,
+        "summarise_provider": "",
+        "summarise_model": "",
+        "summarise_rpd_budget": 0,
     },
     # On-demand phone link via the pinned caelestia-connect sidecar (IF-3
     # owner amendment). Disabled by default. Connect per owner interaction,

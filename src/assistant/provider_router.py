@@ -986,6 +986,26 @@ class ProviderRouter:
         }
 
 
+def create_provider_router(config=None, store=None, *,
+                           state_path: str | os.PathLike | None = None,
+                           clock: Callable[[], float] | None = None) -> ProviderRouter:
+    """Build the production router with all code-owned MATERIAL adapters.
+
+    Registering adapters only makes a provider capability available to the
+    router; dispatch still requires the owner's enabled, fully verified quota
+    row, positive model cap, and provider credentials at the network boundary.
+    Endpoints and credentials remain code/environment owned, never config.
+    """
+    adapters = (
+        HttpMaterialAdapter("groq"),
+        HttpMaterialAdapter("openrouter"),
+        CloudflareMaterialAdapter(),
+    )
+    return ProviderRouter(
+        config, store, adapters=adapters, state_path=state_path, clock=clock,
+    )
+
+
 def iso_stamp() -> str:
     from .cost import iso_now
 
@@ -1051,6 +1071,7 @@ __all__ = [
     "QuotaState",
     "RateLimited",
     "RouteRefused",
+    "create_provider_router",
     "quiet",
     "speakable",
     "verbatim_overlap",
