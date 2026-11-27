@@ -10,9 +10,11 @@ from assistant import _observation_linux, observation
 
 
 class Node:
-    def __init__(self, rect, *children, name='', role='frame',
+    def __init__(self, rect, *children, name='', role='frame', window_rect=None,
                  states=('active', 'showing'), component=True):
-        self.rect, self.children, self.name, self.role = rect, children, name, role
+        self.rect = rect
+        self.window_rect = rect if window_rect is None else window_rect
+        self.children, self.name, self.role = children, name, role
         self.states, self.component = states, component
 
     def get_state_set(self):
@@ -22,8 +24,9 @@ class Node:
         return self if self.component else None
 
     def get_extents(self, coord_type):
-        assert coord_type == 'screen'
-        return NS(**dict(zip(('x', 'y', 'width', 'height'), self.rect)))
+        assert coord_type in ('screen', 'window')
+        rect = self.rect if coord_type == 'screen' else self.window_rect
+        return NS(**dict(zip(('x', 'y', 'width', 'height'), rect)))
 
     def get_role(self):
         return self.role
@@ -42,25 +45,27 @@ class Node:
 
 @pytest.fixture
 def capture_tree(monkeypatch, capsys):
-    def capture(*windows):
+    def capture(*windows, at=(-600, 250), output_bounds=(-1280, 0, 1280, 720)):
         app = Node(None, *windows)
         app.get_process_id = lambda: 42
         atspi = NS(init=lambda: None, get_desktop=lambda _: Node(None, app),
-                   CoordType=NS(SCREEN='screen'), StateType=NS(ACTIVE='active', SHOWING='showing'),
+                   CoordType=NS(SCREEN='screen', WINDOW='window'),
+                   StateType=NS(ACTIVE='active', SHOWING='showing'),
                    Role=NS(PASSWORD_TEXT='password text'))
         monkeypatch.setitem(sys.modules, 'gi', NS(require_version=lambda *_: None))
         monkeypatch.setitem(sys.modules, 'gi.repository', NS(Atspi=atspi))
 
         def run(args):
             if args[0] == 'hyprctl':
-                return json.dumps({'pid': 42, 'at': [-600, 250], 'size': [300, 166]})
+                return json.dumps({'pid': 42, 'at': list(at), 'size': [300, 166]})
             monkeypatch.setattr(sys, 'argv', args[1:])
             assert _observation_linux.atspi() == 0
             return capsys.readouterr().out
 
         monkeypatch.setattr(observation, '_run', run)
-        output = observation.Output('test', (-1280, 0, 1280, 720), 1)
-        png = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR' + struct.pack('>II', 1280, 720)
+        output = observation.Output('test', output_bounds, 1)
+        png = (b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR'
+               + struct.pack('>II', output_bounds[2], output_bounds[3]))
         frame, _ = observation.capture(desktop=lambda: ('focus', output, 1),
                                        screenshot=lambda *_: png)
         return frame
@@ -82,7 +87,9 @@ def test_bug_hw2_relative_tree_reaches_ground(capture_tree):
 
 
 def test_bug_hw2_screen_tree_unchanged(capture_tree):
-    frame = capture_tree(Node((-600, 250, 300, 166), Node((-390, 370, 75, 32), name='Cancel')))
+    frame = capture_tree(Node((-600, 250, 300, 166),
+                              Node((0, 0, 75, 32), name='Cancel',
+                                   window_rect=(210, 120, 75, 32))))
     resolution = observation.ground(frame, observation.semantic_target(frame, 'Cancel'))
     assert resolution.bbox == (-390, 370, 75, 32)
 
@@ -107,14 +114,14 @@ def test_bug_hw2_rejected_windows_are_journaled(capture_tree, journal_stream, re
     (-608, 258, 292, 174),
 ])
 def test_bug_hw2_tolerance_boundary_preserves_exact_translation(capture_tree, rect):
-    relative = abs(rect[0]) <= 8
-    child = (210, 120, 75, 32) if relative else (-390, 370, 75, 32)
-    frame = capture_tree(Node(rect, Node(child, name='Cancel')))
+    relative = abs(rect[0]) <= 8 and abs(rect[1]) <= 8
+    child = Node((0, 0, 75, 32), name='Cancel', window_rect=(210, 120, 75, 32))
+    frame = capture_tree(Node(rect, child))
     dx, dy = (-600, 250) if relative else (0, 0)
     # Do not snap a nearly-zero origin or resize a toolkit rectangle.
     assert frame.elements[0].bounds == (rect[0] + dx, rect[1] + dy, *rect[2:])
     resolution = observation.ground(frame, observation.semantic_target(frame, 'Cancel'))
-    assert resolution.bbox == (-390, 370, 75, 32)
+    assert resolution.bbox == (rect[0] + dx + 210, rect[1] + dy + 120, 75, 32)
 
 
 @pytest.mark.parametrize('rect', [
@@ -198,3 +205,64 @@ def test_bug_hw2_nested_relative_rects_and_sensitive_overlap(capture_tree):
     assert observation.ground(frame, {**target, 'snapshot_id': 'stale'}) is None
     assert observation.ground(frame, observation.semantic_target(frame, 'Entry')) is None
     assert observation.ground(frame, observation.semantic_target(frame, 'Obscured control')) is None
+
+
+def test_bug_hw2b_dialog_button_and_contained_label_resolve_to_button(capture_tree):
+    label = Node((0, 0, 54, 20), name='Cancel', role='label',
+                 window_rect=(212, 108, 54, 20))
+    button = Node((0, 0, 80, 36), label, name='Cancel', role='push button',
+                  window_rect=(200, 100, 80, 36))
+    inner_panel = Node((0, 0, 280, 130), button, name='Button panel', role='panel',
+                       window_rect=(10, 20, 280, 130))
+    panel = Node((0, 0, 290, 146), inner_panel, name='Dialog panel', role='panel',
+                 window_rect=(5, 10, 290, 146))
+    # Every node's SCREEN extents are origin-based, matching the owner's dump.
+    frame = capture_tree(Node((0, 0, 300, 166), panel,
+                              name='Zenity dialog', role='dialog'),
+                         at=(811, 475), output_bounds=(0, 0, 1280, 720))
+
+    matches = [element for element in frame.elements if element.name == 'Cancel']
+    assert len(matches) == 2
+    button_element = next(element for element in matches if element.role == 'push button')
+    target = observation.semantic_target(frame, 'Cancel')
+    assert target['id'] == button_element.id
+    resolution = observation.ground(frame, target)
+    assert resolution.bbox == (1011, 575, 80, 36)
+    assert resolution.bbox == button_element.bounds
+
+
+def test_bug_hw2b_separate_same_name_buttons_remain_ambiguous(capture_tree):
+    first = Node((0, 0, 100, 30), name='Cancel', role='push button',
+                 window_rect=(20, 50, 100, 30))
+    second = Node((0, 0, 100, 30), name='Cancel', role='push button',
+                  window_rect=(160, 50, 100, 30))
+    panel = Node((0, 0, 300, 166), first, second, name='Dialog panel', role='panel',
+                 window_rect=(0, 0, 300, 166))
+    frame = capture_tree(Node((0, 0, 300, 166), panel, name='Zenity dialog', role='dialog'))
+
+    assert observation.semantic_target(frame, 'Cancel') is None
+
+
+def test_bug_hw2b_descendant_escape_rejects_frame_and_journals_reason(
+        capture_tree, journal_stream):
+    outside = Node((0, 0, 30, 30), name='Outside control', role='push button',
+                   window_rect=(280, 145, 30, 30))
+    frame = capture_tree(Node((0, 0, 300, 166), outside, name='Zenity dialog', role='dialog'))
+
+    assert frame.elements == ()
+    assert ('observation.atspi.windows - - rejected '
+            '{"descendant_outside_window": 1}') in journal_stream.getvalue()
+    assert 'Outside control' not in journal_stream.getvalue()
+
+
+def test_bug_hw2b_sensitive_collapsed_control_is_still_refused(capture_tree):
+    label = Node((0, 0, 54, 20), name='Field', role='label',
+                 window_rect=(212, 108, 54, 20))
+    password = Node((0, 0, 80, 36), label, name='Field', role='password text',
+                    window_rect=(200, 100, 80, 36))
+    frame = capture_tree(Node((0, 0, 300, 166), password, name='Zenity dialog', role='dialog'))
+
+    target = observation.semantic_target(frame, 'Field')
+    assert target['id'] == next(element.id for element in frame.elements
+                                if element.role == 'password text')
+    assert observation.ground(frame, target) is None
