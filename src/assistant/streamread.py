@@ -1236,7 +1236,11 @@ def inspect(target: str | Path, *, protected: Iterable[str] = (),
         result.skeleton["format"] = fmt
     if size > budget:
         result.skeleton["sample_bytes"] = budget
-        result.skeleton["estimate"]["exact"] = False
+        # Not every skeleton has a record estimate (notably HTML/XML).
+        # Do not invent one just to mark the sample as inexact.
+        estimate = result.skeleton.get("estimate")
+        if isinstance(estimate, dict):
+            estimate["exact"] = False
     return result
 
 
