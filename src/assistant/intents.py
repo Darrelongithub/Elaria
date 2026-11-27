@@ -63,7 +63,8 @@ OBSERVATION_KIND = "observation"
 
 @dataclass
 class Intent:
-    kind: str                 # status | cost | where | search | remember | forget | halt | undo | organise
+    kind: str                 # status | cost | time | date | where | search | remember | forget
+                              # halt | undo | organise
     argument: str = ""        # the payload (query, fact text, since spec…)
     raw: str = ""             # the text as it was heard/read
     source: str = "owner-typed"
@@ -92,7 +93,7 @@ class Intent:
 
 
 #: Kinds whose execution changes state. `capability`, `confirm`,
-#: `queue_status`, `status`, `cost`, `where`, `search` are read-only.
+#: `queue_status`, `status`, `cost`, `time`, `date`, `where`, `search` are read-only.
 #: Anything NOT listed here is treated as mutating (fail-closed).
 MUTATING_KINDS = frozenset({
     "halt", "mode_offline", "mode_online", "mode_auto", "queue_drain",
@@ -100,8 +101,8 @@ MUTATING_KINDS = frozenset({
 })
 
 READ_ONLY_KINDS = frozenset({
-    "status", "cost", "queue_status", "where", "search", "capability",
-    "confirm", "point", OBSERVATION_KIND,
+    "status", "cost", "time", "date", "queue_status", "where", "search",
+    "capability", "confirm", "point", OBSERVATION_KIND,
 })
 
 
@@ -118,6 +119,20 @@ def is_mutating(kind: str) -> bool:
 _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("halt", re.compile(r"^\s*(?:halt|stop everything|panic stop)(?:\s+(?:now|please))*\s*[!.]*\s*$", re.IGNORECASE)),
     ("status", re.compile(r"^\s*(status|are you (up|running|alive)|health)\s*\??\s*$", re.IGNORECASE)),
+    # Bare, anchored questions only: a question about a meeting, deadline,
+    # or other stored item must continue up the ladder instead of being
+    # answered as the current clock/date.
+    ("time", re.compile(r"^\s*(?:what\s+time(?:\s+is\s+it)?(?:\s+(?:right\s+)?now)?|"
+                         r"what(?:'s|’s| is)\s+(?:the\s+)?(?:current\s+)?time"
+                         r"(?:\s+(?:right\s+)?now)?|current\s+time|"
+                         r"tell\s+me\s+the\s+time|can\s+you\s+tell\s+me\s+the\s+time)"
+                         r"\s*[?.!]*\s*$", re.IGNORECASE)),
+    ("date", re.compile(r"^\s*(?:what\s+day\s+is\s+it(?:\s+today)?|"
+                         r"what\s+day\s+is\s+today|what(?:'s|’s| is)\s+"
+                         r"(?:the\s+)?(?:current\s+)?date(?:\s+today)?|"
+                         r"what(?:'s|’s| is)\s+today(?:'s|’s)\s+date|"
+                         r"what\s+date\s+is\s+(?:it|today)|today(?:'s|’s)\s+date)"
+                         r"\s*[?.!]*\s*$", re.IGNORECASE)),
     ("mode_offline", re.compile(r"^\s*(go offline|offline mode|force offline|disconnect)\s*[!.]*\s*$", re.IGNORECASE)),
     ("mode_online", re.compile(r"^\s*(go online|online mode|reconnect)\s*[!.]*\s*$", re.IGNORECASE)),
     ("mode_auto", re.compile(r"^\s*(auto mode|connectivity auto|automatic mode)\s*[!.]*\s*$", re.IGNORECASE)),
@@ -147,6 +162,11 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     # rudisha = restore/undo.)
     ("halt", re.compile(r"^\s*(simama|wacha yote|simamisha yote)\s*[!.]*\s*$", re.IGNORECASE)),
     ("status", re.compile(r"^\s*(hali|uko sawa|unaendelea vipi)\s*\??\s*$", re.IGNORECASE)),
+    ("time", re.compile(r"^\s*(?:(?:ni\s+)?saa\s+ngapi(?:\s+(?:sasa|leo))?)\s*[?.!]*\s*$", re.IGNORECASE)),
+    ("date", re.compile(r"^\s*(?:leo\s+ni\s+siku\s+gani|ni\s+siku\s+gani(?:\s+leo)?|"
+                         r"siku\s+gani\s+leo|leo(?:\s+ni)?\s+tarehe\s+ngapi|"
+                         r"(?:ni\s+)?tarehe\s+ngapi(?:\s+leo)?)\s*[?.!]*\s*$",
+                         re.IGNORECASE)),
     ("mode_offline", re.compile(r"^\s*(enda nje ya mtandao|hali ya nje ya mtandao)\s*[!.]*\s*$", re.IGNORECASE)),
     ("mode_online", re.compile(r"^\s*(rudi mtandaoni|enda mtandaoni|hali ya mtandaoni)\s*[!.]*\s*$", re.IGNORECASE)),
     ("mode_auto", re.compile(r"^\s*(hali ya kiotomatiki|kiotomatiki)\s*[!.]*\s*$", re.IGNORECASE)),
