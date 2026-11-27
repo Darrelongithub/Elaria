@@ -71,6 +71,10 @@ alive receipt bookkeeping gap · S-C5 backup purge target when
 |---|---|---|---|
 | BUG-HW2 | `_observation_linux.py` (`atspi()`) + `observation.py` (`_elements`) | AT-SPI grounding always empty on owner hardware (Hyprland/Wayland): GTK reports window extents WINDOW-RELATIVE (owner evidence: zenity window `active=True`, extents `(0,0,300,166)`), helper rejects any window whose SCREEN extents differ from `hyprctl` bounds by >8px ("reject disagreements instead of offsetting") → every window rejected → `elements: []` → honest "I couldn't find it" for on-screen buttons. Portal screenshot proven healthy (rc=0, valid PNG); AT-SPI bus/registry healthy; capture() itself succeeds. Fix direction: accept the window when SIZE matches Hyprland's within tolerance and extents are window-relative (origin ~0,0), translating all element bounds by the Hyprland window origin; keep rejecting true disagreements (size mismatch, ambiguous windows). Fail-closed spirit preserved: no guessed coordinates. | OPEN → FIX-HW2 |
 
+| ID | Where | Failure | Status |
+|---|---|---|---|
+| GAP-HW3 | `phone_link.py` (module) vs `daemon.py`/`cli.py` (absent) | Phone lane is module-complete but UNWIRED (found at hardware pass, 2026-11-27): `PhoneLink` is instantiated only in tests; the daemon never imports/instantiates it, no `[phone]` config section, no `assist phone` surface — the owner's SMS approve-each ruling (2026-11-26) has no live path to execute on. Same species as the PR #89 nus unplugged seam. Needs a wiring build (daemon owner-gated IPC + CLI + sidecar supervision), not a patch. | OPEN → PHONE-WIRE |
+
 ## Hunt scoreboard
 
 30 reproduced bugs (5 P0 · 19 P1 · 6 P2… see tables) + 13
