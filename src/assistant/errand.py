@@ -1705,14 +1705,9 @@ class ErrandRunner:
         and the caller falls back to Gemini flash-lite.
         """
         if self.router is None:
-            from .provider_router import HttpMaterialAdapter, ProviderRouter
+            from .provider_router import create_provider_router
 
-            provider = str(
-                self.config.section("organise").get("material_provider") or ""
-            ).strip()
-            adapters = ([HttpMaterialAdapter(provider)]
-                        if provider in {"groq", "openrouter"} else [])
-            self.router = ProviderRouter(self.config, self.store, adapters=adapters)
+            self.router = create_provider_router(self.config, self.store)
         return self.router
 
     def _pointer_permitted(self) -> bool:

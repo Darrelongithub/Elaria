@@ -16,10 +16,11 @@ from assistant.provider_router import (
     ProviderResult,
     ProviderRouter,
     RateLimited,
+    create_provider_router,
 )
 from assistant.store import Store
 
-MODEL = "llama-3.1-8b-instant"
+MODEL = "openai/gpt-oss-20b"
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 
@@ -33,7 +34,7 @@ def _groq_row(*, enabled: bool = True) -> dict:
         "no_card_required": True,
         "terms_reviewed_at": "2026-11-27",
         "data_use_policy": "fixture-reviewed",
-        "models": {MODEL: {"rpm": 30, "rpd": 100,
+        "models": {MODEL: {"rpm": 30, "tpm": 8000, "rpd": 100,
                             "billing_unit": "requests_tokens"}},
     }
 
@@ -184,4 +185,24 @@ async def test_errand_groq_failure_falls_back_to_journaled_gemini(
             assert routed and routed[0]["failures"] == 1
     finally:
         await runner.aclose()
+        store.close()
+
+
+def test_production_router_factory_registers_material_adapters_and_gates_dispatch(config, tmp_path):
+    store = Store(tmp_path / "factory.db")
+    config.raw.setdefault("quota", {})["providers"] = {"groq": _groq_row(enabled=True)}
+    try:
+        router = create_provider_router(config, store,
+                                       state_path=tmp_path / "factory-router-state.json")
+        adapters = router.adapters.report()
+        assert adapters["groq"] == ["material"]
+        assert adapters["openrouter"] == ["material"]
+        assert adapters["cloudflare"] == ["material"]
+        assert router.ladder_state()["material_diverted"] is True
+
+        config.raw["quota"]["providers"]["groq"]["enabled"] = False
+        disabled_router = create_provider_router(
+            config, store, state_path=tmp_path / "factory-router-disabled.json")
+        assert disabled_router.ladder_state()["material_diverted"] is False
+    finally:
         store.close()

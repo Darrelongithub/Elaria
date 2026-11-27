@@ -110,8 +110,9 @@ no_card_required = false
 terms_reviewed_at = ""
 data_use_policy = ""
 
-[quota.providers.groq.models."llama-3.1-8b-instant"]
+[quota.providers.groq.models."openai/gpt-oss-20b"]
 rpm = 30
+tpm = 8000
 rpd = 100
 billing_unit = "requests_tokens"
 

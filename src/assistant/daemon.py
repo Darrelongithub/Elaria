@@ -479,7 +479,7 @@ class Daemon:
         # (state, reason) pair are suppressed.
         from .nus_pointer import GroundingBudget, Pointer, RouterVlmGrounder
         from .nus_surface import NusDispatch
-        from .provider_router import ProviderRouter
+        from .provider_router import create_provider_router
 
         nus_path = config.section("nus_pointer").get("surface_path", "~/Elaria/ui/quickshell/nus")
         self._nus_surface = NusDispatch(Path(nus_path).expanduser())
@@ -494,7 +494,7 @@ class Daemon:
         vlm_grounder = None
         if grounding_budget.enabled and grounding_budget.rpd_cap > 0:
             vlm_grounder = RouterVlmGrounder(
-                ProviderRouter(config, self.store),
+                create_provider_router(config, self.store),
                 purpose="nus_pointer.grounding",
                 mode=str(getattr(config, "gemini_mode", "mock")),
             )
@@ -1545,11 +1545,11 @@ class Daemon:
         # are local SQLite; the ladder reads the same caps/buckets that gate
         # dispatch, so the CLI can never disagree with enforcement.
         from .cost import provider_cost_report
-        from .provider_router import ProviderRouter
+        from .provider_router import create_provider_router
 
         providers = provider_cost_report(self.store, day_start_iso())
         try:
-            ladder = ProviderRouter(self.config, self.store).ladder_state()
+            ladder = create_provider_router(self.config, self.store).ladder_state()
         except Exception as exc:  # an unreadable state file must not kill `cost`
             ladder = {"level": "?", "reason": f"ladder unreadable: {type(exc).__name__}",
                       "gemini_flash": False, "gemini_flash_lite": False,

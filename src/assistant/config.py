@@ -333,8 +333,8 @@ DEFAULTS: dict = {
                 "terms_reviewed_at": "",
                 "data_use_policy": "",
                 "models": {
-                    "llama-3.1-8b-instant": {
-                        "rpm": 30, "rpd": 100,
+                    "openai/gpt-oss-20b": {
+                        "rpm": 30, "tpm": 8000, "rpd": 100,
                         "billing_unit": "requests_tokens",
                     },
                 },
