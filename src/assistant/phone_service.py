@@ -73,6 +73,7 @@ from .provider_router import (
     ProviderRouter,
     QuietStatus,
     RouteRefused,
+    create_provider_router,
     verbatim_overlap,
 )
 from .safety_journal import (
@@ -465,7 +466,7 @@ class PhoneService:
             _gemini_personality,
             capabilities=(Capability.PERSONALITY,),
         )
-        self._router = ProviderRouter(
+        self._router = create_provider_router(
             config=self.config,
             store=self.store,
             adapters=[adapter],

@@ -307,21 +307,6 @@ DEFAULTS: dict = {
             "rpd_cap": 30,
             "timeout_s": 4.0,
         },
-        # Flat aliases remain readable by older code/configs and by the client's
-        # limiter. `0` means "not rate-limited" (Transcribe Live).
-        "flash_rpm": 5,
-        "flash_tpm": 250_000,
-        "flash_rpd": 20,
-        "flash_lite_rpm": 15,
-        "flash_lite_tpm": 250_000,
-        "flash_lite_rpd": 500,
-        "transcribe_live_rpm": 0,
-        "transcribe_live_tpm": 20_000,
-        "transcribe_live_rpd": 0,
-        "transcribe_batch_rpd": 25,
-        "flash_lite_rpd_cap": 400,   # §4.1 chat/intent config cap (under the 500 free)
-        "max_requests_per_day": 1200,
-        "max_requests_per_minute": 12,
         "providers": {
             "groq": {
                 "enabled": False,
@@ -340,6 +325,21 @@ DEFAULTS: dict = {
                 },
             },
         },
+        # Flat aliases remain readable by older code/configs and by the client's
+        # limiter. `0` means "not rate-limited" (Transcribe Live).
+        "flash_rpm": 5,
+        "flash_tpm": 250_000,
+        "flash_rpd": 20,
+        "flash_lite_rpm": 15,
+        "flash_lite_tpm": 250_000,
+        "flash_lite_rpd": 500,
+        "transcribe_live_rpm": 0,
+        "transcribe_live_tpm": 20_000,
+        "transcribe_live_rpd": 0,
+        "transcribe_batch_rpd": 25,
+        "flash_lite_rpd_cap": 400,   # §4.1 chat/intent config cap (under the 500 free)
+        "max_requests_per_day": 1200,
+        "max_requests_per_minute": 12,
     },
     "asr": {
         "primary": "gemini_live",
@@ -666,6 +666,8 @@ DEFAULTS: dict = {
     },
     "organise": {
         "mode": "shadow",
+        "material_provider": "",
+        "material_model": "",
         "confidence_auto": 0.90,
         "confidence_review": 0.60,
         "tier0_min_confidence": 0.85,  # below: would escalate to LLM tiers (§3.7)
@@ -681,8 +683,6 @@ DEFAULTS: dict = {
         "watch": False,
         "watch_interval_s": 60,
         "max_extract_chars": 200_000,
-        "material_provider": "",
-        "material_model": "",
     },
     "policy": {
         "protected": ["~/.ssh", "~/.gnupg", "~/.config", "~/.local/share/assistant"],

@@ -188,9 +188,12 @@ async def test_errand_groq_failure_falls_back_to_journaled_gemini(
         store.close()
 
 
-def test_production_router_factory_registers_material_adapters_and_gates_dispatch(config, tmp_path):
+def test_production_router_factory_registers_material_adapters_and_gates_dispatch(
+    config, tmp_path, monkeypatch,
+):
     store = Store(tmp_path / "factory.db")
     config.raw.setdefault("quota", {})["providers"] = {"groq": _groq_row(enabled=True)}
+    monkeypatch.setenv("ELARIA_GROQ_API_KEY", "fixture-only-not-used")
     try:
         router = create_provider_router(config, store,
                                        state_path=tmp_path / "factory-router-state.json")

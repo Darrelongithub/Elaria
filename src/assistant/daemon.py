@@ -272,6 +272,8 @@ class Daemon:
             f"elaria_ipc_method_{id(self)}", default=None)
         config.ensure_dirs()
         self.store = Store(config.db_path)
+        from .provider_router import create_provider_router
+        self.provider_router = create_provider_router(config, self.store)
         self.governor = PersonaGovernor.from_config(config, load_humour_profile(config))
         self.client = GeminiClient(config, self.store)
         self.started_at = iso_now()
@@ -314,7 +316,8 @@ class Daemon:
         self.dictation = DictationService(
             config, self.store, self.client,
             mode_manager=self.mode_manager, offline_queue=self.cloud_queue)
-        self.organiser = OrganiserService(config, self.store, self.client)
+        self.organiser = OrganiserService(
+            config, self.store, self.client, router=self.provider_router)
         from .executor import Executor
         self.executor = Executor(config, self.store)
         from .embeddings import make_embedder
@@ -334,6 +337,7 @@ class Daemon:
         self.errands = ErrandRunner(
             config, self.store, self.memory,
             client=self.client,
+            router=self.provider_router,
             safety_journal=self.safety_journal,
             broadcast=self.broadcast,
             pointer_provider=lambda: self._nus_pointer,
@@ -479,8 +483,6 @@ class Daemon:
         # (state, reason) pair are suppressed.
         from .nus_pointer import GroundingBudget, Pointer, RouterVlmGrounder
         from .nus_surface import NusDispatch
-        from .provider_router import create_provider_router
-
         nus_path = config.section("nus_pointer").get("surface_path", "~/Elaria/ui/quickshell/nus")
         self._nus_surface = NusDispatch(Path(nus_path).expanduser())
         self._nus_state_lock = asyncio.Lock()
@@ -494,7 +496,7 @@ class Daemon:
         vlm_grounder = None
         if grounding_budget.enabled and grounding_budget.rpd_cap > 0:
             vlm_grounder = RouterVlmGrounder(
-                create_provider_router(config, self.store),
+                self.provider_router,
                 purpose="nus_pointer.grounding",
                 mode=str(getattr(config, "gemini_mode", "mock")),
             )
@@ -1545,11 +1547,10 @@ class Daemon:
         # are local SQLite; the ladder reads the same caps/buckets that gate
         # dispatch, so the CLI can never disagree with enforcement.
         from .cost import provider_cost_report
-        from .provider_router import create_provider_router
 
         providers = provider_cost_report(self.store, day_start_iso())
         try:
-            ladder = create_provider_router(self.config, self.store).ladder_state()
+            ladder = self.provider_router.ladder_state()
         except Exception as exc:  # an unreadable state file must not kill `cost`
             ladder = {"level": "?", "reason": f"ladder unreadable: {type(exc).__name__}",
                       "gemini_flash": False, "gemini_flash_lite": False,
