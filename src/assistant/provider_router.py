@@ -963,8 +963,6 @@ class ProviderRouter:
                 "quota_bucket": bucket, "ts": iso_stamp(),
                 "billing_unit": result.billing_unit,
                 "billing_amount": result.billing_amount,
-                "tokens_in": int((result.usage or {}).get("tokens_in", 0)),
-                "tokens_out": int((result.usage or {}).get("tokens_out", 0)),
                 "reserved_cost": unit_cost,
             }, untrusted=True)
 
@@ -1018,12 +1016,14 @@ class ProviderRouter:
 def create_provider_router(config=None, store=None, *, adapters=(),
                            state_path: str | os.PathLike | None = None,
                            clock: Callable[[], float] | None = None) -> ProviderRouter:
-    """Build the production router with every code-owned material adapter.
+    """Build the production router with all code-owned MATERIAL adapters.
 
-    Registration only makes a provider known to the ladder; dispatch remains
-    gated by the owner's verified quota row, positive model caps, and provider
-    credentials. Caller-supplied adapters are for separately code-owned roles
-    such as the pinned Gemini personality transport.
+    Registering adapters only makes a provider capability available to the
+    router; dispatch still requires the owner's enabled, fully verified quota
+    row, positive model cap, and provider credentials at the network boundary.
+    Endpoints and credentials remain code/environment owned, never config.
+    Extra adapters are reserved for code-owned roles such as pinned Gemini
+    personality; they cannot grant a diverted provider PERSONALITY capability.
     """
     material_adapters = (
         HttpMaterialAdapter("groq"),
@@ -1032,7 +1032,8 @@ def create_provider_router(config=None, store=None, *, adapters=(),
     )
     return ProviderRouter(
         config, store, adapters=(*material_adapters, *tuple(adapters)),
-        state_path=state_path, clock=clock)
+        state_path=state_path, clock=clock,
+    )
 
 
 def iso_stamp() -> str:

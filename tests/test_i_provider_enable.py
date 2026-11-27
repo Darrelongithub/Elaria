@@ -118,11 +118,15 @@ async def test_errand_material_route_and_pinned_gemini_fallback(
         analyze = next(step for step in outcome["steps"]
                        if step["skill"] == "content.analyze")
         assert analyze["model"] == expected_model
+        route = analyze["result"]["provider_route"]
+        assert route["served_by"] == (
+            f"groq/{GROQ_MODEL}" if route_mode == "success"
+            else f"gemini/{CHAT_INTENT}")
         assert bool(gemini.calls) is expect_gemini
         assert all(call[0] == "organise" and call[1] == 1 for call in gemini.calls)
         if route_mode != "success":
-            notes = outcome["report"]["unanswered_or_unasked"]
-            assert any("material route unavailable" in note["reason"] for note in notes)
+            assert route["fallback_reason"] == (
+                "RateLimited" if route_mode == "429" else "ProviderDisabledError")
         else:
             rows = provider_cost_report(store, "2026-11-26T00:00:00+00:00")["rows"]
             assert any(row.get("provider") == "groq" for row in rows)
