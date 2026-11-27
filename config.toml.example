@@ -560,3 +560,18 @@ robots_cache_ttl_s = 86400.0
 user_agent_contact = "elaria-reach@local"
 offline = false
 
+[phone]
+# On-demand phone link via the pinned caelestia-connect sidecar (v1.1.1,
+# GPL-3.0 sidecar over AF_UNIX IPC — never imported). Disabled by default.
+# Strictly on-demand (IF-3 owner amendment): connect per owner interaction,
+# disconnect after; no persistent connection, no reconnect loop, no polling.
+enabled = false
+socket_path = ""                    # "" -> $XDG_RUNTIME_DIR/caelestia-connect/ipc.sock
+device_id = ""                      # optional device binding (refuses mismatches, S-C2)
+connect_timeout_s = 5.0
+request_timeout_s = 10.0
+draft_ttl_s = 900.0                 # pending drafts expire after 15 minutes
+max_inbox_threads = 20
+max_thread_messages = 20
+
+
