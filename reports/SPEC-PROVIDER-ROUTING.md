@@ -89,8 +89,13 @@ Decided in session after fact-checking the survey:
 - **First diverted provider: Groq** (free tier, no card —
   ~30 RPM / ~14.4k req/day on small models per the provider's
   published free limits; the per-token prices on its pricing
-  page are the paid tiers). Model: `llama-3.1-8b-instant` for
-  bulk material. OpenRouter deferred (its useful free uplift
+  page are the paid tiers). Model: `openai/gpt-oss-20b` for
+  bulk material (owner's Groq console, 2026-11-27:
+  `llama-3.1-8b-instant` no longer exists in Groq's catalogue;
+  gpt-oss-20b is the available bulk tier. Owner-verified free
+  limits for it: 30 RPM, 1,000 req/day, 8,000 TPM, 200k
+  tokens/day; allow-list set to this one model only. Her own
+  config cap stays stricter: rpd = 100.) OpenRouter deferred (its useful free uplift
   needs a $10 credit purchase — refused under the $0 rule;
   50 req/day `:free` remains a possible second source later).
   Local Ollama rejected by the owner: the laptop hardware
