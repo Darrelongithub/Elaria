@@ -2198,7 +2198,21 @@ def _errand_command(args, config) -> int:
             for q in result["questions"]:
                 print(f"  question #{q['id']} [{q['status']}]: {q['question']}")
             if result.get("report"):
-                print(f"  report: {result['report'].get('summary')}")
+                report = result["report"]
+                print(f"  report: {report.get('summary')}")
+                for item in report.get("unanswered_or_unasked", []):
+                    if not isinstance(item, dict):
+                        continue
+                    reason = str(item.get("reason") or "unspecified")
+                    label = item.get("path") or item.get("question")
+                    print(f"  unanswered: {label + ': ' if label else ''}{reason}")
+                for failure in report.get("parse_failures", []):
+                    if not isinstance(failure, dict):
+                        continue
+                    error = str(failure.get("parse_error") or "unknown read/parse error")
+                    if len(error) > 240:
+                        error = error[:237] + "..."
+                    print(f"  parse failure: {failure.get('path') or '(unknown path)'}: {error}")
         return 0
 
     if action == "list":

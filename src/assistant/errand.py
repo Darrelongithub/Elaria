@@ -1801,6 +1801,12 @@ class ErrandRunner:
         from the instruction, so a new domain needs no new code.
         """
         target = str(candidate["target"])
+        from .streamread import is_inspect_only
+
+        if is_inspect_only(target):
+            return PlannedStep("file.inspect", {
+                "target": target, "queue_read": False,
+            })
         if Path(target).suffix.lower() in (".sqlite", ".sqlite3", ".db") and not target.startswith("zip://"):
             return PlannedStep("file.read_batch", {
                 "target": target, "never_send": candidate.get("never_send", False)})
@@ -2401,6 +2407,7 @@ class ErrandRunner:
                 step_untrusted_bytes = 0
                 step_summary: dict[str, Any] = {}
                 step_status = "ok"
+                read_failure_target: str | None = None
 
                 try:
                     if step.skill == "web.fetch":
@@ -2491,6 +2498,7 @@ class ErrandRunner:
                         # Structured records are data only. No decoded value is
                         # treated as a command or as byte-span verified evidence.
                         from .streamread import read_batch
+                        read_failure_target = target
                         batch = await asyncio.to_thread(
                             read_batch, target, step.args.get("cursor"),
                             byte_budget=max(256, min(budget.max_read_bytes, 2_000_000)),
@@ -2498,6 +2506,7 @@ class ErrandRunner:
                             max_record_chars=max(256, min(budget.max_read_bytes, 2_000_000)),
                             protected=protected, never_send_roots=never_send_roots,
                             cloud_bound=bool(step.args.get("cloud_bound", False)))
+                        read_failure_target = None
                         page = batch.as_dict()
                         if self.safety_journal is not None:
                             self.safety_journal.note_untrusted_input(
@@ -2557,6 +2566,7 @@ class ErrandRunner:
                                 budget.max_read_bytes,
                             )
                             record_limit = limits["record_limit"]
+                        read_failure_target = target
                         obs = await asyncio.to_thread(
                             skill_file_read,
                             target,
@@ -2573,6 +2583,7 @@ class ErrandRunner:
                             redact=limits["redact_sensitive"],
                             projection=step.args.get("projection"),
                         )
+                        read_failure_target = None
                         previous = files_inspected.get(obs.path)
                         if previous and previous["sha256"] != obs.sha256:
                             raise ValueError(f"file changed during streaming: {obs.path}")
@@ -2729,9 +2740,12 @@ class ErrandRunner:
                                 "path": target,
                                 "reason": f"inspection failed: {skeleton['parse_error']}",
                             })
+                        from .streamread import is_inspect_only
+
                         queued = step.args.get("queue_read")
                         if (adaptive and queued and not skeleton.get("parse_error")
-                                and skeleton.get("format") not in ("zip", "tar")):
+                                and skeleton.get("format") not in ("zip", "tar")
+                                and not is_inspect_only(target)):
                             if skeleton.get("format") in _STREAMED_FORMATS:
                                 queue.insert(0, PlannedStep("file.read", {
                                     "target": target,
@@ -3044,11 +3058,27 @@ class ErrandRunner:
                     )
                     raise
                 except Exception as exc:
-                    if step.skill in ("file.read", "file.stream", "file.inspect"):
+                    if step.skill in (
+                        "file.read", "file.read_batch", "file.stream", "file.inspect",
+                    ):
                         failed_target = str(step.args.get("target", ""))
                         inspections.setdefault(failed_target, {"target": failed_target})["parse_error"] = (
                             f"{type(exc).__name__}: {exc}")
                     step_status = "refused" if isinstance(exc, PermissionError) else "failed"
+                    error_text = f"{type(exc).__name__}: {exc}"
+                    per_file_read_failure = (
+                        step.skill in ("file.read", "file.read_batch", "file.stream")
+                        and read_failure_target is not None
+                    )
+                    if per_file_read_failure:
+                        step_summary = {"path": read_failure_target, "error": error_text}
+                        inspections.setdefault(
+                            read_failure_target, {"target": read_failure_target}
+                        )["parse_error"] = error_text
+                        unanswered_notes.append({
+                            "path": read_failure_target,
+                            "reason": f"read failed: {error_text}",
+                        })
                     duration_ms = round((time.monotonic() - step_t0) * 1000.0, 2)
                     # A stream/inspect/text read step spends real active time
                     # too (metadata-only discovery is cheap, reading is not).
@@ -3084,6 +3114,19 @@ class ErrandRunner:
                         shadow_cost_usd=total_shadow_cost,
                         active_elapsed_s=_active_now(),
                     )
+                    if per_file_read_failure:
+                        # A candidate-local read failure is loud in both report
+                        # channels, but it does not poison later queued files.
+                        await self._emit({
+                            "event": "errand.step",
+                            "errand_id": errand_id,
+                            "step_no": step_no,
+                            "skill": step.skill,
+                            "status": step_status,
+                            "api_calls": step_api_calls,
+                            "shadow_cost_usd": step_shadow_cost,
+                        })
+                        continue
                     terminal_status = "failed"
                     terminal_error = f"step {step_no} ({step.skill}): {type(exc).__name__}: {exc}"
                     break
