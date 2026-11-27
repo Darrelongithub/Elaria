@@ -79,6 +79,10 @@ alive receipt bookkeeping gap · S-C5 backup purge target when
 |---|---|---|---|
 | BUG-HW2B | `_observation_linux.py` (descendant extents) + `observation.py` (`semantic_target`) | Residuals of the HW2 fix, proven on owner hardware 2026-11-27 (elements dump in session): (1) descendant `get_extents(SCREEN)` on GTK/Wayland returns `(0,0,w,h)` for every node — after window-origin translation all elements sit at the window's top-left; ring would point at the dialog corner for any target. Must use WINDOW-relative extents for descendants. (2) `semantic_target` counts a button and its contained label child as two ambiguous matches (`Cancel` button + `Cancel` label → `None` → "couldn't find it"); contained same-name label duplicates of an actionable element must collapse to it, while genuinely distinct same-name elements must still refuse. | FIXED (PR #174; owner hardware retest pending) |
 
+| ID | Where | Failure | Status |
+|---|---|---|---|
+| GAP-HW4 | `reach/**` (module) vs daemon/CLI/errand (absent) | Internet fetcher unwired (found at hardware pass, 2026-11-27): no daemon IPC, no `assist reach`, no errand `web.fetch` skill imports `assistant.reach` outside its own package/tests. `[reach] enabled` currently enables nothing reachable. Needs a wiring build like PHONE-WIRE: owner-gated fetch entry points under the existing egress contract (allowlist, journal-first, terminal outcomes, IF-6 untrusted landing). | OPEN → REACH-WIRE |
+
 ## Hunt scoreboard
 
 30 reproduced bugs (5 P0 · 19 P1 · 6 P2… see tables) + 13
