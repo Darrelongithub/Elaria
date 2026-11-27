@@ -130,7 +130,10 @@ def atspi():
             states = node.get_state_set()
             if not states.contains(Atspi.StateType.SHOWING):
                 continue
-            role = node.get_role_name()
+            sensitive = node.get_role() == Atspi.Role.PASSWORD_TEXT
+            # Decide sensitivity before requesting any accessible content. Keep
+            # only a geometry tombstone, with a canonical role (not node text).
+            role = 'password text' if sensitive else node.get_role_name()
             component = node.get_component_iface()
             if component:
                 # SCREEN is needed to validate and place the top-level window.
@@ -154,8 +157,11 @@ def atspi():
                             escaped = True
                             rect = None
                     if rect is not None and len(rows) < 150:
-                        rows.append([node.get_name()[:256], role, rect,
-                                     node.get_role() == Atspi.Role.PASSWORD_TEXT])
+                        rows.append(['' if sensitive else node.get_name()[:256],
+                                     role, rect, sensitive])
+            if sensitive:
+                # Do not expose content through descendants of a password node.
+                continue
             stack.extend((node.get_child_at_index(k), False)
                          for k in reversed(range(min(150, node.get_child_count()))))
         if escaped:
