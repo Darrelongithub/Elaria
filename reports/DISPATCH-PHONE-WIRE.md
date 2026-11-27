@@ -5,6 +5,39 @@ is complete and test-proven, but nothing in the daemon or CLI
 instantiates it. The owner's SMS ruling (approve-each, `reports/
 OWNER-RULING-SMS-REPLIES-20261126.md`) currently has no live path.
 
+### STATUS (manager, 2026-11-27): partial + MANAGER CORRECTION
+
+First execution: S-C2 fixed (explicit `device=` differing from
+the configured binding is refused + journaled before any packet;
+119 phone-link tests pass) — but **uncommitted, no PR**, so not
+landed. **Correction (agent-caught, manager-owned):** the
+lifecycle below originally said "connect/reconnect with backoff"
+— WRONG. The owner-approved IF-3 amendment
+(`docs/contracts/IF-3-OWNER-AMENDMENT.md`) mandates a strictly
+**on-demand** sidecar: pull on demand + owner-initiated approved
+push, never a continuously running connection. Item (2) is
+amended accordingly in PHONE-WIRE-2.
+
+## PHONE-WIRE-2 — Agent P (complete, on-demand)
+
+> You are Agent P. PHONE-WIRE round 1 landed nothing (S-C2 fix
+> exists only in an uncommitted checkout — first recover or redo
+> it, say which in the PR). Complete the lane per the original
+> dispatch with this amendment: the sidecar lifecycle is
+> **ON-DEMAND** per `docs/contracts/IF-3-OWNER-AMENDMENT.md` —
+> connect per owner-initiated interaction (status/inbox/draft/
+> approve), disconnect after; no persistent connection, no
+> reconnect loop, no background polling. Sidecar absent =
+> `assist phone status` reports down honestly. Everything else
+> stands: `[phone]` config (enabled=false default), owner-gated
+> IPC, `assist phone {status,inbox,drafts,approve,reject}`,
+> personality-path drafting with expiry, fake-sidecar eye-checks
+> (approve fires exactly one `sms.send_sms`; reject/expiry/
+> injection send nothing; sidecar absence crashes nothing), and
+> the owner pairing script ending the report. Completion = a
+> MERGED PR containing the S-C2 fix AND the wiring. Sync main
+> first. Never edit OWNERS.yaml. Never widen the verb set.
+
 ## PHONE-WIRE — Agent P
 
 > You are Agent P. Wire the phone lane end-to-end, daemon side.
