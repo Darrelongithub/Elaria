@@ -87,6 +87,16 @@ MAX_SAMPLE_RECORDS: int = 40
 TEXT_FORMATS: frozenset[str] = frozenset({"text", "markdown", "log", "code"})
 LINE_FORMATS: frozenset[str] = frozenset({"jsonl", "ndjson"})
 
+# One source of truth for formats that can be structurally inspected but do
+# not have a stream reader. Inspection emits these notes, and callers can use
+# the same capability metadata to avoid scheduling a doomed read.
+INSPECT_ONLY_NOTES: dict[str, str] = {
+    "pdf": (
+        "PDF is inspected for metadata only; page-aware extraction is a "
+        "separate build. Streaming this target will fail loudly."
+    ),
+}
+
 _OOXML_PRIMARY: dict[str, tuple[str, ...]] = {
     ".docx": ("word/document.xml",),
     ".odt": ("content.xml",),
@@ -407,6 +417,11 @@ def detect_format(label: str | Path) -> str:
     if suffix in STRUCTURED_SUFFIXES:
         return "text"
     return "text"
+
+
+def is_inspect_only(target: str | Path) -> bool:
+    """Whether inspection can describe a target but streaming is unsupported."""
+    return detect_format(target) in INSPECT_ONLY_NOTES
 
 
 # ---------------------------------------------------------------------------
@@ -1168,11 +1183,9 @@ def inspect(target: str | Path, *, protected: Iterable[str] = (),
         result.parse_error = result.skeleton.get("parse_error")
         return result
 
-    if fmt == "pdf":
-        result.skeleton = {"format": "pdf", "streamable": False}
-        result.notes.append(
-            "PDF is inspected for metadata only; page-aware extraction is a "
-            "separate build. Streaming this target will fail loudly.")
+    if fmt in INSPECT_ONLY_NOTES:
+        result.skeleton = {"format": fmt, "streamable": False}
+        result.notes.append(INSPECT_ONLY_NOTES[fmt])
         return result
 
     ooxml_member = None

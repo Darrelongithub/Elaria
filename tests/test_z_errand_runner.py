@@ -783,6 +783,52 @@ def test_cli_errand_lifecycle_over_live_socket(tmp_path, config, running_daemon,
     assert done["report"]["status"] == "completed"
 
 
+def test_one_bad_candidate_does_not_abort_errand_and_plain_status_names_it(
+    tmp_path, config, running_daemon, capsys
+):
+    _daemon, _server = running_daemon
+    folder = tmp_path / "mixed_readability"
+    folder.mkdir()
+    bad = folder / "a-broken-notes.txt"
+    bad.write_bytes(b"not valid utf-8: \xff\xfe")
+    good = folder / "z-readable-notes.txt"
+    good.write_text("preferred_setting: quiet\n", encoding="utf-8")
+    pdf = folder / "metadata-only-notes.pdf"
+    pdf.write_bytes(b"%PDF-1.7\xff\xfe binary payload")
+    bad_db = folder / "broken-notes.sqlite"
+    bad_db.write_bytes(b"not a SQLite database")
+
+    started = call(config.socket_path, "errand.start", {
+        "instruction": "inspect folder and compare notes",
+        "roots": [str(folder)],
+        "budget": {"max_steps": 12, "max_api_calls": 0},
+    }, timeout=5.0)
+    done = _wait_for_status(config.socket_path, started["errand_id"], {"completed"})
+
+    assert done["report"]["status"] == "completed"
+    assert str(good) in {item["path"] for item in done["report"]["files_inspected"]}
+    failures = done["report"]["parse_failures"]
+    assert any(item["path"] == str(bad) and "UnicodeDecodeError" in item["parse_error"]
+               for item in failures)
+    assert any(item.get("path") == str(bad) and "UnicodeDecodeError" in item.get("reason", "")
+               for item in done["report"]["unanswered_or_unasked"])
+    assert any(item["path"] == str(bad_db) and item["parse_error"]
+               for item in failures)
+    failed_steps = [step for step in done["steps"]
+                    if step["args"].get("target") in {str(bad), str(bad_db)}]
+    assert len(failed_steps) == 2 and all(step["status"] == "failed" for step in failed_steps)
+    pdf_steps = [step for step in done["steps"] if step["args"].get("target") == str(pdf)]
+    assert pdf_steps and all(step["skill"] == "file.inspect" for step in pdf_steps)
+    assert all(step["skill"] != "file.read" or step["args"].get("target") != str(pdf)
+               for step in done["steps"])
+
+    assert cli_main(["errand", "status", str(started["errand_id"])]) == 0
+    plain = capsys.readouterr().out
+    assert str(bad) in plain
+    assert "UnicodeDecodeError" in plain
+    assert "read failed:" in plain
+
+
 def test_is_errand_instruction_stays_narrow_for_ordinary_chat():
     assert is_errand_instruction("errand: check notes") is True
     assert is_errand_instruction(
