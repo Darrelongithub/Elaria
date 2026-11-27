@@ -2333,6 +2333,41 @@ def _phone_command(args, config) -> int:
                 )
         return 0 if result.get("ok") else 1
 
+    if action == "notifications":
+        params = {"reveal": bool(args.reveal)}
+        result = call(config.socket_path, "phone.notifications", params, timeout=15.0)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        elif not result.get("ok"):
+            print(
+                f"assist phone notifications: sidecar down ({result.get('error')})",
+                file=sys.stderr,
+            )
+            return 1
+        elif result.get("restricted"):
+            print(f"{result.get('count', 0)} notifications (restricted mode — details hidden)")
+        elif result.get("bodies_included"):
+            items = result.get("items") or []
+            if not items:
+                print("(no notifications)")
+            for item in items:
+                flag = " [INJECTION-FLAGGED]" if item.get("suspected") else ""
+                who = f" from {item['sender']}" if item.get("sender") else ""
+                print(
+                    f"[UNTRUSTED · SENSITIVE · LOCAL-ONLY{flag}] "
+                    f"{item.get('app')}{who}: {item.get('body', '')}"
+                )
+        else:
+            summary = result.get("summary") or []
+            if not summary:
+                print("(no notifications)")
+            for row in summary:
+                cnt = int(row.get("count") or 0)
+                noun = "notification" if cnt == 1 else "notifications"
+                who = f" from {row['sender']}" if row.get("sender") else ""
+                print(f"{cnt} {noun}{who} ({row.get('app')}) [bodies hidden]")
+        return 0 if result.get("ok") else 1
+
     if action == "draft":
         params = {}
         if args.thread is not None:
@@ -2866,6 +2901,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="also draft a pending reply via the personality path (sends nothing)",
     )
     ph_inbox.add_argument("--json", action="store_true")
+    ph_notifs = phone_sub.add_parser(
+        "notifications",
+        help="show phone notification existence counts (bodies hidden unless --reveal)",
+    )
+    ph_notifs.add_argument(
+        "--reveal", action="store_true",
+        help="explicit owner ask to reveal notification bodies locally (journaled, never cloud)",
+    )
+    ph_notifs.add_argument("--json", action="store_true")
     ph_draft = phone_sub.add_parser(
         "draft", help="draft a pending SMS reply in Elaria's voice (sends nothing)"
     )

@@ -26,18 +26,18 @@
 |---|---|
 | `src/assistant/phone_link.py` | S-C2 fix in `send_approved` and `_call_plugin`; `inspect_state()` read-only helper (uses existing sidecar `"state"` query only); context manager (`__enter__`/`__exit__`) guaranteeing `close()`. **Verb allowlist (`READ_VERBS` = 8 verbs, `WRITE_VERBS` = `{"sms.send_sms"}`) unchanged.** |
 | `src/assistant/config.py` + `config.toml.example` | Added `[phone]` section (`enabled = false` default, `socket_path = ""`, `device_id = ""`, `connect_timeout_s = 5.0`, `request_timeout_s = 10.0`, `draft_ttl_s = 900.0`, `max_inbox_threads = 20`, `max_thread_messages = 20`), `Config.phone_socket_path()` / `phone_device_id()` / `phone_drafts_db_path()` / `phone_pairs_path()`, and `validate_config()` rules. |
-| `src/assistant/phone_service.py` | Strictly on-demand `PhoneService` orchestration: zero persistent connection, zero reconnect loop, zero background polling. Thread-safe local SQLite IF-1 `DraftStore` (`0600`) and `PairingRegistry` (`0600`). Canonical IF-6 trap detector (`hands/injection.py` + `phone_link.suspected_inbound`), IF-6 safe journaling (`SafetyJournal` `untrusted_input.load` + paired `begin`/`observe` without raw SMS content), personality-only drafting through `ProviderRouter.personality` (pinned Gemini `gemini-3.5-flash-lite`; diverted `MaterialEnvelope` requires `revoice_material` + overlap/canary guards), and exact IF-2 console wire framing (`format_console_draft_frame`). |
-| `src/assistant/daemon.py` | Instantiates `self.phone = PhoneService(...)` idle at startup; registers owner-gated (`_require_ipc_owner()`) IPC methods `phone.status`, `phone.inbox`, `phone.draft`, `phone.drafts`, `phone.approve`, `phone.reject`, `phone.revoke`, and `console.command`; wires `events.subscribe({console_replay: true})` replay and live `draft.pending` / `draft.resolved` broadcasts; closes local `DraftStore` in `aclose()`. |
-| `src/assistant/cli.py` | Added `assist phone {status,inbox,draft,drafts,approve,reject,revoke}` CLI surface. |
-| `tests/test_bug7_cli_smoke.py` | Added all 7 `assist phone` leaf subcommands to `_smoke_table`. |
-| `tests/test_p_phone_wire.py` | 17 end-to-end tests and fake-sidecar eye-checks. |
+| `src/assistant/phone_service.py` | Strictly on-demand `PhoneService` orchestration: zero persistent connection, zero reconnect loop, zero background polling. Thread-safe local SQLite IF-1 `DraftStore` (`0600`) and `PairingRegistry` (`0600`). Canonical IF-6 trap detector (`hands/injection.py` + `phone_link.suspected_inbound`), IF-6 safe journaling (`SafetyJournal` `untrusted_input.load` + paired `begin`/`observe` without raw SMS/notification content), 2026-11-27 owner notification privacy ruling (`notifications()` existence-only default, bare count in guest/company/showoff mode, explicit owner-only local `--reveal` excluded from all cloud calls & memory), personality-only drafting through `ProviderRouter.personality` (pinned Gemini `gemini-3.5-flash-lite`; diverted `MaterialEnvelope` requires `revoice_material` + overlap/canary guards), and exact IF-2 console wire framing (`format_console_draft_frame`). |
+| `src/assistant/daemon.py` | Instantiates `self.phone = PhoneService(...)` idle at startup; registers owner-gated (`_require_ipc_owner()`) IPC methods `phone.status`, `phone.inbox`, `phone.notifications`, `phone.draft`, `phone.drafts`, `phone.approve`, `phone.reject`, `phone.revoke`, and `console.command`; wires `events.subscribe({console_replay: true})` replay and live `draft.pending` / `draft.resolved` broadcasts; closes local `DraftStore` in `aclose()`. |
+| `src/assistant/cli.py` | Added `assist phone {status,inbox,notifications,draft,drafts,approve,reject,revoke}` CLI surface. |
+| `tests/test_bug7_cli_smoke.py` | Added all 8 `assist phone` leaf subcommands to `_smoke_table`. |
+| `tests/test_p_phone_wire.py` | 18 end-to-end tests and fake-sidecar eye-checks (including all 4 clauses of the 2026-11-27 notification privacy ruling). |
 | `bugs.md` | Marked `S-C2` and `GAP-HW3` fixed. |
 
 ---
 
 ## 3. Invariant & Eye-Check Verification
 
-All 17 tests in `tests/test_p_phone_wire.py` pass against real Unix sockets (`FakeAndroidPeer` + live `Daemon` + real `assist` CLI + real `console/bridge.py::validate_draft_event`):
+All 18 tests in `tests/test_p_phone_wire.py` pass against real Unix sockets (`FakeAndroidPeer` + live `Daemon` + real `assist` CLI + real `console/bridge.py::validate_draft_event`):
 
 | Check | Result |
 |---|---|
@@ -49,6 +49,7 @@ All 17 tests in `tests/test_p_phone_wire.py` pass against real Unix sockets (`Fa
 | Eye-check 3: `reject` and TTL expiry (`expire_sweeper`) send NOTHING; silence sends NOTHING | PASS |
 | Eye-check 4: prompt-injecting inbound SMS flagged (`suspected=True`), journaled (`phone.inbound.refused`, raw body never in journal), locked to original sender, cannot reach send path unapproved; credential/disclosure leak blocked | PASS |
 | Eye-check 5: sidecar death mid-draft preserves draft in local `0600` SQLite and crashes nothing; approve while sidecar dead leaves draft pending; sidecar send-refusal marks `failed (send-error)` without crashing or retrying | PASS |
+| Owner privacy ruling (2026-11-27 notifications): existence-only `(app, sender, count)` default, bare count only in company/guest/showoff mode, explicit owner local-only `--reveal` (journaled without bodies, excluded from all cloud calls & memory, voice-reveal fail-closed) | PASS |
 | Personality provider pin: `ProviderRouter.personality` Gemini-only; diverted `MaterialEnvelope` verbatim copy refused (`RouteRefused`); quota exhaustion & poisoned/forbidden model refused | PASS |
 | Owner-gated IPC (`SO_PEERCRED`): non-owner UID refused with `PermissionError` on every `phone.*` method and `console.command`; `halt` blocks `phone.approve` | PASS |
 | Console IF-2 compatibility: `events.subscribe({console_replay: true})` + live `draft.pending`/`draft.resolved` frames pass `console/bridge.py::validate_draft_event` and `console.command` works end-to-end | PASS |
@@ -128,6 +129,7 @@ ls -l "$XDG_RUNTIME_DIR/caelestia-connect/ipc.sock"
 
 4. Pair in the sidecar / KDE Connect app (**owner's deliberate act** — confirm the verification key on both devices):
    - Open KDE Connect on your phone, tap your laptop, and accept the pairing request in the sidecar UI/CLI (`caelestia-connect` client).
+   - **Privacy hygiene (2026-11-27 owner ruling):** in the Android KDE Connect app → select your laptop → **Notification sync** plugin → allowlist only apps that should mirror at all (**never** banking/authenticator apps). On Elaria's side, `assist phone notifications` surfaces existence counts only by default (bodies hidden unless you explicitly run `assist phone notifications --reveal`, which is local-only and excluded from all cloud calls).
 
 ### Step 4 — Confirm the pair in Elaria & pin `device_id`
 

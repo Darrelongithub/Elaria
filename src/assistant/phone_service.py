@@ -96,11 +96,15 @@ _JOURNAL_REDACTED_KEYS = frozenset({
 })
 
 
-def _phone_trap_detector(text: str) -> bool:
+def _phone_trap_detector(text: str, *, origin: str = "phone") -> bool:
     """Canonical IF-6 prompt-injection screen for inbound phone content."""
     if not isinstance(text, str) or not text:
         return False
-    return bool(hands_suspected(DataInput("phone", text)) or suspected_inbound(text))
+    return bool(hands_suspected(DataInput(origin, text)) or suspected_inbound(text))
+
+
+def _notification_trap_detector(text: str) -> bool:
+    return _phone_trap_detector(text, origin="notification")
 
 
 def _bound_utf8(value: str, max_bytes: int) -> str:
@@ -523,6 +527,7 @@ class PhoneService:
                         "phone.send.attempt",
                         "phone.send.sent",
                         "draft.sent",
+                        "phone.notifications.reveal",
                     }
                     entry_id = self.safety_journal.begin(
                         actor="phone",
@@ -717,6 +722,211 @@ class PhoneService:
             "error": None,
         }
 
+    def notifications(
+        self,
+        *,
+        reveal_body: bool = False,
+        restricted: bool = False,
+        owner_verified: bool = False,
+        voice_verified: bool | None = None,
+    ) -> dict[str, Any]:
+        """Read phone notifications on demand under the 2026-11-27 privacy ruling.
+
+        Binding rules (reports/DISPATCH-PHONE-WIRE.md):
+        (1) Notification bodies are sensitive — surface existence only
+            (app + sender + count) by default; never body text.
+        (2) Revealing a body requires explicit in-the-moment owner ask
+            (and owner voiceprint verification when voice-initiated), is
+            journaled without writing body text, and is refused when restricted.
+        (3) Notification content is BOTH untrusted (IF-6) AND sensitive:
+            local handling only, excluded from all cloud calls and long-term
+            memory.
+        (4) Stranger / guest / company / showoff modes: return bare count only,
+            not even existence metadata (app/sender).
+        """
+        self._require_enabled("notifications.read")
+        if reveal_body:
+            if restricted:
+                self._audit(
+                    "phone.notifications.refused",
+                    reason="notification bodies cannot be revealed in restricted/guest/showoff mode",
+                )
+                raise PermissionError(
+                    "notification bodies cannot be revealed in guest, company, or showoff mode"
+                )
+            if not owner_verified:
+                self._audit(
+                    "phone.notifications.refused",
+                    reason="revealing notification bodies requires owner authority",
+                )
+                raise PermissionError(
+                    "revealing notification bodies requires authenticated owner authority"
+                )
+            if voice_verified is False:
+                self._audit(
+                    "phone.notifications.refused",
+                    reason="voice-initiated notification body reveal requires owner voiceprint",
+                )
+                raise PermissionError(
+                    "revealing notification bodies by voice requires owner voiceprint verification"
+                )
+
+        try:
+            with self._open_link() as link:
+                link.sync_pairing()
+                raw = link.request("notifications.read")
+                if isinstance(raw, Mapping):
+                    raw_items = list(raw.get("items") or [])
+                elif isinstance(raw, list):
+                    raw_items = list(raw)
+                else:
+                    raw_items = []
+
+                normalized: list[dict[str, Any]] = []
+                for entry in raw_items:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    app_name = str(
+                        entry.get("appName")
+                        or entry.get("app")
+                        or entry.get("packageName")
+                        or "Unknown app"
+                    ).strip()
+                    sender = str(
+                        entry.get("title")
+                        or entry.get("sender")
+                        or entry.get("contact")
+                        or ""
+                    ).strip()
+                    body = str(
+                        entry.get("text")
+                        or entry.get("body")
+                        or entry.get("ticker")
+                        or ""
+                    )
+                    # IF-6 untrusted landing + trap detection (bodies never written to journal).
+                    delivered = link.deliver_inbound(
+                        "notification",
+                        [{"body": body, "title": sender, "app": app_name}],
+                    )
+                    suspected = bool(
+                        (delivered and delivered[0].suspected)
+                        or _notification_trap_detector(body)
+                        or _notification_trap_detector(sender)
+                    )
+                    normalized.append({
+                        "id": str(entry.get("id") or entry.get("internalId") or ""),
+                        "app": app_name,
+                        "sender": sender,
+                        "body": body,
+                        "time": entry.get("time"),
+                        "suspected": suspected,
+                    })
+        except (TransportError, PhoneLinkError, OSError) as exc:
+            self._audit("phone.notifications.unavailable", reason=str(exc))
+            return {
+                "ok": False,
+                "sidecar_reachable": False,
+                "state": "down",
+                "restricted": bool(restricted),
+                "trusted": False,
+                "sensitive": True,
+                "cloud_excluded": True,
+                "memory_excluded": True,
+                "count": 0,
+                "summary": [],
+                "bodies_included": False,
+                "items": [],
+                "error": str(exc),
+            }
+
+        # Clause (4): guest / stranger / company / showoff -> bare count ONLY.
+        if restricted:
+            return {
+                "ok": True,
+                "sidecar_reachable": True,
+                "state": "up",
+                "restricted": True,
+                "trusted": False,
+                "sensitive": True,
+                "cloud_excluded": True,
+                "memory_excluded": True,
+                "count": len(normalized),
+                "summary": [],
+                "bodies_included": False,
+                "items": [],
+                "error": None,
+            }
+
+        # Existence-only aggregation (app + sender + count) — zero body text.
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in normalized:
+            key = (item["app"], item["sender"])
+            bucket = grouped.get(key)
+            if bucket is None:
+                grouped[key] = {
+                    "app": item["app"],
+                    "sender": item["sender"],
+                    "count": 1,
+                    "suspected": item["suspected"],
+                }
+            else:
+                bucket["count"] += 1
+                bucket["suspected"] = bool(bucket["suspected"] or item["suspected"])
+        summary = list(grouped.values())
+
+        if not reveal_body:
+            return {
+                "ok": True,
+                "sidecar_reachable": True,
+                "state": "up",
+                "restricted": False,
+                "trusted": False,
+                "sensitive": True,
+                "cloud_excluded": True,
+                "memory_excluded": True,
+                "count": len(normalized),
+                "summary": summary,
+                "bodies_included": False,
+                "items": [],
+                "error": None,
+            }
+
+        # Clause (2) & (3): explicit in-the-moment owner reveal, journaled without body text.
+        self._audit(
+            "phone.notifications.reveal",
+            count=len(normalized),
+            suspected_count=sum(1 for i in normalized if i["suspected"]),
+        )
+        revealed_items = [
+            {
+                "id": item["id"],
+                "app": item["app"],
+                "sender": item["sender"],
+                "body": item["body"],
+                "time": item["time"],
+                "trusted": False,
+                "sensitive": True,
+                "suspected": item["suspected"],
+            }
+            for item in normalized
+        ]
+        return {
+            "ok": True,
+            "sidecar_reachable": True,
+            "state": "up",
+            "restricted": False,
+            "trusted": False,
+            "sensitive": True,
+            "cloud_excluded": True,
+            "memory_excluded": True,
+            "count": len(normalized),
+            "summary": summary,
+            "bodies_included": True,
+            "items": revealed_items,
+            "error": None,
+        }
+
     def list_drafts(self, *, state: str | None = PENDING) -> dict[str, Any]:
         """List drafts purely from local SQLite (never touches sidecar)."""
         expired = self.draft_store.expire_sweeper(self._clock())
@@ -738,6 +948,7 @@ class PhoneService:
         inbound_body: str | None = None,
         material: MaterialEnvelope | None = None,
         is_offline: bool = False,
+        source: str = "sms",
     ) -> dict[str, Any]:
         """Draft a reply for an inbound SMS strictly via the personality path.
 
@@ -745,6 +956,8 @@ class PhoneService:
           from the sidecar on demand and **disconnects immediately** BEFORE
           invoking the personality model — so sidecar death mid-draft loses
           nothing and crashes nothing.
+        - Notification bodies are sensitive and excluded from all cloud calls
+          (2026-11-27 owner privacy ruling); ``source="notification"`` is refused.
         - Inbound SMS is screened and journaled as untrusted IF-6 data.
         - Only the pinned Gemini personality route (``ProviderRouter.personality``)
           may draft the reply. If ``material`` (a diverted ``MaterialEnvelope``)
@@ -754,6 +967,15 @@ class PhoneService:
           IF-2 ``draft.pending``. Sends **ZERO** SMS packets.
         """
         self._require_enabled("phone.draft")
+        if str(source or "sms").strip().lower() == "notification":
+            self._audit(
+                "phone.draft.refused",
+                reason="notification bodies are sensitive and excluded from cloud calls",
+            )
+            raise ValueError(
+                "notification bodies are sensitive and excluded from cloud calls "
+                "(2026-11-27 owner privacy ruling; local handling only)"
+            )
         self.draft_store.expire_sweeper(self._clock())
 
         resolved_conv_id = str(conversation_id or thread_id or "").strip()

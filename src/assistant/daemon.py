@@ -1248,6 +1248,7 @@ class Daemon:
             "nus.point": self._nus_point,
             "phone.status": self._phone_status,
             "phone.inbox": self._phone_inbox,
+            "phone.notifications": self._phone_notifications,
             "phone.draft": self._phone_draft,
             "phone.drafts": self._phone_drafts,
             "phone.approve": self._phone_approve,
@@ -1818,6 +1819,37 @@ class Daemon:
         finally:
             await self._flush_phone_events()
 
+    async def _phone_notifications(self, params: dict) -> dict:
+        """On-demand notification read enforcing the 2026-11-27 privacy ruling."""
+        self._require_ipc_owner()
+        for forged in ("voiceprint_score", "voice_verified", "owner_verified"):
+            if forged in params:
+                raise ValueError(
+                    f"refused: phone.notifications does not accept caller-supplied {forged!r}; "
+                    "owner authority comes from kernel IPC/daemon verification only"
+                )
+        reveal = bool(params.get("reveal", False))
+        speaker = str(params.get("speaker") or "owner").strip().lower()
+        restricted = bool(
+            self.showoff.status().get("active")
+            or self.disclosure.company()
+            or speaker != "owner"
+        )
+        # Voice-initiated reveal fails closed unless backed by a live verified voice session.
+        voice_verified: bool | None = None
+        if bool(params.get("from_voice")):
+            voice_verified = False
+        try:
+            return await asyncio.to_thread(
+                self.phone.notifications,
+                reveal_body=reveal,
+                restricted=restricted,
+                owner_verified=True,
+                voice_verified=voice_verified,
+            )
+        finally:
+            await self._flush_phone_events()
+
     async def _phone_draft(self, params: dict) -> dict:
         self._require_ipc_owner()
         connectivity = await self._connectivity_snapshot()
@@ -1829,6 +1861,7 @@ class Daemon:
                 recipient=params.get("recipient"),
                 inbound_body=params.get("inbound_body"),
                 is_offline=connectivity.is_offline,
+                source=str(params.get("source") or "sms"),
             )
         finally:
             await self._flush_phone_events()

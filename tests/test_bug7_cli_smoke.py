@@ -132,6 +132,7 @@ def _smoke_table(tmp_path: Path) -> list[list[str]]:
         ["errand", "answer", "1", "--decision", "confirm"],
         ["phone", "status"],
         ["phone", "inbox"],
+        ["phone", "notifications"],
         ["phone", "draft"],
         ["phone", "drafts"],
         ["phone", "approve", "draft-1"],
