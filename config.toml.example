@@ -96,6 +96,25 @@ rpd = 0
 [quota.models.transcribe-batch]
 rpd = 25
 
+# Groq material routing is intentionally inert in the shipped example. After
+# creating an owner account, reviewing terms/data use, and verifying real
+# account limits, fill the evidence fields and enable the row. No API key is
+# stored here; use ELARIA_GROQ_API_KEY in the daemon EnvironmentFile.
+[quota.providers.groq]
+enabled = false
+verified = false
+verified_at = ""
+verified_source = ""
+plan = ""
+no_card_required = false
+terms_reviewed_at = ""
+data_use_policy = ""
+
+[quota.providers.groq.models."llama-3.1-8b-instant"]
+rpm = 30
+rpd = 100
+billing_unit = "requests_tokens"
+
 [quota.grounding]
 # Diverted-material VLM fallback for the NUS pointer (BUILD-3 /
 # SPEC-PROVIDER-ROUTING.md). Grounding is NEVER the personality tier
@@ -451,6 +470,8 @@ roots = []
 watch = false
 watch_interval_s = 60
 max_extract_chars = 200000
+material_provider = ""         # unset = errand stays on Gemini; planner tiers abstain
+material_model = ""
 
 # Roots are opt-in: nothing is indexed until you name it here. New roots
 # start in shadow (nothing moves) whatever you write — Phase 3 builds
@@ -560,6 +581,9 @@ max_extract_chars = 16000
 robots_cache_ttl_s = 86400.0
 user_agent_contact = "elaria-reach@local"
 offline = false
+summarise_provider = ""
+summarise_model = ""
+summarise_rpd_budget = 0     # must be positive explicitly to enable any summary calls
 
 [phone]
 # On-demand phone link via the pinned caelestia-connect sidecar (v1.1.1,
