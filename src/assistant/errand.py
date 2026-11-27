@@ -66,6 +66,7 @@ from .safety import expand, is_halted, is_protected, open_directory_nofollow, op
 # -- strict read-only skill allowlist (no writes, no moves, no sends) --------
 # `point` is point-only screen guidance (BUILD-3): NO clicking, NO acting.
 READ_ONLY_SKILLS: frozenset[str] = frozenset({
+    "web.fetch",
     "fs.locate",
     "file.inspect",
     "file.read",
@@ -298,7 +299,7 @@ class ErrandBudget:
 
 @dataclass(frozen=True)
 class UntrustedObservation:
-    """IF-6 envelope: every byte read from disk/archives is untrusted data."""
+    """IF-6 envelope: disk, archive and web content is untrusted data."""
 
     path: str
     sha256: str
@@ -1671,6 +1672,7 @@ class ErrandRunner:
         pointer=None,
         pointer_provider: Callable[[], Any] | None = None,
         is_offline: Callable[[], bool] | None = None,
+        web_fetch: Callable[..., Awaitable[Any]] | None = None,
     ):
         self.config = config
         self.store = store
@@ -1681,6 +1683,7 @@ class ErrandRunner:
         self._pointer = pointer
         self._pointer_provider = pointer_provider
         self._is_offline = is_offline
+        self._web_fetch = web_fetch
         self._tasks: dict[int, asyncio.Task] = {}
         self._cancel_events: dict[int, asyncio.Event] = {}
         self._resume_events: dict[int, asyncio.Event] = {}
@@ -2400,7 +2403,42 @@ class ErrandRunner:
                 step_status = "ok"
 
                 try:
-                    if step.skill == "fs.locate":
+                    if step.skill == "web.fetch":
+                        url = step.args.get("url")
+                        if not isinstance(url, str) or not url.strip() or len(url) > 4096:
+                            raise ValueError("web.fetch needs args.url (at most 4096 characters)")
+                        if self._web_fetch is None:
+                            raise RuntimeError("REACH is not available in this errand runner")
+                        fetched = await self._web_fetch(
+                            url, time_budget_s=max(0.0, budget.max_seconds - _active_now()),
+                        )
+                        _check_cancelled()
+                        step_summary = {"terminal": fetched.terminal.value,
+                                        "action_id": fetched.action_id,
+                                        "message": fetched.plain_message}
+                        if fetched.doc is None:
+                            step_status = "refused"
+                            terminal_status = "failed"
+                            terminal_error = f"web.fetch: {fetched.terminal.value}"
+                            queue.clear()  # terminal, no fallback or alternate URL
+                        else:
+                            doc = fetched.doc
+                            size = len(doc.text.encode("utf-8"))
+                            obs = UntrustedObservation(
+                                path=doc.final_url, sha256=doc.sha256, byte_start=0,
+                                byte_end=size, total_size=size, text=doc.text, eof=True,
+                                truncated=False, source="web", never_send=True,
+                            )
+                            # Display-only envelope: never join the file analysis,
+                            # owner-question, or evidence-to-memory inputs.
+                            step_untrusted_bytes = size
+                            step_summary["observation"] = {
+                                "origin": obs.source, "trusted": obs.trusted,
+                                "sources": [obs.path], "sha256": obs.sha256,
+                                "quoted_excerpt": obs.text[:280],
+                            }
+
+                    elif step.skill == "fs.locate":
                         discovery_cfg = self._discovery_cfg()
                         # Caller-supplied roots may narrow this errand's scope,
                         # never widen it (BUG-A2).
@@ -3015,7 +3053,7 @@ class ErrandRunner:
                     # A stream/inspect/text read step spends real active time
                     # too (metadata-only discovery is cheap, reading is not).
                     if step.skill in ("file.read", "file.stream", "file.inspect",
-                                      "content.analyze", "owner.ask"):
+                                      "content.analyze", "owner.ask", "web.fetch"):
                         active_elapsed_s = _active_now()
                         active_segment_start = time.monotonic()
                     self.store.finish_errand_step(
@@ -3060,7 +3098,7 @@ class ErrandRunner:
                 # metadata-only discovery is cheap and must never starve a step
                 # budget (I3: the deadline is total, not per-step).
                 if step.skill in ("file.read", "file.stream", "file.inspect",
-                                  "content.analyze", "owner.ask"):
+                                  "content.analyze", "owner.ask", "web.fetch"):
                     active_elapsed_s = _active_now()
                     active_segment_start = time.monotonic()
 

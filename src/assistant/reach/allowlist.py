@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ LOGIN_WALLED_DOMAINS = frozenset({
     "pinterest.com",
     "quora.com",
 })
+
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 DENIED_HOST_SUFFIXES = (".local", ".internal", ".home.arpa", ".localhost")
 
@@ -164,18 +167,27 @@ def validate_url(
     if method_up not in spec.methods:
         raise ReachError(TerminalOutcome.DENIED, f"method {method_up!r} not allowed on channel {channel!r}")
 
-    parts = urlsplit(str(url or "").strip())
+    raw = str(url or "").strip()
+    if any(ord(char) < 32 or ord(char) == 127 for char in raw) or "\\" in raw:
+        raise ReachError(TerminalOutcome.DENIED, "invalid character in URL")
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError as exc:
+        raise ReachError(TerminalOutcome.DENIED, "malformed URL") from exc
     if parts.scheme.lower() != "https":
         raise ReachError(TerminalOutcome.DENIED, f"only https:// is allowed, got {parts.scheme!r}")
     if parts.username is not None or parts.password is not None:
         raise ReachError(TerminalOutcome.DENIED, "userinfo in URL is denied")
-    if parts.port is not None and parts.port != 443:
-        raise ReachError(TerminalOutcome.DENIED, f"non-443 port {parts.port} is denied")
+    if port is not None and port != 443:
+        raise ReachError(TerminalOutcome.DENIED, f"non-443 port {port} is denied")
     if not parts.hostname:
         raise ReachError(TerminalOutcome.DENIED, "URL has no hostname")
 
     host = normalize_host(parts.hostname)
     check_host_denylist(host)
+    if len(host) > 253 or not all(_DNS_LABEL.fullmatch(label) for label in host.split(".")):
+        raise ReachError(TerminalOutcome.DENIED, "invalid DNS hostname")
 
     if spec.exact_hosts is not None and host not in spec.exact_hosts:
         raise ReachError(TerminalOutcome.DENIED, f"host {host!r} not in channel {channel!r} allowlist")
