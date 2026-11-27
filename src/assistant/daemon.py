@@ -320,14 +320,23 @@ class Daemon:
         from .memory import Memory
         self.memory = Memory(self.store, make_embedder(config))
         from .errand import ErrandRunner
+        from .reach.service import ReachService
+        from .reach.surface import InterestingnessGate
         from .safety_journal import DEFAULT_JOURNAL_NAME, JournalLog
         self.safety_journal = JournalLog(config.data_dir / DEFAULT_JOURNAL_NAME)
+        self.reach = ReachService(
+            config, self.safety_journal,
+            is_offline=lambda: self.mode_manager.status(refresh=False).is_offline,
+            is_halted=lambda: is_halted(config.socket_path.parent),
+        )
+        self._reach_interest_gate = InterestingnessGate()
         self.errands = ErrandRunner(
             config, self.store, self.memory,
             client=self.client,
             safety_journal=self.safety_journal,
             broadcast=self.broadcast,
             pointer_provider=lambda: self._nus_pointer,
+            web_fetch=self.reach.fetch,
             is_offline=lambda: self.mode_manager.status().is_offline,
         )
         from .meeting import MEETING_TRANSCRIPTION_TIMEOUT_S, MeetingService
@@ -1224,6 +1233,10 @@ class Daemon:
             "class.status": self._class_status,
             "class.set": self._class_set,
             "class.toggle": self._class_toggle,
+            "reach.fetch": self._reach_fetch,
+            "reach.news": self._reach_news,
+            "reach.github": self._reach_github,
+            "reach.status": self._reach_status,
             "errand.start": self._errand_start,
             "errand.status": self._errand_status,
             "errand.list": self._errand_list,
@@ -4853,6 +4866,42 @@ class Daemon:
             "company": self.disclosure.status(),
             "withheld": withheld,
         }
+
+    # -- owner-only Phase-0 REACH ----------------------------------------------
+    async def _reach_direct(self, params: dict, channel: str) -> dict:
+        from .reach.service import attributed_excerpt
+
+        self._require_ipc_owner()
+        if self.showoff.status().get("active"):
+            raise PermissionError("REACH is disabled during show-off mode")
+        url = params.get("url")
+        if not isinstance(url, str) or not url.strip() or len(url) > 4096:
+            raise ValueError("reach needs params.url (an HTTPS URL, at most 4096 characters)")
+        result = await self.reach.fetch(url, channel=channel)
+        reply = {"ok": result.ok, "channel": channel, "terminal": result.terminal.value,
+                 "message": result.plain_message, "action_id": result.action_id}
+        if result.doc is not None:
+            reply["summary"] = attributed_excerpt(result.doc)
+            if self.reach.interests:
+                try:
+                    self._reach_interest_gate.evaluate(result.doc, interests=self.reach.interests,
+                                                       initiative=self.initiative)
+                except InitiativeError:
+                    pass  # a reason/presence/retirement refusal does not change the fetch
+        return reply
+
+    async def _reach_fetch(self, params: dict) -> dict:
+        return await self._reach_direct(params, "web")
+
+    async def _reach_news(self, params: dict) -> dict:
+        return await self._reach_direct(params, "news")
+
+    async def _reach_github(self, params: dict) -> dict:
+        return await self._reach_direct(params, "github")
+
+    async def _reach_status(self, params: dict) -> dict:
+        self._require_ipc_owner()
+        return await asyncio.to_thread(self.reach.status)
 
     # -- bounded async read-errands (GAP-1) ----------------------------------
     async def _errand_start(self, params: dict) -> dict:

@@ -8,6 +8,9 @@ byte counts only — never content bytes.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from urllib.parse import urlsplit, urlunsplit
+
 from ..safety_journal import (
     OUTCOME_FAILED,
     OUTCOME_OK,
@@ -17,10 +20,21 @@ from ..safety_journal import (
 from .contract import FetchedDoc, ReachError, TerminalOutcome
 
 
+def journal_target(url: str) -> str | None:
+    # Do not persist credentials, query tokens or fragments from owner URLs.
+    try:
+        parts = urlsplit(url)
+        if parts.hostname:
+            return urlunsplit((parts.scheme, parts.hostname, parts.path, "", ""))[:2048]
+    except ValueError:
+        pass
+    return None
+
+
 def begin_fetch(
     journal: JournalLog,
     *,
-    url: str,
+    url: str | None,
     channel: str,
     method: str,
     correlation_id: str | None = None,
@@ -43,7 +57,7 @@ def begin_fetch(
     except Exception as exc:
         raise ReachError(
             TerminalOutcome.JOURNAL_FAILED,
-            f"journal.begin failed: {type(exc).__name__}: {exc}",
+            "could not record request intent",
         ) from exc
 
 
@@ -62,6 +76,7 @@ def finish_fetch(
         TerminalOutcome.ROBOTS_DISALLOWED,
         TerminalOutcome.PLATFORM_BLOCKED,
         TerminalOutcome.NEED_LOGIN,
+        TerminalOutcome.RATE_LIMITED,
     ):
         outcome = OUTCOME_REFUSED
     else:
@@ -81,7 +96,7 @@ def record_untrusted_load(
 ) -> str:
     """Journal that untrusted web content was seen (hashes/lengths only, never bytes)."""
     return journal.note_untrusted_input(
-        doc.final_url,
+        journal_target(doc.final_url) or "web",
         actor="reach",
         correlation_id=correlation_id,
         detail={
@@ -91,6 +106,14 @@ def record_untrusted_load(
             "bytes": len(doc.text.encode("utf-8")),
         },
     )
+
+
+def is_request_action(row: dict) -> bool:
+    return (row["kind"], row.get("actor"), row.get("action")) == ("action", "reach", "reach.request")
+
+
+def request_actions(journal: JournalLog) -> Iterator[dict]:
+    return (row for row in journal.records() if is_request_action(row))
 
 
 def reconcile_outstanding(journal: JournalLog) -> list[dict]:

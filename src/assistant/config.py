@@ -780,6 +780,7 @@ DEFAULTS: dict = {
     # Phase-0 internet fetcher (BUILD-7, Agent REACH). Disabled by default.
     "reach": {
         "enabled": False,
+        "interests": [],
         "web_host_mode": "open-public",
         "allowed_web_hosts": [],
         "github_req_per_hr": 30,
