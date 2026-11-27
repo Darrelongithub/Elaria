@@ -4,6 +4,7 @@ import os
 import stat
 import sys
 import uuid
+from collections import Counter
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -79,7 +80,10 @@ def atspi():
     pid, *window_bounds = map(int, sys.argv[2:])
     Atspi.init()
     desktop = Atspi.get_desktop(0)
-    rows = []
+    x, y, width, height = window_bounds
+    tolerance = 8
+    reasons = Counter()
+    candidates = []
     for i in range(desktop.get_child_count()):
         app = desktop.get_child_at_index(i)
         if app.get_process_id() != pid:
@@ -87,35 +91,51 @@ def atspi():
         for j in range(app.get_child_count()):
             window = app.get_child_at_index(j)
             if not window.get_state_set().contains(Atspi.StateType.ACTIVE):
+                reasons['inactive'] += 1
                 continue
             component = window.get_component_iface()
             if component is None:
+                reasons['no_component'] += 1
                 continue
             r = component.get_extents(Atspi.CoordType.SCREEN)
-            # Wayland toolkits sometimes report window-relative coords even
-            # when SCREEN is requested. Reject disagreements instead of offsetting.
-            if any(abs(a - b) > 8 for a, b in zip((r.x, r.y, r.width, r.height), window_bounds)):
+            if (min(r.width, r.height, width, height) <= 0
+                    or abs(r.width - width) > tolerance or abs(r.height - height) > tolerance):
+                reasons['size_mismatch'] += 1
+            elif abs(r.x - x) <= tolerance and abs(r.y - y) <= tolerance:
+                candidates.append((window, 0, 0))
+            elif abs(r.x) <= tolerance and abs(r.y) <= tolerance:
+                # Some Wayland toolkits return window-relative extents for SCREEN.
+                candidates.append((window, x, y))
+            else:
+                reasons['origin_mismatch'] += 1
+
+    rows = []
+    if len(candidates) > 1:
+        reasons['ambiguous'] = len(candidates)
+    elif not candidates and not reasons:
+        reasons['no_pid_windows'] = 1
+    if len(candidates) == 1:
+        window, dx, dy = candidates[0]
+        stack = [window]
+        visited = 0
+        while stack and visited < 1000:
+            node = stack.pop()
+            visited += 1
+            if node is None:
                 continue
-            stack = [window]
-            visited = 0
-            while stack and visited < 1000:
-                node = stack.pop()
-                visited += 1
-                if node is None:
-                    continue
-                states = node.get_state_set()
-                if not states.contains(Atspi.StateType.SHOWING):
-                    continue
-                role = node.get_role_name()
-                component = node.get_component_iface()
-                if component and len(rows) < 150:
-                    r = component.get_extents(Atspi.CoordType.SCREEN)
-                    if r.width > 0 and r.height > 0 and r.x != -2147483648 and r.y != -2147483648:
-                        rows.append([node.get_name()[:256], role, [r.x, r.y, r.width, r.height],
-                                     node.get_role() == Atspi.Role.PASSWORD_TEXT])
-                stack.extend(node.get_child_at_index(k)
-                             for k in reversed(range(min(150, node.get_child_count()))))
-    print(json.dumps(rows))
+            states = node.get_state_set()
+            if not states.contains(Atspi.StateType.SHOWING):
+                continue
+            role = node.get_role_name()
+            component = node.get_component_iface()
+            if component and len(rows) < 150:
+                r = component.get_extents(Atspi.CoordType.SCREEN)
+                if r.width > 0 and r.height > 0 and r.x != -2147483648 and r.y != -2147483648:
+                    rows.append([node.get_name()[:256], role, [r.x + dx, r.y + dy, r.width, r.height],
+                                 node.get_role() == Atspi.Role.PASSWORD_TEXT])
+            stack.extend(node.get_child_at_index(k)
+                         for k in reversed(range(min(150, node.get_child_count()))))
+    print(json.dumps({"rows": rows, "rejections": reasons}))
     return 0
 
 
