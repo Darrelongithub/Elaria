@@ -986,32 +986,31 @@ def skill_fs_survey(
     front. Per-target failures are named, counted and non-fatal (FIX-HW5
     spirit): the sweep itself always returns.
     """
-    from .streamread import StreamError
+    from .streamread import inspect
 
     records: list[dict[str, Any]] = []
     covered = 0
     errors = 0
     for cand in candidates:
-        target = str(cand.get("target") or "")
-        member_name = target.split("#")[-1] if "#" in target else target
-        rec: dict[str, Any] = {
-            "target": target,
-            "name": str(cand.get("name") or Path(member_name).name or target),
-            "ext": str(cand.get("ext") or ""),
-            "kind": str(cand.get("kind") or "file"),
-            "never_send": bool(cand.get("never_send", False)),
-            "size": cand.get("size"),
-        }
+        rec: dict[str, Any] = {"target": ""}
         try:
+            target = str(cand.get("target") or "")
+            rec["target"] = target
+            member_name = target.split("#")[-1] if "#" in target else target
+            rec.update({
+                "name": str(cand.get("name") or Path(member_name).name or target),
+                "ext": str(cand.get("ext") or ""),
+                "kind": str(cand.get("kind") or "file"),
+                "never_send": bool(cand.get("never_send", False)),
+                "size": cand.get("size"),
+            })
             require_within_roots(target, roots)
-            skeleton = skill_file_inspect(
+            # Call inspect directly: skill_file_inspect converts StreamError
+            # into a placeholder, which is not real metadata coverage.
+            skeleton = inspect(
                 target, protected=protected, never_send_roots=never_send_roots,
-            )
-        except (OSError, ValueError, PermissionError, StreamError,
-                zipfile.BadZipFile, tarfile.TarError) as exc:
-            rec["error"] = f"{type(exc).__name__}: {exc}"
-            errors += 1
-        else:
+                skeleton_bytes=4096,
+            ).as_dict()
             rec["format"] = skeleton.get("format")
             if skeleton.get("size") is not None:
                 rec["size"] = skeleton.get("size")
@@ -1023,6 +1022,11 @@ def skill_fs_survey(
                 # failure travels with the record instead of hiding coverage.
                 rec["parse_error"] = str(skeleton["parse_error"])
             covered += 1
+        except Exception as exc:
+            # Deliberate per-file resilience boundary: never count a failed
+            # inspection as coverage, and preserve its type and message.
+            rec["error"] = f"{type(exc).__name__}: {exc}"
+            errors += 1
         records.append(rec)
     return {
         "records": records,
