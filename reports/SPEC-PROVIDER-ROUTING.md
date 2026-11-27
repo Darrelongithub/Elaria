@@ -82,6 +82,35 @@ and local Ollama-class models on the owner's hardware.
 4. Recovery is automatic at quota reset; no state is lost,
    because memory and identity never lived in any provider.
 
+## Owner decision (2026-11-27): Groq first, all material, Gemini fallback
+
+Decided in session after fact-checking the survey:
+
+- **First diverted provider: Groq** (free tier, no card —
+  ~30 RPM / ~14.4k req/day on small models per the provider's
+  published free limits; the per-token prices on its pricing
+  page are the paid tiers). Model: `llama-3.1-8b-instant` for
+  bulk material. OpenRouter deferred (its useful free uplift
+  needs a $10 credit purchase — refused under the $0 rule;
+  50 req/day `:free` remains a possible second source later).
+  Local Ollama rejected by the owner: the laptop hardware
+  isn't up to it. Cloudflare stays a built-but-unenabled
+  adapter.
+- **Scope: ALL material jobs divert** — errand `content.analyze`
+  (organise), REACH summarisation, classification/extraction/
+  dedupe. Personality is untouched: Gemini pinned in code,
+  re-voicing of diverted material on Gemini, no personality
+  failover ever.
+- **Degradation: diverted provider down/limited → fall back to
+  Gemini flash-lite** for material (still re-voiced; still not
+  a personality failover — her voice never moved). Local-only
+  remains the floor when all cloud is gone, per the ladder.
+- Enablement is the owner's deliberate act per BUILD-9R/9S:
+  own Groq account + `ELARIA_GROQ_API_KEY` in the daemon's
+  environment file + a verified `[quota.providers.groq]` row
+  (dates/source recorded after checking the account limits
+  page). Enable lane: `reports/DISPATCH-PROVIDER-ENABLE.md`.
+
 ## Lane
 
 Agent I (model registry owner): fact-check the free-provider
