@@ -30,6 +30,7 @@ import sys
 import time
 import uuid
 from contextvars import ContextVar
+from datetime import datetime
 from pathlib import Path
 
 from . import __version__
@@ -58,6 +59,7 @@ from .persona import (
     build_chat_prompt,
     chat_reply_violation,
     checkin_reply,
+    daemon_now_stamp,
     timeout_fallback_reply,
 )
 from .phone_service import PhoneService
@@ -4512,6 +4514,9 @@ class Daemon:
         model = None
         if verdict.get("allowed"):
             prompt = self.showoff.build_guest_prompt(text)
+            prompt, gen_config = build_chat_prompt(
+                prompt, daemon_facts=(
+                    f"Current local time: {daemon_now_stamp()}"))
             connectivity = await self._connectivity_snapshot()
             if connectivity.is_offline:
                 reply = ("I'm offline, so the demo is text-only right now — "
@@ -4520,7 +4525,8 @@ class Daemon:
             else:
                 try:
                     result = await self._generate(
-                        prompt, purpose="housekeeping:guest_turn", is_user_turn=0)
+                        prompt, gen_config=gen_config,
+                        purpose="housekeeping:guest_turn", is_user_turn=0)
                     reply, model = result.text, result.model
                     via = "showoff"
                 except TimeoutError:
@@ -4877,7 +4883,20 @@ class Daemon:
                 reply, via = (f"Not run: {why}. Say it again, or type it.", 
                               "local-refused")
                 intent = None
-        if intent is not None:
+        if intent is not None and intent.kind in ("time", "date"):
+            # Clock questions are trusted, read-only facts. Resolve them from
+            # the OS clock in its system-local timezone; never send them to a
+            # provider or charge the model ledger.
+            local_now = datetime.now().astimezone()
+            if intent.kind == "time":
+                hour = local_now.strftime("%I").lstrip("0") or "12"
+                reply = f"It's {hour}:{local_now:%M} {local_now:%p}."
+            else:
+                day = local_now.strftime("%d").lstrip("0") or "0"
+                reply = (f"Today is {local_now:%A}, {local_now:%B} {day}, "
+                         f"{local_now:%Y}.")
+            via = "local-clock"
+        elif intent is not None:
             reply, via, receipt = await self._run_intent(intent)
         if (reply is None and wake is not None and wake.is_checkin
                 and not unparsed_command):
@@ -4965,7 +4984,9 @@ class Daemon:
                 if restricted else None)
             full_prompt, gen_config = build_chat_prompt(
                 body, decision=decision, restricted=restricted,
-                disclosure_note=disclosure_note)
+                disclosure_note=disclosure_note,
+                daemon_facts=(
+                    f"Current local time: {daemon_now_stamp()}"))
             # For offline we still queue the full prompt (system + body) so
             # replay on reconnect is faithful
             if connectivity.is_offline:
