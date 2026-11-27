@@ -2199,6 +2199,55 @@ def _errand_command(args, config) -> int:
                 print(f"  question #{q['id']} [{q['status']}]: {q['question']}")
             if result.get("report"):
                 report = result["report"]
+                # BUG-HW6: the ANSWER (groups + coverage) first; step/file
+                # counts are accounting and stay below it.
+                groups = report.get("groups") or []
+                if groups:
+                    meta = report.get("grouping") or {}
+                    axis = meta.get("axis") or "format"
+                    source = meta.get("axis_source") or ""
+                    axis_note = f"{axis}" + (f", from {source}" if source else "")
+                    print(f"  answer: grouped into {len(groups)} group(s) "
+                          f"(axis: {axis_note})")
+                    for group in groups:
+                        if not isinstance(group, dict):
+                            continue
+                        basis = group.get("basis") or {}
+                        names = ", ".join(group.get("representative_names") or [])
+                        print(f"    - {group.get('label')}: "
+                              f"{group.get('member_count', 0)} member(s): {names}"
+                              f" · basis: {basis.get('evidence') or basis.get('kind') or 'unspecified'}")
+                    if meta.get("note"):
+                        print(f"    note: {meta['note']}")
+                coverage = report.get("coverage")
+                if isinstance(coverage, dict) and coverage:
+                    print(
+                        f"  coverage: metadata "
+                        f"{coverage.get('metadata_covered', 0)}/"
+                        f"{coverage.get('selected', 0)} "
+                        f"({float(coverage.get('metadata_fraction') or 0.0):.0%}), "
+                        f"content {coverage.get('content_read', 0)}/"
+                        f"{coverage.get('selected', 0)} "
+                        f"({float(coverage.get('content_fraction') or 0.0):.0%}), "
+                        f"duplicates collapsed: "
+                        f"{coverage.get('duplicates_collapsed', 0)}"
+                    )
+                    skip_counts: dict[str, int] = {}
+                    for skip in coverage.get("skipped") or []:
+                        if not isinstance(skip, dict):
+                            continue
+                        reason = str(skip.get("reason") or "unspecified")
+                        # Collapse the shared reason prefix so a long skip
+                        # list stays readable while remaining honest.
+                        key = reason.split(" (same content digest")[0]
+                        skip_counts[key] = skip_counts.get(key, 0) + 1
+                    for reason, count in sorted(skip_counts.items()):
+                        print(f"    skipped {count}: {reason}")
+                for cand in report.get("unconfirmed_candidates") or []:
+                    if not isinstance(cand, dict):
+                        continue
+                    print(f"  unconfirmed candidate (not stored): "
+                          f"{cand.get('text') or ''}")
                 print(f"  report: {report.get('summary')}")
                 for item in report.get("unanswered_or_unasked", []):
                     if not isinstance(item, dict):
